@@ -81,7 +81,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         """Decoder"""
         depths=depths[::-1]
         dims=dims[::-1]
-        decoder_embed_dim=64
+        decoder_embed_dim=512
         
         self.upsample_layers = nn.ModuleList()
         

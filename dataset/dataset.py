@@ -5,7 +5,8 @@ import numpy as np
 import MinkowskiEngine as ME
 from glob import glob
 from torch.utils.data import Dataset
-    
+from utils import random_rotation_saul
+
     
 class SparseFASERCALDataset(Dataset):
     def __init__(self, args):
@@ -59,22 +60,68 @@ class SparseFASERCALDataset(Dataset):
         """
         return len(self.data_files)
 
-    def collate_sparse_minkowski(self, batch):
-        """
-        Collates a batch of data into a format suitable for MinkowskiEngine.
+    def _augment(self, coords, feats, labels, prim_vertex, round_coords=True):
+        # rotate
+        coords = self._rotate(coords, prim_vertex)
+        # translate
+        coords = self._translate(coords)
+        # drop voxels
+        coords, feats, labels = self._drop(coords, feats, labels, std_dev=0.1)
+        # shift feature values
+        feats = self._shift_q_gaussian(feats, std_dev=0.05)
+        # keep within limits
+        #coords, feats, labels = self._within_limits(coords, feats, labels)
+        if round_coords:
+            coords = coords.round()
 
-        Args:
-        batch (list): List of data dictionaries.
+        return coords, feats, labels
 
-        Returns:
-        dict: Collated data with coordinates, features, and labels.
-        """
-        coords = [d['coords'].int() for d in batch if d['coords'] is not None]
-        feats = torch.cat([d['feats'] for d in batch if d['coords'] is not None])
-        labels = torch.cat([d['labels'] for d in batch if d['coords'] is not None])
-        
-        return {'f': feats, 'c': coords, 'y': labels}
-    
+    def _rotate(self, coords, prim_vertex):
+        """Random rotation along"""
+        angle_limits = torch.tensor([
+            [-torch.pi/8, -torch.pi/8, -torch.pi],  # Min angles for X, Y, Z
+            [torch.pi/8, torch.pi/8,  torch.pi]   # Max angles for X, Y, Z
+        ])
+        if (angle_limits==0).all():
+            # no rotation at all
+            return coords
+        return random_rotation_saul(coords=coords,
+                                    angle_limits=angle_limits,
+                                    origin=prim_vertex)
+ 
+    def _translate(self, coords):
+        shift_x, shift_y = np.random.randint(low=-10, high=10, size=(2,))
+        coords[:, 0] += shift_x
+        coords[:, 1] += shift_y
+        return coords
+
+
+    def _drop(self, coords, feats, labels, std_dev=0.1):
+        p = abs(np.random.randn(1) * std_dev)
+        mask = np.random.rand(coords.shape[0]) > p
+        #don't drop all coordinates
+        if mask.sum() == 0:
+            return coords, feats
+        return coords[mask], feats[mask], labels[mask]
+
+
+    def _shift_q_uniform(self, feats, max_scale_factor=0.1):
+        shift = 1 - np.random.rand(*feats.shape) * max_scale_factor
+        return feats * shift
+
+
+    def _shift_q_gaussian(self, feats, std_dev=0.1):
+        shift = 1 - np.random.randn(*feats.shape) * std_dev
+        return feats * shift
+
+
+    def _within_limits(self, coords, feats, labels):
+        mask = (coords[:, 0] >= 0) & (coords[:, 0] < 48) & \
+           (coords[:, 1] >= 0) & (coords[:, 1] < 48) & \
+           (coords[:, 2] >= 0) & (coords[:, 2] < 400)
+        return coords[mask], feats[mask], labels[mask]
+
+ 
     def voxelise(self, coords):
         """
         Convert physical coordinates to voxel coordinates by mapping them to 
@@ -141,7 +188,25 @@ class SparseFASERCALDataset(Dataset):
         
         # PDGs to labels
         labels = self.process_labels(reco_hit_pdgs)
-        
+       
+        if self.training:
+            if np.random.rand() > 0.05:
+                prim_vertex = data['prim_vertex'].reshape(1, 3)
+                self.voxelise(prim_vertex)
+                prim_vertex = prim_vertex.reshape(3)
+                # Augment 95% of the times during training
+                coords, feats, labels = self._augment(coords, feats, labels, prim_vertex, round_coords=True)
+                #c, x, y = trilinear_interpolation(c, x, y)
+                # Quantize (voxelise and detect duplicates)
+                _, indices = ME.utils.sparse_quantize(
+                    coordinates=coords, 
+                    return_index=True,
+                    quantization_size=1.0
+                )
+                coords = coords[indices]
+                feats = feats[indices]
+                labels = labels[indices]
+
         # torch tensors
         coords = torch.from_numpy(coords).float()
         feats = torch.from_numpy(feats).float()

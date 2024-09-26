@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import arrange_sparse_minkowski, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
@@ -63,6 +63,7 @@ class SparseLightningModel(pl.LightningModule):
         for step, (out, tgt) in enumerate(zip(batch_output, batch_target)):
             weight = 1 / (2 ** step)  # inspired by https://arxiv.org/pdf/2310.04110
 
+            '''
             out_coords, out_feats = out.decomposed_coordinates_and_features
             tgt_coords, tgt_feats = tgt.decomposed_coordinates_and_features     
             
@@ -77,17 +78,40 @@ class SparseLightningModel(pl.LightningModule):
                     if not (c1==c2).all():
                         sorted_indices_c1 = argsort_coords(c1)
                         sorted_indices_c2 = argsort_coords(c2)
-
                         assert (c1[sorted_indices_c1] == c2[sorted_indices_c2]).all()
-
                         f1 = f1[sorted_indices_c1]
                         f2 = f2[sorted_indices_c2]
-
-                    loss_ghost += loss_fn(f1[:, 0], f2[:, 0], **extra_args) / batch_size
+                    loss_ghost += loss_fn(f1[:, 0], f2[:, 0], **extra_args)
                     mask = f2[:, 0] < 0.5  # ghost mask
-                    loss_muonic += loss_fn(f1[mask, 1], f2[mask, 1], **extra_args) / batch_size
-                    loss_electromagnetic += loss_fn(f1[mask, 2], f2[mask, 2], **extra_args) / batch_size
-                    loss_hadronic += loss_fn(f1[mask, 3], f2[mask, 3], **extra_args) / batch_size
+                    loss_muonic += loss_fn(f1[mask, 1], f2[mask, 1], **extra_args)
+                    loss_electromagnetic += loss_fn(f1[mask, 2], f2[mask, 2], **extra_args)
+                    loss_hadronic += loss_fn(f1[mask, 3], f2[mask, 3], **extra_args)
+                loss_ghost /= batch_size
+                loss_muonic /= batch_size
+                loss_electromagnetic /= batch_size
+                loss_hadronic /= batch_size
+            '''
+            sorted_ind_out = argsort_sparse_tensor(out)
+            sorted_ind_tgt = argsort_sparse_tensor(tgt)
+            
+            sorted_coords_out = out.coordinates[sorted_ind_out]
+            sorted_coords_tgt = tgt.coordinates[sorted_ind_tgt]
+
+            # Now the coordinates should be aligned; you can sum the features
+            assert (sorted_coords_out == sorted_coords_tgt).all(), "Coordinates are still not aligned!"
+
+            sorted_feats_out = out.F[sorted_ind_out]
+            sorted_feats_tgt = tgt.F[sorted_ind_tgt]
+
+            # Compute losses
+            for i, (loss, loss_fn) in enumerate(zip(self.losses, self.loss_fn)):
+                extra_args = {"gamma": 1.0} if loss == "focal" else {}
+
+                loss_ghost = loss_fn(sorted_feats_out[:, 0], sorted_feats_tgt[:, 0], **extra_args)
+                mask = sorted_feats_tgt[:, 0] < 0.5  # ghost mask
+                loss_muonic = loss_fn(sorted_feats_out[mask, 1], sorted_feats_tgt[mask, 1], **extra_args)
+                loss_electromagnetic = loss_fn(sorted_feats_out[mask, 2], sorted_feats_tgt[mask, 2], **extra_args)
+                loss_hadronic = loss_fn(sorted_feats_out[mask, 3], sorted_feats_tgt[mask, 3], **extra_args)
 
                 part_losses[i].append([loss_ghost, loss_muonic, loss_electromagnetic, loss_hadronic])
                 curr_loss = loss_ghost + loss_muonic + loss_electromagnetic + loss_hadronic
