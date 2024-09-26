@@ -111,7 +111,7 @@ class SparseFASERCALDataset(Dataset):
             # Assign real hit types based on the presence of PDG codes
             y[i, 0] = 1 if label_set & ghost_pdg else 0
             y[i, 1] = 1 if label_set & muonic_pdg else 0
-            y[i, 2] = 1 if label_set & electromagnetic_pdg else 0
+            y[i, 2] = 1 if label_set & electromagnetic_pdg else y[i, 1]
             y[i, 3] = 1 if label_set & hadronic_pdg else 0
 
         return y

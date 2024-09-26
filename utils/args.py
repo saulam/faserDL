@@ -16,7 +16,7 @@ def ini_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", default=True, help="set if training")
     parser.add_argument("--test", action="store_false", dest="train", help="set if testing")
-    parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/medical_data/data_kits23_{}_{}_{}_good/*", help="Dataset path")
+    parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch_size")
     parser.add_argument("-e", "--epochs", type=int, default=50, help="number of epochs")

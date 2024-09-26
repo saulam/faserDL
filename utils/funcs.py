@@ -86,6 +86,19 @@ def arrange_truth(data, device):
          device=device)
     return y
 
+def argsort_coords(coordinates):
+    # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
+    # Multiply coordinates by powers of a large number to encode them uniquely into one tensor
+    max_val = coordinates.max() + 1
+    multipliers = torch.tensor([max_val**i for i in reversed(range(coordinates.shape[1]))], device=coordinates.device)
+
+    # Create a single sortable tensor
+    encoded_coords = (coordinates * multipliers).sum(dim=1)
+
+    # Sort based on the encoded coordinates
+    sorted_indices = torch.argsort(encoded_coords)
+
+    return sorted_indices
 
 def argsort_sparse_tensor(tensor):
     # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
