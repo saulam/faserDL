@@ -53,6 +53,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         #depths=[2, 2, 6, 2]
         #dims=(32, 64, 128, 256)
         drop_path_rate=0.
+        self.contrastive = args.contrastive
 
         self.downsample_layers = nn.ModuleList()
 
@@ -81,8 +82,9 @@ class MinkUNetConvNeXtV2(nn.Module):
         """Decoder"""
         depths=depths[::-1]
         dims=dims[::-1]
-        decoder_embed_dim=512
-        
+        #decoder_embed_dim=128
+        decoder_embed_dim=256 if self.contrastive else 512
+
         self.upsample_layers = nn.ModuleList()
         
         for i in range(3):
@@ -107,35 +109,39 @@ class MinkUNetConvNeXtV2(nn.Module):
             )
             self.stages_dec.append(stage)
             cur += depths[i]
-        
+       
         """Cls layers"""
         self.cls_layers = nn.ModuleList()
         for i in range(4):
             cls_layer = nn.Sequential(
-                MinkowskiConvolution(dims[i], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
+                MinkowskiConvolution(dims[-1] if self.contrastive else dims[i], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
                 Block(dim=decoder_embed_dim, drop_path=0., D=3),
-                MinkowskiConvolution(decoder_embed_dim, out_channels, kernel_size=1, stride=1, dimension=3),
-            )
+                MinkowskiConvolution(decoder_embed_dim, decoder_embed_dim if self.contrastive else out_channels, kernel_size=1, stride=1, dimension=3),
+            ) 
             self.cls_layers.append(cls_layer)
-            
-        """ Max pool just for generating downsampled labels """        
-        self.avg_pool2x2 = ME.MinkowskiAvgPooling(kernel_size=2, stride=2, dimension=3) 
-        self.avg_pool4x4 = ME.MinkowskiAvgPooling(kernel_size=4, stride=4, dimension=3) 
+
+        if not self.contrastive:
+            """ Max pool just for generating downsampled labels """
+            self.avg_pool2x2 = ME.MinkowskiAvgPooling(kernel_size=2, stride=2, dimension=3)
+            self.avg_pool4x4 = ME.MinkowskiAvgPooling(kernel_size=4, stride=4, dimension=3)
 
         """ Initialise weights """
         self.apply(_init_weights)
 
     def forward(self, x, y):
         """ Generate labels for deep supervision """
-        ys = []
-        for i in range(5):
-            if i==0:
-                y_aux = y.detach()
-            elif i==1:
-                y_aux = self.avg_pool4x4(y_aux)
-            else:
-                y_aux = self.avg_pool2x2(y_aux)
-            ys.append(y_aux)
+        if self.contrastive:
+            ys = y.detach()
+        else:
+            ys = []
+            for i in range(5):
+                if i==0:
+                    y_aux = y.detach()
+                elif i==1:
+                    y_aux = self.avg_pool4x4(y_aux)
+                else:
+                    y_aux = self.avg_pool2x2(y_aux)
+                ys.append(y_aux)
   
         """Encoder"""
         x = self.downsample_layers[0](x)
@@ -153,8 +159,15 @@ class MinkUNetConvNeXtV2(nn.Module):
                 x = ME.cat(x, x_enc[i])
             x = self.upsample_layers[i](x)
             x = self.stages_dec[i](x)
-            out_cl = self.cls_layers[i](x)
-            out_cls.insert(0, out_cl)
+
+            if not self.contrastive:
+                out_cl = self.cls_layers[i](x)
+                out_cls.insert(0, out_cl)
+
+        if self.contrastive:
+            for i in range(4):
+                out_cl = self.cls_layers[i](x)
+                out_cls.append(out_cl)
         
         return out_cls, ys
 

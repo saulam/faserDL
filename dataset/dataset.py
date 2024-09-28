@@ -181,7 +181,7 @@ class SparseFASERCALDataset(Dataset):
 
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
-        feats = np.log(reco_hits[:, 4]).reshape(-1, 1) 
+        feats = reco_hits[:, 4].reshape(-1, 1) 
 
         # voxelise
         self.voxelise(coords)
@@ -206,6 +206,9 @@ class SparseFASERCALDataset(Dataset):
                 coords = coords[indices]
                 feats = feats[indices]
                 labels = labels[indices]
+
+        # log features
+        feats = np.log(feats)
 
         # torch tensors
         coords = torch.from_numpy(coords).float()

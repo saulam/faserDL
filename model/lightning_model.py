@@ -19,6 +19,8 @@ class SparseLightningModel(pl.LightningModule):
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
+        self.contrastive = args.contrastive
+        self.chunk_size = args.chunk_size
 
 
     def on_train_start(self):
@@ -121,7 +123,25 @@ class SparseLightningModel(pl.LightningModule):
         total_loss = sum(losses)
 
         return total_loss, part_losses
-   
+
+    
+    def compute_losses_contrastive(self, batch_output, batch_target):
+        losses = [0.]
+        part_losses = [[]] 
+        for i, output in enumerate(batch_output):
+            assert (output.coordinates == batch_target.coordinates).all()
+            output = output.F
+            target = batch_target.F[:, i]
+            curr_loss = self.loss_fn(output, target, chunk_size=self.chunk_size)
+            
+            part_losses[0].append([curr_loss])
+            losses[0] += curr_loss
+
+        part_losses = torch.tensor(part_losses)
+        total_loss = sum(losses)
+
+        return total_loss, part_losses
+            
 
     def common_step(self, batch):
         batch_size = len(batch["c"])
@@ -131,7 +151,10 @@ class SparseLightningModel(pl.LightningModule):
         batch_output, batch_target = self.forward(batch_input, batch_target)
 
         # Compute loss
-        loss, part_losses = self.compute_losses(batch_output, batch_target)
+        if self.contrastive:
+            loss, part_losses = self.compute_losses_contrastive(batch_output, batch_target)
+        else:
+            loss, part_losses = self.compute_losses(batch_output, batch_target)
   
         # Retrieve current learning rate
         lr = self.optimizers().param_groups[0]['lr']

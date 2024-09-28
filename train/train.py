@@ -11,7 +11,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import ini_argparse, split_dataset, sigmoid_focal_loss, dice_loss
+from utils import ini_argparse, split_dataset, label_based_contrastive_loss_random_chunk, sigmoid_focal_loss, dice_loss
 from dataset import SparseFASERCALDataset
 from model import MinkUNetConvNeXtV2, SparseLightningModel
 from pytorch_lightning.loggers import CSVLogger
@@ -36,14 +36,17 @@ def main():
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3]) 
 
     # Define loss functions
-    loss_fn = []
-    for loss in args.losses:
-        if loss == "focal":
-            loss_fn.append(partial(sigmoid_focal_loss, reduction="mean"))
-        elif loss == "dice":
-            loss_fn.append(dice_loss)
-        else:
-            raise ValueError("Wrong loss")
+    if args.contrastive:
+        loss_fn = label_based_contrastive_loss_random_chunk
+    else:
+        loss_fn = []
+        for loss in args.losses:
+            if loss == "focal":
+                loss_fn.append(partial(sigmoid_focal_loss, reduction="mean"))
+            elif loss == "dice":
+                loss_fn.append(dice_loss)
+            else:
+                raise ValueError("Wrong loss")
 
     # Calculate arguments for scheduler
     nb_batches = len(train_loader)
