@@ -242,6 +242,9 @@ def label_based_contrastive_loss_random_chunk(projs, labels, temperature=0.1, ch
     """
     N, device = projs.shape[0], projs.device
 
+    if N < chunk_size * 2:
+        chunk_size = N // 2
+
     indices = torch.randperm(N)
     chunk1_indices = indices[:chunk_size]
     chunk2_indices = indices[chunk_size:2*chunk_size]
@@ -256,8 +259,8 @@ def label_based_contrastive_loss_random_chunk(projs, labels, temperature=0.1, ch
 
     similarity_matrix = F.cosine_similarity(projs1.unsqueeze(1), projs2.unsqueeze(0), dim=2 )
 
-    positives_mask = labels1[:, None] == labels2[None, :]
-    nominator = positives_mask.float() * torch.exp(similarity_matrix / temperature)
+    positives_mask = (labels1[:, None] == labels2[None, :]).float()
+    nominator = positives_mask * torch.exp(similarity_matrix / temperature)
     denominator = torch.exp(similarity_matrix / temperature)    
 
     loss_partial = -torch.log((torch.sum(nominator, dim=1) + eps) / (torch.sum(denominator, dim=1) + eps))

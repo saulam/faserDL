@@ -132,6 +132,13 @@ class SparseLightningModel(pl.LightningModule):
             assert (output.coordinates == batch_target.coordinates).all()
             output = output.F
             target = batch_target.F[:, i]
+
+            if i > 0:
+                # mask ghosts out
+                mask = batch_target.F[:, 0] < 0.5
+                output = output[mask]
+                target = target[mask]
+
             curr_loss = self.loss_fn(output, target, chunk_size=self.chunk_size)
             
             part_losses[0].append([curr_loss])
