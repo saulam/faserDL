@@ -62,13 +62,23 @@ def collate_sparse_minkowski(batch):
     feats = torch.cat([d['feats'] for d in batch])
     y = torch.cat([d['labels'] for d in batch])
 
-    # Create the return dictionary
     ret = {
         'f': feats,
         'c': coords,
         'y': y,
     }
-    
+
+    aug_fields = [('coords_aug', 'c_aug'), ('feats_aug', 'f_aug'), ('labels_aug', 'y_aug')]
+
+    # Augmented data if available
+    for aug_key, ret_key in aug_fields:
+        aug_data = [d[aug_key] for d in batch if aug_key in d]
+        if aug_data:
+            if 'feats' in aug_key or 'labels' in aug_key:
+                ret[ret_key] = torch.cat(aug_data)
+            else:
+                ret[ret_key] = aug_data
+
     return ret
 
 
@@ -85,6 +95,43 @@ def arrange_truth(data, device):
          coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
          device=device)
     return y
+
+
+def arrange_sparse_minkowski(data, device):
+    main_tensor = ME.SparseTensor(
+        features=data['f'],
+        coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
+        device=device
+    )
+
+    if 'f_aug' in data and 'c_aug' in data:
+        aug_tensor = ME.SparseTensor(
+            features=data['f_aug'],
+            coordinates=ME.utils.batched_coordinates(data['c_aug'], dtype=torch.int),
+            device=device
+        )
+        return main_tensor, aug_tensor
+
+    return main_tensor
+
+
+def arrange_truth(data, device):
+    main_truth = ME.SparseTensor(
+        features=data['y'],
+        coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
+        device=device
+    )
+
+    if 'y_aug' in data and 'c_aug' in data:
+        aug_truth = ME.SparseTensor(
+            features=data['y_aug'],
+            coordinates=ME.utils.batched_coordinates(data['c_aug'], dtype=torch.int),
+            device=device
+        )
+        return main_truth, aug_truth
+
+    return main_truth
+
 
 def argsort_coords(coordinates):
     # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.

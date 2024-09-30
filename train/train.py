@@ -11,7 +11,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import ini_argparse, split_dataset, label_based_contrastive_loss_random_chunk, sigmoid_focal_loss, dice_loss
+from utils import ini_argparse, split_dataset, supervised_pixel_contrastive_loss, sigmoid_focal_loss, dice_loss
 from dataset import SparseFASERCALDataset
 from model import MinkUNetConvNeXtV2, SparseLightningModel
 from pytorch_lightning.loggers import CSVLogger
@@ -37,7 +37,7 @@ def main():
 
     # Define loss functions
     if args.contrastive:
-        loss_fn = label_based_contrastive_loss_random_chunk
+        loss_fn = supervised_pixel_contrastive_loss
     else:
         loss_fn = []
         for loss in args.losses:

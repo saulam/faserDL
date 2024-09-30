@@ -125,22 +125,32 @@ class SparseLightningModel(pl.LightningModule):
         return total_loss, part_losses
 
     
-    def compute_losses_contrastive(self, batch_output, batch_target):
+    def compute_losses_contrastive(self, batch_output1, batch_output2, batch_target1, batch_target2):
+        coords1, labels1 = batch_target1.decomposed_coordinates_and_features
+        coords2, labels2 = batch_target2.decomposed_coordinates_and_features
+
         losses = [0.]
         part_losses = [[]] 
-        for i, output in enumerate(batch_output):
-            assert (output.coordinates == batch_target.coordinates).all()
-            output = output.F
-            target = batch_target.F[:, i]
+        for i, (output1, output2) in enumerate(zip(batch_output1, batch_output2)):
+            
+            coords1_, feats1 = output1.decomposed_coordinates_and_features
+            coords2_, feats2 = output2.decomposed_coordinates_and_features
+            labs1 = [x[:, i] for x in labels1]
+            labs2 = [x[:, i] for x in labels2]
+
+            assert (coords1[0] == coords1_[0]).all()
+            assert (coords2[0] == coords2_[0]).all()
 
             if i > 0:
-                # mask ghosts out
-                mask = batch_target.F[:, 0] < 0.5
-                output = output[mask]
-                target = target[mask]
+                mask1 = [x[:, 0] < 0.5 for x in labels1]
+                mask2 = [x[:, 0] < 0.5 for x in labels2]
+                feats1 = [x[mask] for x, mask in zip(feats1, mask1)]
+                feats2 = [x[mask] for x, mask in zip(feats2, mask2)]
+                labs1 = [x[mask] for x, mask in zip(labs1, mask1)]
+                labs2 = [x[mask] for x, mask in zip(labs2, mask2)]
 
-            curr_loss = self.loss_fn(output, target, chunk_size=self.chunk_size)
-            
+            curr_loss = self.loss_fn(feats1, feats2, labs1, labs2, chunk_size=self.chunk_size)
+
             part_losses[0].append([curr_loss])
             losses[0] += curr_loss
 
@@ -154,13 +164,21 @@ class SparseLightningModel(pl.LightningModule):
         batch_size = len(batch["c"])
         batch_input, batch_target = self._arrange_batch(batch)
 
-        # Forward pass
-        batch_output, batch_target = self.forward(batch_input, batch_target)
-
-        # Compute loss
         if self.contrastive:
-            loss, part_losses = self.compute_losses_contrastive(batch_output, batch_target)
+            batch_input_i, batch_input_j = batch_input
+            batch_target_i, batch_target_j = batch_target
+
+            batch_output_i, _ = self.forward(batch_input_i, batch_target_i)
+            batch_output_j, _ = self.forward(batch_input_j, batch_target_j)
+           
+            loss, part_losses = self.compute_losses_contrastive(batch_output_i,
+                                                                batch_output_j,
+                                                                batch_target_i,
+                                                                batch_target_j)
+        
         else:
+            # Forward pass
+            batch_output, batch_target = self.forward(batch_input, batch_target)
             loss, part_losses = self.compute_losses(batch_output, batch_target)
   
         # Retrieve current learning rate

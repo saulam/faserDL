@@ -18,6 +18,7 @@ class SparseFASERCALDataset(Dataset):
         shuffle (bool): Whether to shuffle the dataset (default: False).
         """
         self.root = args.dataset_path
+        self.contrastive = args.contrastive
         self.data_files = self.processed_file_names
         self.training = False
         self.total_events = self.__len__
@@ -189,43 +190,49 @@ class SparseFASERCALDataset(Dataset):
         # PDGs to labels
         labels = self.process_labels(reco_hit_pdgs)
        
-        if self.training:
-            if np.random.rand() > 0.05:
-                prim_vertex = data['prim_vertex'].reshape(1, 3)
-                self.voxelise(prim_vertex)
-                prim_vertex = prim_vertex.reshape(3)
-                # Augment 95% of the times during training
-                coords, feats, labels = self._augment(coords, feats, labels, prim_vertex, round_coords=True)
-                #c, x, y = trilinear_interpolation(c, x, y)
-                # Quantize (voxelise and detect duplicates)
-                _, indices = ME.utils.sparse_quantize(
-                    coordinates=coords, 
-                    return_index=True,
-                    quantization_size=1.0
-                )
-                coords = coords[indices]
-                feats = feats[indices]
-                labels = labels[indices]
+        # output
+        output = {'run_number': run_number,
+                  'event_id': event_id}
+
+        if self.contrastive or (self.training and np.random.rand() > 0.05):
+            coords_true = coords.copy()
+            feats_true = feats.copy()
+            labels_true = labels.copy() 
+
+            prim_vertex = data['prim_vertex'].reshape(1, 3)
+            self.voxelise(prim_vertex)
+            prim_vertex = prim_vertex.reshape(3)
+            coords_aug, feats_aug, labels_aug = self._augment(coords, feats, labels, prim_vertex, round_coords=True)
+            
+            # Quantize (voxelise and detect duplicates)
+            _, indices = ME.utils.sparse_quantize(
+                coordinates=coords_aug, 
+                return_index=True,
+                quantization_size=1.0
+            )
+            coords_aug = coords_aug[indices]
+            feats_aug = feats_aug[indices]
+            labels_aug = labels_aug[indices]
+
+            if self.contrastive:
+                # restore to original values
+                coords, feats, labels = coords_true, feats_true, labels_true
+                if (self.training and np.random.rand() < 0.2):
+                    # don't augment 20% of the times during training
+                    coords_aug, feats_aug, labels_aug = coords, feats, labels
+                feats_aug = np.log(feats_aug)
+                output['coords_aug'] = torch.from_numpy(coords_aug).float()
+                output['feats_aug'] = torch.from_numpy(feats_aug).float()
+                output['labels_aug'] = torch.from_numpy(labels_aug).float()
+            else:
+                coords, feats, labels = coords_aug, feats_aug, labels_aug
 
         # log features
         feats = np.log(feats)
 
-        # torch tensors
-        coords = torch.from_numpy(coords).float()
-        feats = torch.from_numpy(feats).float()
-        labels = torch.from_numpy(labels).float()
+        output['coords'] = torch.from_numpy(coords).float()
+        output['feats'] = torch.from_numpy(feats).float()
+        output['labels'] = torch.from_numpy(labels).float()
 
-        '''
-        # Quantize (voxelise and detect duplicates)
-        coords, feats, labels = ME.utils.sparse_quantize(
-            coordinates=coords, features=feats, labels=labels, quantization_size=1.0
-        )
-        '''
+        return output
 
-        return {'run_number': run_number,
-                'event_id': event_id,
-                'coords': coords, 
-                'feats': feats, 
-                'labels': labels,
-               }
-    

@@ -131,7 +131,7 @@ class MinkUNetConvNeXtV2(nn.Module):
     def forward(self, x, y):
         """ Generate labels for deep supervision """
         if self.contrastive:
-            ys = y.detach()
+            ys = None
         else:
             ys = []
             for i in range(5):

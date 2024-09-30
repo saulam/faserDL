@@ -1,5 +1,5 @@
 from .args import ini_argparse
 from .funcs import *
-from .losses import label_based_nt_xent_loss, label_based_nt_xent_loss_in_chunks, label_based_contrastive_loss_in_chunks, label_based_contrastive_loss_random_chunk, sigmoid_focal_loss, sigmoid_focal_loss_star, dice_loss
+from .losses import supervised_pixel_contrastive_loss, label_based_nt_xent_loss, label_based_nt_xent_loss_in_chunks, label_based_contrastive_loss_in_chunks, label_based_contrastive_loss_random_chunk, sigmoid_focal_loss, sigmoid_focal_loss_star, dice_loss
 from .rotation_conversions import random_rotation_saul
 
