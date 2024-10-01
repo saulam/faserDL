@@ -11,6 +11,7 @@ class SparseLightningModel(pl.LightningModule):
         super(SparseLightningModel, self).__init__()
 
         self.model = model
+        self.sigmoid = args.sigmoid
         self.losses = args.losses
         self.loss_fn = loss_fn
         self.warmup_steps = args.warmup_steps
@@ -20,6 +21,7 @@ class SparseLightningModel(pl.LightningModule):
         self.weight_decay = args.weight_decay
         self.eps = args.eps
         self.contrastive = args.contrastive
+        self.finetuning = args.finetuning
         self.chunk_size = args.chunk_size
 
 
@@ -125,57 +127,77 @@ class SparseLightningModel(pl.LightningModule):
         return total_loss, part_losses
 
     
-    def compute_losses_contrastive(self, batch_output1, batch_output2, batch_target1, batch_target2):
-        coords1, labels1 = batch_target1.decomposed_coordinates_and_features
-        coords2, labels2 = batch_target2.decomposed_coordinates_and_features
-
+    def compute_losses_contrastive(self, batch_output, batch_target):
         losses = [0.]
         part_losses = [[]] 
-        for i, (output1, output2) in enumerate(zip(batch_output1, batch_output2)):
-            
-            coords1_, feats1 = output1.decomposed_coordinates_and_features
-            coords2_, feats2 = output2.decomposed_coordinates_and_features
-            labs1 = [x[:, i] for x in labels1]
-            labs2 = [x[:, i] for x in labels2]
+ 
+        coords, labels = batch_target.decomposed_coordinates_and_features
+        coords1_, feats1 = batch_output.decomposed_coordinates_and_features
+        coords2_, feats2 = batch_output.decomposed_coordinates_and_features
+         
+        assert (batch_output.coordinates == batch_target.coordinates).all()
+           
+        labs1 = labels
+        labs2 = labels
 
-            assert (coords1[0] == coords1_[0]).all()
-            assert (coords2[0] == coords2_[0]).all()
+        curr_loss = self.loss_fn(feats1, feats2, labs1, labs2, chunk_size=self.chunk_size)
 
-            if i > 0:
-                mask1 = [x[:, 0] < 0.5 for x in labels1]
-                mask2 = [x[:, 0] < 0.5 for x in labels2]
-                feats1 = [x[mask] for x, mask in zip(feats1, mask1)]
-                feats2 = [x[mask] for x, mask in zip(feats2, mask2)]
-                labs1 = [x[mask] for x, mask in zip(labs1, mask1)]
-                labs2 = [x[mask] for x, mask in zip(labs2, mask2)]
-
-            curr_loss = self.loss_fn(feats1, feats2, labs1, labs2, chunk_size=self.chunk_size)
-
-            part_losses[0].append([curr_loss])
-            losses[0] += curr_loss
+        part_losses[0].append([curr_loss])
+        losses[0] += curr_loss
 
         part_losses = torch.tensor(part_losses)
         total_loss = sum(losses)
 
         return total_loss, part_losses
-            
+
+
+    def compute_losses_finetuning(self, batch_output, batch_target):
+        losses = [0. for _ in range(len(self.losses))]
+        part_losses = [[] for _ in range(len(self.losses))]
+
+        feats_out = batch_output.F
+        feats_tgt = batch_target.F
+        feats_out_list = batch_output.decomposed_features
+        feats_tgt_list = batch_target.decomposed_features
+
+        # Compute losses
+        for i, (loss, loss_fn) in enumerate(zip(self.losses, self.loss_fn)):
+            extra_args = {"gamma": 1.0} if loss == "focal" else {}
+
+            if self.sigmoid:
+                loss_ghost = loss_fn(feats_out[:, 0], feats_tgt[:, 0], **extra_args)
+                loss_muonic = loss_fn(feats_out[mask, 1], feats_tgt[mask, 1], **extra_args)
+                loss_electromagnetic = loss_fn(feats_out[mask, 2], feats_tgt[mask, 2], **extra_args)
+                loss_hadronic = loss_fn(feats_out[mask, 3], feats_tgt[mask, 3], **extra_args)
+
+                part_losses[i].append([loss_ghost, loss_muonic, loss_electromagnetic, loss_hadronic])
+                curr_loss = loss_ghost + loss_muonic + loss_electromagnetic + loss_hadronic
+            else:
+                if loss == "focal":
+                    curr_loss = loss_fn(feats_out, feats_tgt, **extra_args)
+                else:
+                    curr_loss = loss_fn(feats_out_list, feats_tgt_list)
+                part_losses[i].append([curr_loss])
+
+            losses[i] += curr_loss
+
+        part_losses = torch.tensor(part_losses)
+        total_loss = sum(losses)
+
+        return total_loss, part_losses
+ 
 
     def common_step(self, batch):
         batch_size = len(batch["c"])
         batch_input, batch_target = self._arrange_batch(batch)
 
-        if self.contrastive:
-            batch_input_i, batch_input_j = batch_input
-            batch_target_i, batch_target_j = batch_target
-
-            batch_output_i, _ = self.forward(batch_input_i, batch_target_i)
-            batch_output_j, _ = self.forward(batch_input_j, batch_target_j)
-           
-            loss, part_losses = self.compute_losses_contrastive(batch_output_i,
-                                                                batch_output_j,
-                                                                batch_target_i,
-                                                                batch_target_j)
-        
+        if self.contrastive or self.finetuning:
+            batch_output, _ = self.forward(batch_input, batch_target)
+ 
+            if self.finetuning:
+                loss, part_losses = self.compute_losses_finetuning(batch_output, batch_target)
+            else:
+                loss, part_losses = self.compute_losses_contrastive(batch_output, batch_target)
         else:
             # Forward pass
             batch_output, batch_target = self.forward(batch_input, batch_target)

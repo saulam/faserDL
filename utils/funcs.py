@@ -68,17 +68,6 @@ def collate_sparse_minkowski(batch):
         'y': y,
     }
 
-    aug_fields = [('coords_aug', 'c_aug'), ('feats_aug', 'f_aug'), ('labels_aug', 'y_aug')]
-
-    # Augmented data if available
-    for aug_key, ret_key in aug_fields:
-        aug_data = [d[aug_key] for d in batch if aug_key in d]
-        if aug_data:
-            if 'feats' in aug_key or 'labels' in aug_key:
-                ret[ret_key] = torch.cat(aug_data)
-            else:
-                ret[ret_key] = aug_data
-
     return ret
 
 
@@ -98,21 +87,13 @@ def arrange_truth(data, device):
 
 
 def arrange_sparse_minkowski(data, device):
-    main_tensor = ME.SparseTensor(
+    tensor = ME.SparseTensor(
         features=data['f'],
         coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
         device=device
     )
 
-    if 'f_aug' in data and 'c_aug' in data:
-        aug_tensor = ME.SparseTensor(
-            features=data['f_aug'],
-            coordinates=ME.utils.batched_coordinates(data['c_aug'], dtype=torch.int),
-            device=device
-        )
-        return main_tensor, aug_tensor
-
-    return main_tensor
+    return tensor
 
 
 def arrange_truth(data, device):

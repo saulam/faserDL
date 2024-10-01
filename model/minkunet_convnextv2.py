@@ -16,7 +16,8 @@ from MinkowskiEngine import (
     MinkowskiConvolutionTranspose,
     MinkowskiDepthwiseConvolution,
     MinkowskiLinear,
-    MinkowskiGELU
+    MinkowskiReLU,
+    MinkowskiGELU,
 )
 
 
@@ -54,6 +55,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         #dims=(32, 64, 128, 256)
         drop_path_rate=0.
         self.contrastive = args.contrastive
+        self.finetuning = args.finetuning
 
         self.downsample_layers = nn.ModuleList()
 
@@ -111,14 +113,27 @@ class MinkUNetConvNeXtV2(nn.Module):
             cur += depths[i]
        
         """Cls layers"""
-        self.cls_layers = nn.ModuleList()
-        for i in range(4):
-            cls_layer = nn.Sequential(
-                MinkowskiConvolution(dims[-1] if self.contrastive else dims[i], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
-                Block(dim=decoder_embed_dim, drop_path=0., D=3),
-                MinkowskiConvolution(decoder_embed_dim, decoder_embed_dim if self.contrastive else out_channels, kernel_size=1, stride=1, dimension=3),
+        if self.finetuning:
+            self.cls_layer = MinkowskiConvolution(dims[-1], out_channels, kernel_size=1, stride=1, dimension=3)
+        elif self.contrastive:
+            self.cls_layer = nn.Sequential(
+                MinkowskiConvolution(dims[-1], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
+                MinkowskiReLU(),
+                MinkowskiLayerNorm(decoder_embed_dim, eps=1e-6),
+                MinkowskiConvolution(decoder_embed_dim, decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
+                MinkowskiReLU(),
+                MinkowskiLayerNorm(decoder_embed_dim, eps=1e-6),     
+                MinkowskiConvolution(decoder_embed_dim, decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
             ) 
-            self.cls_layers.append(cls_layer)
+        else:
+            self.cls_layers = nn.ModuleList()
+            for i in range(4):
+                cls_layer = nn.Sequential(
+                        MinkowskiConvolution(dims[i], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
+                        Block(dim=decoder_embed_dim, drop_path=0., D=3),
+                        MinkowskiConvolution(decoder_embed_dim, out_channels, kernel_size=1, stride=1, dimension=3),
+                ) 
+                self.cls_layers.append(cls_layer)
 
         if not self.contrastive:
             """ Max pool just for generating downsampled labels """
@@ -160,14 +175,12 @@ class MinkUNetConvNeXtV2(nn.Module):
             x = self.upsample_layers[i](x)
             x = self.stages_dec[i](x)
 
-            if not self.contrastive:
+            if not self.contrastive and not self.finetuning:
                 out_cl = self.cls_layers[i](x)
                 out_cls.insert(0, out_cl)
 
-        if self.contrastive:
-            for i in range(4):
-                out_cl = self.cls_layers[i](x)
-                out_cls.append(out_cl)
-        
+        if self.contrastive or self.finetuning:
+            out_cls =  self.cls_layer(x)
+       
         return out_cls, ys
 

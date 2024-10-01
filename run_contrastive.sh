@@ -1,25 +1,25 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v3_new"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v3_new2"
 eps=1e-12
-chunk_size=1024
-batch_size=4
-epochs=50
+chunk_size=2024
+batch_size=16
+epochs=100
 num_workers=32
-lr=1e-4
+lr=1e-3
 accum_grad_batches=1
 warmup_steps=0
-weight_decay=0.0001
+weight_decay=4e-5
 beta1=0.9
 beta2=0.999
 losses=("focal" "dice")
 save_dir="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/logs_contrastive"
-name="v1"
+name="v3"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints"
-checkpoint_name="v1"
+checkpoint_name="v3"
 load_checkpoint=None
 gpus=(0)
 

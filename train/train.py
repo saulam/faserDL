@@ -11,7 +11,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import ini_argparse, split_dataset, supervised_pixel_contrastive_loss, sigmoid_focal_loss, dice_loss
+from utils import ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
 from dataset import SparseFASERCALDataset
 from model import MinkUNetConvNeXtV2, SparseLightningModel
 from pytorch_lightning.loggers import CSVLogger
@@ -36,15 +36,15 @@ def main():
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3]) 
 
     # Define loss functions
-    if args.contrastive:
+    if args.contrastive and not args.finetuning:
         loss_fn = supervised_pixel_contrastive_loss
     else:
         loss_fn = []
         for loss in args.losses:
             if loss == "focal":
-                loss_fn.append(partial(sigmoid_focal_loss, reduction="mean"))
+                loss_fn.append(partial(focal_loss, sigmoid=args.sigmoid, reduction="mean"))
             elif loss == "dice":
-                loss_fn.append(dice_loss)
+                loss_fn.append(partial(dice_loss, sigmoid=args.sigmoid, reduction="mean"))
             else:
                 raise ValueError("Wrong loss")
 
@@ -54,11 +54,20 @@ def main():
     args.warmup_steps = nb_batches * args.warmup_steps // (args.accum_grad_batches * nb_gpus)
 
     # Initialize the model
-    model = MinkUNetConvNeXtV2(in_channels=1, out_channels=4, D=3, args=args)
+    model = MinkUNetConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
 
+    if args.finetuning:
+        # load pre-trained model if fine-tuning 
+        checkpoint = torch.load(args.pretrained_path)
+        # Remove the "model." prefix from the keys in the state_dict
+        state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
+        model.load_state_dict(state_dict, strict=False)
+        print("Loaded model weights of: {}".format(args.pretrained_path))
+
+    # Lightning model
     lightning_model = SparseLightningModel(model=model,
         loss_fn=loss_fn,
         args=args)

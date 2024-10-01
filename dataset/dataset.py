@@ -62,8 +62,11 @@ class SparseFASERCALDataset(Dataset):
         return len(self.data_files)
 
     def _augment(self, coords, feats, labels, prim_vertex, round_coords=True):
+        coords, feats, labels = coords.copy(), feats.copy(), labels.copy()
+
         # rotate
-        coords = self._rotate(coords, prim_vertex)
+        #coords = self._rotate(coords, prim_vertex)
+        coords = self._rotate_90(coords)
         # translate
         coords = self._translate(coords)
         # drop voxels
@@ -75,8 +78,43 @@ class SparseFASERCALDataset(Dataset):
         if round_coords:
             coords = coords.round()
 
+        # Quantize (voxelise and detect duplicates)
+        _, indices = ME.utils.sparse_quantize(
+            coordinates=coords, 
+            return_index=True,
+            quantization_size=1.0
+        )
+        coords = coords[indices]
+        feats = feats[indices]
+        labels = labels[indices]
+
         return coords, feats, labels
 
+
+    def _rotate_90(self, point_cloud):
+         # Rotation matrices for 90, 180, and 270 degrees on each axis
+         rotations = {
+            'x': {90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
+                  180: np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),
+                  270: np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])},
+            'y': {90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
+                  180: np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
+                  270: np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])},
+            'z': {90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
+                  180: np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
+                  270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
+         }
+
+         final_rotation_matrix = np.eye(3) 
+
+         for axis in ['x', 'y', 'z']:  # Loop over each axis
+             if np.random.choice([True, False]):  # Randomly decide if we rotate
+                 angle = np.random.choice([90, 180, 270])
+                 final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
+
+         return point_cloud @ final_rotation_matrix.T
+
+ 
     def _rotate(self, coords, prim_vertex):
         """Random rotation along"""
         angle_limits = torch.tensor([
@@ -101,8 +139,8 @@ class SparseFASERCALDataset(Dataset):
         p = abs(np.random.randn(1) * std_dev)
         mask = np.random.rand(coords.shape[0]) > p
         #don't drop all coordinates
-        if mask.sum() == 0:
-            return coords, feats
+        if mask.sum() == 0 or np.random.randn() < std_dev:
+            return coords, feats, labels
         return coords[mask], feats[mask], labels[mask]
 
 
@@ -141,26 +179,32 @@ class SparseFASERCALDataset(Dataset):
         coords[:, 1] = self.metadata['y'][coords[:, 1].astype(int)]
         coords[:, 2] = self.metadata['z'][coords[:, 2].astype(int), 0]
 
-    def process_labels(self, labels):
+    def process_labels(self, reco_hits_true, true_hits):
         """
         Process a list of labels into binary classification arrays:
         - y: (non-ghost/ghost label, muonic, electromagnetic, hadronic)
         """
-        num_labels = len(labels)
-        y = np.zeros((num_labels, 4))  # ghost, muonic, electromagnetic, hadronic
+        num_labels = len(reco_hits_true)
+        y = np.zeros((num_labels, 3))  # ghost, muonic+electromagnetic, hadronic
 
-        ghost_pdg = self.metadata['ghost_pdg']
-        muonic_pdg = self.metadata['muonic_pdg']
-        electromagnetic_pdg = self.metadata['electromagnetic_pdg']
-        hadronic_pdg = self.metadata['hadronic_pdg']
+        ghost_pdg = list(self.metadata['ghost_pdg'])
+        muonic_pdg = list(self.metadata['muonic_pdg'])
+        electromagnetic_pdg = list(self.metadata['electromagnetic_pdg'])
+        hadronic_pdg = list(self.metadata['hadronic_pdg'])
+        for i, reco_hit_true in enumerate(reco_hits_true):
+            matched_hits = true_hits[reco_hit_true]
+            m_mask = np.isin(matched_hits[:, 3], muonic_pdg)
+            e_mask = np.isin(matched_hits[:, 3], electromagnetic_pdg)
+            h_mask = np.isin(matched_hits[:, 3], hadronic_pdg)
 
-        for i, label_set in enumerate(labels):
-            label_set = set(label_set)
-            # Assign real hit types based on the presence of PDG codes
-            y[i, 0] = 1 if label_set & ghost_pdg else 0
-            y[i, 1] = 1 if label_set & muonic_pdg else 0
-            y[i, 2] = 1 if label_set & electromagnetic_pdg else y[i, 1]
-            y[i, 3] = 1 if label_set & hadronic_pdg else 0
+            m_edepo = matched_hits[m_mask, -1].sum()
+            e_edepo = matched_hits[e_mask, -1].sum()
+            h_edepo = matched_hits[h_mask, -1].sum()
+            total_edepo = matched_hits[:, -1].sum()
+
+            y[i, 0] = 1 if reco_hit_true[0] == -1 else 0
+            y[i, 1] = (m_edepo+e_edepo)/total_edepo
+            y[i, 2] = h_edepo/total_edepo 
 
         return y
 
@@ -177,8 +221,9 @@ class SparseFASERCALDataset(Dataset):
         data = np.load(self.data_files[idx], allow_pickle=True)
         run_number = data['run_number']
         event_id = data['event_id']
+        true_hits = data['true_hits']
         reco_hits = data['reco_hits']
-        reco_hit_pdgs = data['reco_hit_pdgs']
+        reco_hits_true = data['reco_hits_true']
 
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
@@ -188,45 +233,21 @@ class SparseFASERCALDataset(Dataset):
         self.voxelise(coords)
         
         # PDGs to labels
-        labels = self.process_labels(reco_hit_pdgs)
-       
+        labels = self.process_labels(reco_hits_true, true_hits)
+        labels = np.argmax(labels, axis=1).reshape(-1, 1)
+
         # output
         output = {'run_number': run_number,
                   'event_id': event_id}
 
-        if self.contrastive or (self.training and np.random.rand() > 0.05):
-            coords_true = coords.copy()
-            feats_true = feats.copy()
-            labels_true = labels.copy() 
-
+        if self.training and np.random.rand() > 0.05:
             prim_vertex = data['prim_vertex'].reshape(1, 3)
             self.voxelise(prim_vertex)
             prim_vertex = prim_vertex.reshape(3)
-            coords_aug, feats_aug, labels_aug = self._augment(coords, feats, labels, prim_vertex, round_coords=True)
-            
-            # Quantize (voxelise and detect duplicates)
-            _, indices = ME.utils.sparse_quantize(
-                coordinates=coords_aug, 
-                return_index=True,
-                quantization_size=1.0
-            )
-            coords_aug = coords_aug[indices]
-            feats_aug = feats_aug[indices]
-            labels_aug = labels_aug[indices]
-
-            if self.contrastive:
-                # restore to original values
-                coords, feats, labels = coords_true, feats_true, labels_true
-                if (self.training and np.random.rand() < 0.2):
-                    # don't augment 20% of the times during training
-                    coords_aug, feats_aug, labels_aug = coords, feats, labels
-                feats_aug = np.log(feats_aug)
-                output['coords_aug'] = torch.from_numpy(coords_aug).float()
-                output['feats_aug'] = torch.from_numpy(feats_aug).float()
-                output['labels_aug'] = torch.from_numpy(labels_aug).float()
-            else:
-                coords, feats, labels = coords_aug, feats_aug, labels_aug
-
+           
+            # augmented event
+            coords, feats, labels = self._augment(coords, feats, labels, prim_vertex, round_coords=False)
+           
         # log features
         feats = np.log(feats)
 

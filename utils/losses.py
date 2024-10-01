@@ -2,10 +2,99 @@ import torch
 from torch.nn import functional as F
 
 
+def focal_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    alpha = None,
+    gamma: float = 0.,
+    reduction: str = "none",
+    sigmoid: bool = True,
+) -> torch.Tensor:
+    """
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+        alpha: (optional) Weighting factor for each class to balance
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+        reduction: 'none' | 'mean' | 'sum'
+                 'none': No reduction will be applied to the output.
+                 'mean': The output will be averaged.
+                 'sum': The output will be summed.
+    """
+    if sigmoid:
+        loss = sigmoid_focal_loss(inputs, targets, alpha, gamma, reduction)
+    else:
+        loss = softmax_focal_loss(inputs, targets, alpha, gamma, reduction)
+    
+    return loss
+
+
+def softmax_focal_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: list = None,
+    gamma: float = 0.,
+    reduction: str = "none",
+) -> torch.Tensor:
+    """
+    Multi-class focal loss, based on: https://github.com/AdeelH/pytorch-multi-class-focal-loss/blob/master/focal_loss.py
+
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+        alpha: (optional) Weighting factor for each class to balance
+        gamma: Exponent of the modulating factor (1 - p_t) to
+               balance easy vs hard examples.
+        reduction: 'none' | 'mean' | 'sum'
+                 'none': No reduction will be applied to the output.
+                 'mean': The output will be averaged.
+                 'sum': The output will be summed.
+    Returns:
+        Loss tensor with the reduction option applied.
+    """
+    if inputs.ndim > 2:
+        # (N, C, d1, d2, ..., dK) --> (N * d1 * ... * dK, C)
+        c = inputs.shape[1]
+        inputs = inputs.permute(0, *range(2, inputs.ndim), 1).reshape(-1, c)
+        # (N, d1, d2, ..., dK) --> (N * d1 * ... * dK,)
+    
+    targets = targets.view(-1)
+
+    inputs = inputs.float()
+    targets = targets.long()
+
+    # compute weighted cross entropy term: -alpha * log(pt)
+    log_p = F.log_softmax(inputs, dim=1)
+    ce_loss = F.nll_loss(log_p, targets, weight=alpha, reduction='none')
+   
+    # get true class column from each row
+    all_rows = torch.arange(len(inputs))
+    log_pt = log_p[all_rows, targets]
+
+    # compute focal term: (1 - pt)^gamma
+    pt = log_pt.exp()
+    focal_term = (1 - pt)**gamma
+
+    # the full loss: -alpha * ((1 - pt)^gamma) * log(pt)
+    loss = focal_term * ce_loss
+
+    if reduction == 'mean':
+        loss = loss.mean()
+    elif reduction == 'sum':
+        loss = loss.sum()
+
+    return loss
+
+
 def sigmoid_focal_loss(
     inputs: torch.Tensor,
     targets: torch.Tensor,
-    alpha: float = -1,
+    alpha: float = None,
     gamma: float = 2,
     reduction: str = "none",
 ) -> torch.Tensor:
@@ -18,7 +107,7 @@ def sigmoid_focal_loss(
                  classification label for each element in inputs
                 (0 for the negative class and 1 for the positive class).
         alpha: (optional) Weighting factor in range (0,1) to balance
-                positive vs negative examples. Default = -1 (no weighting).
+                positive vs negative examples. Default = None (no weighting).
         gamma: Exponent of the modulating factor (1 - p_t) to
                balance easy vs hard examples.
         reduction: 'none' | 'mean' | 'sum'
@@ -35,7 +124,7 @@ def sigmoid_focal_loss(
     p_t = p * targets + (1 - p) * (1 - targets)
     loss = ce_loss * ((1 - p_t) ** gamma)
 
-    if alpha >= 0:
+    if alpha:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
 
@@ -89,33 +178,81 @@ def sigmoid_focal_loss_star(
     return loss
 
 
-def dice_loss(inputs: torch.Tensor,
-              targets: torch.Tensor,
+def dice_score(inputs: torch.Tensor,
+               targets: torch.Tensor,
+               eps: float = 1e-6):
+    """
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs.
+        eps: A smoothing constant to avoid division by zero. 
+    Returns:
+        dice_score: Dice loss value.
+    """    
+    reduce_axes: list[int] = torch.arange(1, len(inputs.shape)).tolist()
+    intersection = torch.sum(targets * inputs, dim=reduce_axes)
+    union = torch.sum(targets, dim=reduce_axes) + torch.sum(inputs, dim=reduce_axes)
+
+    dice_score = (2. * intersection + eps) / (union + eps)
+    
+    return torch.mean(dice_score)
+
+
+def dice_loss(inputs: torch.Tensor or list[torch.Tensor],
+              targets: torch.Tensor or list[torch.Tensor],
+              sigmoid: bool = True,
               eps: float = 1e-6,
+              reduction: str = "none",
 ) -> torch.Tensor:
     """
     Args:
         inputs: A float tensor of arbitrary shape.
                 The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
+        targets: A float tensor with the same shape as inputs.
+        sigmoid: A boolean indicating binary or multi-class.
         eps: A smoothing constant to avoid division by zero. 
     Returns:
         dice_loss: Dice loss value.
+
+    Note:
+        Assumes class in dimension 1.
     """
-    inputs = inputs.float()
-    targets = targets.float()
-    inputs = torch.sigmoid(inputs)
+    # If inputs and targets are not lists, convert them to lists
+    if not isinstance(inputs, list):
+        inputs = [inputs]
+    if not isinstance(targets, list):
+        targets = [targets]
 
-    reduce_axis: list[int] = torch.arange(1, len(inputs.shape)).tolist()
-    intersection = torch.sum(targets * inputs, dim=reduce_axis)
-    union = torch.sum(targets, dim=reduce_axis) + torch.sum(inputs, dim=reduce_axis)
-     
-    dice_score = (2. * intersection + eps) / (union + eps)
-    dice_loss = 1 - dice_score
+    assert len(inputs) == len(targets), "batch size not the same for inputs and targets"
+    batch_size = len(inputs)
 
-    return torch.mean(dice_loss)
+    scores = torch.zeros(batch_size, device=inputs[0].device)
+    if sigmoid:
+        # binary
+        for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)): 
+            ipt = torch.sigmoid(ipt)
+            scores[batch_idx] = dice_score(ipt, tgt, eps)
+    else:
+        # multi-class
+        for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)):
+            ipt = torch.softmax(ipt, 1)
+            score, nb_labels = 0., ipt.size(1)
+            for i in range(nb_labels):
+                ipt_i = ipt[:, i]
+                tgt_i = (tgt[:, 0] == i).float()
+                score += dice_score(ipt_i, tgt_i, eps)
+            score /= nb_labels
+            scores[batch_idx] = score
+
+    loss = 1 - scores
+
+    if reduction == 'mean':
+        loss = loss.mean()
+    elif reduction == 'sum':
+        loss = loss.sum()
+
+    return loss
 
 
 def label_based_contrastive_loss_random_chunk(projs, labels, temperature=0.1, chunk_size=512, eps=1e-6):
@@ -168,11 +305,12 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
                                       labels_aug_list: torch.Tensor,
                                       temperature: float = 0.07,
                                       chunk_size: int = 512,
+                                      ignore_labels: list = [-1],
                                       within_image_loss: bool = False):
     """
     Computes pixel-level supervised contrastive loss for batches with variable-sized inputs.
     
-    Inpiration: https://github.com/google-research/google-research/blob/master/supervised_pixel_contrastive_loss/contrastive_loss.py
+    Inspiration: https://github.com/google-research/google-research/blob/master/supervised_pixel_contrastive_loss/contrastive_loss.py
     Paper: https://arxiv.org/abs/2012.06985
     
     Args:
@@ -182,6 +320,7 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
         labels_aug_list: List of tensors for augmented labels
         temperature: Temperature to use in contrastive loss
         chunk_size: Maximum number of voxels per event.
+        ignore_labels: A list of labels to ignore.
         within_image_loss: whether to use within_image or cross_image loss.
 
     Returns:
@@ -199,8 +338,8 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
     for i in range(batch_size):
         features_ori = features_ori_list[i]
         features_aug = features_aug_list[i]
-        labels_ori = labels_ori_list[i]
-        labels_aug = labels_aug_list[i]
+        labels_ori = labels_ori_list[i].squeeze()
+        labels_aug = labels_aug_list[i].squeeze()
 
         N_ori, N_aug = features_ori.size(0), features_aug.size(0)
         if N_ori > chunk_size:
@@ -208,7 +347,6 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
             chunk_idx = shuffled_idx[:chunk_size]
             features_ori = features_ori[chunk_idx]
             labels_ori = labels_ori[chunk_idx]
-
         if N_aug > chunk_size:
             shuffled_idx = torch.randperm(N_aug)
             chunk_idx = shuffled_idx[:chunk_size] 
