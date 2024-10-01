@@ -11,7 +11,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
+from utils import CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
 from dataset import SparseFASERCALDataset
 from model import MinkUNetConvNeXtV2, SparseLightningModel
 from pytorch_lightning.loggers import CSVLogger
@@ -77,6 +77,11 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
     checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_path + "/" + args.checkpoint_name,
         save_last=True, save_top_k=args.save_top_k, monitor="loss/val_total")
+    callbacks = [checkpoint_callback]
+
+    if args.finetuning:
+        finetuning_callback = CustomFinetuningReversed(unfreeze_at_epoch=1, gradual_unfreeze_steps=1)
+        callbacks.append(finetuning_callback)
 
     # Log the hyperparameters
     logger.log_hyperparams(vars(args))
@@ -86,7 +91,7 @@ def main():
     trainer = pl.Trainer(
         #num_sanity_val_steps=0,
         max_epochs=args.epochs,
-        callbacks=[checkpoint_callback],
+        callbacks=callbacks,
         accelerator="gpu",
         devices=gpus,
         strategy="ddp" if nb_gpus > 1 else None,

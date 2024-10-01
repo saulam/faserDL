@@ -271,7 +271,8 @@ class SparseLightningModel(pl.LightningModule):
         """Configure and initialize the optimizer and learning rate scheduler."""
         # Optimiser
         optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            #self.model.parameters(),
             lr=self.lr,
             betas=self.betas,
             eps=self.eps,
