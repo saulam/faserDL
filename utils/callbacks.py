@@ -76,7 +76,7 @@ class CustomFinetuningReversed(pl.callbacks.BaseFinetuning):
                 # Add both layers to the unfrozen set
                 self.unfrozen_layers.add(layer1)
                 self.unfrozen_layers.add(layer2)
-                self.total_layers_unfrozen += 2
+                self.total_layers_unfrozen += 1
                 layer1_name = self._get_module_name(pl_module, layer1)
                 layer2_name = self._get_module_name(pl_module, layer2)
                 # Print layer unfreezing information for both layers, including learning rate

@@ -131,16 +131,12 @@ class SparseLightningModel(pl.LightningModule):
         losses = [0.]
         part_losses = [[]] 
  
-        coords, labels = batch_target.decomposed_coordinates_and_features
-        coords1_, feats1 = batch_output.decomposed_coordinates_and_features
-        coords2_, feats2 = batch_output.decomposed_coordinates_and_features
-         
         assert (batch_output.coordinates == batch_target.coordinates).all()
-           
-        labs1 = labels
-        labs2 = labels
-
-        curr_loss = self.loss_fn(feats1, feats2, labs1, labs2, chunk_size=self.chunk_size)
+        
+        coords, labels = batch_target.decomposed_coordinates_and_features
+        coords_, feats = batch_output.decomposed_coordinates_and_features
+          
+        curr_loss = self.loss_fn(feats, feats, labels, labels, chunk_size=self.chunk_size)
 
         part_losses[0].append([curr_loss])
         losses[0] += curr_loss

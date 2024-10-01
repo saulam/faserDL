@@ -16,11 +16,11 @@ beta1=0.9
 beta2=0.999
 losses=("focal" "dice")
 save_dir="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/logs_finetuning"
-name="v2"
+name="v4"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints_finetuning"
-checkpoint_name="v2"
+checkpoint_name="v4"
 load_checkpoint=None
 gpus=(0)
 

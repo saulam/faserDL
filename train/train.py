@@ -59,19 +59,6 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
 
-    if args.finetuning:
-        # load pre-trained model if fine-tuning 
-        checkpoint = torch.load(args.pretrained_path)
-        # Remove the "model." prefix from the keys in the state_dict
-        state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
-        model.load_state_dict(state_dict, strict=False)
-        print("Loaded model weights of: {}".format(args.pretrained_path))
-
-    # Lightning model
-    lightning_model = SparseLightningModel(model=model,
-        loss_fn=loss_fn,
-        args=args)
-
     # Define logger and checkpoint
     logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
@@ -80,8 +67,19 @@ def main():
     callbacks = [checkpoint_callback]
 
     if args.finetuning:
-        finetuning_callback = CustomFinetuningReversed(unfreeze_at_epoch=1, gradual_unfreeze_steps=1)
+        # load pre-trained model if fine-tuning 
+        checkpoint = torch.load(args.pretrained_path)
+        # Remove the "model." prefix from the keys in the state_dict
+        state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
+        model.load_state_dict(state_dict, strict=False)
+        print("Loaded model weights of: {}".format(args.pretrained_path))
+        finetuning_callback = CustomFinetuningReversed(unfreeze_at_epoch=1, gradual_unfreeze_steps=1, lr_factor=1.0)
         callbacks.append(finetuning_callback)
+
+    # Lightning model
+    lightning_model = SparseLightningModel(model=model,
+        loss_fn=loss_fn,
+        args=args)
 
     # Log the hyperparameters
     logger.log_hyperparams(vars(args))

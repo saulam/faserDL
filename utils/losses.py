@@ -325,14 +325,15 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
 
     Returns:
         Scalar contrastive loss for the batch
+
+    Note:
+        Expect feats and labels be (batch_size, -1, num_channels)
     """
 
-    # expect feats and labels be (batch_size, -1, num_channels)
     batch_size = len(labels_ori_list)
-    shuffled_idx = torch.randperm(batch_size)
 
-    features_aug_list = [features_aug_list[i] for i in shuffled_idx]
-    labels_aug_list = [labels_aug_list[i] for i in shuffled_idx]
+    features_aug_list = features_aug_list[::-1]
+    labels_aug_list = labels_aug_list[::-1]
 
     total_loss = 0.0
     for i in range(batch_size):

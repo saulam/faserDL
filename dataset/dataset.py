@@ -139,7 +139,7 @@ class SparseFASERCALDataset(Dataset):
         p = abs(np.random.randn(1) * std_dev)
         mask = np.random.rand(coords.shape[0]) > p
         #don't drop all coordinates
-        if mask.sum() == 0 or np.random.randn() < std_dev:
+        if mask.sum() == 0:
             return coords, feats, labels
         return coords[mask], feats[mask], labels[mask]
 
@@ -203,8 +203,8 @@ class SparseFASERCALDataset(Dataset):
             total_edepo = matched_hits[:, -1].sum()
 
             y[i, 0] = 1 if reco_hit_true[0] == -1 else 0
-            y[i, 1] = (m_edepo+e_edepo)/total_edepo
-            y[i, 2] = h_edepo/total_edepo 
+            y[i, 1] = (m_edepo + e_edepo) / total_edepo
+            y[i, 2] = h_edepo / total_edepo 
 
         return y
 
