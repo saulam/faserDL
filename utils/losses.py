@@ -350,19 +350,17 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
             labels_ori = labels_ori[chunk_idx]
         if N_aug > chunk_size:
             shuffled_idx = torch.randperm(N_aug)
-            chunk_idx = shuffled_idx[:chunk_size] 
+            chunk_idx = shuffled_idx[:chunk_size]
             features_aug = features_aug[chunk_idx]
             labels_aug = labels_aug[chunk_idx]
 
         features_ori = F.normalize(features_ori, p=2, dim=-1)
         features_aug = F.normalize(features_aug, p=2, dim=-1)
-   
+
         if within_image_loss:
-            loss_ori = within_image_supervised_pixel_contrastive_loss(features_ori, labels_ori, temperature)
-            loss_aug = within_image_supervised_pixel_contrastive_loss(features_aug, labels_aug, temperature)
-            curr_loss = loss_ori + loss_aug
+            curr_loss = within_image_supervised_pixel_contrastive_loss(features_ori, labels_ori, temperature)
         else:
-            curr_loss = cross_image_supervised_pixel_contrastive_loss(features_ori, features_aug, labels_ori, labels_aug, temperature)                
+            curr_loss = cross_image_supervised_pixel_contrastive_loss(features_ori, features_aug, labels_ori, labels_aug, temperature)
 
         total_loss += curr_loss
 
@@ -372,7 +370,7 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
 def within_image_supervised_pixel_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, temperature):
     """Computes within-image supervised pixel contrastive loss for two individual images."""
     logits = torch.matmul(features, features.T) / temperature
-    positive_mask, negative_mask = generate_positive_and_negative_masks(labels)
+    positive_mask, negative_mask = generate_positive_and_negative_masks(labels, labels)
     return compute_contrastive_loss(logits, positive_mask, negative_mask)
 
 
@@ -380,20 +378,24 @@ def cross_image_supervised_pixel_contrastive_loss(features1, features2, labels1,
     """Computes cross-image supervised pixel contrastive loss for two individual images."""
     num_pixels1 = features1.size(0)  # Number of pixels in image 1
     num_pixels2 = features2.size(0)  # Number of pixels in image 2
-    
-    features = torch.cat([features1, features2], dim=0)  # Concatenate pixel features from both images
-    labels = torch.cat([labels1, labels2], dim=0)        # Concatenate labels
 
-    same_image_mask = generate_same_image_mask([num_pixels1, num_pixels2], device=features.device)
+    features2 = torch.cat([features1, features2], dim=0)  # Concatenate pixel features from both images
+    labels2 = torch.cat([labels1, labels2], dim=0)        # Concatenate labels
+
+    same_image_mask = generate_same_image_mask([num_pixels1],
+                                               [num_pixels1, num_pixels2],
+                                               device=features1.device)
 
     # Compute logits across all pixel pairs from the two images
-    logits = torch.matmul(features, features.T) / temperature
-    positive_mask, negative_mask = generate_positive_and_negative_masks(labels)
+    logits = torch.matmul(features1, features2.T) / temperature
+    #logits = F.cosine_similarity( features.unsqueeze(1), features.unsqueeze(0), dim=2 ) / temperature
+    
+    positive_mask, negative_mask = generate_positive_and_negative_masks(labels1, labels2)
     negative_mask *= same_image_mask  # Only consider negatives within the same image
 
     return compute_contrastive_loss(logits, positive_mask, negative_mask)
 
-
+'''
 def compute_contrastive_loss(logits, positive_mask, negative_mask):
     """Contrastive loss function."""
     exp_logits = torch.exp(logits)
@@ -412,24 +414,46 @@ def compute_contrastive_loss(logits, positive_mask, negative_mask):
     loss = torch.mean(neg_log_likelihood * normalized_weight)    
 
     return loss
+'''
+
+def compute_contrastive_loss(logits, positive_mask, negative_mask, eps=1e-12):
+    """Contrastive loss function."""
+    validity_mask = 1 - torch.eye(positive_mask.size(0), positive_mask.size(1),
+                            dtype=bool, device=positive_mask.device).float()
+    validity_mask *= (positive_mask + negative_mask)
+    positive_mask = positive_mask * validity_mask
+
+    exp_logits = torch.exp(logits)
+
+    nominator = positive_mask * exp_logits
+    denominator = validity_mask * exp_logits
+
+    loss_partial = -torch.log((torch.sum(nominator, dim=1) + eps) / (torch.sum(denominator, dim=1)) + eps)
+
+    loss = torch.mean(loss_partial)
+
+    return loss
 
 
-def generate_same_image_mask(num_pixels, device):
+def generate_same_image_mask(num_pixels1, num_pixels2, device):
     """Generates a mask indicating if two pixels belong to the same image or not."""
-    image_ids = []
-    for img_id, pixel_count in enumerate(num_pixels):
-        image_ids += [img_id] * pixel_count
+    image_ids1, image_ids2 = [], []
+    for img_id, pixel_count in enumerate(num_pixels1):
+        image_ids1 += [img_id] * pixel_count
+    for img_id, pixel_count in enumerate(num_pixels2):
+        image_ids2 += [img_id] * pixel_count
 
-    image_ids = torch.tensor(image_ids, device=device).view(-1, 1)
-    same_image_mask = (image_ids == image_ids.T).float()
-    
+    image_ids1 = torch.tensor(image_ids1, device=device).view(-1, 1)
+    image_ids2 = torch.tensor(image_ids2, device=device).view(-1, 1)
+    same_image_mask = (image_ids1 == image_ids2.T).float()
+
     return same_image_mask
 
 
-def generate_positive_and_negative_masks(labels: torch.Tensor):
+def generate_positive_and_negative_masks(labels1: torch.Tensor, labels2: torch.Tensor):
     """Generates positive and negative masks used by contrastive loss."""
-    positive_mask = (labels[:, None] == labels[None, :]).float()
+    positive_mask = (labels1[:, None] == labels2[None, :]).float()
     negative_mask = 1 - positive_mask
-    
+
     return positive_mask, negative_mask
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default arguments
-pretrained_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints/v3/last.ckpt"
+pretrained_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints/v5/last.ckpt"
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v3_new2"
 eps=1e-12
 chunk_size=2024
