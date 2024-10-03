@@ -71,9 +71,11 @@ def main():
         checkpoint = torch.load(args.pretrained_path)
         # Remove the "model." prefix from the keys in the state_dict
         state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
-        model.load_state_dict(state_dict, strict=False)
+        filtered_state_dict = {key: value for key, value in state_dict.items() if "cls_layer" not in key}
+        model.load_state_dict(filtered_state_dict, strict=False)
         print("Loaded model weights of: {}".format(args.pretrained_path))
-        finetuning_callback = CustomFinetuningReversed(unfreeze_at_epoch=1, gradual_unfreeze_steps=1, lr_factor=1.0)
+        finetuning_callback = CustomFinetuningReversed(unfreeze_at_epoch=args.unfreeze_at_epoch, 
+            gradual_unfreeze_steps=args.gradual_unfreeze_steps, lr_factor=args.lr_factor, unfreeze_all=args.unfreeze_all)
         callbacks.append(finetuning_callback)
 
     # Lightning model
