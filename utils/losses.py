@@ -395,43 +395,39 @@ def cross_image_supervised_pixel_contrastive_loss(features1, features2, labels1,
 
     return compute_contrastive_loss(logits, positive_mask, negative_mask)
 
-'''
-def compute_contrastive_loss(logits, positive_mask, negative_mask):
+
+def compute_contrastive_loss(logits, positive_mask, negative_mask, eps=1e-12, original=True):
     """Contrastive loss function."""
-    exp_logits = torch.exp(logits)
+
+    if original:
+        exp_logits = torch.exp(logits)
     
-    normalized_exp_logits = exp_logits / (exp_logits + torch.sum(exp_logits * negative_mask, dim=1, keepdim=True))
-    neg_log_likelihood = -torch.log(normalized_exp_logits)
+        normalized_exp_logits = exp_logits / (exp_logits + torch.sum(exp_logits * negative_mask, dim=1, keepdim=True))
+        neg_log_likelihood = -torch.log(normalized_exp_logits)
 
-    positive_mask_sum = torch.sum(positive_mask, dim=1, keepdim=True)
-    normalized_weight = positive_mask / torch.clamp(positive_mask_sum, min=1e-6)
-    neg_log_likelihood = torch.sum(neg_log_likelihood * normalized_weight, dim=1)
+        positive_mask_sum = torch.sum(positive_mask, dim=1, keepdim=True)
+        normalized_weight = positive_mask / torch.clamp(positive_mask_sum, min=1e-6)
+        neg_log_likelihood = torch.sum(neg_log_likelihood * normalized_weight, dim=1)
 
-    # Handle the case where there are no positive pairs
-    valid_index = 1 - (positive_mask_sum.squeeze() == 0).float()
-    normalized_weight = valid_index / torch.clamp(valid_index.sum(), min=1e-6)
+        # Handle the case where there are no positive pairs
+        valid_index = 1 - (positive_mask_sum.squeeze() == 0).float()
+        normalized_weight = valid_index / torch.clamp(valid_index.sum(), min=1e-6)
     
-    loss = torch.mean(neg_log_likelihood * normalized_weight)    
+        loss = torch.mean(neg_log_likelihood * normalized_weight)    
+    else:
+        validity_mask = 1 - torch.eye(positive_mask.size(0), positive_mask.size(1),
+            dtype=bool, device=positive_mask.device).float()
+        validity_mask *= (positive_mask + negative_mask)
+        positive_mask = positive_mask * validity_mask
 
-    return loss
-'''
+        exp_logits = torch.exp(logits)
 
-def compute_contrastive_loss(logits, positive_mask, negative_mask, eps=1e-12):
-    """Contrastive loss function."""
-    validity_mask = 1 - torch.eye(positive_mask.size(0), positive_mask.size(1),
-                            dtype=bool, device=positive_mask.device).float()
-    validity_mask *= (positive_mask + negative_mask)
-    positive_mask = positive_mask * validity_mask
+        nominator = positive_mask * exp_logits
+        denominator = validity_mask * exp_logits
 
-    exp_logits = torch.exp(logits)
+        loss_partial = -torch.log((torch.sum(nominator, dim=1) + eps) / (torch.sum(denominator, dim=1)) + eps)
 
-    nominator = positive_mask * exp_logits
-    denominator = validity_mask * exp_logits
-
-    loss_partial = -torch.log((torch.sum(nominator, dim=1) + eps) / (torch.sum(denominator, dim=1)) + eps)
-
-    loss = torch.mean(loss_partial)
-
+        loss = torch.mean(loss_partial)
     return loss
 
 
