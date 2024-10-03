@@ -25,6 +25,10 @@ def ini_argparse():
     parser.add_argument("--gradual_unfreeze_steps", type=int, default=1, help="layers to unfreeze at once if fine-tuning")
     parser.add_argument("--lr_factor", type=float, default=0.1, help="factor to multiply the learning rate of unfrozen layers if fine-tuning")
     parser.add_argument("--unfreeze_all", action="store_true", default=False, help="set if all layers should be unfrozen at once if fine-tuning")
+    parser.add_argument('--label_weights', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
+                        default=None,  # Default list
+                        help='label weights for loss computation'
+                        )
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("--chunk_size", type=int, default=512, help="chunk size if contrastive learning")
@@ -39,7 +43,7 @@ def ini_argparse():
     parser.add_argument("-b2", "--beta2", type=float, default=0.999, help="AdamW second beta value")
     parser.add_argument('--losses', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
                         default=["focal", "dice"],  # Default list
-                        help='List of losses to use (options: "focal", "dice")'
+                        help='kist of losses to use (options: "focal", "dice")'
                         )
     parser.add_argument("--save_dir", type=str, default="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL", help="Log save directory")
     parser.add_argument("--name", type=str, default="v1", help="model name")
@@ -50,7 +54,7 @@ def ini_argparse():
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Name of the checkpoint to load")
     parser.add_argument('--gpus', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
                         default=[0],  # Default list
-                        help='List of GPUs to use (more than 1 GPU will run the training in parallel)'
+                        help='list of GPUs to use (more than 1 GPU will run the training in parallel)'
                         )
 
     return parser

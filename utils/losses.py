@@ -303,6 +303,7 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
                                       features_aug_list: torch.Tensor,
                                       labels_ori_list: torch.Tensor,
                                       labels_aug_list: torch.Tensor,
+                                      label_weights: list = None,
                                       temperature: float = 0.07,
                                       chunk_size: int = 512,
                                       ignore_labels: list = [-1],
@@ -318,6 +319,7 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
         features_aug_list: List of tensors for augmented features
         labels_ori_list: List of tensors for original labels
         labels_aug_list: List of tensors for augmented labels
+        label_weights: Weight for each label in the loss computation
         temperature: Temperature to use in contrastive loss
         chunk_size: Maximum number of voxels per event.
         ignore_labels: A list of labels to ignore.
@@ -358,23 +360,23 @@ def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
         features_aug = F.normalize(features_aug, p=2, dim=-1)
 
         if within_image_loss:
-            curr_loss = within_image_supervised_pixel_contrastive_loss(features_ori, labels_ori, temperature)
+            curr_loss = within_image_supervised_pixel_contrastive_loss(features_ori, labels_ori, label_weights, temperature)
         else:
-            curr_loss = cross_image_supervised_pixel_contrastive_loss(features_ori, features_aug, labels_ori, labels_aug, temperature)
+            curr_loss = cross_image_supervised_pixel_contrastive_loss(features_ori, features_aug, labels_ori, labels_aug, label_weights, temperature)
 
         total_loss += curr_loss
 
     return total_loss / batch_size
 
 
-def within_image_supervised_pixel_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, temperature):
+def within_image_supervised_pixel_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, label_weights, temperature):
     """Computes within-image supervised pixel contrastive loss for two individual images."""
     logits = torch.matmul(features, features.T) / temperature
-    positive_mask, negative_mask = generate_positive_and_negative_masks(labels, labels)
+    positive_mask, negative_mask = generate_positive_and_negative_masks(labels, labels, label_weights)
     return compute_contrastive_loss(logits, positive_mask, negative_mask)
 
 
-def cross_image_supervised_pixel_contrastive_loss(features1, features2, labels1, labels2, temperature):
+def cross_image_supervised_pixel_contrastive_loss(features1, features2, labels1, labels2, label_weights, temperature):
     """Computes cross-image supervised pixel contrastive loss for two individual images."""
     num_pixels1 = features1.size(0)  # Number of pixels in image 1
     num_pixels2 = features2.size(0)  # Number of pixels in image 2
@@ -390,13 +392,13 @@ def cross_image_supervised_pixel_contrastive_loss(features1, features2, labels1,
     logits = torch.matmul(features1, features2.T) / temperature
     #logits = F.cosine_similarity( features.unsqueeze(1), features.unsqueeze(0), dim=2 ) / temperature
     
-    positive_mask, negative_mask = generate_positive_and_negative_masks(labels1, labels2)
+    positive_mask, negative_mask = generate_positive_and_negative_masks(labels1, labels2, label_weights)
     negative_mask *= same_image_mask  # Only consider negatives within the same image
 
     return compute_contrastive_loss(logits, positive_mask, negative_mask)
 
 
-def compute_contrastive_loss(logits, positive_mask, negative_mask, eps=1e-12, original=True):
+def compute_contrastive_loss(logits, positive_mask, negative_mask, eps=1e-12, original=False):
     """Contrastive loss function."""
 
     if original:
@@ -446,9 +448,13 @@ def generate_same_image_mask(num_pixels1, num_pixels2, device):
     return same_image_mask
 
 
-def generate_positive_and_negative_masks(labels1: torch.Tensor, labels2: torch.Tensor):
+def generate_positive_and_negative_masks(labels1: torch.Tensor, labels2: torch.Tensor, label_weights):
     """Generates positive and negative masks used by contrastive loss."""
     positive_mask = (labels1[:, None] == labels2[None, :]).float()
+    if label_weights is not None:
+        weights_tensor = torch.tensor(label_weights, device=labels1.device)
+        label_weights = weights_tensor[labels1.long()]
+        positive_mask *= label_weights[:, None]
     negative_mask = 1 - positive_mask
 
     return positive_mask, negative_mask

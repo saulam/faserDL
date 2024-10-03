@@ -23,6 +23,7 @@ class SparseLightningModel(pl.LightningModule):
         self.contrastive = args.contrastive
         self.finetuning = args.finetuning
         self.chunk_size = args.chunk_size
+        self.label_weights = [float(x) for x in args.label_weights] if args.label_weights is not None else None
 
 
     def on_train_start(self):
@@ -136,7 +137,7 @@ class SparseLightningModel(pl.LightningModule):
         coords, labels = batch_target.decomposed_coordinates_and_features
         coords_, feats = batch_output.decomposed_coordinates_and_features
           
-        curr_loss = self.loss_fn(feats, feats, labels, labels, chunk_size=self.chunk_size)
+        curr_loss = self.loss_fn(feats, feats, labels, labels, label_weights=[0.6, 1, 1], chunk_size=self.chunk_size)
 
         part_losses[0].append([curr_loss])
         losses[0] += curr_loss
