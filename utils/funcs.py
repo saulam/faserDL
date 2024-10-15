@@ -68,6 +68,10 @@ def collate_sparse_minkowski(batch):
         'y': y,
     }
 
+    if 'global_feats' in batch[0]:
+        global_labels = torch.stack([d['global_feats'] for d in batch])
+        ret['global_feats'] = global_labels
+
     return ret
 
 

@@ -65,8 +65,8 @@ class SparseFASERCALDatasetCls(Dataset):
         coords, feats = coords.copy(), feats.copy()
 
         # rotate
-        #coords = self._rotate(coords, prim_vertex)
-        coords = self._rotate_90(coords)
+        coords = self._rotate(coords, prim_vertex)
+        #coords = self._rotate_90(coords)
         # translate
         coords = self._translate(coords)
         # drop voxels
@@ -120,8 +120,8 @@ class SparseFASERCALDatasetCls(Dataset):
     def _rotate(self, coords, prim_vertex):
         """Random rotation along"""
         angle_limits = torch.tensor([
-            [-torch.pi/8, -torch.pi/8, -torch.pi],  # Min angles for X, Y, Z
-            [torch.pi/8, torch.pi/8,  torch.pi]   # Max angles for X, Y, Z
+            [-torch.pi, -torch.pi, -torch.pi],  # Min angles for X, Y, Z
+            [torch.pi, torch.pi,  torch.pi]   # Max angles for X, Y, Z
         ])
         if (angle_limits==0).all():
             # no rotation at all
@@ -131,7 +131,7 @@ class SparseFASERCALDatasetCls(Dataset):
                                     origin=prim_vertex)
  
     def _translate(self, coords):
-        shift_x, shift_y = np.random.randint(low=-10, high=10, size=(2,))
+        shift_x, shift_y = np.random.randint(low=-20, high=20, size=(2,))
         coords[:, 0] += shift_x
         coords[:, 1] += shift_y
         return coords
@@ -215,6 +215,8 @@ class SparseFASERCALDatasetCls(Dataset):
         reco_hits_true = data['reco_hits_true']
         pdg = data['in_neutrino_pdg']
         iscc = data['iscc']
+        rearcal_energydeposit = data['rearcal_energydeposit']
+        rearmucal_energydeposit = data['rearmucal_energydeposit']
 
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
@@ -240,9 +242,12 @@ class SparseFASERCALDatasetCls(Dataset):
            
         # log features
         feats = np.log(feats)
+        rearcal_energydeposit = np.log(rearcal_energydeposit + 1)
+        rearmucal_energydeposit = np.log(rearmucal_energydeposit + 1)
 
         output['coords'] = torch.from_numpy(coords).float()
         output['feats'] = torch.from_numpy(feats).float()
+        output['global_feats'] = torch.from_numpy(np.array((rearcal_energydeposit, rearmucal_energydeposit))).float()
         output['labels'] = torch.tensor([label]).long()
 
         return output

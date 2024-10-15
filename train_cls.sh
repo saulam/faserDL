@@ -13,11 +13,11 @@ weight_decay=4e-5
 beta1=0.9
 beta2=0.999
 save_dir="logs_cls"
-name="v1"
+name="v3"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_cls"
-checkpoint_name="v1"
+checkpoint_name="v3"
 load_checkpoint=None
 gpus=(4)
 

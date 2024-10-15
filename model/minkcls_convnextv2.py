@@ -80,43 +80,46 @@ class MinkClsConvNeXtV2(nn.Module):
             )
             self.stages_enc.append(stage)
             cur += depths[i]
-        
+      
+        """MLP for global features"""
+        self.global_mlp = nn.Sequential(
+            nn.Linear(2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 768)
+        )
+
+        """Global poolin"""
+        self.global_pool = MinkowskiGlobalMaxPooling()
 
         """Cls layers"""
-        if self.finetuning:
+        if self.contrastive:
             self.cls_layer = nn.Sequential(
-                MinkowskiGlobalMaxPooling(),
-                MinkowskiConvolution(dims[-1], out_channels, kernel_size=1, stride=1, dimension=3)
-            )
-        elif self.contrastive:
-            self.cls_layer = nn.Sequential(
-                MinkowskiGlobalMaxPooling(),
-                MinkowskiConvolution(dims[-1], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
-                MinkowskiReLU(),
-                MinkowskiLayerNorm(decoder_embed_dim, eps=1e-6),
-                MinkowskiConvolution(decoder_embed_dim, decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
-                MinkowskiReLU(),
-                MinkowskiLayerNorm(decoder_embed_dim, eps=1e-6),     
-                MinkowskiConvolution(decoder_embed_dim, decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
+                torch.nn.Linear(dims[-1], decoder_embed_dim),
+                nn.ReLU(),
+                torch.nn.Linear(decoder_embed_dim, decoder_embed_dim)
             ) 
         else:
             self.cls_layer = nn.Sequential(
-                MinkowskiGlobalMaxPooling(),
-                    MinkowskiConvolution(dims[i], decoder_embed_dim, kernel_size=1, stride=1, dimension=3),
-                    Block(dim=decoder_embed_dim, drop_path=0., D=3),
-                    MinkowskiConvolution(decoder_embed_dim, out_channels, kernel_size=1, stride=1, dimension=3),
-                ) 
+                torch.nn.Linear(dims[-1], out_channels)
+            ) 
 
         """ Initialise weights """
         self.apply(_init_weights)
 
-    def forward(self, x):
+    def forward(self, x, glob_x):
         """Encoder"""
         x = self.downsample_layers[0](x)
         for i in range(4):
             x = self.downsample_layers[i](x) if i > 0 else x
             x = self.stages_enc[i](x)
-        
+        x = self.global_pool(x)
+
+        # add global features
+        glob_x = self.global_mlp(glob_x)
+        x = x.F + glob_x
+
         out_cls =  self.cls_layer(x)
        
         return out_cls

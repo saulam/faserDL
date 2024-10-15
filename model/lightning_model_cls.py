@@ -52,22 +52,19 @@ class SparseClsLightningModel(pl.LightningModule):
         test_loader.dataset.dataset.set_training_mode(False)
 
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, x_glob):
+        return self.model(x, x_glob)
 
 
     def _arrange_batch(self, batch):
         batch_input = arrange_sparse_minkowski(batch, self.device)
+        batch_input_global = batch["global_feats"]
         batch_target = batch['y']
-        return batch_input, batch_target
+        return batch_input, batch_input_global, batch_target
 
 
     def compute_losses(self, batch_output, batch_target):
-        logits_out = batch_output.F
-        labels_tgt = batch_target
-
-        total_loss = self.loss_fn(logits_out, labels_tgt)
-
+        total_loss = self.loss_fn(batch_output, batch_target)
         return total_loss
 
     
@@ -77,14 +74,14 @@ class SparseClsLightningModel(pl.LightningModule):
 
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, batch_target = self._arrange_batch(batch)
+        batch_input, batch_input_global, batch_target = self._arrange_batch(batch)
 
         if self.contrastive:
             batch_output = self.forward(batch_input)
             loss = self.compute_losses_contrastive(batch_output, batch_target)
         else:
             # Forward pass
-            batch_output = self.forward(batch_input)
+            batch_output = self.forward(batch_input, batch_input_global)
             loss = self.compute_losses(batch_output, batch_target)
   
         # Retrieve current learning rate
