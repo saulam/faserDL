@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # Default arguments
-pretrained_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints/v9/last.ckpt"
+pretrained_path="../checkpoints/original3/epoch=286-step=118531.ckpt"
 unfreeze_at_epoch=2
 gradual_unfreeze_steps=1
 lr_factor=1.0
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v3_new"
+dataset_path="../events_v3_new"
 eps=1e-12
 chunk_size=2024
-batch_size=32
+batch_size=8
 epochs=50
-num_workers=32
+num_workers=16
 lr=1e-4
 accum_grad_batches=1
 warmup_steps=0
@@ -18,16 +18,16 @@ weight_decay=4e-5
 beta1=0.9
 beta2=0.999
 losses=("focal" "dice")
-save_dir="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/logs_finetuning"
-name="v8"
+save_dir="logs_finetuning"
+name="original3"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints_finetuning"
-checkpoint_name="v8"
+checkpoint_path="../checkpoints_finetuning"
+checkpoint_name="original1_v3"
 load_checkpoint=None
-gpus=(0)
+gpus=(1 2)
 
-python -m train.train \
+python -m train.train_seg \
     --train \
     --contrastive \
     --finetuning \

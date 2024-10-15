@@ -1,10 +1,8 @@
 #!/bin/bash
 
 # Default arguments
-label_weights=(0.6 1 1)
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v3_new"
 eps=1e-12
-chunk_size=4096
 batch_size=16
 epochs=150
 num_workers=32
@@ -15,19 +13,17 @@ weight_decay=4e-5
 beta1=0.9
 beta2=0.999
 losses=("focal" "dice")
-save_dir="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/logs_contrastive"
-name="v10"
+save_dir="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/logs_original"
+name="v1"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints"
-checkpoint_name="v10"
+checkpoint_path="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints_original"
+checkpoint_name="v1"
 load_checkpoint=None
 gpus=(0)
 
-python -m train.train \
+python -m train.train_seg \
     --train \
-    --contrastive \
-    --label_weights "${label_weights[@]}" \
     --dataset_path $dataset_path \
     --eps $eps \
     --chunk_size $chunk_size \

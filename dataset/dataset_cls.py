@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from utils import random_rotation_saul
 
     
-class SparseFASERCALDataset(Dataset):
+class SparseFASERCALDatasetCls(Dataset):
     def __init__(self, args):
         """
         Initializes the SparseFASERCALDataset class.
@@ -61,8 +61,8 @@ class SparseFASERCALDataset(Dataset):
         """
         return len(self.data_files)
 
-    def _augment(self, coords, feats, labels, prim_vertex, round_coords=True):
-        coords, feats, labels = coords.copy(), feats.copy(), labels.copy()
+    def _augment(self, coords, feats, prim_vertex, round_coords=True):
+        coords, feats = coords.copy(), feats.copy()
 
         # rotate
         #coords = self._rotate(coords, prim_vertex)
@@ -70,7 +70,7 @@ class SparseFASERCALDataset(Dataset):
         # translate
         coords = self._translate(coords)
         # drop voxels
-        coords, feats, labels = self._drop(coords, feats, labels, std_dev=0.1)
+        coords, feats = self._drop(coords, feats, std_dev=0.1)
         # shift feature values
         feats = self._shift_q_gaussian(feats, std_dev=0.05)
         # keep within limits
@@ -86,21 +86,23 @@ class SparseFASERCALDataset(Dataset):
         )
         coords = coords[indices]
         feats = feats[indices]
-        labels = labels[indices]
 
-        return coords, feats, labels
+        return coords, feats
 
 
     def _rotate_90(self, point_cloud):
          # Rotation matrices for 90, 180, and 270 degrees on each axis
          rotations = {
-            'x': {90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
+            'x': {0: np.eye(3),
+                  90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
                   180: np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),
                   270: np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])},
-            'y': {90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
+            'y': {0: np.eye(3),
+                  90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
                   180: np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
                   270: np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])},
-            'z': {90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
+            'z': {0: np.eye(3),
+                  90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
                   180: np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
                   270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
          }
@@ -109,7 +111,7 @@ class SparseFASERCALDataset(Dataset):
 
          for axis in ['x', 'y', 'z']:  # Loop over each axis
              if np.random.choice([True, False]):  # Randomly decide if we rotate
-                 angle = np.random.choice([90, 180, 270])
+                 angle = np.random.choice([0, 90, 180, 270])
                  final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
          return point_cloud @ final_rotation_matrix.T
@@ -135,13 +137,13 @@ class SparseFASERCALDataset(Dataset):
         return coords
 
 
-    def _drop(self, coords, feats, labels, std_dev=0.1):
+    def _drop(self, coords, feats, std_dev=0.1):
         p = abs(np.random.randn(1) * std_dev)
         mask = np.random.rand(coords.shape[0]) > p
         #don't drop all coordinates
         if mask.sum() == 0:
             return coords, feats, labels
-        return coords[mask], feats[mask], labels[mask]
+        return coords[mask], feats[mask]
 
 
     def _shift_q_uniform(self, feats, max_scale_factor=0.1):
@@ -154,11 +156,11 @@ class SparseFASERCALDataset(Dataset):
         return feats * shift
 
 
-    def _within_limits(self, coords, feats, labels):
+    def _within_limits(self, coords, feats):
         mask = (coords[:, 0] >= 0) & (coords[:, 0] < 48) & \
            (coords[:, 1] >= 0) & (coords[:, 1] < 48) & \
            (coords[:, 2] >= 0) & (coords[:, 2] < 400)
-        return coords[mask], feats[mask], labels[mask]
+        return coords[mask], feats[mask]
 
  
     def voxelise(self, coords):
@@ -179,34 +181,21 @@ class SparseFASERCALDataset(Dataset):
         coords[:, 1] = self.metadata['y'][coords[:, 1].astype(int)]
         coords[:, 2] = self.metadata['z'][coords[:, 2].astype(int), 0]
 
-    def process_labels(self, reco_hits_true, true_hits):
+    def pdg2label(self, pdg, iscc):
         """
-        Process a list of labels into binary classification arrays:
-        - y: (non-ghost/ghost label, muonic, electromagnetic, hadronic)
+        PDG to label.
         """
-        num_labels = len(reco_hits_true)
-        y = np.zeros((num_labels, 3))  # ghost, muonic+electromagnetic, hadronic
+        if iscc:
+            if pdg in [-12, 12]:  # ICC nue
+                label = 0
+            elif pdg in [-14, 14]:  # CC numu
+                label = 1
+            elif pdg in [-16, 16]:  # CC nutau
+                label = 2
+        else:
+            label = 3  # NC
 
-        ghost_pdg = list(self.metadata['ghost_pdg'])
-        muonic_pdg = list(self.metadata['muonic_pdg'])
-        electromagnetic_pdg = list(self.metadata['electromagnetic_pdg'])
-        hadronic_pdg = list(self.metadata['hadronic_pdg'])
-        for i, reco_hit_true in enumerate(reco_hits_true):
-            matched_hits = true_hits[reco_hit_true]
-            m_mask = np.isin(matched_hits[:, 3], muonic_pdg)
-            e_mask = np.isin(matched_hits[:, 3], electromagnetic_pdg)
-            h_mask = np.isin(matched_hits[:, 3], hadronic_pdg)
-
-            m_edepo = matched_hits[m_mask, -1].sum()
-            e_edepo = matched_hits[e_mask, -1].sum()
-            h_edepo = matched_hits[h_mask, -1].sum()
-            total_edepo = matched_hits[:, -1].sum()
-
-            y[i, 0] = 1 if reco_hit_true[0] == -1 else 0
-            y[i, 1] = (m_edepo + e_edepo) / total_edepo
-            y[i, 2] = h_edepo / total_edepo 
-
-        return y
+        return label
 
     def __getitem__(self, idx):
         """
@@ -224,6 +213,8 @@ class SparseFASERCALDataset(Dataset):
         true_hits = data['true_hits']
         reco_hits = data['reco_hits']
         reco_hits_true = data['reco_hits_true']
+        pdg = data['in_neutrino_pdg']
+        iscc = data['iscc']
 
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
@@ -233,8 +224,7 @@ class SparseFASERCALDataset(Dataset):
         self.voxelise(coords)
         
         # PDGs to labels
-        labels = self.process_labels(reco_hits_true, true_hits)
-        labels = np.argmax(labels, axis=1).reshape(-1, 1)
+        label = self.pdg2label(pdg, iscc)
 
         # output
         output = {'run_number': run_number,
@@ -246,14 +236,14 @@ class SparseFASERCALDataset(Dataset):
             prim_vertex = prim_vertex.reshape(3)
            
             # augmented event
-            coords, feats, labels = self._augment(coords, feats, labels, prim_vertex, round_coords=False)
+            coords, feats = self._augment(coords, feats, prim_vertex, round_coords=False)
            
         # log features
         feats = np.log(feats)
 
         output['coords'] = torch.from_numpy(coords).float()
         output['feats'] = torch.from_numpy(feats).float()
-        output['labels'] = torch.from_numpy(labels).float()
+        output['labels'] = torch.tensor([label]).long()
 
         return output
 

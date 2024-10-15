@@ -12,8 +12,8 @@ import torch
 import pytorch_lightning as pl
 from functools import partial
 from utils import CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
-from dataset import SparseFASERCALDataset
-from model import MinkUNetConvNeXtV2, SparseLightningModel
+from dataset import SparseFASERCALDatasetSeg
+from model import MinkUNetConvNeXtV2, SparseSegLightningModel
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -31,7 +31,7 @@ def main():
     gpus = [int(gpu) for gpu in args.gpus]
 
     # Dataset
-    dataset = SparseFASERCALDataset(args)
+    dataset = SparseFASERCALDatasetSeg(args)
     print("- Dataset size: {} events".format(len(dataset)))
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3]) 
 
@@ -68,7 +68,7 @@ def main():
 
     if args.finetuning:
         # load pre-trained model if fine-tuning 
-        checkpoint = torch.load(args.pretrained_path)
+        checkpoint = torch.load(args.pretrained_path, map_location='cpu')
         # Remove the "model." prefix from the keys in the state_dict
         state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
         filtered_state_dict = {key: value for key, value in state_dict.items() if "cls_layer" not in key}
@@ -79,7 +79,7 @@ def main():
         callbacks.append(finetuning_callback)
 
     # Lightning model
-    lightning_model = SparseLightningModel(model=model,
+    lightning_model = SparseSegLightningModel(model=model,
         loss_fn=loss_fn,
         args=args)
 

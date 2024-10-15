@@ -6,9 +6,9 @@ from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
-class SparseLightningModel(pl.LightningModule):
+class SparseSegLightningModel(pl.LightningModule):
     def __init__(self, model, loss_fn, args):
-        super(SparseLightningModel, self).__init__()
+        super(SparseSegLightningModel, self).__init__()
 
         self.model = model
         self.sigmoid = args.sigmoid
@@ -159,7 +159,7 @@ class SparseLightningModel(pl.LightningModule):
 
         # Compute losses
         for i, (loss, loss_fn) in enumerate(zip(self.losses, self.loss_fn)):
-            extra_args = {"gamma": 1.0} if loss == "focal" else {}
+            extra_args = {"gamma": 2.0} if loss == "focal" else {}
 
             if self.sigmoid:
                 loss_ghost = loss_fn(feats_out[:, 0], feats_tgt[:, 0], **extra_args)
