@@ -169,7 +169,7 @@ def generate_events(number, chunks, disable):
             old_stderr_fno = os.dup(2)  # Save the current stderr file descriptor
             os.dup2(devnull.fileno(), 1)  # Redirect stdout to devnull
             os.dup2(devnull.fileno(), 2)  # Redirect stderr to devnull
-
+            
             # Params
             tcal_event = ROOT.TcalEvent()
             po_event = ROOT.TPOEvent()
@@ -187,7 +187,7 @@ def generate_events(number, chunks, disable):
             fPORecoEvent.TrackReconstruct()
             fPORecoEvent.Reconstruct2DViewsPS()
             fPORecoEvent.ReconstructClusters(0)
-            fPORecoEvent.Reconstruct3DPS()
+            fPORecoEvent.Reconstruct3DPS(150, 300)
             fPORecoEvent.PSVoxelParticleFilter()
             fPORecoEvent.ReconstructRearCals()
             fPORecoEvent.Fill2DViewsPS()
@@ -196,6 +196,7 @@ def generate_events(number, chunks, disable):
             yz_view = fPORecoEvent.Get2DViewYPS()
             z_view = fPORecoEvent.zviewPS
             rearcal_energydeposit = fPORecoEvent.rearCals.rearCalDeposit
+            rearmucal_energydeposit = fPORecoEvent.rearCals.rearMuCalDeposit
             geom_detector = tcal_event.geom_detector
 
             # Retrieve true 3D hits and 2D projections
@@ -236,13 +237,14 @@ def generate_events(number, chunks, disable):
             tktracks = get_tracks(fPORecoEvent.fTKTracks)
             pstracks = get_tracks(fPORecoEvent.fPSTracks)
 
-            np.savez_compressed('/scratch2/salonso/faser/events_v3_new2/{}_{}'.format(run_number, event_id),
+            np.savez_compressed('/scratch2/salonso/faser/events_v3_new3/{}_{}'.format(run_number, event_id),
                                 run_number = run_number,
                                 event_id = event_id,
                                 iscc = iscc,
                                 evis = evis,
                                 ptmiss = ptmiss,
                                 rearcal_energydeposit = rearcal_energydeposit,
+                                rearmucal_energydeposit = rearmucal_energydeposit,
                                 prim_vertex = prim_vertex,
                                 true_hits = true_hits,
                                 reco_hits = reco_hits,
