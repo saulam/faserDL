@@ -152,7 +152,7 @@ def get_tracks(tktracks):
     return tracks
 
 def generate_events(number, chunks, disable):
-    path = "/scratch2/salonso/faser/FASERCALDATA_v3.0/"
+    path = "/scratch2/salonso/faser/FASERCALDATA_v3.1/"
     ROOT.gSystem.Load("/scratch5/FASER/Python_io/lib/ClassesDict.so")
 
     files = glob.glob(path + "*.root")
@@ -164,6 +164,8 @@ def generate_events(number, chunks, disable):
     print("Number of files: {}/{}".format(len(chunk), len(files)))
     t = tqdm.tqdm(enumerate(chunk), total=len(chunk), disable=disable)
     for i, file in t:
+        #if i < 7600:
+        #    continue
         with open(os.devnull, 'w') as devnull:
             old_stdout_fno = os.dup(1)  # Save the current stdout file descriptor
             old_stderr_fno = os.dup(2)  # Save the current stderr file descriptor
@@ -187,7 +189,7 @@ def generate_events(number, chunks, disable):
             fPORecoEvent.TrackReconstruct()
             fPORecoEvent.Reconstruct2DViewsPS()
             fPORecoEvent.ReconstructClusters(0)
-            fPORecoEvent.Reconstruct3DPS(150, 300)
+            fPORecoEvent.Reconstruct3DPS()
             fPORecoEvent.PSVoxelParticleFilter()
             fPORecoEvent.ReconstructRearCals()
             fPORecoEvent.Fill2DViewsPS()
@@ -237,7 +239,7 @@ def generate_events(number, chunks, disable):
             tktracks = get_tracks(fPORecoEvent.fTKTracks)
             pstracks = get_tracks(fPORecoEvent.fPSTracks)
 
-            np.savez_compressed('/scratch2/salonso/faser/events_v3_new3/{}_{}'.format(run_number, event_id),
+            np.savez_compressed('/scratch2/salonso/faser/events_v3_large/{}_{}'.format(run_number, event_id),
                                 run_number = run_number,
                                 event_id = event_id,
                                 iscc = iscc,
