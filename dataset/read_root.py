@@ -151,8 +151,26 @@ def get_tracks(tktracks):
         tracks.append(tktrack)
     return tracks
 
+
+def disable_print(os, devnull):
+    old_stdout_fno = os.dup(1)  # Save the current stdout file descriptor
+    old_stderr_fno = os.dup(2)  # Save the current stderr file descriptor
+    os.dup2(devnull.fileno(), 1)  # Redirect stdout to devnull
+    os.dup2(devnull.fileno(), 2)  # Redirect stderr to devnull
+
+    return old_stdout_fno, old_stderr_fno
+
+
+def enable_print(os, old_stdout_fno, old_stderr_fno):
+    # Restore stdout and stderr
+    os.dup2(old_stdout_fno, 1)  # Restore the original stdout
+    os.dup2(old_stderr_fno, 2)  # Restore the original stderr
+    os.close(old_stdout_fno)
+    os.close(old_stderr_fno)
+   
+
 def generate_events(number, chunks, disable):
-    path = "/scratch2/salonso/faser/FASERCALDATA_v3.1/"
+    path = "/scratch3/salonso/faser/FASERCALDATA_v3.1/"
     ROOT.gSystem.Load("/scratch5/FASER/Python_io/lib/ClassesDict.so")
 
     files = glob.glob(path + "*.root")
@@ -164,82 +182,82 @@ def generate_events(number, chunks, disable):
     print("Number of files: {}/{}".format(len(chunk), len(files)))
     t = tqdm.tqdm(enumerate(chunk), total=len(chunk), disable=disable)
     for i, file in t:
-        #if i < 7600:
-        #    continue
         with open(os.devnull, 'w') as devnull:
-            old_stdout_fno = os.dup(1)  # Save the current stdout file descriptor
-            old_stderr_fno = os.dup(2)  # Save the current stderr file descriptor
-            os.dup2(devnull.fileno(), 1)  # Redirect stdout to devnull
-            os.dup2(devnull.fileno(), 2)  # Redirect stderr to devnull
+            old_stdout_fno, old_stderr_fno = disable_print(os, devnull)
+
+            try:
+                # Params
+                tcal_event = ROOT.TcalEvent()
+                po_event = ROOT.TPOEvent()
+                split = file.split("_")
+                run_number, ievent = int(split[-2]), int(split[-1][:-5])
+                event_mask = 0
+
+                # Load event
+                po_event_address = ROOT.AddressOf(po_event)
+                result = tcal_event.Load_event(path, run_number, ievent, event_mask, po_event)
+
+                # Global information
+                run_number = po_event.run_number
+                event_id = po_event.event_id        
+                prim_vertex = po_event.prim_vx
             
-            # Params
-            tcal_event = ROOT.TcalEvent()
-            po_event = ROOT.TPOEvent()
-            split = file.split("_")
-            run_number, ievent = int(split[-2]), int(split[-1][:-5])
-            event_mask = 0
+                # Reconstruct
+                fPORecoEvent = ROOT.TPORecoEvent(tcal_event, tcal_event.fTPOEvent)
+                fPORecoEvent.Reconstruct()
+                fPORecoEvent.TrackReconstruct()
+                fPORecoEvent.Reconstruct2DViewsPS()
+                fPORecoEvent.ReconstructClusters(0)
+                #fPORecoEvent.Reconstruct3DPS()
+                fPORecoEvent.Reconstruct3DPS_2()
+                fPORecoEvent.PSVoxelParticleFilter()
+                fPORecoEvent.ReconstructRearCals()
+                fPORecoEvent.Fill2DViewsPS()
 
-            # Load event
-            po_event_address = ROOT.AddressOf(po_event)
-            result = tcal_event.Load_event(path, run_number, ievent, event_mask, po_event)
+                xz_view = fPORecoEvent.Get2DViewXPS()
+                yz_view = fPORecoEvent.Get2DViewYPS()
+                z_view = fPORecoEvent.zviewPS
+                rearcal_energydeposit = fPORecoEvent.rearCals.rearCalDeposit
+                rearmucal_energydeposit = fPORecoEvent.rearCals.rearMuCalDeposit
+                geom_detector = tcal_event.geom_detector
 
-            # Reconstruct
-            fPORecoEvent = ROOT.TPORecoEvent(tcal_event, tcal_event.fTPOEvent)
-            fPORecoEvent.Reconstruct()
-            fPORecoEvent.TrackReconstruct()
-            fPORecoEvent.Reconstruct2DViewsPS()
-            fPORecoEvent.ReconstructClusters(0)
-            fPORecoEvent.Reconstruct3DPS()
-            fPORecoEvent.PSVoxelParticleFilter()
-            fPORecoEvent.ReconstructRearCals()
-            fPORecoEvent.Fill2DViewsPS()
+                # Retrieve true 3D hits and 2D projections
+                true_hits = get_true_hits(tcal_event)
+                if true_hits is None:
+                    # Restore stdout and stderr
+                    enable_print(os, old_stdout_fno, old_stderr_fno)
+                    print("Empty event {}".format(i))
+                    continue
 
-            xz_view = fPORecoEvent.Get2DViewXPS()
-            yz_view = fPORecoEvent.Get2DViewYPS()
-            z_view = fPORecoEvent.zviewPS
-            rearcal_energydeposit = fPORecoEvent.rearCals.rearCalDeposit
-            rearmucal_energydeposit = fPORecoEvent.rearCals.rearMuCalDeposit
-            geom_detector = tcal_event.geom_detector
+                xz_proj = th2d_to_numpy(xz_view)
+                yz_proj = th2d_to_numpy(yz_view)
+                xy_projs = []
+                for layer in range(20):
+                    view = z_view[layer]
+                    proj = th2d_to_numpy(view)
+                    xy_projs.append(proj)
 
-            # Retrieve true 3D hits and 2D projections
-            true_hits = get_true_hits(tcal_event)
-            if true_hits is None:
-                print("Empty event {}".format(i))
-                continue
+                # Retrieve reco 3d hits
+                reco_hits, reco_hits_true = get_reco_hits(fPORecoEvent, tcal_event, true_hits, geom_detector)
 
-            xz_proj = th2d_to_numpy(xz_view)
-            yz_proj = th2d_to_numpy(yz_view)
-            xy_projs = []
-            for layer in range(20):
-                view = z_view[layer]
-                proj = th2d_to_numpy(view)
-                xy_projs.append(proj)
+                prim_vertex = np.array([prim_vertex.x(), prim_vertex.y(), prim_vertex.z()])
+                iscc = bool(po_event.isCC)
+                evis = po_event.Evis
+                ptmiss = po_event.ptmiss
+                in_neutrino = po_event.in_neutrino
+                out_lepton = po_event.out_lepton
+                in_neutrino_pdg = in_neutrino.m_pdg_id
+                in_neutrino_momentum = np.array([in_neutrino.m_px, in_neutrino.m_py, in_neutrino.m_pz]) 
+                in_neutrino_energy = in_neutrino.m_energy
+                out_lepton_pdg = out_lepton.m_pdg_id
+                out_lepton_momentum = np.array([out_lepton.m_px, out_lepton.m_py, out_lepton.m_pz]) 
+                out_lepton_energy = out_lepton.m_energy
 
-            # Retrieve reco 3d hits
-            reco_hits, reco_hits_true = get_reco_hits(fPORecoEvent, tcal_event, true_hits, geom_detector)
-
-            # Global information
-            run_number = po_event.run_number
-            event_id = po_event.event_id        
-            prim_vertex = po_event.prim_vx
-            prim_vertex = np.array([prim_vertex.x(), prim_vertex.y(), prim_vertex.z()])
-            iscc = bool(po_event.isCC)
-            evis = po_event.Evis
-            ptmiss = po_event.ptmiss
-            in_neutrino = po_event.in_neutrino
-            out_lepton = po_event.out_lepton
-            in_neutrino_pdg = in_neutrino.m_pdg_id
-            in_neutrino_momentum = np.array([in_neutrino.m_px, in_neutrino.m_py, in_neutrino.m_pz]) 
-            in_neutrino_energy = in_neutrino.m_energy
-            out_lepton_pdg = out_lepton.m_pdg_id
-            out_lepton_momentum = np.array([out_lepton.m_px, out_lepton.m_py, out_lepton.m_pz]) 
-            out_lepton_energy = out_lepton.m_energy
-
-            # tracks
-            tktracks = get_tracks(fPORecoEvent.fTKTracks)
-            pstracks = get_tracks(fPORecoEvent.fPSTracks)
-
-            np.savez_compressed('/scratch2/salonso/faser/events_v3_large/{}_{}'.format(run_number, event_id),
+                # tracks
+                tktracks = get_tracks(fPORecoEvent.fTKTracks)
+                pstracks = get_tracks(fPORecoEvent.fPSTracks)
+          
+                np.savez_compressed('/scratch3/salonso/faser/events_v3_large3/{}_{}'.format(run_number, event_id),
                                 run_number = run_number,
                                 event_id = event_id,
                                 iscc = iscc,
@@ -250,11 +268,11 @@ def generate_events(number, chunks, disable):
                                 prim_vertex = prim_vertex,
                                 true_hits = true_hits,
                                 reco_hits = reco_hits,
-                                reco_hits_true = reco_hits_true,
+                                reco_hits_true = np.array(reco_hits_true, dtype=object),
                                 xz_proj = xz_proj,
                                 yz_proj = yz_proj,
-                                xy_projs = xy_projs,
-                                tktracks = tktracks,
+                                xy_projs = np.array(xy_projs, dtype=object),
+                                tktracks = np.array(tktracks, dtype=object),
                                 pstracks = pstracks,
                                 in_neutrino_pdg = in_neutrino_pdg,
                                 in_neutrino_momentum = in_neutrino_momentum,
@@ -263,12 +281,14 @@ def generate_events(number, chunks, disable):
                                 out_lepton_momentum = out_lepton_momentum,
                                 out_lepton_energy = out_lepton_energy,
                                )
+            
+            except:
+                enable_print(os, old_stdout_fno, old_stderr_fno)
+                assert False, "Error in chunk {0}, run number {1}, event id {2}".format(number, run_number, event_id)
 
+           
             # Restore stdout and stderr
-            os.dup2(old_stdout_fno, 1)  # Restore the original stdout
-            os.dup2(old_stderr_fno, 2)  # Restore the original stderr
-            os.close(old_stdout_fno)
-            os.close(old_stderr_fno)
+            enable_print(os, old_stdout_fno, old_stderr_fno)             
 
 # Main function to handle command-line arguments
 if __name__ == "__main__":
@@ -287,9 +307,9 @@ if __name__ == "__main__":
     disable = args.disable
 
     # Validate number range
-    if number < 0 or number > 9:
+    if number < 0 or number >= chunks:
         raise ValueError("Number must be between 0 and 9")
   
     generate_events(number, chunks, disable)
-    print("Done!")
+    print("{}/{} Done!".format(number, chunks))
  
