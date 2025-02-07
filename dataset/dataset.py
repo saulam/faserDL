@@ -2,13 +2,14 @@ import pickle as pk
 import numpy as np
 import torch
 import numpy as np
-import MinkowskiEngine as ME
+import os
+import sys
 from glob import glob
 from torch.utils.data import Dataset
-from utils import random_rotation_saul
+from utils import ini_argparse, random_rotation_saul
+import MinkowskiEngine as ME
 
-    
-class SparseFASERCALDatasetSeg(Dataset):
+class SparseFASERCALDataset(Dataset):
     def __init__(self, args):
         """
         Initializes the SparseFASERCALDataset class.
@@ -20,6 +21,7 @@ class SparseFASERCALDatasetSeg(Dataset):
         self.root = args.dataset_path
         self.contrastive = args.contrastive
         self.data_files = self.processed_file_names
+        self.glob = args.glob
         self.training = False
         self.total_events = self.__len__
         with open(self.root + "/metadata.pkl", "rb") as fd:
@@ -63,8 +65,8 @@ class SparseFASERCALDatasetSeg(Dataset):
         """
         return len(self.data_files)
 
-    def _augment(self, coords, feats, labels, prim_vertex, round_coords=True):
-        coords, feats, labels = coords.copy(), feats.copy(), labels.copy()
+    def _augment(self, coords, feats, labels1, labels2, prim_vertex, round_coords=True):
+        coords, feats, labels1, labels2 = coords.copy(), feats.copy(), labels1.copy(), labels2.copy()
 
         # rotate
         #coords = self._rotate(coords, prim_vertex)
@@ -72,7 +74,7 @@ class SparseFASERCALDatasetSeg(Dataset):
         # translate
         coords = self._translate(coords)
         # drop voxels
-        coords, feats, labels = self._drop(coords, feats, labels, std_dev=0.1)
+        coords, feats, labels1, labels2 = self._drop(coords, feats, labels1, labels2, std_dev=0.1)
         # shift feature values
         feats = self._shift_q_gaussian(feats, std_dev=0.05)
         # keep within limits
@@ -88,9 +90,10 @@ class SparseFASERCALDatasetSeg(Dataset):
         )
         coords = coords[indices]
         feats = feats[indices]
-        labels = labels[indices]
+        labels1 = labels1[indices]
+        labels2 = labels2[indices]
 
-        return coords, feats, labels
+        return coords, feats, labels1, labels2
 
 
     def _rotate_90(self, point_cloud):
@@ -140,13 +143,13 @@ class SparseFASERCALDatasetSeg(Dataset):
         return coords
 
 
-    def _drop(self, coords, feats, labels, std_dev=0.1):
+    def _drop(self, coords, feats, labels1, labels2, std_dev=0.1):
         p = abs(np.random.randn(1) * std_dev)
         mask = np.random.rand(coords.shape[0]) > p
         #don't drop all coordinates
         if mask.sum() == 0:
-            return coords, feats, labels
-        return coords[mask], feats[mask], labels[mask]
+            return coords, feats, labels1, labels2
+        return coords[mask], feats[mask], labels1[mask], labels2[mask]
 
 
     def _shift_q_uniform(self, feats, max_scale_factor=0.1):
@@ -184,20 +187,49 @@ class SparseFASERCALDatasetSeg(Dataset):
         coords[:, 1] = self.metadata['y'][coords[:, 1].astype(int)]
         coords[:, 2] = self.metadata['z'][coords[:, 2].astype(int), 0]
 
-    def process_labels(self, reco_hits_true, true_hits):
+    def contains_primary_lepton(self, hits, lepton_pdg, iscc):
+        """
+        Checks if any row in the numpy array satisfies the following conditions:
+        - ftrackID equals fprimaryID.
+        - fparentID equals 0.
+        - fPDG is leptonic.
+    
+        Returns:
+        bool: True if any row satisfies the conditions, False otherwise.
+        """
+        if iscc == False:
+            return False
+    
+        # Check the conditions across all rows
+        condition = (
+            (hits[:, 0] == hits[:, 2]) &
+            (hits[:, 1] == 0) &
+            (np.isin(hits[:, 3], lepton_pdg))
+        )
+            
+        return np.any(condition)
+
+    def process_labels(self, reco_hits_true, true_hits, pdg, iscc):
         """
         Process a list of labels into binary classification arrays:
-        - y: (non-ghost/ghost label, muonic, electromagnetic, hadronic)
+        - seg_labels: (non-ghost/ghost label, muonic, electromagnetic, hadronic)
+        - primlepton_labels: whether voxel belongs to primary lepton
         """
-        num_labels = len(reco_hits_true)
-        y = np.zeros((num_labels, 3))  # ghost, muonic+electromagnetic, hadronic
+        num_hits = len(reco_hits_true)
+        seg_labels = np.zeros((num_hits, 3))  # ghost, muonic+electromagnetic, hadronic
+        primlepton_labels = np.zeros((num_hits, 1))
 
         ghost_pdg = list(self.metadata['ghost_pdg'])
         muonic_pdg = list(self.metadata['muonic_pdg'])
         electromagnetic_pdg = list(self.metadata['electromagnetic_pdg'])
         hadronic_pdg = list(self.metadata['hadronic_pdg'])
         for i, reco_hit_true in enumerate(reco_hits_true):
-            matched_hits = true_hits[reco_hit_true]
+            reco_hit_true = np.array(reco_hit_true).astype(int)
+            try:
+                matched_hits = true_hits[reco_hit_true]
+            except:
+                print("hey", reco_hit_true, type(reco_hit_true))
+                assert False
             m_mask = np.isin(matched_hits[:, 3], muonic_pdg)
             e_mask = np.isin(matched_hits[:, 3], electromagnetic_pdg)
             h_mask = np.isin(matched_hits[:, 3], hadronic_pdg)
@@ -207,11 +239,28 @@ class SparseFASERCALDatasetSeg(Dataset):
             h_edepo = matched_hits[h_mask, -1].sum()
             total_edepo = matched_hits[:, -1].sum()
 
-            y[i, 0] = 1 if reco_hit_true[0] == -1 else 0
-            y[i, 1] = (m_edepo + e_edepo) / total_edepo
-            y[i, 2] = h_edepo / total_edepo 
+            primlepton_labels[i, 0] = self.contains_primary_lepton(matched_hits, pdg, iscc)
+            seg_labels[i, 0] = 1 if reco_hit_true[0] == -1 else 0
+            seg_labels[i, 1] = 0 if reco_hit_true[0] == -1 else (m_edepo + e_edepo) / total_edepo
+            seg_labels[i, 2] = 0 if reco_hit_true[0] == -1 else h_edepo / total_edepo 
 
-        return y
+        return primlepton_labels, seg_labels
+
+    def pdg2label(self, pdg, iscc):
+        """
+        PDG to label.
+        """
+        if iscc:
+            if pdg in [-12, 12]:  # CC nue
+                label = 0
+            elif pdg in [-14, 14]:  # CC numu
+                label = 1
+            elif pdg in [-16, 16]:  # CC nutau
+                label = 2
+        else:
+            label = 3  # NC
+
+        return label
 
     def __getitem__(self, idx):
         """
@@ -224,41 +273,66 @@ class SparseFASERCALDatasetSeg(Dataset):
         dict: Data sample with filename, coordinates, features, and labels.
         """
         data = np.load(self.data_files[idx], allow_pickle=True)
-        run_number = data['run_number']
-        event_id = data['event_id']
+        run_number = data['run_number'].item()
+        event_id = data['event_id'].item()
         true_hits = data['true_hits']
         reco_hits = data['reco_hits']
         reco_hits_true = data['reco_hits_true']
+        in_neutrino_pdg = data['in_neutrino_pdg'].item()
+        in_neutrino_energy = data['in_neutrino_energy'].item()
+        out_lepton_pdg = data['out_lepton_pdg'].item()
+        iscc = data['iscc'].item()
+        evis = data['evis'].item()
+        ptmiss = data['ptmiss'].item()
+        rearcal_energydeposit = (data['rearcal_energydeposit'].reshape(1,)-self.metadata['rearcal_energydeposit_mean']) / self.metadata['rearcal_energydeposit_std']
+        rearhcal_energydeposit = (data['rearhcal_energydeposit'].reshape(1,)-self.metadata['rearhcal_energydeposit_mean']) / self.metadata['rearhcal_energydeposit_std']
+        rearmucal_energydeposit = (data['rearmucal_energydeposit'].reshape(1,)-self.metadata['rearmucal_energydeposit_mean']) / self.metadata['rearmucal_energydeposit_std']
+        fasercal_energydeposit = (data['fasercal_energydeposit'].reshape(1,)-self.metadata['fasercal_energydeposit_mean']) / self.metadata['fasercal_energydeposit_std']
+        rearhcalmodules = (data['rearhcalmodules']-self.metadata['rearhcalmodules_mean']) / self.metadata['rearhcalmodules_std']
+        fasercalmodules = (data['fasercalmodules']-self.metadata['fasercalmodules_mean']) / self.metadata['fasercalmodules_std']
 
+        prim_vertex = data['prim_vertex'].reshape(1, 3)
+        
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
-        feats = reco_hits[:, 4].reshape(-1, 1) 
+        feats = reco_hits[:, 4].reshape(-1, 1)
 
         # voxelise
         self.voxelise(coords)
         
-        # PDGs to labels
-        labels = self.process_labels(reco_hits_true, true_hits)
-        labels = np.argmax(labels, axis=1).reshape(-1, 1)
+        # process labels
+        primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
+        #seg_labels = np.argmax(seg_labels, axis=1).reshape(-1, 1)
+        flavour_label = self.pdg2label(in_neutrino_pdg, iscc)
 
         # output
         output = {'run_number': run_number,
                   'event_id': event_id}
 
         if self.training and np.random.rand() > 0.05:
-            prim_vertex = data['prim_vertex'].reshape(1, 3)
             self.voxelise(prim_vertex)
             prim_vertex = prim_vertex.reshape(3)
            
             # augmented event
-            coords, feats, labels = self._augment(coords, feats, labels, prim_vertex, round_coords=False)
+            coords, feats, seg_labels, primlepton_labels = self._augment(coords, feats, seg_labels, primlepton_labels, prim_vertex, round_coords=False)
            
         # log features
-        feats = np.log(feats)
+        feats = np.log(feats).reshape(-1, 1)
+        feats_global = np.concatenate([rearcal_energydeposit, rearhcal_energydeposit, rearmucal_energydeposit, fasercal_energydeposit, rearhcalmodules, fasercalmodules])
+        rearcal_energydeposit = np.log(rearcal_energydeposit + 1)
+        rearmucal_energydeposit = np.log(rearmucal_energydeposit + 1)
 
-        output['coords'] = torch.from_numpy(coords).float()
+        output['prim_vertex'] = prim_vertex
+        output['in_neutrino_pdg'] = in_neutrino_pdg
+        output['in_neutrino_energy'] = in_neutrino_energy
+        output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
         output['feats'] = torch.from_numpy(feats).float()
-        output['labels'] = torch.from_numpy(labels).float()
+        output['feats_global'] = torch.from_numpy(feats_global).float()
+        output['primlepton_labels'] = torch.from_numpy(primlepton_labels.reshape(-1, 1)).float()
+        output['seg_labels'] = torch.from_numpy(seg_labels.reshape(-1, 3)).float()
+        output['flavour_label'] = torch.tensor([flavour_label]).long()
+        output['evis'] = torch.tensor([(evis-self.metadata['evis_mean'])/self.metadata['evis_std']]).float()
+        output['ptmiss'] = torch.tensor([(ptmiss-self.metadata['ptmiss_mean'])/self.metadata['ptmiss_std']]).float()
 
         return output
 

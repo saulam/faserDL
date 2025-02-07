@@ -5,7 +5,7 @@ from torch.utils.data import random_split, Subset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
 
-def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7):
+def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     """
     Splits the dataset into training, validation, and test sets based on the given splits.
 
@@ -41,32 +41,112 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7):
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, num_workers=args.num_workers,
         shuffle=True, pin_memory=True, persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_sparse_minkowski
+        collate_fn=collate_test if test else collate_sparse_minkowski
     )
     valid_loader = DataLoader(
         val_set, batch_size=args.batch_size, num_workers=args.num_workers,
         shuffle=False, pin_memory=True, persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_sparse_minkowski
+        collate_fn=collate_test if test else collate_sparse_minkowski
     )
     test_loader = DataLoader(
         test_set, batch_size=args.batch_size, num_workers=args.num_workers,
         shuffle=False, pin_memory=True, persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_sparse_minkowski
+        collate_fn=collate_test if test else collate_sparse_minkowski
     )
 
     return train_loader, valid_loader, test_loader
 
 
-def collate_sparse_minkowski(batch):
+def collate_test(batch):
     coords = [d['coords'] for d in batch]
     feats = torch.cat([d['feats'] for d in batch])
-    y = torch.cat([d['labels'] for d in batch])
 
     ret = {
         'f': feats,
         'c': coords,
-        'y': y,
     }
+
+    if 'prim_vertex' in batch[0]:
+        prim_vertex = [d['prim_vertex'] for d in batch]
+        ret['prim_vertex'] = prim_vertex
+
+    if 'in_neutrino_pdg' in batch[0]:
+        in_neutrino_pdg = [d['in_neutrino_pdg'] for d in batch]
+        ret['in_neutrino_pdg'] = in_neutrino_pdg
+
+    if 'in_neutrino_energy' in batch[0]:
+        in_neutrino_energy = [d['in_neutrino_energy'] for d in batch]
+        ret['in_neutrino_energy'] = in_neutrino_energy
+
+    if 'primlepton_labels' in batch[0]:
+        primlepton_labels = [d['primlepton_labels'].numpy() for d in batch]
+        ret['primlepton_labels'] = primlepton_labels
+
+    if 'seg_labels' in batch[0]:
+        seg_labels = [d['seg_labels'].numpy() for d in batch]
+        ret['seg_labels'] = seg_labels
+
+    if 'flavour_label' in batch[0]:
+        flavour_label = [d['flavour_label'].unsqueeze(0).numpy() for d in batch]
+        ret['flavour_label'] = flavour_label
+
+    if 'evis' in batch[0]:
+        evis = [d['evis'].item() for d in batch]
+        ret['evis'] = evis
+
+    if 'ptmiss' in batch[0]:
+        ptmiss = [d['ptmiss'].item() for d in batch]
+        ret['ptmiss'] = ptmiss
+
+    return ret
+
+
+def collate_sparse_minkowski(batch):
+    coords = [d['coords'] for d in batch]
+    feats = torch.cat([d['feats'] for d in batch])
+    feats_global = torch.stack([d['feats_global'] for d in batch])
+
+    ret = {
+        'f': feats,
+        'f_glob': feats_global,
+        'c': coords,
+    }
+
+    if 'prim_vertex' in batch[0]:
+        prim_vertex = [d['prim_vertex'] for d in batch]
+        ret['prim_vertex'] = prim_vertex
+
+    if 'in_neutrino_pdg' in batch[0]:
+        in_neutrino_pdg = [d['in_neutrino_pdg'] for d in batch]
+        ret['in_neutrino_pdg'] = in_neutrino_pdg
+
+    if 'in_neutrino_energy' in batch[0]:
+        in_neutrino_energy = [d['in_neutrino_energy'] for d in batch]
+        ret['in_neutrino_energy'] = in_neutrino_energy
+
+    if 'y' in batch[0]:
+        y = torch.cat([d['labels'] for d in batch])
+        ret['y'] = y
+
+    if 'primlepton_labels' in batch[0]:
+        primlepton_labels = torch.cat([d['primlepton_labels'] for d in batch])
+        ret['primlepton_labels'] = primlepton_labels
+
+    if 'seg_labels' in batch[0]:
+        seg_labels = torch.cat([d['seg_labels'] for d in batch])
+        ret['seg_labels'] = seg_labels
+
+    if 'flavour_label' in batch[0]:
+        flavour_label = torch.cat([d['flavour_label'] for d in batch])
+        ret['flavour_label'] = flavour_label
+
+    if 'evis' in batch[0]:
+        evis = torch.cat([d['evis'] for d in batch])
+        ret['evis'] = evis
+
+    if 'ptmiss' in batch[0]:
+        ptmiss = torch.cat([d['ptmiss'] for d in batch])
+        ret['ptmiss'] = ptmiss
 
     if 'global_feats' in batch[0]:
         global_labels = torch.stack([d['global_feats'] for d in batch])
@@ -76,46 +156,28 @@ def collate_sparse_minkowski(batch):
 
 
 def arrange_sparse_minkowski(data, device):
-    return ME.SparseTensor(
-        features=data['f'],
-        coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
-        device=device)
-
-
-def arrange_truth(data, device):
-    y = ME.SparseTensor(
-         features=data['y'],
-         coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
-         device=device)
-    return y
-
-
-def arrange_sparse_minkowski(data, device):
     tensor = ME.SparseTensor(
         features=data['f'],
         coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
         device=device
     )
+    tensor_global = data['f_glob']
 
-    return tensor
+    return tensor, tensor_global
 
 
-def arrange_truth(data, device):
-    main_truth = ME.SparseTensor(
-        features=data['y'],
-        coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
-        device=device
-    )
-
-    if 'y_aug' in data and 'c_aug' in data:
-        aug_truth = ME.SparseTensor(
-            features=data['y_aug'],
-            coordinates=ME.utils.batched_coordinates(data['c_aug'], dtype=torch.int),
-            device=device
-        )
-        return main_truth, aug_truth
-
-    return main_truth
+def arrange_truth(data):
+    output = {'coords': [x.detach().cpu().numpy() for x in data['c']],
+              'prim_vertex': data['prim_vertex'],
+              'in_neutrino_pdg': data['in_neutrino_pdg'],
+              'in_neutrino_energy': data['in_neutrino_energy'],
+              'primlepton_labels': data['primlepton_labels'],
+              'seg_labels': data['seg_labels'],
+              'flavour_label': data['flavour_label'],
+              'evis': data['evis'],
+              'ptmiss': data['ptmiss']
+             }
+    return output
 
 
 def argsort_coords(coordinates):
@@ -175,7 +237,7 @@ class CustomLambdaLR(LambdaLR):
 
 
 class CombinedScheduler(_LRScheduler):
-    def __init__(self, optimizer, scheduler1, scheduler2, lr_decay=1.0, warmup_steps=100):
+    def __init__(self, optimizer, scheduler1, scheduler2, lr_decay=1.0, warmup_steps=100, start_cosine_step=100):
         """
         Initialize the CombinedScheduler.
 
@@ -185,11 +247,13 @@ class CombinedScheduler(_LRScheduler):
             scheduler2 (_LRScheduler): The second scheduler for the main phase.
             lr_decay (float): The factor by which the learning rate is decayed after each restart (default: 1.0).
             warmup_steps (int): The number of steps for the warm-up phase (default: 100).
+            start_cosine_step (int): The step to start cosine annealing scheduling.
         """
         self.optimizer = optimizer
         self.scheduler1 = scheduler1
         self.scheduler2 = scheduler2
         self.warmup_steps = warmup_steps
+        self.start_cosine_step = start_cosine_step
         self.step_num = 0  # current scheduler step
         self.lr_decay = lr_decay  # decrease of lr after every restart
 
@@ -202,7 +266,7 @@ class CombinedScheduler(_LRScheduler):
         """
         if self.step_num < self.warmup_steps:
             self.scheduler1.step()
-        else:
+        elif self.step_num >= self.start_cosine_step:
             self.scheduler2.step()
             if self.lr_decay < 1.0 and (self.scheduler2.T_cur+1 == self.scheduler2.T_i):
                 # Reduce the learning rate after every restart

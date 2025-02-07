@@ -26,17 +26,19 @@ class Block(nn.Module):
 
     Args:
         dim (int): Number of input channels.
+        kernel_size (int): Size of input kernel.
         drop_path (float): Stochastic depth rate. Default: 0.0
         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
     """
-    def __init__(self, dim, drop_path=0., D=3):
+    def __init__(self, dim, kernel_size=7, drop_path=0., D=3):
         super().__init__()
-        self.dwconv = MinkowskiDepthwiseConvolution(dim, kernel_size=5, bias=True, dimension=D)
+        
+        self.dwconv = MinkowskiDepthwiseConvolution(dim, kernel_size=kernel_size, bias=True, dimension=D)
         self.norm = MinkowskiLayerNorm(dim, 1e-6)
         self.pwconv1 = MinkowskiLinear(dim, 4 * dim)   
         self.act = MinkowskiGELU()
-        self.pwconv2 = MinkowskiLinear(4 * dim, dim)
         self.grn = MinkowskiGRN(4  * dim)
+        self.pwconv2 = MinkowskiLinear(4 * dim, dim)
         self.drop_path = MinkowskiDropPath(drop_path)
     
     def forward(self, x):
@@ -48,6 +50,7 @@ class Block(nn.Module):
         x = self.grn(x)
         x = self.pwconv2(x)
         x = input + self.drop_path(x)
+
         return x
 
 
