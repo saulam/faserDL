@@ -199,7 +199,8 @@ def generate_events(number, chunks, disable):
             out_lepton_pdg = out_lepton.m_pdg_id
             out_lepton_momentum = np.array([out_lepton.m_px, out_lepton.m_py, out_lepton.m_pz]) 
             out_lepton_energy = out_lepton.m_energy
-    
+            jet_momentum = np.array([po_event.jetpx, po_event.jetpy, po_event.jetpz])
+
             # Tracks
             tktracks = get_tracks(tporeco_event.fTKTracks)
             pstracks = get_tracks(tporeco_event.fPSTracks)
@@ -260,6 +261,7 @@ def generate_events(number, chunks, disable):
                                 out_lepton_pdg = out_lepton_pdg,
                                 out_lepton_momentum = out_lepton_momentum,
                                 out_lepton_energy = out_lepton_energy,
+                                jet_momentum = jet_momentum,
                                )
              
 # Main function to handle command-line arguments

@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 from utils import ini_argparse, random_rotation_saul
 import MinkowskiEngine as ME
 
-class SparseFASERCALDataset(Dataset):
+class SparseFASERCALDatasetEnc(Dataset):
     def __init__(self, args):
         """
         Initializes the SparseFASERCALDataset class.
@@ -65,12 +65,11 @@ class SparseFASERCALDataset(Dataset):
         """
         return len(self.data_files)
 
-    def _augment(self, coords, feats, labels1, labels2, prim_vertex, round_coords=True):
+    def _augment(self, coords, feats, labels1, labels2, momentum1, momentum2, prim_vertex, round_coords=True):
         coords, feats, labels1, labels2 = coords.copy(), feats.copy(), labels1.copy(), labels2.copy()
 
         # rotate
-        #coords = self._rotate(coords, prim_vertex)
-        coords = self._rotate_90(coords)
+        coords, momentum1, momentum2 = self._rotate(coords, momentum1, momentum2, prim_vertex)
         # translate
         coords = self._translate(coords)
         # drop voxels
@@ -93,43 +92,10 @@ class SparseFASERCALDataset(Dataset):
         labels1 = labels1[indices]
         labels2 = labels2[indices]
 
-        return coords, feats, labels1, labels2
+        return coords, feats, labels1, labels2, momentum1, momentum2
 
 
-    def _rotate_90(self, point_cloud):
-         # Rotation matrices for 90, 180, and 270 degrees on each axis
-         rotations = {
-            'x': {0: np.eye(3),
-                  90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
-                  180: np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),
-                  270: np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])},
-            'y': {0: np.eye(3),
-                  90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
-                  180: np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
-                  270: np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])},
-            'z': {0: np.eye(3),
-                  90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
-                  180: np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
-                  270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
-         }
-
-         reference_point = np.array([(self.metadata['x'].shape[0]-1)/2.,
-                                     (self.metadata['y'].shape[0]-1)/2.,
-                                     (self.metadata['z'].shape[0]-1)/2.])
-         final_rotation_matrix = np.eye(3) 
-
-         for axis in ['x', 'y', 'z']:  # Loop over each axis
-             if np.random.choice([False, True]):
-                 angle = np.random.choice([0, 90, 180, 270])
-                 final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
-
-         translated_points = point_cloud - reference_point
-         rotated_points = translated_points @ final_rotation_matrix.T
-         final_points = rotated_points + reference_point
-         return final_points
-
- 
-    def _rotate(self, coords, prim_vertex):
+    def _rotate(self, coords, momentum1, momentum2, prim_vertex):
         """Random rotation along"""
         angle_limits = torch.tensor([
             [-torch.pi/8, -torch.pi/8, -torch.pi],  # Min angles for X, Y, Z
@@ -137,8 +103,10 @@ class SparseFASERCALDataset(Dataset):
         ])
         if (angle_limits==0).all():
             # no rotation at all
-            return coords
+            return coords, momentum1, momentum2
         return random_rotation_saul(coords=coords,
+                                    momentum1=momentum1,
+                                    momentum2=momentum2,
                                     angle_limits=angle_limits,
                                     origin=prim_vertex)
  
@@ -273,6 +241,59 @@ class SparseFASERCALDataset(Dataset):
     def standardize(self, x, mean, std):
         return (x-mean)/std
 
+
+    def add_gaussian_noise(self, probs, std=0.05, shuffle_prob=0.01):
+        """
+        Adds Gaussian noise to a probability distribution while ensuring the sum remains 1.
+        Additionally, in 1% of cases, it either shuffles the probabilities (if num_classes > 1)
+        or applies (1 - current_value) when num_classes = 1.
+
+        :param probs: NumPy array of shape (batch_size, num_classes) with probability distributions.
+        :param std: Standard deviation of Gaussian noise.
+        :param shuffle_prob: Probability of applying shuffling (or 1 - value if num_classes = 1).
+        :return: Noisy probability distributions of the same shape as probs.
+        """
+        batch_size, num_classes = probs.shape
+
+        # Add Gaussian noise
+        noise = np.random.normal(0, std, size=(batch_size, num_classes))
+        noisy_probs = probs + noise
+        noisy_probs = np.clip(noisy_probs, 0, 1)  # Ensure values are in the range (0,1)
+        if num_classes > 1:
+            noisy_probs /= noisy_probs.sum(axis=1, keepdims=True)  # Normalize each row
+        
+        # Create mask for selected rows that need shuffling (num_classes > 1) or inversion (num_classes = 1)
+        shuffle_mask = np.random.rand(batch_size) < shuffle_prob
+
+        if num_classes > 1:
+            # Shuffle probabilities within selected rows
+            shuffled_probs = np.apply_along_axis(np.random.permutation, 1, probs)
+            noisy_probs[shuffle_mask] = shuffled_probs[shuffle_mask]
+        else:
+            # Apply (1 - current_value) for single-class cases
+            noisy_probs[shuffle_mask] = 1 - noisy_probs[shuffle_mask]
+
+        return noisy_probs
+
+
+    def to_one_hot(self, indices, length):
+        """
+        Converts a vector of indices into a batch of one-hot encoded vectors.
+
+        :param indices: List or NumPy array of indices (shape: (batch_size,))
+        :param length: Length of the one-hot encoded vectors
+        :return: NumPy array of shape (batch_size, length) with one-hot encodings
+        """
+        if np.any((indices < 0) | (indices >= length)):
+            raise ValueError("Some indices are out of range for one-hot encoding")
+
+        batch_size = len(indices)
+        print(indices.shape)
+        one_hot = np.zeros((batch_size, length), dtype=np.float32)
+        one_hot[np.arange(batch_size), indices.astype(int)] = 1.0
+        return one_hot
+
+
     def __getitem__(self, idx):
         """
         Retrieves a data sample by index.
@@ -301,6 +322,9 @@ class SparseFASERCALDataset(Dataset):
         fasercal_energydeposit = self.standardize(data['fasercal_energydeposit'].reshape(1,), self.metadata['fasercal_energydeposit_mean'], self.metadata['fasercal_energydeposit_std'])
         rearhcalmodules = self.standardize(data['rearhcalmodules'], self.metadata['rearhcalmodules_mean'], self.metadata['rearhcalmodules_std'])
         fasercalmodules = self.standardize(data['fasercalmodules'], self.metadata['fasercalmodules_mean'], self.metadata['fasercalmodules_std'])
+        out_lepton_momentum = data['out_lepton_momentum'] / self.metadata['out_lepton_momentum_std']
+        out_lepton_energy = self.standardize(data['out_lepton_energy'].reshape(1,), self.metadata['out_lepton_energy_mean'], self.metadata['out_lepton_energy_std'])
+        jet_momentum = data['jet_momentum'] / self.metadata['jet_momentum_std']
         prim_vertex = data['prim_vertex'].reshape(1, 3)
         
         # retrieve coordiantes and features (energy deposited)
@@ -312,7 +336,6 @@ class SparseFASERCALDataset(Dataset):
         
         # process labels
         primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
-        #seg_labels = np.argmax(seg_labels, axis=1).reshape(-1, 1)
         flavour_label = self.pdg2label(in_neutrino_pdg, iscc)
 
         # output
@@ -324,11 +347,14 @@ class SparseFASERCALDataset(Dataset):
             prim_vertex = prim_vertex.reshape(3)
            
             # augmented event
-            coords, feats, seg_labels, primlepton_labels = self._augment(coords, feats, seg_labels, primlepton_labels, prim_vertex, round_coords=False)
-           
+            coords, feats, seg_labels, primlepton_labels, out_lepton_momentum, jet_momentum = self._augment(coords, feats, seg_labels, primlepton_labels, out_lepton_momentum, jet_momentum, prim_vertex, round_coords=False)
+            primlepton_labels = self.add_gaussian_noise(primlepton_labels)
+            seg_labels = self.add_gaussian_noise(seg_labels)
+
         # log features
         #feats = np.log(feats).reshape(-1, 1)
         feats = feats.reshape(-1, 1)
+        feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
         feats_global = np.concatenate([rearcal_energydeposit, rearhcal_energydeposit, rearmucal_energydeposit, fasercal_energydeposit, rearhcalmodules, fasercalmodules])
 
         output['prim_vertex'] = prim_vertex
@@ -337,11 +363,11 @@ class SparseFASERCALDataset(Dataset):
         output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
         output['feats'] = torch.from_numpy(feats).float()
         output['feats_global'] = torch.from_numpy(feats_global).float()
-        output['primlepton_labels'] = torch.from_numpy(primlepton_labels.reshape(-1, 1)).float()
-        output['seg_labels'] = torch.from_numpy(seg_labels.reshape(-1, 3)).float()
         output['flavour_label'] = torch.tensor([flavour_label]).long()
         output['evis'] = torch.from_numpy(evis).float()
         output['ptmiss'] = torch.tensor(ptmiss).float()
+        output['out_lepton_momentum'] = torch.from_numpy(out_lepton_momentum)
+        output['jet_momentum'] = torch.from_numpy(jet_momentum)
 
         return output
 

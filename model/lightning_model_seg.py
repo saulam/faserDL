@@ -7,14 +7,15 @@ from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
 class SparseSegLightningModel(pl.LightningModule):
-    def __init__(self, model, loss_fn, args):
+    def __init__(self, model, args):
         super(SparseSegLightningModel, self).__init__()
 
         self.model = model
         self.sigmoid = args.sigmoid
-        self.losses = args.losses
-        self.loss_fn = loss_fn
+        self.loss_primlepton = nn.BCEWithLogitsLoss()
+        self.loss_seg= nn.CrossEntropyLoss() 
         self.warmup_steps = args.warmup_steps
+        self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
         self.lr = args.lr
         self.betas = (args.beta1, args.beta2)
@@ -23,7 +24,6 @@ class SparseSegLightningModel(pl.LightningModule):
         self.contrastive = args.contrastive
         self.finetuning = args.finetuning
         self.chunk_size = args.chunk_size
-        self.label_weights = [float(x) for x in args.label_weights] if args.label_weights is not None else None
 
 
     def on_train_start(self):
@@ -52,153 +52,43 @@ class SparseSegLightningModel(pl.LightningModule):
         test_loader.dataset.dataset.set_training_mode(False)
 
 
-    def forward(self, x, y):
-        return self.model(x, y)
+    def forward(self, x, x_glob):
+        return self.model(x, x_glob)
 
 
     def _arrange_batch(self, batch):
-        batch_input = arrange_sparse_minkowski(batch, self.device)
-        batch_target = arrange_truth(batch, self.device)
-        return batch_input, batch_target
+        batch_input, batch_input_global = arrange_sparse_minkowski(batch, self.device)
+        target = arrange_truth(batch)
+        return batch_input, batch_input_global, target
 
 
-    def compute_losses(self, batch_output, batch_target):
-        losses = [0. for _ in range(len(self.losses))]
-        part_losses = [[] for _ in range(len(self.losses))]
-        for step, (out, tgt) in enumerate(zip(batch_output, batch_target)):
-            weight = 1 / (2 ** step)  # inspired by https://arxiv.org/pdf/2310.04110
+    def compute_losses(self, batch_output, target):
+        # pred
+        out_primlepton = batch_output['out_primlepton'].F
+        out_seg = batch_output['out_seg'].F
 
-            '''
-            out_coords, out_feats = out.decomposed_coordinates_and_features
-            tgt_coords, tgt_feats = tgt.decomposed_coordinates_and_features     
-            
-            batch_size = len(tgt_coords)
-            
-            # Compute losses
-            for i, (loss, loss_fn) in enumerate(zip(self.losses, self.loss_fn)):
-                extra_args = {"gamma": 1.0} if loss == "focal" else {}
-                
-                loss_ghost, loss_muonic, loss_electromagnetic, loss_hadronic = 0., 0., 0., 0.
-                for (c1, f1, c2, f2) in zip(out_coords, out_feats, tgt_coords, tgt_feats):
-                    if not (c1==c2).all():
-                        sorted_indices_c1 = argsort_coords(c1)
-                        sorted_indices_c2 = argsort_coords(c2)
-                        assert (c1[sorted_indices_c1] == c2[sorted_indices_c2]).all()
-                        f1 = f1[sorted_indices_c1]
-                        f2 = f2[sorted_indices_c2]
-                    loss_ghost += loss_fn(f1[:, 0], f2[:, 0], **extra_args)
-                    mask = f2[:, 0] < 0.5  # ghost mask
-                    loss_muonic += loss_fn(f1[mask, 1], f2[mask, 1], **extra_args)
-                    loss_electromagnetic += loss_fn(f1[mask, 2], f2[mask, 2], **extra_args)
-                    loss_hadronic += loss_fn(f1[mask, 3], f2[mask, 3], **extra_args)
-                loss_ghost /= batch_size
-                loss_muonic /= batch_size
-                loss_electromagnetic /= batch_size
-                loss_hadronic /= batch_size
-            '''
-            sorted_ind_out = argsort_sparse_tensor(out)
-            sorted_ind_tgt = argsort_sparse_tensor(tgt)
-            
-            sorted_coords_out = out.coordinates[sorted_ind_out]
-            sorted_coords_tgt = tgt.coordinates[sorted_ind_tgt]
+        # true
+        targ_primlepton = target['primlepton_labels']
+        targ_seg = target['seg_labels']
 
-            # Now the coordinates should be aligned; you can sum the features
-            assert (sorted_coords_out == sorted_coords_tgt).all(), "Coordinates are still not aligned!"
-
-            sorted_feats_out = out.F[sorted_ind_out]
-            sorted_feats_tgt = tgt.F[sorted_ind_tgt]
-
-            # Compute losses
-            for i, (loss, loss_fn) in enumerate(zip(self.losses, self.loss_fn)):
-                extra_args = {"gamma": 1.0} if loss == "focal" else {}
-
-                loss_ghost = loss_fn(sorted_feats_out[:, 0], sorted_feats_tgt[:, 0], **extra_args)
-                mask = sorted_feats_tgt[:, 0] < 0.5  # ghost mask
-                loss_muonic = loss_fn(sorted_feats_out[mask, 1], sorted_feats_tgt[mask, 1], **extra_args)
-                loss_electromagnetic = loss_fn(sorted_feats_out[mask, 2], sorted_feats_tgt[mask, 2], **extra_args)
-                loss_hadronic = loss_fn(sorted_feats_out[mask, 3], sorted_feats_tgt[mask, 3], **extra_args)
-
-                part_losses[i].append([loss_ghost, loss_muonic, loss_electromagnetic, loss_hadronic])
-                curr_loss = loss_ghost + loss_muonic + loss_electromagnetic + loss_hadronic
-                losses[i] += weight * curr_loss 
-
-        part_losses = torch.tensor(part_losses)
-        total_loss = sum(losses)
+        # losses
+        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
+        loss_seg = self.loss_seg(out_seg, targ_seg)
+        part_losses = {'primlepton': loss_primlepton,
+                       'seg': loss_seg,
+                       }
+        total_loss = loss_primlepton + loss_seg
 
         return total_loss, part_losses
 
     
-    def compute_losses_contrastive(self, batch_output, batch_target):
-        losses = [0.]
-        part_losses = [[]] 
- 
-        assert (batch_output.coordinates == batch_target.coordinates).all()
-        
-        coords, labels = batch_target.decomposed_coordinates_and_features
-        coords_, feats = batch_output.decomposed_coordinates_and_features
-          
-        curr_loss = self.loss_fn(feats, feats, labels, labels, label_weights=[0.6, 1, 1], chunk_size=self.chunk_size)
-
-        part_losses[0].append([curr_loss])
-        losses[0] += curr_loss
-
-        part_losses = torch.tensor(part_losses)
-        total_loss = sum(losses)
-
-        return total_loss, part_losses
-
-
-    def compute_losses_finetuning(self, batch_output, batch_target):
-        losses = [0. for _ in range(len(self.losses))]
-        part_losses = [[] for _ in range(len(self.losses))]
-
-        feats_out = batch_output.F
-        feats_tgt = batch_target.F
-        feats_out_list = batch_output.decomposed_features
-        feats_tgt_list = batch_target.decomposed_features
-
-        # Compute losses
-        for i, (loss, loss_fn) in enumerate(zip(self.losses, self.loss_fn)):
-            extra_args = {"gamma": 2.0} if loss == "focal" else {}
-
-            if self.sigmoid:
-                loss_ghost = loss_fn(feats_out[:, 0], feats_tgt[:, 0], **extra_args)
-                loss_muonic = loss_fn(feats_out[mask, 1], feats_tgt[mask, 1], **extra_args)
-                loss_electromagnetic = loss_fn(feats_out[mask, 2], feats_tgt[mask, 2], **extra_args)
-                loss_hadronic = loss_fn(feats_out[mask, 3], feats_tgt[mask, 3], **extra_args)
-
-                part_losses[i].append([loss_ghost, loss_muonic, loss_electromagnetic, loss_hadronic])
-                curr_loss = loss_ghost + loss_muonic + loss_electromagnetic + loss_hadronic
-            else:
-                if loss == "focal":
-                    curr_loss = loss_fn(feats_out, feats_tgt, **extra_args)
-                else:
-                    curr_loss = loss_fn(feats_out_list, feats_tgt_list)
-                part_losses[i].append([curr_loss])
-
-            losses[i] += curr_loss
-
-        part_losses = torch.tensor(part_losses)
-        total_loss = sum(losses)
-
-        return total_loss, part_losses
- 
-
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, batch_target = self._arrange_batch(batch)
+        batch_input, batch_input_global, target = self._arrange_batch(batch)
 
-        if self.contrastive or self.finetuning:
-            batch_output, _ = self.forward(batch_input, batch_target)
- 
-            if self.finetuning:
-                loss, part_losses = self.compute_losses_finetuning(batch_output, batch_target)
-            else:
-                loss, part_losses = self.compute_losses_contrastive(batch_output, batch_target)
-        else:
-            # Forward pass
-            batch_output, batch_target = self.forward(batch_input, batch_target)
-            loss, part_losses = self.compute_losses(batch_output, batch_target)
+        # Forward pass
+        batch_output = self.forward(batch_input, batch_input_global)
+        loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
         lr = self.optimizers().param_groups[0]['lr']
@@ -212,25 +102,8 @@ class SparseSegLightningModel(pl.LightningModule):
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(f"loss/train_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
-
-        for i in range(part_losses.shape[0]):  # Loop over N
-            total_sum_over_mk = part_losses[i, :, :].sum().item()  # Sum over M and K for the i-th N
-            self.log(f"loss/train_l{i}", total_sum_over_mk, batch_size=batch_size, prog_bar=True, sync_dist=True)
-
-        for j in range(part_losses.shape[1]):  # Loop over M
-            total_sum_over_nk = part_losses[:, j, :].sum().item()  # Sum over N and K for the j-th M
-            self.log(f"loss/train_step{j}", total_sum_over_nk, batch_size=batch_size, prog_bar=False, sync_dist=True)
-
-        for k in range(part_losses.shape[2]):  # Loop over K
-            total_sum_over_nm = part_losses[:, :, k].sum().item()  # Sum over N and M for the k-th K
-            self.log(f"loss/train_o{k}", total_sum_over_nm, batch_size=batch_size, prog_bar=False, sync_dist=True)
-
-        for i in range(part_losses.shape[0]):
-            for j in range(part_losses.shape[1]):
-                for k in range(part_losses.shape[2]):
-                    output = part_losses[i, j, k].item()
-                    self.log("loss/train_o{}_l{}_step{}".format(k, i, j), output, batch_size=batch_size, prog_bar=False, sync_dist=True)
-        
+        for key, value in part_losses.items():
+            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss
@@ -242,24 +115,8 @@ class SparseSegLightningModel(pl.LightningModule):
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(f"loss/val_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
-
-        for i in range(part_losses.shape[0]):  # Loop over N
-            total_sum_over_mk = part_losses[i, :, :].sum().item()  # Sum over M and K for the i-th N
-            self.log(f"loss/val_l{i}", total_sum_over_mk, batch_size=batch_size, prog_bar=False, sync_dist=True)
-
-        for j in range(part_losses.shape[1]):  # Loop over M
-            total_sum_over_nk = part_losses[:, j, :].sum().item()  # Sum over N and K for the j-th M
-            self.log(f"loss/val_step{j}", total_sum_over_nk, batch_size=batch_size, prog_bar=False, sync_dist=True)
-
-        for k in range(part_losses.shape[2]):  # Loop over K
-            total_sum_over_nm = part_losses[:, :, k].sum().item()  # Sum over N and M for the k-th K
-            self.log(f"loss/val_o{k}", total_sum_over_nm, batch_size=batch_size, prog_bar=False, sync_dist=True)
-
-        for i in range(part_losses.shape[0]):
-            for j in range(part_losses.shape[1]):
-                for k in range(part_losses.shape[2]):
-                    output = part_losses[i, j, k].item()
-                    self.log("loss/val_o{}_l{}_step{}".format(k, i, j), output, batch_size=batch_size, prog_bar=False, sync_dist=True)
+        for key, value in part_losses.items():
+            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
 
         return loss
 
@@ -276,28 +133,34 @@ class SparseSegLightningModel(pl.LightningModule):
             weight_decay=self.weight_decay
         )
 
-        # Cosine annealing scheduler
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer=optimizer,
-            T_max=self.cosine_annealing_steps,
-            eta_min=0
-        )
+        if self.warmup_steps==0 and self.cosine_annealing_steps==0:
+            return optimizer
 
-        if self.warmup_steps > 0:
+        if self.warmup_steps == 0:
+            warmup_scheduler = None
+        else:
             # Warm-up scheduler
             warmup_scheduler = CustomLambdaLR(optimizer, self.warmup_steps)
-        
-            # Combine both schedulers
-            combined_scheduler = CombinedScheduler(
-                optimizer=optimizer,
-                scheduler1=warmup_scheduler,
-                scheduler2=cosine_scheduler,
-                warmup_steps=self.warmup_steps,
-                lr_decay=1.0
-            )
+ 
+        if self.cosine_annealing_steps == 0:
+            cosine_scheduler = None
         else:
-            # No warm-up
-            combined_scheduler = cosine_scheduler
+            # Cosine annealing scheduler
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=optimizer,
+                T_max=self.cosine_annealing_steps,
+                eta_min=0
+            )
+
+        # Combine both schedulers
+        combined_scheduler = CombinedScheduler(
+            optimizer=optimizer,
+            scheduler1=warmup_scheduler,
+            scheduler2=cosine_scheduler,
+            warmup_steps=self.warmup_steps,
+            start_cosine_step=self.start_cosine_step,
+            lr_decay=1.0
+        )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
 

@@ -2,6 +2,64 @@ import torch
 from torch.nn import functional as F
 
 
+class MomentumLoss(torch.nn.Module):
+    """
+    Custom loss function for predicting 3D momentum vectors.
+    Combines:
+    - Cosine similarity loss for direction.
+    - Mean Absolute Error (MAE) for magnitude.
+
+    Args:
+        lambda_magnitude (float): Weight for magnitude loss. Default is 0.1.
+    """
+    def __init__(self, lambda_magnitude=0.1):
+        super(MomentumLoss, self).__init__()
+        self.lambda_magnitude = lambda_magnitude
+
+    def forward(self, pred, target):
+        """
+        Compute the loss given predicted and target 3D momentum vectors.
+
+        Args:
+            pred (Tensor): Predicted momentum vectors (batch_size, 3).
+            target (Tensor): Ground truth momentum vectors (batch_size, 3).
+
+        Returns:
+            Tensor: The computed loss value.
+        """
+        # Normalize predictions and targets to unit vectors
+        pred_norm = pred / (torch.norm(pred, dim=1, keepdim=True) + 1e-8)  # Avoid division by zero
+        target_norm = target / (torch.norm(target, dim=1, keepdim=True) + 1e-8)
+
+        # Cosine similarity loss (1 - cos(theta))
+        cos_loss = 1 - torch.sum(pred_norm * target_norm, dim=1).mean()
+
+        # Magnitude loss (Mean Absolute Error on norms)
+        mag_loss = torch.abs(torch.norm(pred, dim=1) - torch.norm(target, dim=1)).mean()
+
+        # Combined loss
+        loss = cos_loss + self.lambda_magnitude * mag_loss
+        return loss
+
+
+class LogCoshLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, y_pred, y_true):
+        diff = y_true - y_pred
+        return torch.mean(torch.log(torch.cosh(diff + 1e-12)))
+
+
+class StableLogCoshLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, y_pred, y_true):
+        diff = y_true - y_pred
+        return torch.mean(torch.abs(diff) + torch.log1p(torch.exp(-2 * torch.abs(diff))) - torch.log(torch.tensor(2.0)))
+
+
 def focal_loss(
     inputs: torch.Tensor,
     targets: torch.Tensor,

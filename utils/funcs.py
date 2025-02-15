@@ -60,9 +60,11 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
 def collate_test(batch):
     coords = [d['coords'] for d in batch]
     feats = torch.cat([d['feats'] for d in batch])
+    feats_global = torch.stack([d['feats_global'] for d in batch])
 
     ret = {
         'f': feats,
+        'f_glob': feats_global,
         'c': coords,
     }
 
@@ -148,6 +150,14 @@ def collate_sparse_minkowski(batch):
         ptmiss = torch.cat([d['ptmiss'] for d in batch])
         ret['ptmiss'] = ptmiss
 
+    if 'out_lepton_momentum' in batch[0]:
+        out_lepton_momentum = torch.stack([d['out_lepton_momentum'] for d in batch])
+        ret['out_lepton_momentum'] = out_lepton_momentum
+
+    if 'jet_momentum' in batch[0]:
+        jet_momentum = torch.stack([d['jet_momentum'] for d in batch])
+        ret['jet_momentum'] = jet_momentum
+
     if 'global_feats' in batch[0]:
         global_labels = torch.stack([d['global_feats'] for d in batch])
         ret['global_feats'] = global_labels
@@ -171,11 +181,13 @@ def arrange_truth(data):
               'prim_vertex': data['prim_vertex'],
               'in_neutrino_pdg': data['in_neutrino_pdg'],
               'in_neutrino_energy': data['in_neutrino_energy'],
-              'primlepton_labels': data['primlepton_labels'],
-              'seg_labels': data['seg_labels'],
+              'primlepton_labels': data['primlepton_labels'] if 'primlepton_labels' in data else None,
+              'seg_labels': data['seg_labels'] if 'seg_labels' in data else None,
               'flavour_label': data['flavour_label'],
               'evis': data['evis'],
-              'ptmiss': data['ptmiss']
+              'ptmiss': data['ptmiss'],
+              'out_lepton_momentum': data['out_lepton_momentum'] if 'out_lepton_momentum' in data else None,
+              'jet_momentum': data['jet_momentum'] if 'jet_momentum' in data else None,
              }
     return output
 
@@ -273,5 +285,23 @@ class CombinedScheduler(_LRScheduler):
                 self.scheduler2.base_lrs[0] *= self.lr_decay
         self.step_num += 1
 
+    def state_dict(self):
+        """Return the state of the scheduler."""
+        return {
+            'warmup_steps': self.warmup_steps,
+            'start_cosine_step': self.start_cosine_step,
+            'step_num': self.step_num,
+            'lr_decay': self.lr_decay,
+            'scheduler1': self.scheduler1.state_dict(),
+            'scheduler2': self.scheduler2.state_dict()
+        }
 
+    def load_state_dict(self, state_dict):
+        """Load the scheduler state."""
+        self.warmup_steps = state_dict['warmup_steps']
+        self.start_cosine_step = state_dict['start_cosine_step']
+        self.step_num = state_dict['step_num']
+        self.lr_decay = state_dict['lr_decay']
+        self.scheduler1.load_state_dict(state_dict['scheduler1'])
+        self.scheduler2.load_state_dict(state_dict['scheduler2'])
 

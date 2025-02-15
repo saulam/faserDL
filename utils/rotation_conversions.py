@@ -377,7 +377,9 @@ def random_quaternions(
 
 
 def random_rotation_saul(
-    coords, 
+    coords,
+    momentum1,
+    momentum2,
     angle_limits: torch.Tensor, 
     origin: torch.Tensor, 
     convention: str = "XYZ",
@@ -409,20 +411,24 @@ def random_rotation_saul(
     min_angles, max_angles = angle_limits[0], angle_limits[1]
     angles = min_angles + (torch.rand(3) * (max_angles - min_angles))
 
-    # Translate coords to align the origin at (0, 0, 0)
+    # Translate coords to align the origin
     translated_coords = coords - origin
 
     # Compute the rotation matrix using the constrained random Euler angles
-    rotation_matrix = euler_angles_to_matrix(angles, convention)
+    rotation_matrix = euler_angles_to_matrix(angles, convention).numpy()
 
     # Rotate the translated coordinates using matrix multiplication
     #rotated_coords = torch.matmul(translated_coords, rotation_matrix.T)  # Transpose to apply to row vectors
-    rotated_coords = translated_coords @ rotation_matrix.numpy() 
+    rotated_coords = translated_coords @ rotation_matrix
 
     # Translate the rotated coordinates back to the original frame
     rotated_coords = rotated_coords + origin
 
-    return rotated_coords
+    # Translate the momentum vectors
+    rotated_momentum1 = momentum1 @ rotation_matrix.T
+    rotated_momentum2 = momentum2 @ rotation_matrix.T
+
+    return rotated_coords, rotated_momentum1, rotated_momentum2
 
 
 def random_rotations(

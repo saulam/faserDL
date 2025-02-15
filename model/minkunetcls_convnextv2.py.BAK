@@ -51,7 +51,7 @@ def _init_weights(m):
         nn.init.constant_(m.weight, 1.0)
 
 
-class MinkUNetConvNeXtV2(nn.Module):
+class MinkUNetClsConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
         nn.Module.__init__(self)
 
@@ -72,14 +72,10 @@ class MinkUNetConvNeXtV2(nn.Module):
         dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
 
-        # Linear transformation for glibal features
-        self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[0]),
+        self.stem = nn.Sequential(
+            MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D),
+            MinkowskiLayerNorm(dims[0], eps=1e-6),
         )
-
-        # stem
-        self.stem = MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D)
-        self.stem_ln = MinkowskiLayerNorm(dims[0], eps=1e-6)
 
         for i in range(self.nb_elayers):
             encoder_layer = nn.Sequential(
@@ -120,7 +116,34 @@ class MinkUNetConvNeXtV2(nn.Module):
                 *[Block(dim=dims[i+1], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
             )
             self.decoder_layers.append(decoder_layer)
-            cur += depths[i] 
+            cur += depths[i]
+
+        """MLP for global features"""
+        self.global_mlp = nn.Sequential(
+            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[0]),
+            nn.GELU(),
+            nn.Linear(dims[0], dims[0]),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
+
+        """Classification/regression layers"""
+        self.global_pool = MinkowskiGlobalMaxPooling()
+        self.flavour_layer = nn.Sequential(
+            nn.Linear(dims[0], dims[0]),
+            nn.GELU(),
+            nn.Linear(dims[0], 4)
+        ) 
+        self.evis_layer = nn.Sequential(
+            nn.Linear(dims[0], dims[0]),
+            nn.GELU(),
+            nn.Linear(dims[0], 1)
+        ) 
+        self.ptmiss_layer = nn.Sequential(
+            nn.Linear(dims[0], dims[0]),
+            nn.GELU(),
+            nn.Linear(dims[0], 1)
+        )
 
         """Semantic-segmentation layers"""
         self.primlepton_layer = nn.Sequential(
@@ -139,20 +162,7 @@ class MinkUNetConvNeXtV2(nn.Module):
 
     def forward(self, x, x_glob):
         """Encoder"""
-        # stem
         x = self.stem(x)
-        x_glob = self.global_mlp(x_glob)
-
-        # add global to voxel features
-        batch_indices = x.C[:, 0].long()  # batch idx
-        x_glob_expanded = x_glob[batch_indices]
-        new_feats = x.F + x_glob_expanded
-        x = ME.SparseTensor(features=new_feats, coordinates=x.C)
-
-        # layer norm
-        x = self.stem_ln(x)
-
-        # encoder layers
         x_enc = []
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
@@ -160,60 +170,30 @@ class MinkUNetConvNeXtV2(nn.Module):
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
 
-        """Decoder"""
+        x_glob = self.global_mlp(x_glob)
+        x_pooled = self.global_pool(x).F + x_glob
+        out_flavour = self.flavour_layer(x_pooled)
+        out_evis = self.evis_layer(x_pooled)
+        out_ptmiss = self.ptmiss_layer(x_pooled)
+        
         x_enc = x_enc[::-1]
         
-        # decoder layers
+        """Decoder"""
         out_cls = []
         for i in range(self.nb_dlayers):
             x = self.upsample_layers[i](x)
             x = x + x_enc[i]
             x = self.decoder_layers[i](x)
 
-        # voxel predictions
         out_primlepton = self.primlepton_layer(x)
         out_seg = self.seg_layer(x)
 
-        output = {"out_primlepton": out_primlepton,
+        output = {"out_flavour": out_flavour,
+                  "out_evis": out_evis,
+                  "out_ptmiss": out_ptmiss,
+                  "out_primlepton": out_primlepton,
                   "out_seg": out_seg,
                   }
         
         return output
-
-    def replace_depthwise_with_channelwise(self):
-        for name, module in self.named_modules():
-            if isinstance(module, ME.MinkowskiDepthwiseConvolution):
-                # Get the parameters of the current depthwise convolution
-                in_channels = module.in_channels
-                kernel_size = module.kernel_generator.kernel_size
-                stride = module.kernel_generator.kernel_stride
-                dilation = module.kernel_generator.kernel_dilation
-                bias = module.bias is not None
-                dimension = module.dimension
-                
-                # Create a new MinkowskiChannelwiseConvolution with the same parameters
-                new_conv = ME.MinkowskiChannelwiseConvolution(
-                    in_channels=in_channels,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                    bias=bias,
-                    dimension=dimension
-                )
-                new_conv.kernel = module.kernel
-                if bias:
-                    new_conv.bias = module.bias
-                
-                # Replace the old depthwise convolution with the new channelwise convolution
-                parent_module, attr_name = self._get_parent_module(name)
-                setattr(parent_module, attr_name, new_conv)
-        
-        return
-    
-    def _get_parent_module(self, layer_name):
-        components = layer_name.split('.')
-        parent = self
-        for comp in components[:-1]:
-            parent = getattr(parent, comp)
-        return parent, components[-1]
 

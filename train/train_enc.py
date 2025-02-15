@@ -12,8 +12,8 @@ import torch
 import pytorch_lightning as pl
 from functools import partial
 from utils import CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
-from dataset import SparseFASERCALDataset
-from model import MinkUNetConvNeXtV2, SparseSegLightningModel
+from dataset import SparseFASERCALDatasetEnc
+from model import MinkEncConvNeXtV2, SparseEncLightningModel
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
@@ -46,7 +46,7 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
  
     # Dataset
-    dataset = SparseFASERCALDataset(args)
+    dataset = SparseFASERCALDatasetEnc(args)
     print("- Dataset size: {} events".format(len(dataset)))
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3]) 
 
@@ -57,7 +57,7 @@ def main():
     args.start_cosine_step = (nb_batches * args.epochs // (args.accum_grad_batches * nb_gpus)) - args.scheduler_steps
 
     # Initialize the model
-    model = MinkUNetConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
+    model = MinkEncConvNeXtV2(in_channels=5, out_channels=3, D=3, args=args)
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
@@ -71,7 +71,7 @@ def main():
     callbacks = [checkpoint_callback, progress_bar]
 
     # Lightning model
-    lightning_model = SparseSegLightningModel(model=model,
+    lightning_model = SparseEncLightningModel(model=model,
         args=args)
 
     # Log the hyperparameters

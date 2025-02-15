@@ -51,7 +51,7 @@ def _init_weights(m):
         nn.init.constant_(m.weight, 1.0)
 
 
-class MinkUNetConvNeXtV2(nn.Module):
+class MinkEncConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
         nn.Module.__init__(self)
 
@@ -72,11 +72,6 @@ class MinkUNetConvNeXtV2(nn.Module):
         dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
 
-        # Linear transformation for glibal features
-        self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[0]),
-        )
-
         # stem
         self.stem = MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D)
         self.stem_ln = MinkowskiLayerNorm(dims[0], eps=1e-6)
@@ -95,43 +90,41 @@ class MinkUNetConvNeXtV2(nn.Module):
                 )
                 self.downsample_layers.append(downsample_layer)
 
-        """Decoder"""
-        last_enc_depth = depths[-1]
-        depths = [2, 2, 2, 2, 2]
-        #depths = depths[:-1][::-1]
-        dims = dims[::-1]
-        decoder_embed_dim = 32
-
-        self.nb_dlayers = len(dims) - 1
-
-        self.decoder_layers = nn.ModuleList()
-        self.upsample_layers = nn.ModuleList()
-        dp_rates = [x.item() for x in torch.linspace(dp_rates[-last_enc_depth], 0, sum(depths))]
-        cur = 0
-
-        for i in range(self.nb_dlayers):
-            upsample_layer = nn.Sequential(
-                MinkowskiLayerNorm(dims[i], eps=1e-6), 
-                MinkowskiConvolutionTranspose(dims[i], dims[i+1], kernel_size=2, stride=2, bias=True, dimension=D),
-            )
-            self.upsample_layers.append(upsample_layer)
-
-            decoder_layer = nn.Sequential(
-                *[Block(dim=dims[i+1], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
-            )
-            self.decoder_layers.append(decoder_layer)
-            cur += depths[i] 
-
-        """Semantic-segmentation layers"""
-        self.primlepton_layer = nn.Sequential(
-            MinkowskiLayerNorm(dims[-1], eps=1e-6),
-            Block(dim=dims[-1], kernel_size=kernel_size, drop_path=0., D=D),
-            MinkowskiConvolution(dims[-1], 1, kernel_size=1, stride=1, dimension=D),
+        # Linear transformation for glibal features
+        self.global_mlp = nn.Sequential(
+            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, 64),
+            nn.ReLU(),
+            nn.Droput(0.1),
+            nn.Linear(dims[0], dims[0]),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dims[0], dims[0]),
+            nn.ReLU(),
+            nn.Dropout(0.1),
         )
-        self.seg_layer = nn.Sequential(
-            MinkowskiLayerNorm(dims[-1], eps=1e-6),
-            Block(dim=dims[-1], kernel_size=kernel_size, drop_path=0., D=D),
-            MinkowskiConvolution(dims[-1], 3, kernel_size=1, stride=1, dimension=D),
+
+        """Classification/regression layers"""
+        self.global_pool = MinkowskiGlobalMaxPooling()
+        self.flavour_layer = nn.Sequential(
+            #MinkowskiLinear(dims[0], dims[0]),
+            #MinkowskiGELU(),
+            nn.Linear(dims[0], 4)
+        ) 
+        self.evis_layer = nn.Sequential(
+            #MinkowskiLinear(dims[0], dims[0]),
+            #MinkowskiGELU(),
+            nn.Linear(dims[0], 1)
+        ) 
+        self.ptmiss_layer = nn.Sequential(
+            #MinkowskiLinear(dims[0], dims[0]),
+            #MinkowskiGELU(),
+            nn.Linear(dims[0], 1)
+        )
+        self.out_lepton_momentum = nn.Sequential(
+            nn.Linear(dims[0], 3),
+        )
+        self.jet_momentum = nn.Sequential(
+            nn.Linear(dims[0], 3),
         )
 
         """ Initialise weights """
@@ -141,15 +134,6 @@ class MinkUNetConvNeXtV2(nn.Module):
         """Encoder"""
         # stem
         x = self.stem(x)
-        x_glob = self.global_mlp(x_glob)
-
-        # add global to voxel features
-        batch_indices = x.C[:, 0].long()  # batch idx
-        x_glob_expanded = x_glob[batch_indices]
-        new_feats = x.F + x_glob_expanded
-        x = ME.SparseTensor(features=new_feats, coordinates=x.C)
-
-        # layer norm
         x = self.stem_ln(x)
 
         # encoder layers
@@ -159,23 +143,28 @@ class MinkUNetConvNeXtV2(nn.Module):
             if i < self.nb_elayers - 1:
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
-
-        """Decoder"""
-        x_enc = x_enc[::-1]
         
-        # decoder layers
-        out_cls = []
-        for i in range(self.nb_dlayers):
-            x = self.upsample_layers[i](x)
-            x = x + x_enc[i]
-            x = self.decoder_layers[i](x)
+        # global params
+        x_glob = self.global_mlp(x_glob)
+        
+        # event predictions
+        x_pooled = self.global_pool(x)
 
-        # voxel predictions
-        out_primlepton = self.primlepton_layer(x)
-        out_seg = self.seg_layer(x)
+        x_pooled = x_pooled.F + x_glob 
+        x_glob = self.global_mlp(x_glob)
+        x_pooled = x_glob
 
-        output = {"out_primlepton": out_primlepton,
-                  "out_seg": out_seg,
+        out_flavour = self.flavour_layer(x_pooled)
+        out_evis = self.evis_layer(x_pooled)
+        out_ptmiss = self.ptmiss_layer(x_pooled)
+        out_lepton_momentum = self.out_lepton_momentum_layer(x_pooled)
+        out_jet_momentum = self.jet_momentum_layer(x_pooled)
+
+        output = {"out_flavour": out_flavour,
+                  "out_evis": out_evis,
+                  "out_ptmiss": out_ptmiss,
+                  "out_lepton_momentum": out_lepton_momentum,
+                  "out_jet_momentum": out_lepton_momentum,
                   }
         
         return output

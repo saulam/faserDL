@@ -2,21 +2,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import MomentumLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
-class SparseLightningModel(pl.LightningModule):
+class SparseEncLightningModel(pl.LightningModule):
     def __init__(self, model, args):
-        super(SparseLightningModel, self).__init__()
+        super(SparseEncLightningModel, self).__init__()
 
         self.model = model
         self.sigmoid = args.sigmoid
         self.loss_flavour = nn.CrossEntropyLoss()
         self.loss_evis = StableLogCoshLoss()  #nn.MSELoss()
         self.loss_ptmiss = StableLogCoshLoss()  #nn.MSELoss()
-        self.loss_primlepton = nn.BCEWithLogitsLoss()
-        self.loss_seg= nn.CrossEntropyLoss() 
+        self.loss_lepton_momentum = MomentumLoss()
+        self.loss_jet_momentum = MomentumLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -70,29 +70,29 @@ class SparseLightningModel(pl.LightningModule):
         out_flavour = batch_output['out_flavour'].F
         out_evis = batch_output['out_evis'].F.view(-1)
         out_ptmiss = batch_output['out_ptmiss'].F.view(-1)
-        out_primlepton = batch_output['out_primlepton'].F
-        out_seg = batch_output['out_seg'].F
+        out_lepton_momentum = batch_output['out_lepton_momentum'].F
+        out_jet_momentum = batch_output['jet_momentum'].F
 
         # true
         targ_flavour = target['flavour_label']
         targ_evis = target['evis']
         targ_ptmiss = target['ptmiss']
-        targ_primlepton = target['primlepton_labels']
-        targ_seg = target['seg_labels']
+        targ_lepton_momentum = target['out_lepton_momentum']
+        targ_jet_momentum = target['jet_momentum']
 
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_evis = self.loss_evis(out_evis, targ_evis)
         loss_ptmiss = self.loss_ptmiss(out_ptmiss, targ_ptmiss)
-        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
-        loss_seg = self.loss_seg(out_seg, targ_seg)
+        loss_lepton_momentum = self.loss_lepton_momentum(out_lepton_momentum, targ_lepton_momentum)
+        loss_jet_momentum = self.loss_jet_momentum(out_jet_momentum, targ_jet_momentum)
         part_losses = {'flavour': loss_flavour,
                        'evis': loss_evis,
                        'ptmiss': loss_ptmiss,
-                       'primlepton': loss_primlepton,
-                       'seg': loss_seg,
+                       'lepton_momentum': loss_lepton_momentum,
+                       'jet_momentum': loss_jet_momentum,
                        }
-        total_loss = loss_flavour + loss_evis + loss_ptmiss + loss_primlepton + loss_seg
+        total_loss = loss_flavour + loss_evis + loss_ptmiss + loss_lepton_momentum + loss_jet_momentum
 
         return total_loss, part_losses
 
