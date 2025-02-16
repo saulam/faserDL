@@ -89,8 +89,8 @@ class SparseFASERCALDatasetEnc(Dataset):
         )
         coords = coords[indices]
         feats = feats[indices]
-        labels1 = labels1[indices]
-        labels2 = labels2[indices]
+        labels1 = labels1[indices].reshape(-1, 1)
+        labels2 = labels2[indices].reshape(-1, 3)
 
         return coords, feats, labels1, labels2, momentum1, momentum2
 
@@ -123,7 +123,7 @@ class SparseFASERCALDatasetEnc(Dataset):
         p = abs(np.random.randn(1) * std_dev)
         mask = np.random.rand(coords.shape[0]) > p
         #don't drop all coordinates
-        if mask.sum() == 0:
+        if mask.sum() < 2:
             return coords, feats, labels1, labels2
         return coords[mask], feats[mask], labels1[mask], labels2[mask]
 
@@ -288,7 +288,6 @@ class SparseFASERCALDatasetEnc(Dataset):
             raise ValueError("Some indices are out of range for one-hot encoding")
 
         batch_size = len(indices)
-        print(indices.shape)
         one_hot = np.zeros((batch_size, length), dtype=np.float32)
         one_hot[np.arange(batch_size), indices.astype(int)] = 1.0
         return one_hot
@@ -337,6 +336,8 @@ class SparseFASERCALDatasetEnc(Dataset):
         # process labels
         primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
         flavour_label = self.pdg2label(in_neutrino_pdg, iscc)
+        primlepton_labels = primlepton_labels.reshape(-1, 1)
+        seg_labels = seg_labels.reshape(-1, 3)
 
         # output
         output = {'run_number': run_number,
@@ -347,7 +348,7 @@ class SparseFASERCALDatasetEnc(Dataset):
             prim_vertex = prim_vertex.reshape(3)
            
             # augmented event
-            coords, feats, seg_labels, primlepton_labels, out_lepton_momentum, jet_momentum = self._augment(coords, feats, seg_labels, primlepton_labels, out_lepton_momentum, jet_momentum, prim_vertex, round_coords=False)
+            coords, feats, primlepton_labels, seg_labels, out_lepton_momentum, jet_momentum = self._augment(coords, feats, primlepton_labels, seg_labels, out_lepton_momentum, jet_momentum, prim_vertex, round_coords=False)
             primlepton_labels = self.add_gaussian_noise(primlepton_labels)
             seg_labels = self.add_gaussian_noise(seg_labels)
 

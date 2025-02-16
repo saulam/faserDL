@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import MomentumLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import MomentumLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
@@ -67,11 +67,11 @@ class SparseEncLightningModel(pl.LightningModule):
 
     def compute_losses(self, batch_output, target):
         # pred
-        out_flavour = batch_output['out_flavour'].F
-        out_evis = batch_output['out_evis'].F.view(-1)
-        out_ptmiss = batch_output['out_ptmiss'].F.view(-1)
-        out_lepton_momentum = batch_output['out_lepton_momentum'].F
-        out_jet_momentum = batch_output['jet_momentum'].F
+        out_flavour = batch_output['out_flavour']
+        out_evis = batch_output['out_evis'].view(-1)
+        out_ptmiss = batch_output['out_ptmiss'].view(-1)
+        out_lepton_momentum = batch_output['out_lepton_momentum']
+        out_jet_momentum = batch_output['out_jet_momentum']
 
         # true
         targ_flavour = target['flavour_label']

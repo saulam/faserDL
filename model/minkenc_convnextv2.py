@@ -92,13 +92,13 @@ class MinkEncConvNeXtV2(nn.Module):
 
         # Linear transformation for glibal features
         self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, 64),
-            nn.ReLU(),
-            nn.Droput(0.1),
-            nn.Linear(dims[0], dims[0]),
+            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[-1]),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(dims[0], dims[0]),
+            nn.Linear(dims[-1], dims[-1]),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dims[-1], dims[-1]),
             nn.ReLU(),
             nn.Dropout(0.1),
         )
@@ -108,23 +108,23 @@ class MinkEncConvNeXtV2(nn.Module):
         self.flavour_layer = nn.Sequential(
             #MinkowskiLinear(dims[0], dims[0]),
             #MinkowskiGELU(),
-            nn.Linear(dims[0], 4)
+            nn.Linear(dims[-1], 4)
         ) 
         self.evis_layer = nn.Sequential(
             #MinkowskiLinear(dims[0], dims[0]),
             #MinkowskiGELU(),
-            nn.Linear(dims[0], 1)
+            nn.Linear(dims[-1], 1)
         ) 
         self.ptmiss_layer = nn.Sequential(
             #MinkowskiLinear(dims[0], dims[0]),
             #MinkowskiGELU(),
-            nn.Linear(dims[0], 1)
+            nn.Linear(dims[-1], 1)
         )
-        self.out_lepton_momentum = nn.Sequential(
-            nn.Linear(dims[0], 3),
+        self.out_lepton_momentum_layer = nn.Sequential(
+            nn.Linear(dims[-1], 3),
         )
-        self.jet_momentum = nn.Sequential(
-            nn.Linear(dims[0], 3),
+        self.jet_momentum_layer = nn.Sequential(
+            nn.Linear(dims[-1], 3),
         )
 
         """ Initialise weights """
@@ -149,10 +149,7 @@ class MinkEncConvNeXtV2(nn.Module):
         
         # event predictions
         x_pooled = self.global_pool(x)
-
         x_pooled = x_pooled.F + x_glob 
-        x_glob = self.global_mlp(x_glob)
-        x_pooled = x_glob
 
         out_flavour = self.flavour_layer(x_pooled)
         out_evis = self.evis_layer(x_pooled)
