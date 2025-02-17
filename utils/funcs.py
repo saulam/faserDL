@@ -1,3 +1,6 @@
+import copy
+import pickle as pkl
+import numpy as np
 import torch
 import MinkowskiEngine as ME
 from sklearn.model_selection import KFold
@@ -21,21 +24,36 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     tuple: DataLoader objects for training, validation, and test sets.
     """
 
-    # Ensure the splits sum up to 1
-    assert sum(splits) == 1, "The splits should sum up to 1."
+    if args.sets_path is not None:
+        # Load saved sets
+        with open(args.sets_path, "rb") as fd:
+            sets = pkl.load(fd)
+        sets["train_files"] = np.char.replace(sets["train_files"], "path", args.dataset_path, count=1)
+        sets["valid_files"] = np.char.replace(sets["valid_files"], "path", args.dataset_path, count=1)
+        sets["test_files"] = np.char.replace(sets["test_files"], "path", args.dataset_path, count=1)
+        train_set = copy.deepcopy(dataset)
+        val_set = copy.deepcopy(dataset)
+        test_set = copy.deepcopy(dataset)
+        train_set.data_files = sets["train_files"]
+        val_set.data_files = sets["valid_files"]
+        test_set.data_files = sets["test_files"]
+        print("Loaded saved splits!")
+    else:
+        # Ensure the splits sum up to 1
+        assert sum(splits) == 1, "The splits should sum up to 1."
 
-    # Calculate the lengths of each split
-    fulllen = len(dataset)
-    train_len = int(fulllen * splits[0])
-    val_len = int(fulllen * splits[1])
-    test_len = fulllen - train_len - val_len  # Remaining length for the test set
+        # Calculate the lengths of each split
+        fulllen = len(dataset)
+        train_len = int(fulllen * splits[0])
+        val_len = int(fulllen * splits[1])
+        test_len = fulllen - train_len - val_len  # Remaining length for the test set
 
-    # Split the dataset into train, validation, and test sets
-    train_set, val_set, test_set = random_split(
-        dataset, 
-        [train_len, val_len, test_len], 
-        generator=torch.Generator().manual_seed(seed)
-    )
+        # Split the dataset into train, validation, and test sets
+        train_set, val_set, test_set = random_split(
+            dataset, 
+            [train_len, val_len, test_len], 
+            generator=torch.Generator().manual_seed(seed)
+        )   
 
     # Create DataLoader for each split
     train_loader = DataLoader(
@@ -99,6 +117,15 @@ def collate_test(batch):
     if 'ptmiss' in batch[0]:
         ptmiss = [d['ptmiss'].item() for d in batch]
         ret['ptmiss'] = ptmiss
+
+    if 'out_lepton_momentum' in batch[0]:
+        out_lepton_momentum = [d['out_lepton_momentum'] for d in batch]
+        ret['out_lepton_momentum'] = out_lepton_momentum
+
+    if 'jet_momentum' in batch[0]:
+        jet_momentum = [d['jet_momentum'] for d in batch]
+        ret['jet_momentum'] = jet_momentum
+
 
     return ret
 

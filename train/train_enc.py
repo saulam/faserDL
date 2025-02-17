@@ -48,6 +48,7 @@ def main():
     # Dataset
     dataset = SparseFASERCALDatasetEnc(args)
     print("- Dataset size: {} events".format(len(dataset)))
+    
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3]) 
 
     # Calculate arguments for scheduler
