@@ -2,6 +2,60 @@ import torch
 from torch.nn import functional as F
 
 
+class SphericalAngularMomentumLoss(torch.nn.Module):
+    """
+    Custom loss function that combines:
+    - Geodesic angular distance for direction optimization.
+    - Mean Absolute Error (MAE) for magnitude optimization.
+
+    This ensures that both the direction (theta, phi) and the magnitude are optimized correctly.
+
+    Args:
+        lambda_magnitude (float): Weight for the magnitude loss. Default is 0.1.
+        reduction (str): 'mean' (default) to average over batch, or 'sum' for total loss.
+    """
+    def __init__(self, lambda_magnitude=1, reduction='mean'):
+        super(SphericalAngularMomentumLoss, self).__init__()
+        self.lambda_magnitude = lambda_magnitude
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        """
+        Computes the combined loss given predicted and target 3D momentum vectors.
+
+        Args:
+            pred (torch.Tensor): Predicted 3D momentum vectors (batch_size, 3).
+            target (torch.Tensor): True 3D momentum vectors (batch_size, 3).
+
+        Returns:
+            torch.Tensor: The computed loss.
+        """
+        pred_norm = pred / (torch.norm(pred, dim=1, keepdim=True) + 1e-8)
+        target_norm = target / (torch.norm(target, dim=1, keepdim=True) + 1e-8)
+
+        # Compute the dot product (cosine of the angle)
+        dot_product = torch.sum(pred_norm * target_norm, dim=1).clamp(-1, 1)  # Clamp to avoid numerical errors
+
+        # Compute the angular distance (geodesic distance on the unit sphere)
+        angular_loss = torch.acos(dot_product)  # Returns angles in radians
+
+        # Compute magnitude loss (Absolute Difference)
+        mag_loss = torch.abs(torch.norm(pred, dim=1) - torch.norm(target, dim=1))
+
+        # Apply reduction method (default: mean)
+        if self.reduction == 'mean':
+            angular_loss = angular_loss.mean()
+            mag_loss = mag_loss.mean()
+        elif self.reduction == 'sum':
+            angular_loss = angular_loss.sum()
+            mag_loss = mag_loss.sum()
+
+        # Combined loss: Angular Loss + Lambda * Magnitude Loss
+        total_loss = angular_loss + self.lambda_magnitude * mag_loss
+
+        return total_loss
+
+
 class MomentumLoss(torch.nn.Module):
     """
     Custom loss function for predicting 3D momentum vectors.

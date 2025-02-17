@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import MomentumLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import SphericalAngularMomentumLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
@@ -15,8 +15,8 @@ class SparseEncLightningModel(pl.LightningModule):
         self.loss_flavour = nn.CrossEntropyLoss()
         self.loss_evis = StableLogCoshLoss()  #nn.MSELoss()
         self.loss_ptmiss = StableLogCoshLoss()  #nn.MSELoss()
-        self.loss_lepton_momentum = MomentumLoss()
-        self.loss_jet_momentum = MomentumLoss()
+        self.loss_lepton_momentum = SphericalAngularMomentumLoss()
+        self.loss_jet_momentum = SphericalAngularMomentumLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps

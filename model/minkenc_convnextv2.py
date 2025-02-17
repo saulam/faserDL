@@ -93,37 +93,44 @@ class MinkEncConvNeXtV2(nn.Module):
         # Linear transformation for glibal features
         self.global_mlp = nn.Sequential(
             nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[-1]),
-            nn.ReLU(),
+            #nn.GELU(),
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
             nn.Linear(dims[-1], dims[-1]),
-            nn.ReLU(),
+            #nn.GELU(),
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
-            nn.Linear(dims[-1], dims[-1]),
-            nn.ReLU(),
+            nn.Linear(dims[-1], 64),
+            #nn.GELU(),
+            nn.LeakyReLU(0.1),
             nn.Dropout(0.1),
         )
 
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
         self.flavour_layer = nn.Sequential(
-            #MinkowskiLinear(dims[0], dims[0]),
-            #MinkowskiGELU(),
+            nn.Linear(dims[-1] + 64, dims[-1]),
+            nn.GELU(),
             nn.Linear(dims[-1], 4)
         ) 
         self.evis_layer = nn.Sequential(
-            #MinkowskiLinear(dims[0], dims[0]),
-            #MinkowskiGELU(),
+            nn.Linear(dims[-1] + 64, dims[-1]),
+            nn.LeakyReLU(0.1),
             nn.Linear(dims[-1], 1)
         ) 
         self.ptmiss_layer = nn.Sequential(
-            #MinkowskiLinear(dims[0], dims[0]),
-            #MinkowskiGELU(),
+            nn.Linear(dims[-1] + 64, dims[-1]),
+            nn.LeakyReLU(0.1),
             nn.Linear(dims[-1], 1)
         )
         self.out_lepton_momentum_layer = nn.Sequential(
+            nn.Linear(dims[-1] + 64, dims[-1]),
+            nn.LeakyReLU(0.1),
             nn.Linear(dims[-1], 3),
         )
         self.jet_momentum_layer = nn.Sequential(
+            nn.Linear(dims[-1] + 64, dims[-1]),
+            nn.LeakyReLU(0.1),
             nn.Linear(dims[-1], 3),
         )
 
@@ -149,7 +156,8 @@ class MinkEncConvNeXtV2(nn.Module):
         
         # event predictions
         x_pooled = self.global_pool(x)
-        x_pooled = x_pooled.F + x_glob 
+        #x_pooled = x_pooled.F + x_glob 
+        x_pooled = torch.cat((x_pooled.F, x_glob), dim=1) 
 
         out_flavour = self.flavour_layer(x_pooled)
         out_evis = self.evis_layer(x_pooled)
