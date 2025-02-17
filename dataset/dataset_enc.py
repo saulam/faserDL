@@ -21,6 +21,7 @@ class SparseFASERCALDatasetEnc(Dataset):
         self.root = args.dataset_path
         self.contrastive = args.contrastive
         self.data_files = self.processed_file_names
+        self.load_seg = args.load_seg
         self.glob = args.glob
         self.training = False
         self.total_events = self.__len__
@@ -334,7 +335,13 @@ class SparseFASERCALDatasetEnc(Dataset):
         self.voxelise(coords)
         
         # process labels
-        primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
+        if self.load_seg:
+            # load labels from pretrained model predictions
+            file_name = self.data_files[idx].replace("events_v3.5", "events_v3.5_seg_results")
+            segs = np.load(file_name)
+            primlepton_labels, seg_labels = segs['out_primlepton'], segs['out_seg']
+        else:
+            primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
         flavour_label = self.pdg2label(in_neutrino_pdg, iscc)
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)

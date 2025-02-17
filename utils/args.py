@@ -32,6 +32,7 @@ def ini_argparse():
                         )
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
     parser.add_argument("--sets_path", type=str, default=None, help="Path of pickle file with training/val/test splits")
+    parser.add_argument("--load_seg", action="store_true", default=False, help="Whether to load results from segmentation network.")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("--chunk_size", type=int, default=512, help="chunk size if contrastive learning")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch size")
