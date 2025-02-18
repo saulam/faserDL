@@ -2,6 +2,49 @@ import torch
 from torch.nn import functional as F
 
 
+class MAPE(torch.nn.Module):
+    """
+    Standard Mean Absolute Percentage Error (MAPE) loss function in PyTorch.
+
+    MAPE is defined as:
+        L = (1/n) * sum(|(y_pred - y_true) / y_true|)
+
+    - Handles numerical stability by adding a small epsilon to the denominator.
+    - Supports 'mean' or 'sum' reduction.
+    
+    Args:
+        epsilon (float): Small value to prevent division by zero. Default is 1e-8.
+        reduction (str): Specifies the reduction method ('mean' or 'sum'). Default is 'mean'.
+    """
+
+    def __init__(self, epsilon=1e-8, reduction='mean'):
+        super(MAPE, self).__init__()
+        self.epsilon = epsilon
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        """
+        Computes the MAPE loss.
+
+        Args:
+            pred (torch.Tensor): Predicted values (batch_size, *)
+            target (torch.Tensor): Ground truth values (batch_size, *)
+
+        Returns:
+            torch.Tensor: Computed MAPE loss.
+        """
+        # Avoid division by zero by adding a small epsilon
+        percentage_error = torch.abs((pred - target) / (target + self.epsilon))
+
+        # Apply reduction method
+        if self.reduction == 'mean':
+            return percentage_error.mean()
+        elif self.reduction == 'sum':
+            return percentage_error.sum()
+        else:
+            return percentage_error  # No reduction
+
+
 class SphericalAngularMomentumLoss(torch.nn.Module):
     """
     Custom loss function that combines:
@@ -18,6 +61,7 @@ class SphericalAngularMomentumLoss(torch.nn.Module):
         super(SphericalAngularMomentumLoss, self).__init__()
         self.lambda_magnitude = lambda_magnitude
         self.reduction = reduction
+        self.magnitude_loss = MAPE(reduction=None)
 
     def forward(self, pred, target):
         """
@@ -40,7 +84,7 @@ class SphericalAngularMomentumLoss(torch.nn.Module):
         angular_loss = torch.acos(dot_product)  # Returns angles in radians
 
         # Compute magnitude loss (Absolute Difference)
-        mag_loss = torch.abs(torch.norm(pred, dim=1) - torch.norm(target, dim=1))
+        mag_loss = self.magnitude_loss(torch.norm(pred, dim=1), torch.norm(target, dim=1))
 
         # Apply reduction method (default: mean)
         if self.reduction == 'mean':

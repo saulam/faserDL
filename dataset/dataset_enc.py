@@ -319,8 +319,10 @@ class SparseFASERCALDatasetEnc(Dataset):
         in_neutrino_energy = data['in_neutrino_energy'].item()
         out_lepton_pdg = data['out_lepton_pdg'].item()
         iscc = data['iscc'].item()
-        evis = self.standardize(data['evis'].reshape(1,), self.metadata['evis_mean'], self.metadata['evis_std'])
-        ptmiss = self.standardize(data['ptmiss'].reshape(1,), self.metadata['ptmiss_mean'], self.metadata['ptmiss_std']) 
+        #evis = self.standardize(data['evis'].reshape(1,), self.metadata['evis_mean'], self.metadata['evis_std'])
+        #ptmiss = self.standardize(data['ptmiss'].reshape(1,), self.metadata['ptmiss_mean'], self.metadata['ptmiss_std']) 
+        evis = data['evis'].reshape(1,) / self.metadata['evis_std']
+        ptmiss = data['ptmiss'].reshape(1,) / self.metadata['ptmiss_std']
         rearcal_energydeposit = self.standardize(data['rearcal_energydeposit'].reshape(1,), self.metadata['rearcal_energydeposit_mean'], self.metadata['rearcal_energydeposit_std'])
         rearhcal_energydeposit = self.standardize(data['rearhcal_energydeposit'].reshape(1,), self.metadata['rearhcal_energydeposit_mean'], self.metadata['rearhcal_energydeposit_std'])
         rearmucal_energydeposit = self.standardize(data['rearmucal_energydeposit'].reshape(1,), self.metadata['rearmucal_energydeposit_mean'], self.metadata['rearmucal_energydeposit_std'])
