@@ -1,6 +1,7 @@
 from .minkunetcls_convnextv2 import MinkUNetClsConvNeXtV2 
 from .minkenccls_convnextv2 import MinkEncClsConvNeXtV2
 from .minkencreg_convnextv2 import MinkEncRegConvNeXtV2
+from .minkencreg2_convnextv2 import MinkEncReg2ConvNeXtV2
 from .minkunet_convnextv2 import MinkUNetConvNeXtV2
 from .lightning_model import SparseLightningModel
 from .lightning_model_cls import SparseClsLightningModel
