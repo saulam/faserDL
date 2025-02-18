@@ -66,11 +66,12 @@ class SparseFASERCALDatasetEnc(Dataset):
         """
         return len(self.data_files)
 
-    def _augment(self, coords, feats, labels1, labels2, momentum1, momentum2, prim_vertex, round_coords=True):
-        coords, feats, labels1, labels2 = coords.copy(), feats.copy(), labels1.copy(), labels2.copy()
-
+    def _augment(self, coords_ori, feats_ori, labels1_ori, labels2_ori, momentum1_ori, momentum2_ori, prim_vertex, round_coords=True):
+        coords, feats, labels1 = coords_ori.copy(), feats_ori.copy(), labels1_ori.copy()
+        labels2, momentum1, momentum2 = labels2_ori.copy(), momentum1_ori.copy(), momentum2_ori.copy()
+ 
         # rotate
-        coords, momentum1, momentum2 = self._rotate(coords, momentum1, momentum2, prim_vertex)
+        #coords, momentum1, momentum2 = self._rotate(coords, momentum1, momentum2, prim_vertex)
         # translate
         coords = self._translate(coords)
         # drop voxels
@@ -78,7 +79,11 @@ class SparseFASERCALDatasetEnc(Dataset):
         # shift feature values
         feats = self._shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
-        #coords, feats, labels = self._within_limits(coords, feats, labels)
+        coords, feats, labels1, labels2 = self._within_limits(coords, feats, labels1, labels2)
+        
+        if coords.shape[0] == 0:
+            return coords_ori, feats_ori, labels1_ori, labels2_ori, momentum1_ori, momentum2_ori
+
         if round_coords:
             coords = coords.round()
 
@@ -139,11 +144,11 @@ class SparseFASERCALDatasetEnc(Dataset):
         return feats * shift
 
 
-    def _within_limits(self, coords, feats, labels):
+    def _within_limits(self, coords, feats, labels1, labels2):
         mask = (coords[:, 0] >= 0) & (coords[:, 0] < 48) & \
            (coords[:, 1] >= 0) & (coords[:, 1] < 48) & \
-           (coords[:, 2] >= 0) & (coords[:, 2] < 400)
-        return coords[mask], feats[mask], labels[mask]
+           (coords[:, 2] >= 0) & (coords[:, 2] < 300)
+        return coords[mask], feats[mask], labels1[mask], labels2[mask]
 
  
     def voxelise(self, coords):
