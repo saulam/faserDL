@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 
 from .utils import (
+    Block,
     LayerNorm,
     MinkowskiLayerNorm,
     MinkowskiGRN,
@@ -21,36 +22,6 @@ from MinkowskiEngine import (
     MinkowskiReLU,
     MinkowskiGELU,
 )
-
-class Block(nn.Module):
-    """ Sparse ConvNeXtV2 Block. 
-
-    Args:
-        dim (int): Number of input channels.
-        kernel_size (int): Size of input kernel.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-    """
-    def __init__(self, dim, kernel_size=7, drop_path=0., D=3):
-        super().__init__()
-        
-        self.dwconv = MinkowskiDepthwiseConvolution(dim, kernel_size=kernel_size, bias=True, dimension=D)
-        self.pwconv1 = MinkowskiLinear(dim, 4 * dim)   
-        self.act = MinkowskiGELU()
-        self.grn = MinkowskiGRN(4  * dim)
-        self.pwconv2 = MinkowskiLinear(4 * dim, dim)
-        self.drop_path = MinkowskiDropPath(drop_path)
-    
-    def forward(self, x):
-        input = x
-        x = self.dwconv(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.grn(x)
-        x = self.pwconv2(x)
-        x = input + self.drop_path(x)
-
-        return x
 
 
 # Custom weight initialization function
@@ -132,7 +103,7 @@ class MinkEncRegConvNeXtV2(nn.Module):
 
             if i < self.nb_elayers - 1:  
                 downsample_layer = nn.Sequential(
-                    #MinkowskiLayerNorm(dims[i], eps=1e-6),                
+                    MinkowskiLayerNorm(dims[i], eps=1e-6),                
                     MinkowskiConvolution(dims[i], dims[i+1], kernel_size=2, stride=2, bias=True, dimension=D),
                 )
                 self.downsample_layers.append(downsample_layer)

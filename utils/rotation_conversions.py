@@ -378,10 +378,10 @@ def random_quaternions(
 
 def random_rotation_saul(
     coords,
-    momentum1,
-    momentum2,
-    angle_limits: torch.Tensor, 
-    origin: torch.Tensor, 
+    momentum1 = None,
+    momentum2 = None,
+    angle_limits: torch.Tensor = None, 
+    origin: torch.Tensor = None, 
     convention: str = "XYZ",
 ) -> torch.Tensor:
     """
@@ -425,8 +425,11 @@ def random_rotation_saul(
     rotated_coords = rotated_coords + origin
 
     # Translate the momentum vectors
-    rotated_momentum1 = momentum1 @ rotation_matrix.T
-    rotated_momentum2 = momentum2 @ rotation_matrix.T
+    if momentum1 is not None and momentum2 is not None:
+        rotated_momentum1 = momentum1 @ rotation_matrix.T
+        rotated_momentum2 = momentum2 @ rotation_matrix.T
+    else:
+        return rotated_coords
 
     return rotated_coords, rotated_momentum1, rotated_momentum2
 

@@ -78,7 +78,7 @@ class SparseFASERCALDataset(Dataset):
         # shift feature values
         feats = self._shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
-        #coords, feats, labels = self._within_limits(coords, feats, labels)
+        coords, feats, labels = self._within_limits(coords, feats, labels)
         if round_coords:
             coords = coords.round()
 
@@ -173,7 +173,7 @@ class SparseFASERCALDataset(Dataset):
     def _within_limits(self, coords, feats, labels):
         mask = (coords[:, 0] >= 0) & (coords[:, 0] < 48) & \
            (coords[:, 1] >= 0) & (coords[:, 1] < 48) & \
-           (coords[:, 2] >= 0) & (coords[:, 2] < 400)
+           (coords[:, 2] >= 0) & (coords[:, 2] < 300)
         return coords[mask], feats[mask], labels[mask]
 
  

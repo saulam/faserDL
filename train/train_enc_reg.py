@@ -13,7 +13,7 @@ import pytorch_lightning as pl
 from functools import partial
 from utils import CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
 from dataset import SparseFASERCALDatasetEnc
-from model import MinkEncRegConvNeXtV2, SparseEncRegLightningModel
+from model import MinkEncReg2ConvNeXtV2, SparseEncRegLightningModel
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
@@ -58,7 +58,7 @@ def main():
     args.start_cosine_step = (nb_batches * args.epochs // (args.accum_grad_batches * nb_gpus)) - args.scheduler_steps
 
     # Initialize the model
-    model = MinkEncRegConvNeXtV2(in_channels=5, out_channels=3, D=3, args=args)
+    model = MinkEncReg2ConvNeXtV2(in_channels=5, out_channels=3, D=3, args=args)
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))

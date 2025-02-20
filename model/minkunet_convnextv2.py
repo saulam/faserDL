@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import SGD
@@ -58,9 +59,11 @@ class MinkUNetConvNeXtV2(nn.Module):
         """Encoder"""
         #depths=[2, 4, 4, 8, 8, 8]
         #dims = (16, 32, 64, 128, 256, 512)
-        depths=[3, 3, 9, 3]
-        dims=[96, 192, 384, 768]     
-        kernel_size = 3
+        #depths=[3, 3, 9, 3]
+        #dims=[96, 192, 384, 768]     
+        dims = (64, 128, 256, 512, 512)
+        depths = (3, 3, 3, 9, 3)
+        kernel_size = (2, 2, 3)
         drop_path_rate=0.
 
         assert len(depths) == len(dims)
@@ -91,14 +94,13 @@ class MinkUNetConvNeXtV2(nn.Module):
             if i < self.nb_elayers - 1:  
                 downsample_layer = nn.Sequential(
                     MinkowskiLayerNorm(dims[i], eps=1e-6),                
-                    MinkowskiConvolution(dims[i], dims[i+1], kernel_size=2, stride=2, bias=True, dimension=D),
+                    MinkowskiConvolution(dims[i], dims[i+1], kernel_size=kernel_size, stride=kernel_size, bias=True, dimension=D),
                 )
                 self.downsample_layers.append(downsample_layer)
 
         """Decoder"""
         last_enc_depth = depths[-1]
-        depths = [2, 2, 2, 2, 2]
-        #depths = depths[:-1][::-1]
+        depths = [2] * (len(depths) + 1)
         dims = dims[::-1]
         decoder_embed_dim = 32
 
@@ -112,7 +114,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         for i in range(self.nb_dlayers):
             upsample_layer = nn.Sequential(
                 MinkowskiLayerNorm(dims[i], eps=1e-6), 
-                MinkowskiConvolutionTranspose(dims[i], dims[i+1], kernel_size=2, stride=2, bias=True, dimension=D),
+                MinkowskiConvolutionTranspose(dims[i], dims[i+1], kernel_size=kernel_size, stride=kernel_size, bias=True, dimension=D),
             )
             self.upsample_layers.append(upsample_layer)
 
@@ -137,7 +139,20 @@ class MinkUNetConvNeXtV2(nn.Module):
         """ Initialise weights """
         self.apply(_init_weights)
 
+    
+    def print_tensor(self, x, label=""):
+        print(label + " "*(20-len(label)),
+              np.array(x.shape),
+              x.coordinates.min(dim=0)[0].detach().cpu().numpy(),
+              x.coordinates.max(dim=0)[0].detach().cpu().numpy())
+        print("\tx:", torch.unique(x.coordinates[:, 1]).detach().cpu().numpy())
+        print("\ty:", torch.unique(x.coordinates[:, 2]).detach().cpu().numpy())
+        print("\tz:", torch.unique(x.coordinates[:, 3]).detach().cpu().numpy())
+        print("\n")
+
+
     def forward(self, x, x_glob):
+        self.print_tensor(x, label="x")
         """Encoder"""
         # stem
         x = self.stem(x)
@@ -152,13 +167,17 @@ class MinkUNetConvNeXtV2(nn.Module):
         # layer norm
         x = self.stem_ln(x)
 
+        self.print_tensor(x, label="x_stem")
+
         # encoder layers
         x_enc = []
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
+            self.print_tensor(x, "enc_{}".format(i))
             if i < self.nb_elayers - 1:
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
+                self.print_tensor(x, "down_{}".format(i))
 
         """Decoder"""
         x_enc = x_enc[::-1]
