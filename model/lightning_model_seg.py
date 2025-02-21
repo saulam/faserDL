@@ -35,7 +35,10 @@ class SparseSegLightningModel(pl.LightningModule):
         """Hook to be called at the start of each training epoch."""
         train_loader = self.trainer.train_dataloader
         if isinstance(train_loader.dataset, CombinedDataset):
-            train_loader.dataset.datasets.dataset.set_training_mode(True)
+            if getattr(train_loader.dataset.datasets, "dataset", None) is not None:
+                train_loader.dataset.datasets.dataset.set_training_mode(True)
+            else:
+                train_loader.dataset.datasets.set_training_mode(True)
         else:
             train_loader.dataset.set_training_mode(True)
 
@@ -43,14 +46,20 @@ class SparseSegLightningModel(pl.LightningModule):
     def on_validation_epoch_start(self):
         """Hook to be called at the start of each validation epoch."""
         val_loader = self.trainer.val_dataloaders[0]
-        val_loader.dataset.dataset.set_training_mode(False)
+        if getattr(val_loader.dataset, "dataset", None) is not None:
+            val_loader.dataset.dataset.set_training_mode(False)
+        else:
+            val_loader.dataset.set_training_mode(False)
 
 
     def on_test_epoch_start(self):
         """Hook to be called at the start of each test epoch."""
         test_loader = self.trainer.test_dataloaders[0]
-        test_loader.dataset.dataset.set_training_mode(False)
-
+        if getattr(val_loader.dataset, "dataset", None) is not None:
+            test_loader.dataset.dataset.set_training_mode(False)
+        else:
+            test_loader.dataset.set_training_mode(False)
+ 
 
     def forward(self, x, x_glob):
         return self.model(x, x_glob)

@@ -152,7 +152,6 @@ class MinkUNetConvNeXtV2(nn.Module):
 
 
     def forward(self, x, x_glob):
-        self.print_tensor(x, label="x")
         """Encoder"""
         # stem
         x = self.stem(x)
@@ -167,17 +166,13 @@ class MinkUNetConvNeXtV2(nn.Module):
         # layer norm
         x = self.stem_ln(x)
 
-        self.print_tensor(x, label="x_stem")
-
         # encoder layers
         x_enc = []
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
-            self.print_tensor(x, "enc_{}".format(i))
             if i < self.nb_elayers - 1:
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
-                self.print_tensor(x, "down_{}".format(i))
 
         """Decoder"""
         x_enc = x_enc[::-1]
