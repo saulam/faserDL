@@ -36,7 +36,6 @@ class SparseFASERCALDatasetEnc(Dataset):
         print("Setting training mode to {}.".format(training))
         self.training = training
 
- 
     @property
     def processed_dir(self):
         """
@@ -79,7 +78,7 @@ class SparseFASERCALDatasetEnc(Dataset):
         # shift feature values
         feats = self._shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
-        coords, feats, labels1, labels2 = self._within_limits(coords, feats, labels1, labels2)
+        #coords, feats, labels1, labels2 = self._within_limits(coords, feats, labels1, labels2)
         
         if coords.shape[0] == 0:
             return coords_ori, feats_ori, labels1_ori, labels2_ori, momentum1_ori, momentum2_ori
@@ -100,6 +99,39 @@ class SparseFASERCALDatasetEnc(Dataset):
 
         return coords, feats, labels1, labels2, momentum1, momentum2
 
+    def _rotate_90(self, point_cloud):
+        # Rotation matrices for 90, 180, and 270 degrees on each axis
+        rotations = {
+            'x': {0: np.eye(3),
+                 90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
+                 180: np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),
+                 270: np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])},
+            'y': {0: np.eye(3),
+                  90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
+                  180: np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
+                  270: np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])},
+            'z': {0: np.eye(3),
+                  90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
+                  180: np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
+                  270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
+        }
+
+        reference_point = np.array([
+            (self.metadata['x'].shape[0]-1) / 2.,
+            (self.metadata['y'].shape[0]-1) / 2.,
+            (self.metadata['z'].shape[0]-1) / 2.]
+        )
+        final_rotation_matrix = np.eye(3)
+
+        for axis in ['x', 'y', 'z']:  # Loop over each axis
+            if np.random.choice([False, True]):
+                angle = np.random.choice([0, 90, 180, 270])
+                final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
+
+        translated_points = point_cloud - reference_point
+        rotated_points = translated_points @ final_rotation_matrix.T
+        final_points = rotated_points + reference_point
+        return final_points
 
     def _rotate(self, coords, momentum1, momentum2, prim_vertex):
         """Random rotation along"""
@@ -124,7 +156,6 @@ class SparseFASERCALDatasetEnc(Dataset):
         coords[:, 2] += shift_z
         return coords
 
-
     def _drop(self, coords, feats, labels1, labels2, std_dev=0.1):
         p = abs(np.random.randn(1) * std_dev)
         mask = np.random.rand(coords.shape[0]) > p
@@ -132,7 +163,6 @@ class SparseFASERCALDatasetEnc(Dataset):
         if mask.sum() < 2:
             return coords, feats, labels1, labels2
         return coords[mask], feats[mask], labels1[mask], labels2[mask]
-
 
     def _shift_q_uniform(self, feats, max_scale_factor=0.1):
         shift = 1 - np.random.rand(*feats.shape) * max_scale_factor
@@ -143,31 +173,32 @@ class SparseFASERCALDatasetEnc(Dataset):
         shift = 1 - np.random.randn(*feats.shape) * std_dev
         return feats * shift
 
-
     def _within_limits(self, coords, feats, labels1, labels2):
-        mask = (coords[:, 0] >= 0) & (coords[:, 0] < 48) & \
-           (coords[:, 1] >= 0) & (coords[:, 1] < 48) & \
-           (coords[:, 2] >= 0) & (coords[:, 2] < 300)
+        lim_x = self.metadata['x'].shape[0]
+        lim_y = self.metadata['y'].shape[0]
+        lim_z = self.metadata['z'].shape[0]
+        mask = (coords[:, 0] >= 0) & (coords[:, 0] < lim_x) & \
+           (coords[:, 1] >= 0) & (coords[:, 1] < lim_y) & \
+           (coords[:, 2] >= 0) & (coords[:, 2] < lim_z)  
         return coords[mask], feats[mask], labels1[mask], labels2[mask]
 
- 
     def voxelise(self, coords):
         """
         Convert physical coordinates to voxel coordinates by mapping them to 
         their closest indices within the x, y, and z metadata ranges.
         """
-        coords[:, 0] = np.searchsorted(self.metadata['x'], coords[:, 0])
-        coords[:, 1] = np.searchsorted(self.metadata['y'], coords[:, 1])
-        coords[:, 2] = np.searchsorted(self.metadata['z'][:, 0], coords[:, 2])
+        coords[..., 0] = np.searchsorted(self.metadata['x'], coords[..., 0])
+        coords[..., 1] = np.searchsorted(self.metadata['y'], coords[..., 1])
+        coords[..., 2] = np.searchsorted(self.metadata['z'][:, 0], coords[..., 2])
 
     def unvoxelise(self, coords):
         """
         Convert voxel coordinates back to physical coordinates using the 
         corresponding indices in the metadata.
         """
-        coords[:, 0] = self.metadata['x'][coords[:, 0].astype(int)]
-        coords[:, 1] = self.metadata['y'][coords[:, 1].astype(int)]
-        coords[:, 2] = self.metadata['z'][coords[:, 2].astype(int), 0]
+        coords[..., 0] = self.metadata['x'][coords[..., 0].astype(int)]
+        coords[..., 1] = self.metadata['y'][coords[..., 1].astype(int)]
+        coords[..., 2] = self.metadata['z'][coords[..., 2].astype(int), 0]
 
     def contains_primary_lepton(self, hits, lepton_pdg, iscc):
         """
@@ -244,9 +275,11 @@ class SparseFASERCALDatasetEnc(Dataset):
 
         return label
 
-    def standardize(self, x, mean, std):
-        return (x-mean)/std
-
+    def standardize(self, x, param_name):
+        return (x - self.metadata[param_name]['mean']) / self.metadata[param_name]['std']    
+    
+    def divide_by_std(self, x, param_name):
+        return x / self.metadata[param_name]['std']
 
     def add_gaussian_noise(self, probs, std=0.05, shuffle_prob=0.01):
         """
@@ -298,6 +331,55 @@ class SparseFASERCALDatasetEnc(Dataset):
         one_hot[np.arange(batch_size), indices.astype(int)] = 1.0
         return one_hot
 
+    def decompose_momentum(self, momentum):
+        """
+        Given a 3D momentum vector or an array of N 3D momentum vectors, 
+        return the magnitudes and directions separately.
+        
+        Parameters:
+            momentum (np.ndarray): A (3,) or (N, 3) NumPy array representing momentum vector(s).
+            
+        Returns:
+            magnitude (np.ndarray): The magnitude(s) of the momentum vector(s).
+            direction (np.ndarray): A unit vector (or unit vectors) representing the direction(s) of the momentum.
+        """
+        momentum = np.atleast_2d(momentum)  # Converts (3,) -> (1, 3), leaves (N,3) unchanged
+        magnitudes = np.linalg.norm(momentum, axis=1, keepdims=True)
+        directions = np.divide(momentum, magnitudes, where=magnitudes != 0)
+    
+        if magnitudes.shape[0] == 1:
+            return magnitudes[0], directions[0]
+    
+        return magnitudes.flatten(), directions
+
+    def reconstruct_momentum(self, magnitude, direction):
+        """
+        Given magnitude and direction, reconstruct the original momentum vector.
+        
+        Parameters:
+            magnitude (float or np.ndarray): A scalar or an array of shape (N,) representing momentum magnitudes.
+            direction (np.ndarray): A (3,) or (N, 3) NumPy array representing unit direction vectors.
+            
+        Returns:
+            momentum (np.ndarray): The reconstructed momentum vector(s).
+        """
+        magnitude = np.atleast_1d(magnitude)
+        direction = np.atleast_2d(direction)  # Converts (3,) -> (1, 3), leaves (N,3) unchanged
+    
+        momentum = magnitude[:, np.newaxis] * direction
+    
+        return momentum[0] if magnitude.shape[0] == 1 else momentum
+
+    def get_param(self, data, param_name, preprocess=False):
+        if param_name not in data:
+            return None
+
+        param = data[param_name]
+        if param.ndim == 0:
+            param = param.reshape(1,) if preprocess else param.item()
+        param = self.divide_by_std(param, param_name) if preprocess else param
+        
+        return param
 
     def __getitem__(self, idx):
         """
@@ -310,36 +392,39 @@ class SparseFASERCALDatasetEnc(Dataset):
         dict: Data sample with filename, coordinates, features, and labels.
         """
         data = np.load(self.data_files[idx], allow_pickle=True)
-        run_number = data['run_number'].item()
-        event_id = data['event_id'].item()
-        true_hits = data['true_hits']
-        reco_hits = data['reco_hits']
-        reco_hits_true = data['reco_hits_true']
-        in_neutrino_pdg = data['in_neutrino_pdg'].item()
-        in_neutrino_energy = data['in_neutrino_energy'].item()
-        out_lepton_pdg = data['out_lepton_pdg'].item()
-        iscc = data['iscc'].item()
-        #evis = self.standardize(data['evis'].reshape(1,), self.metadata['evis_mean'], self.metadata['evis_std'])
-        #ptmiss = self.standardize(data['ptmiss'].reshape(1,), self.metadata['ptmiss_mean'], self.metadata['ptmiss_std']) 
-        evis = data['evis'].reshape(1,) / self.metadata['evis_std']
-        ptmiss = data['ptmiss'].reshape(1,) / self.metadata['ptmiss_std']
-        rearcal_energydeposit = self.standardize(data['rearcal_energydeposit'].reshape(1,), self.metadata['rearcal_energydeposit_mean'], self.metadata['rearcal_energydeposit_std'])
-        rearhcal_energydeposit = self.standardize(data['rearhcal_energydeposit'].reshape(1,), self.metadata['rearhcal_energydeposit_mean'], self.metadata['rearhcal_energydeposit_std'])
-        rearmucal_energydeposit = self.standardize(data['rearmucal_energydeposit'].reshape(1,), self.metadata['rearmucal_energydeposit_mean'], self.metadata['rearmucal_energydeposit_std'])
-        fasercal_energydeposit = self.standardize(data['fasercal_energydeposit'].reshape(1,), self.metadata['fasercal_energydeposit_mean'], self.metadata['fasercal_energydeposit_std'])
-        rearhcalmodules = self.standardize(data['rearhcalmodules'], self.metadata['rearhcalmodules_mean'], self.metadata['rearhcalmodules_std'])
-        fasercalmodules = self.standardize(data['fasercalmodules'], self.metadata['fasercalmodules_mean'], self.metadata['fasercalmodules_std'])
-        out_lepton_momentum = data['out_lepton_momentum'] / self.metadata['out_lepton_momentum_std']
-        out_lepton_energy = self.standardize(data['out_lepton_energy'].reshape(1,), self.metadata['out_lepton_energy_mean'], self.metadata['out_lepton_energy_std'])
-        jet_momentum = data['jet_momentum'] / self.metadata['jet_momentum_std']
+        
+        run_number = self.get_param(data, 'run_number')
+        event_id = self.get_param(data, 'event_id')
+        true_hits = self.get_param(data, 'true_hits')
+        reco_hits = self.get_param(data, 'reco_hits')
+        reco_hits_true = self.get_param(data, 'reco_hits_true')
+        in_neutrino_pdg = self.get_param(data, 'in_neutrino_pdg')
+        in_neutrino_energy = self.get_param(data, 'in_neutrino_energy')
+        out_lepton_pdg = self.get_param(data, 'out_lepton_pdg')
+        iscc = self.get_param(data, 'iscc')
+        evis = self.get_param(data, 'evis', preprocess=True)
+        ptmiss = self.get_param(data, 'ptmiss', preprocess=True)
+        rearcal_energydeposit = self.get_param(data, 'rearcal_energydeposit', preprocess=True)
+        rearhcal_energydeposit = self.get_param(data, 'rearhcal_energydeposit', preprocess=True)
+        rearmucal_energydeposit = self.get_param(data, 'rearmucal_energydeposit', preprocess=True)
+        fasercal_energydeposit = self.get_param(data, 'fasercal_energydeposit', preprocess=True)
+        rearhcalmodules = self.get_param(data, 'rearhcalmodules', preprocess=True)
+        fasercalmodules = self.get_param(data, 'fasercalmodules', preprocess=True)
+        out_lepton_momentum = self.get_param(data, 'out_lepton_momentum', preprocess=False)
+        jet_momentum = self.get_param(data, 'jet_momentum', preprocess=False)
+        out_lepton_momentum_mag, out_lepton_momentum_dir = self.decompose_momentum(out_lepton_momentum)
+        jet_momentum_mag, jet_momentum_dir = self.decompose_momentum(jet_momentum)
+        out_lepton_momentum_mag = self.divide_by_std(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude')
+        jet_momentum_mag = self.divide_by_std(jet_momentum_mag, 'jet_momentum_magnitude')
         prim_vertex = data['prim_vertex'].reshape(1, 3)
         
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
-        feats = self.standardize(reco_hits[:, 4].reshape(-1, 1), self.metadata['q_mean'], self.metadata['q_std'])
+        q = self.divide_by_std(reco_hits[:, 4].reshape(-1, 1), 'q')
 
-        # voxelise
+        # voxelise coordinates and vertex
         self.voxelise(coords)
+        self.voxelise(prim_vertex)
         
         # process labels
         if self.load_seg:
@@ -348,7 +433,10 @@ class SparseFASERCALDatasetEnc(Dataset):
             segs = np.load(file_name)
             primlepton_labels, seg_labels = segs['out_primlepton'], segs['out_seg']
         else:
-            primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
+            primlepton_labels = self.get_param(data, 'primlepton_labels')
+            seg_labels = self.get_param(data, 'seg_labels')
+            if 'primlepton_labels' not in data or 'seg_labels' not in data:
+                primlepton_labels, seg_labels = self.process_labels(reco_hits_true, true_hits, out_lepton_pdg, iscc)
         flavour_label = self.pdg2label(in_neutrino_pdg, iscc)
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)
@@ -357,6 +445,7 @@ class SparseFASERCALDatasetEnc(Dataset):
         output = {'run_number': run_number,
                   'event_id': event_id}
 
+        feats = q
         if self.training and np.random.rand() > 0.01:
             self.voxelise(prim_vertex)
             prim_vertex = prim_vertex.reshape(3)
@@ -366,8 +455,6 @@ class SparseFASERCALDatasetEnc(Dataset):
             primlepton_labels = self.add_gaussian_noise(primlepton_labels)
             seg_labels = self.add_gaussian_noise(seg_labels)
 
-        # log features
-        #feats = np.log(feats).reshape(-1, 1)
         feats = feats.reshape(-1, 1)
         feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
         feats_global = np.concatenate([rearcal_energydeposit, rearhcal_energydeposit, rearmucal_energydeposit, fasercal_energydeposit, rearhcalmodules, fasercalmodules])
@@ -381,8 +468,10 @@ class SparseFASERCALDatasetEnc(Dataset):
         output['flavour_label'] = torch.tensor([flavour_label]).long()
         output['evis'] = torch.from_numpy(evis).float()
         output['ptmiss'] = torch.tensor(ptmiss).float()
-        output['out_lepton_momentum'] = torch.from_numpy(out_lepton_momentum)
-        output['jet_momentum'] = torch.from_numpy(jet_momentum)
+        output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag)
+        output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir)
+        output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag)
+        output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir)
 
         return output
 
