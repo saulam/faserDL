@@ -59,11 +59,12 @@ class MinkUNetConvNeXtV2(nn.Module):
         """Encoder"""
         #depths=[2, 4, 4, 8, 8, 8]
         #dims = (16, 32, 64, 128, 256, 512)
-        #depths=[3, 3, 9, 3]
-        #dims=[96, 192, 384, 768]     
-        dims = (64, 128, 256, 512, 512)
-        depths = (3, 3, 3, 9, 3)
-        kernel_size = (2, 2, 3)
+        depths=[3, 3, 9, 3]
+        dims=[96, 192, 384, 768]     
+        #dims = (64, 128, 256, 512, 512)
+        #depths = (3, 3, 3, 9, 3)
+        #kernel_size = (2, 2, 3)
+        kernel_size = 2
         drop_path_rate=0.
 
         assert len(depths) == len(dims)
@@ -86,7 +87,7 @@ class MinkUNetConvNeXtV2(nn.Module):
 
         for i in range(self.nb_elayers):
             encoder_layer = nn.Sequential(
-                *[Block(dim=dims[i], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
+                *[Block(dim=dims[i], kernel_size=5, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
             )
             self.encoder_layers.append(encoder_layer)
             cur += depths[i]
@@ -119,7 +120,7 @@ class MinkUNetConvNeXtV2(nn.Module):
             self.upsample_layers.append(upsample_layer)
 
             decoder_layer = nn.Sequential(
-                *[Block(dim=dims[i+1], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
+                *[Block(dim=dims[i+1], kernel_size=5, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
             )
             self.decoder_layers.append(decoder_layer)
             cur += depths[i] 
@@ -127,12 +128,12 @@ class MinkUNetConvNeXtV2(nn.Module):
         """Semantic-segmentation layers"""
         self.primlepton_layer = nn.Sequential(
             MinkowskiLayerNorm(dims[-1], eps=1e-6),
-            Block(dim=dims[-1], kernel_size=kernel_size, drop_path=0., D=D),
+            Block(dim=dims[-1], kernel_size=5, drop_path=0., D=D),
             MinkowskiConvolution(dims[-1], 1, kernel_size=1, stride=1, dimension=D),
         )
         self.seg_layer = nn.Sequential(
             MinkowskiLayerNorm(dims[-1], eps=1e-6),
-            Block(dim=dims[-1], kernel_size=kernel_size, drop_path=0., D=D),
+            Block(dim=dims[-1], kernel_size=5, drop_path=0., D=D),
             MinkowskiConvolution(dims[-1], 3, kernel_size=1, stride=1, dimension=D),
         )
 
