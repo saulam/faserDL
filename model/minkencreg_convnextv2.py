@@ -21,6 +21,8 @@ from MinkowskiEngine import (
     MinkowskiGlobalMaxPooling,
     MinkowskiReLU,
     MinkowskiGELU,
+    MinkowskiLeakyReLU,
+    MinkowskiSoftplus,
 )
 
 
@@ -49,24 +51,6 @@ def _init_weights(m):
     if isinstance(m, nn.LayerNorm):
         nn.init.constant_(m.bias, 0)
         nn.init.constant_(m.weight, 1.0)
-'''
-def _init_weights(m):
-    if isinstance(m, (ME.MinkowskiConvolution, ME.MinkowskiConvolutionTranspose, ME.MinkowskiDepthwiseConvolution)):
-        nn.init.kaiming_uniform_(m.kernel, mode="fan_in", nonlinearity="relu")  # He uniform for sparse convs
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    if isinstance(m, ME.MinkowskiLinear):
-        nn.init.kaiming_uniform_(m.linear.weight, mode="fan_in", nonlinearity="relu")  # He uniform for regression
-        if m.linear.bias is not None:
-            nn.init.constant_(m.linear.bias, 0)
-    if isinstance(m, nn.Linear):
-        nn.init.kaiming_uniform_(m.weight, mode="fan_in", nonlinearity="relu")  # He uniform for regression
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    if isinstance(m, nn.LayerNorm):
-        nn.init.constant_(m.bias, 0)
-        nn.init.constant_(m.weight, 1.0)
-'''
 
 
 class MinkEncRegConvNeXtV2(nn.Module):
@@ -78,7 +62,7 @@ class MinkEncRegConvNeXtV2(nn.Module):
         #dims = (16, 32, 64, 128, 256, 512)
         depths=[3, 3, 9, 3]
         dims=[96, 192, 384, 768]     
-        kernel_size = 3
+        kernel_size = 5
         drop_path_rate=0.
 
         assert len(depths) == len(dims)
@@ -94,6 +78,11 @@ class MinkEncRegConvNeXtV2(nn.Module):
         self.stem = MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D)
         self.stem_ln = MinkowskiLayerNorm(dims[0], eps=1e-6)
 
+        # Linear transformation for glibal features
+        self.global_mlp = nn.Sequential(
+            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[0]),
+        )
+
         for i in range(self.nb_elayers):
             encoder_layer = nn.Sequential(
                 *[Block(dim=dims[i], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
@@ -108,38 +97,43 @@ class MinkEncRegConvNeXtV2(nn.Module):
                 )
                 self.downsample_layers.append(downsample_layer)
 
-        # Linear transformation for glibal features
-        self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[-1]),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dims[-1], dims[-1]),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dims[-1], dims[-1]),
-            nn.LeakyReLU(0.1),
-        )
-
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
         self.evis_layer = nn.Sequential(
-            nn.Linear(dims[-1], dims[-1]),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dims[-1], 1)
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiLeakyReLU(0.1),
+            MinkowskiLinear(dims[-1], 1),
+            MinkowskiSoftplus(beta=1, threshold=5),
         ) 
         self.ptmiss_layer = nn.Sequential(
-            nn.Linear(dims[-1], dims[-1]),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dims[-1], 1)
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiLeakyReLU(0.1),
+            MinkowskiLinear(dims[-1], 1),
+            MinkowskiSoftplus(beta=1, threshold=5),
         )
-        self.out_lepton_momentum_layer = nn.Sequential(
-            nn.Linear(dims[-1], dims[-1]),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dims[-1], 3),
+        self.out_lepton_momentum_mag_layer = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiLeakyReLU(0.1),
+            MinkowskiLinear(dims[-1], 1),
+            MinkowskiSoftplus(beta=1, threshold=5),
         )
-        self.jet_momentum_layer = nn.Sequential(
-            nn.Linear(dims[-1], dims[-1]),
-            nn.LeakyReLU(0.1),
-            nn.Linear(dims[-1], 3),
+        self.out_lepton_momentum_dir_layer = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiLeakyReLU(0.1),
+            MinkowskiLinear(dims[-1], 3),
         )
+        self.jet_momentum_mag_layer = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiLeakyReLU(0.1),
+            MinkowskiLinear(dims[-1], 1),
+            MinkowskiSoftplus(beta=1, threshold=5),
+        )
+        self.jet_momentum_dir_layer = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiLeakyReLU(0.1),
+            MinkowskiLinear(dims[-1], 3),
+        )
+
 
         """ Initialise weights """
         self.apply(_init_weights)
@@ -148,7 +142,13 @@ class MinkEncRegConvNeXtV2(nn.Module):
         """Encoder"""
         # stem
         x = self.stem(x)
-        #x = self.stem_ln(x)
+        x_glob = self.global_mlp(x_glob)
+
+        # add global to voxel features
+        batch_indices = x.C[:, 0].long()  # batch idx
+        x_glob_expanded = x_glob[batch_indices]
+        new_feats = x.F + x_glob_expanded
+        x = ME.SparseTensor(features=new_feats, coordinates=x.C)
 
         # encoder layers
         x_enc = []
@@ -158,23 +158,21 @@ class MinkEncRegConvNeXtV2(nn.Module):
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
         
-        # global params
-        x_glob = self.global_mlp(x_glob)
-        
         # event predictions
         x_pooled = self.global_pool(x)
-        x_pooled = x_pooled.F + x_glob 
-        #x_pooled = torch.cat((x_pooled.F, x_glob), dim=1) 
-
         out_evis = self.evis_layer(x_pooled)
         out_ptmiss = self.ptmiss_layer(x_pooled)
-        out_lepton_momentum = self.out_lepton_momentum_layer(x_pooled)
-        out_jet_momentum = self.jet_momentum_layer(x_pooled)
+        out_lepton_momentum_mag = self.out_lepton_momentum_mag_layer(x_pooled)
+        out_lepton_momentum_dir = self.out_lepton_momentum_dir_layer(x_pooled)
+        out_jet_momentum_mag = self.jet_momentum_mag_layer(x_pooled)
+        out_jet_momentum_dir = self.jet_momentum_dir_layer(x_pooled)
 
-        output = {"out_evis": out_evis,
-                  "out_ptmiss": out_ptmiss,
-                  "out_lepton_momentum": out_lepton_momentum,
-                  "out_jet_momentum": out_lepton_momentum,
+        output = {"out_evis": out_evis.F,
+                  "out_ptmiss": out_ptmiss.F,
+                  "out_lepton_momentum_mag": out_lepton_momentum_mag.F,
+                  "out_lepton_momentum_dir": out_lepton_momentum_dir.F,
+                  "out_jet_momentum_mag": out_lepton_momentum_mag.F,
+                  "out_jet_momentum_dir": out_lepton_momentum_dir.F,
                   }
         
         return output

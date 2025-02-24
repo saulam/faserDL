@@ -60,7 +60,7 @@ class MinkEncClsConvNeXtV2(nn.Module):
         #dims = (16, 32, 64, 128, 256, 512)
         depths=[3, 3, 9, 3]
         dims=[96, 192, 384, 768]     
-        kernel_size = 3
+        kernel_size = 5
         drop_path_rate=0.
 
         assert len(depths) == len(dims)
@@ -76,6 +76,11 @@ class MinkEncClsConvNeXtV2(nn.Module):
         self.stem = MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D)
         self.stem_ln = MinkowskiLayerNorm(dims[0], eps=1e-6)
 
+        # Linear transformation for glibal features
+        self.global_mlp = nn.Sequential(
+            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[0]),
+        )
+ 
         for i in range(self.nb_elayers):
             encoder_layer = nn.Sequential(
                 *[Block(dim=dims[i], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
@@ -90,23 +95,12 @@ class MinkEncClsConvNeXtV2(nn.Module):
                 )
                 self.downsample_layers.append(downsample_layer)
 
-        # Linear transformation for glibal features
-        self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[-1]),
-            nn.GELU(),
-            nn.Linear(dims[-1], dims[-1]),
-            nn.GELU(),
-            nn.Linear(dims[-1], dims[-1]),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
-
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
         self.flavour_layer = nn.Sequential(
-            nn.Linear(dims[-1], dims[-1]),
-            nn.GELU(),
-            nn.Linear(dims[-1], 4)
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 4)
         ) 
 
         """ Initialise weights """
@@ -116,6 +110,14 @@ class MinkEncClsConvNeXtV2(nn.Module):
         """Encoder"""
         # stem
         x = self.stem(x)
+        x_glob = self.global_mlp(x_glob)
+        
+        # add global to voxel features
+        batch_indices = x.C[:, 0].long()  # batch idx
+        x_glob_expanded = x_glob[batch_indices]
+        new_feats = x.F + x_glob_expanded
+        x = ME.SparseTensor(features=new_feats, coordinates=x.C)
+        
         x = self.stem_ln(x)
 
         # encoder layers
@@ -126,16 +128,11 @@ class MinkEncClsConvNeXtV2(nn.Module):
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
         
-        # global params
-        x_glob = self.global_mlp(x_glob)
-        
         # event predictions
         x_pooled = self.global_pool(x)
-        x_pooled = x_pooled.F + x_glob 
-        #x_pooled = torch.cat((x_pooled.F, x_glob), dim=1) 
-
         out_flavour = self.flavour_layer(x_pooled)
-        output = {"out_flavour": out_flavour}
+        output = {"out_flavour": out_flavour.F}
+        
         
         return output
 

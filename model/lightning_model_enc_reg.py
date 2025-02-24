@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import MAPE, SphericalAngularMomentumLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import MAPE, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
@@ -14,8 +14,10 @@ class SparseEncRegLightningModel(pl.LightningModule):
         self.sigmoid = args.sigmoid
         self.loss_evis = MAPE()
         self.loss_ptmiss = MAPE()
-        self.loss_lepton_momentum = SphericalAngularMomentumLoss()
-        self.loss_jet_momentum = SphericalAngularMomentumLoss()
+        self.loss_lepton_momentum_mag = MAPE()
+        self.loss_lepton_momentum_dir = SphericalAngularLoss()
+        self.loss_jet_momentum_mag = MAPE()
+        self.loss_jet_momentum_dir = SphericalAngularLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -77,26 +79,34 @@ class SparseEncRegLightningModel(pl.LightningModule):
         # pred
         out_evis = batch_output['out_evis'].view(-1)
         out_ptmiss = batch_output['out_ptmiss'].view(-1)
-        out_lepton_momentum = batch_output['out_lepton_momentum']
-        out_jet_momentum = batch_output['out_jet_momentum']
+        out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag']
+        out_lepton_momentum_dir = batch_output['out_lepton_momentum_dir']
+        out_jet_momentum_mag = batch_output['out_jet_momentum_mag']
+        out_jet_momentum_dir = batch_output['out_jet_momentum_dir']
 
         # true
         targ_evis = target['evis']
         targ_ptmiss = target['ptmiss']
-        targ_lepton_momentum = target['out_lepton_momentum']
-        targ_jet_momentum = target['jet_momentum']
+        targ_lepton_momentum_mag = target['out_lepton_momentum_mag']
+        targ_lepton_momentum_dir = target['out_lepton_momentum_dir']
+        targ_jet_momentum_mag = target['jet_momentum_mag']
+        targ_jet_momentum_dir = target['jet_momentum_dir']
 
         # losses
         loss_evis = self.loss_evis(out_evis, targ_evis)
         loss_ptmiss = self.loss_ptmiss(out_ptmiss, targ_ptmiss)
-        loss_lepton_momentum = self.loss_lepton_momentum(out_lepton_momentum, targ_lepton_momentum)
-        loss_jet_momentum = self.loss_jet_momentum(out_jet_momentum, targ_jet_momentum)
+        loss_lepton_momentum_mag = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
+        loss_lepton_momentum_dir = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
+        loss_jet_momentum_mag = self.loss_jet_momentum_mag(out_jet_momentum_mag, targ_jet_momentum_mag)
+        loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
         part_losses = {'evis': loss_evis,
                        'ptmiss': loss_ptmiss,
-                       'lepton_momentum': loss_lepton_momentum,
-                       'jet_momentum': loss_jet_momentum,
+                       'lepton_momentum_mag': loss_lepton_momentum_mag,
+                       'lepton_momentum_dir': loss_lepton_momentum_dir,
+                       'jet_momentum_mag': loss_jet_momentum_mag,
+                       'jet_momentum_dir': loss_jet_momentum_dir,
                        }
-        total_loss = loss_evis + loss_ptmiss + loss_lepton_momentum + loss_jet_momentum
+        total_loss = loss_evis + loss_ptmiss + loss_lepton_momentum_mag + loss_lepton_momentum_dir + loss_jet_momentum_mag + loss_jet_momentum_dir
 
         return total_loss, part_losses
 
