@@ -99,33 +99,51 @@ class MinkEncRegConvNeXtV2(nn.Module):
 
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
-        self.evis_layer = nn.Sequential(
-            #MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLinear(dims[-1], 1),
+        self.evis_head = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]//2),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         ) 
-        self.ptmiss_layer = nn.Sequential(
-            #MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLinear(dims[-1], 1),
+        self.ptmiss_head = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]//2),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
-        self.out_lepton_momentum_mag_layer = nn.Sequential(
-            #MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLinear(dims[-1], 1),
+        self.out_lepton_momentum_mag_head = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]//2),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
-        self.out_lepton_momentum_dir_layer = nn.Sequential(
-            #MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLinear(dims[-1], 3),
+        self.out_lepton_momentum_dir_head = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]//2),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//4, 3),
         )
-        self.jet_momentum_mag_layer = nn.Sequential(
-            #MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLinear(dims[-1], 1),
+        self.jet_momentum_mag_head = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]//2),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
-        self.jet_momentum_dir_layer = nn.Sequential(
-            #MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLinear(dims[-1], 3),
+        self.jet_momentum_dir_head = nn.Sequential(
+            MinkowskiLinear(dims[-1], dims[-1]//2),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
+            MinkowskiLeakyReLU(0.01),
+            MinkowskiLinear(dims[-1]//4, 3),
         )
 
 
@@ -154,12 +172,12 @@ class MinkEncRegConvNeXtV2(nn.Module):
         
         # event predictions
         x_pooled = self.global_pool(x)
-        out_evis = self.evis_layer(x_pooled)
-        out_ptmiss = self.ptmiss_layer(x_pooled)
-        out_lepton_momentum_mag = self.out_lepton_momentum_mag_layer(x_pooled)
-        out_lepton_momentum_dir = self.out_lepton_momentum_dir_layer(x_pooled)
-        out_jet_momentum_mag = self.jet_momentum_mag_layer(x_pooled)
-        out_jet_momentum_dir = self.jet_momentum_dir_layer(x_pooled)
+        out_evis = self.evis_head(x_pooled)
+        out_ptmiss = self.ptmiss_head(x_pooled)
+        out_lepton_momentum_mag = self.out_lepton_momentum_mag_head(x_pooled)
+        out_lepton_momentum_dir = self.out_lepton_momentum_dir_head(x_pooled)
+        out_jet_momentum_mag = self.jet_momentum_mag_head(x_pooled)
+        out_jet_momentum_dir = self.jet_momentum_dir_head(x_pooled)
 
         output = {"out_evis": out_evis.F,
                   "out_ptmiss": out_ptmiss.F,
