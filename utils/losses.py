@@ -40,6 +40,7 @@ class MAPE(torch.nn.Module):
         percentage_error = torch.abs((pred - target) / (target + self.epsilon))
 
         # Apply the mask: only retain the values where target > 0
+        percentage_error = torch.nan_to_num(percentage_error, nan=0.0)
         percentage_error = percentage_error * mask
 
         # Apply reduction method
@@ -89,6 +90,7 @@ class SphericalAngularLoss(torch.nn.Module):
 
         # Compute the angular distance (geodesic distance on the unit sphere)
         angular_loss = torch.acos(dot_product)  # Returns angles in radians
+        angular_loss = torch.nan_to_num(angular_loss, nan=0.0)
         angular_loss = angular_loss * mask.float()
 
         # Apply reduction method (default: mean)
