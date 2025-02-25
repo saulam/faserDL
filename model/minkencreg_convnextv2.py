@@ -100,37 +100,31 @@ class MinkEncRegConvNeXtV2(nn.Module):
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
         self.evis_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLeakyReLU(0.1),
+            #MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=5),
+            MinkowskiSoftplus(beta=1, threshold=20),
         ) 
         self.ptmiss_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLeakyReLU(0.1),
+            #MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=5),
+            MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.out_lepton_momentum_mag_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLeakyReLU(0.1),
+            #MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=5),
+            MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.out_lepton_momentum_dir_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLeakyReLU(0.1),
+            #MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiLinear(dims[-1], 3),
         )
         self.jet_momentum_mag_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLeakyReLU(0.1),
+            #MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=5),
+            MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.jet_momentum_dir_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiLeakyReLU(0.1),
+            #MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiLinear(dims[-1], 3),
         )
 
