@@ -96,7 +96,7 @@ class SparseEncRegLightningModel(pl.LightningModule):
         loss_evis = self.loss_evis(out_evis, targ_evis)
         loss_ptmiss = self.loss_ptmiss(out_ptmiss, targ_ptmiss)
         loss_lepton_momentum_mag = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
-        loss_lepton_momentum_dir = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
+        loss_lepton_momentum_dir = self.loss_lepton_momentum_dir(out_lepton_momentum_dir, targ_lepton_momentum_dir)
         loss_jet_momentum_mag = self.loss_jet_momentum_mag(out_jet_momentum_mag, targ_jet_momentum_mag)
         loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
         part_losses = {'evis': loss_evis,

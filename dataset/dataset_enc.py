@@ -424,7 +424,6 @@ class SparseFASERCALDatasetEnc(Dataset):
 
         # voxelise coordinates and vertex
         self.voxelise(coords)
-        self.voxelise(prim_vertex)
         
         # process labels
         if self.load_seg:
@@ -467,11 +466,11 @@ class SparseFASERCALDatasetEnc(Dataset):
         output['feats_global'] = torch.from_numpy(feats_global).float()
         output['flavour_label'] = torch.tensor([flavour_label]).long()
         output['evis'] = torch.from_numpy(evis).float()
-        output['ptmiss'] = torch.tensor(ptmiss).float()
-        output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag)
-        output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir)
-        output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag)
-        output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir)
+        output['ptmiss'] = torch.from_numpy(ptmiss).float()
+        output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag).float()
+        output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir).float()
+        output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag).float()
+        output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir).float()
 
         return output
 
