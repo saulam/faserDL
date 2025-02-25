@@ -24,21 +24,28 @@ class MAPE(torch.nn.Module):
 
     def forward(self, pred, target):
         """
-        Computes the MAPE loss.
+        Computes the MAPE loss, but only for target values greater than 0.
 
         Args:
             pred (torch.Tensor): Predicted values (batch_size, *)
             target (torch.Tensor): Ground truth values (batch_size, *)
 
         Returns:
-            torch.Tensor: Computed MAPE loss.
+            torch.Tensor: Computed MAPE loss, considering only target values > 0.
         """
-        # Avoid division by zero by adding a small epsilon
+        # Create a mask to only compute the loss where target > 0
+        mask = target > 0
+
+        # Calculate percentage error where the target is greater than 0
         percentage_error = torch.abs((pred - target) / (target + self.epsilon))
+
+        # Apply the mask: only retain the values where target > 0
+        percentage_error = percentage_error * mask
 
         # Apply reduction method
         if self.reduction == 'mean':
-            return percentage_error.mean()
+            # Compute the mean loss only for valid values (where target > 0)
+            return percentage_error.sum() / mask.sum() if mask.sum() > 0 else torch.tensor(0.0)
         elif self.reduction == 'sum':
             return percentage_error.sum()
         else:
@@ -72,6 +79,8 @@ class SphericalAngularLoss(torch.nn.Module):
         Returns:
             torch.Tensor: The computed loss.
         """
+        mask = torch.all(target != 0, dim=1)
+
         pred_norm = torch.nn.functional.normalize(pred, dim=-1, eps=self.eps)
         target_norm = torch.nn.functional.normalize(target, dim=-1, eps=self.eps)
  
@@ -80,10 +89,12 @@ class SphericalAngularLoss(torch.nn.Module):
 
         # Compute the angular distance (geodesic distance on the unit sphere)
         angular_loss = torch.acos(dot_product)  # Returns angles in radians
+        angular_loss = angular_loss * mask.float()
 
         # Apply reduction method (default: mean)
         if self.reduction == 'mean':
-            angular_loss = angular_loss.mean()
+            valid_loss_count = mask.sum()
+            angular_loss = angular_loss.sum() / valid_loss_count if valid_loss_count > 0 else torch.tensor(0.0)
         elif self.reduction == 'sum':
             angular_loss = angular_loss.sum()
 
