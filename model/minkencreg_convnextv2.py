@@ -101,48 +101,48 @@ class MinkEncRegConvNeXtV2(nn.Module):
         self.global_pool = MinkowskiGlobalMaxPooling()
         self.evis_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         ) 
         self.ptmiss_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.out_lepton_momentum_mag_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.out_lepton_momentum_dir_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//4, 3),
         )
         self.jet_momentum_mag_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.jet_momentum_dir_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.01),
+            MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//4, 3),
         )
 
