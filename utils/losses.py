@@ -17,9 +17,9 @@ class MAPE(torch.nn.Module):
         reduction (str): Specifies the reduction method ('mean' or 'sum'). Default is 'mean'.
     """
 
-    def __init__(self, epsilon=1e-8, reduction='mean'):
+    def __init__(self, eps=1e-8, reduction='mean'):
         super(MAPE, self).__init__()
-        self.epsilon = epsilon
+        self.eps = eps
         self.reduction = reduction
 
     def forward(self, pred, target):
@@ -37,16 +37,13 @@ class MAPE(torch.nn.Module):
         mask = target > 0
 
         # Calculate percentage error where the target is greater than 0
-        percentage_error = torch.abs((pred - target) / (target + self.epsilon))
-
-        # Apply the mask: only retain the values where target > 0
-        percentage_error = torch.nan_to_num(percentage_error, nan=0.0)
-        percentage_error = percentage_error * mask
+        percentage_error = torch.abs((pred - target) / (target + self.eps))
+        percentage_error = torch.nan_to_num(percentage_error, nan=0.0) * mask
 
         # Apply reduction method
         if self.reduction == 'mean':
             # Compute the mean loss only for valid values (where target > 0)
-            return percentage_error.sum() / mask.sum() if mask.sum() > 0 else torch.tensor(0.0)
+            return percentage_error.sum() / (mask.sum() + self.eps)
         elif self.reduction == 'sum':
             return percentage_error.sum()
         else:
@@ -63,11 +60,10 @@ class SphericalAngularLoss(torch.nn.Module):
     Args:
         reduction (str): 'mean' (default) to average over batch, or 'sum' for total loss.
     """
-    def __init__(self, reduction='mean', eps=1e-8):
+    def __init__(self, reduction='mean', eps=1e-6):
         super(SphericalAngularLoss, self).__init__()
         self.reduction = reduction
         self.eps = eps
-        self.magnitude_loss = MAPE(reduction=None)
 
     def forward(self, pred, target):
         """
@@ -86,17 +82,16 @@ class SphericalAngularLoss(torch.nn.Module):
         target_norm = torch.nn.functional.normalize(target, dim=-1, eps=self.eps)
  
         # Compute the dot product (cosine of the angle)
-        dot_product = torch.sum(pred_norm * target_norm, dim=1).clamp(-1 + self.eps, 1 - self.eps)  # Clamp to avoid numerical errors
+        dot_product = torch.sum(pred_norm * target_norm, dim=1).clamp(-0.9999, 0.9999)
 
         # Compute the angular distance (geodesic distance on the unit sphere)
         angular_loss = torch.acos(dot_product)  # Returns angles in radians
-        angular_loss = torch.nan_to_num(angular_loss, nan=0.0)
-        angular_loss = angular_loss * mask.float()
+        angular_loss = torch.nan_to_num(angular_loss, nan=0.0) * mask.float()
 
         # Apply reduction method (default: mean)
         if self.reduction == 'mean':
             valid_loss_count = mask.sum()
-            angular_loss = angular_loss.sum() / valid_loss_count if valid_loss_count > 0 else torch.tensor(0.0)
+            angular_loss = angular_loss.sum() / (valid_loss_count + self.eps)
         elif self.reduction == 'sum':
             angular_loss = angular_loss.sum()
 
