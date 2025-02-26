@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from utils import ini_argparse, random_rotation_saul
 import MinkowskiEngine as ME
 
+
 class SparseFASERCALDatasetEnc(Dataset):
     def __init__(self, args):
         """
@@ -65,12 +66,14 @@ class SparseFASERCALDatasetEnc(Dataset):
         """
         return len(self.data_files)
 
-    def _augment(self, coords_ori, feats_ori, labels1_ori, labels2_ori, momentum1_ori, momentum2_ori, prim_vertex, round_coords=True):
+    def _augment(self, coords_ori, feats_ori, labels1_ori, labels2_ori, dir1_ori, dir2_ori, prim_vertex, round_coords=True):
         coords, feats, labels1 = coords_ori.copy(), feats_ori.copy(), labels1_ori.copy()
-        labels2, momentum1, momentum2 = labels2_ori.copy(), momentum1_ori.copy(), momentum2_ori.copy()
+        labels2, dir1, dir2 = labels2_ori.copy(), dir1_ori.copy(), dir2_ori.copy()
  
         # rotate
-        #coords, momentum1, momentum2 = self._rotate(coords, momentum1, momentum2, prim_vertex)
+        #coords, dir1, dir2 = self._rotate(coords, dir1, dir2, prim_vertex)
+        coords, dir1, dir2 = self._rotate_90(coords, dir1, dir2)
+        
         # translate
         coords = self._translate(coords)
         # drop voxels
@@ -81,10 +84,10 @@ class SparseFASERCALDatasetEnc(Dataset):
         #coords, feats, labels1, labels2 = self._within_limits(coords, feats, labels1, labels2)
         
         if coords.shape[0] == 0:
-            return coords_ori, feats_ori, labels1_ori, labels2_ori, momentum1_ori, momentum2_ori
+            return coords_ori, feats_ori, labels1_ori, labels2_ori, dir1_ori, dir2_ori
 
-        if round_coords:
-            coords = coords.round()
+        #if round_coords:
+        #    coords = coords.round()
 
         # Quantize (voxelise and detect duplicates)
         _, indices = ME.utils.sparse_quantize(
@@ -97,9 +100,9 @@ class SparseFASERCALDatasetEnc(Dataset):
         labels1 = labels1[indices].reshape(-1, 1)
         labels2 = labels2[indices].reshape(-1, 3)
 
-        return coords, feats, labels1, labels2, momentum1, momentum2
+        return coords, feats, labels1, labels2, dir1, dir2
 
-    def _rotate_90(self, point_cloud):
+    def _rotate_90(self, point_cloud, dir1, dir2):
         # Rotation matrices for 90, 180, and 270 degrees on each axis
         rotations = {
             'x': {0: np.eye(3),
@@ -123,21 +126,23 @@ class SparseFASERCALDatasetEnc(Dataset):
         )
         final_rotation_matrix = np.eye(3)
 
-        for axis in ['x', 'y', 'z']:  # Loop over each axis
-            if np.random.choice([False, True]):
-                angle = np.random.choice([0, 90, 180, 270])
-                final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
+        for axis in ['x', 'y', 'z']:
+            angle = np.random.choice([0, 90, 180, 270])
+            final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
         translated_points = point_cloud - reference_point
         rotated_points = translated_points @ final_rotation_matrix.T
         final_points = rotated_points + reference_point
-        return final_points
+        rotated_dir1 = dir1 @ final_rotation_matrix.T
+        rotated_dir2 = dir2 @ final_rotation_matrix.T
+
+        return final_points, rotated_dir1, rotated_dir2
 
     def _rotate(self, coords, momentum1, momentum2, prim_vertex):
         """Random rotation along"""
         angle_limits = torch.tensor([
-            [-torch.pi/8, -torch.pi/8, -torch.pi],  # Min angles for X, Y, Z
-            [torch.pi/8, torch.pi/8,  torch.pi]   # Max angles for X, Y, Z
+            [-torch.pi/8, -torch.pi/8, -torch.pi],
+            [torch.pi/8, torch.pi/8,  torch.pi]
         ])
         if (angle_limits==0).all():
             # no rotation at all
@@ -424,7 +429,6 @@ class SparseFASERCALDatasetEnc(Dataset):
 
         # voxelise coordinates and vertex
         self.voxelise(coords)
-        self.voxelise(prim_vertex)
         
         # process labels
         if self.load_seg:
@@ -451,7 +455,14 @@ class SparseFASERCALDatasetEnc(Dataset):
             prim_vertex = prim_vertex.reshape(3)
            
             # augmented event
-            coords, feats, primlepton_labels, seg_labels, out_lepton_momentum, jet_momentum = self._augment(coords, feats, primlepton_labels, seg_labels, out_lepton_momentum, jet_momentum, prim_vertex, round_coords=False)
+            (
+                coords, feats, primlepton_labels, seg_labels,
+                out_lepton_momentum_dir, jet_momentum_dir
+            ) = self._augment(
+                coords, feats, primlepton_labels, seg_labels,
+                out_lepton_momentum_dir, jet_momentum_dir,
+                prim_vertex, round_coords=False
+            )
             primlepton_labels = self.add_gaussian_noise(primlepton_labels)
             seg_labels = self.add_gaussian_noise(seg_labels)
 
@@ -467,11 +478,11 @@ class SparseFASERCALDatasetEnc(Dataset):
         output['feats_global'] = torch.from_numpy(feats_global).float()
         output['flavour_label'] = torch.tensor([flavour_label]).long()
         output['evis'] = torch.from_numpy(evis).float()
-        output['ptmiss'] = torch.tensor(ptmiss).float()
-        output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag)
-        output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir)
-        output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag)
-        output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir)
+        output['ptmiss'] = torch.from_numpy(ptmiss).float()
+        output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag).float()
+        output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir).float()
+        output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag).float()
+        output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir).float()
 
         return output
 

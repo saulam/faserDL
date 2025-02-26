@@ -118,14 +118,21 @@ def collate_test(batch):
         ptmiss = [d['ptmiss'].item() for d in batch]
         ret['ptmiss'] = ptmiss
 
-    if 'out_lepton_momentum' in batch[0]:
-        out_lepton_momentum = [d['out_lepton_momentum'] for d in batch]
-        ret['out_lepton_momentum'] = out_lepton_momentum
+    if 'out_lepton_momentum_mag' in batch[0]:
+        out_lepton_momentum_mag = [d['out_lepton_momentum_mag'] for d in batch]
+        ret['out_lepton_momentum_mag'] = out_lepton_momentum_mag
 
-    if 'jet_momentum' in batch[0]:
-        jet_momentum = [d['jet_momentum'] for d in batch]
-        ret['jet_momentum'] = jet_momentum
+    if 'out_lepton_momentum_dir' in batch[0]:
+        out_lepton_momentum_dir = [d['out_lepton_momentum_dir'] for d in batch]
+        ret['out_lepton_momentum_dir'] = out_lepton_momentum_dir
 
+    if 'jet_momentum_mag' in batch[0]:
+        jet_momentum_mag = [d['jet_momentum_mag'] for d in batch]
+        ret['jet_momentum_mag'] = jet_momentum_mag
+
+    if 'jet_momentum_dir' in batch[0]:
+        jet_momentum_dir = [d['jet_momentum_dir'] for d in batch]
+        ret['jet_momentum_dir'] = jet_momentum_dir
 
     return ret
 
@@ -177,13 +184,21 @@ def collate_sparse_minkowski(batch):
         ptmiss = torch.cat([d['ptmiss'] for d in batch])
         ret['ptmiss'] = ptmiss
 
-    if 'out_lepton_momentum' in batch[0]:
-        out_lepton_momentum = torch.stack([d['out_lepton_momentum'] for d in batch])
-        ret['out_lepton_momentum'] = out_lepton_momentum
+    if 'out_lepton_momentum_mag' in batch[0]:
+        out_lepton_momentum_mag = torch.stack([d['out_lepton_momentum_mag'] for d in batch])
+        ret['out_lepton_momentum_mag'] = out_lepton_momentum_mag
 
-    if 'jet_momentum' in batch[0]:
-        jet_momentum = torch.stack([d['jet_momentum'] for d in batch])
-        ret['jet_momentum'] = jet_momentum
+    if 'out_lepton_momentum_dir' in batch[0]:
+        out_lepton_momentum_dir = torch.stack([d['out_lepton_momentum_dir'] for d in batch])
+        ret['out_lepton_momentum_dir'] = out_lepton_momentum_dir
+
+    if 'jet_momentum_mag' in batch[0]:
+        jet_momentum_mag = torch.stack([d['jet_momentum_mag'] for d in batch])
+        ret['jet_momentum_mag'] = jet_momentum_mag
+
+    if 'jet_momentum_dir' in batch[0]:
+        jet_momentum_dir = torch.stack([d['jet_momentum_dir'] for d in batch])
+        ret['jet_momentum_dir'] = jet_momentum_dir
 
     if 'global_feats' in batch[0]:
         global_labels = torch.stack([d['global_feats'] for d in batch])
@@ -213,8 +228,10 @@ def arrange_truth(data):
               'flavour_label': data['flavour_label'],
               'evis': data['evis'],
               'ptmiss': data['ptmiss'],
-              'out_lepton_momentum': data['out_lepton_momentum'] if 'out_lepton_momentum' in data else None,
-              'jet_momentum': data['jet_momentum'] if 'jet_momentum' in data else None,
+              'out_lepton_momentum_mag': data['out_lepton_momentum_mag'] if 'out_lepton_momentum_mag' in data else None,
+              'out_lepton_momentum_dir': data['out_lepton_momentum_dir'] if 'out_lepton_momentum_dir' in data else None,
+              'jet_momentum_mag': data['jet_momentum_mag'] if 'jet_momentum_mag' in data else None,
+              'jet_momentum_dir': data['jet_momentum_dir'] if 'jet_momentum_dir' in data else None,
              }
     return output
 

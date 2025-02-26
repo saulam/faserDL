@@ -329,7 +329,6 @@ class SparseFASERCALDatasetSeg(Dataset):
         
         # voxelise coordinates and vertex
         self.voxelise(coords)
-        self.voxelise(prim_vertex)
         
         # process labels
         primlepton_labels = self.get_param(data, 'primlepton_labels')
@@ -344,6 +343,8 @@ class SparseFASERCALDatasetSeg(Dataset):
         
         feats = q
         if self.training and np.random.rand() > 0.01:
+            self.voxelise(prim_vertex)
+
             # augmented event
             coords, feats, seg_labels, primlepton_labels = self._augment(coords, q, seg_labels, primlepton_labels, prim_vertex, round_coords=True)
 
