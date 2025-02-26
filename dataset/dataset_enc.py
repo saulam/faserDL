@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from utils import ini_argparse, random_rotation_saul
 import MinkowskiEngine as ME
 
+
 class SparseFASERCALDatasetEnc(Dataset):
     def __init__(self, args):
         """
@@ -125,11 +126,9 @@ class SparseFASERCALDatasetEnc(Dataset):
         )
         final_rotation_matrix = np.eye(3)
 
-        for axis in ['x', 'y', 'z']:  # Loop over each axis
-            if np.random.choice([False, True]):
-                angle = np.random.choice([0, 90, 180, 270])
-                print(axis, angle)
-                final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
+        for axis in ['x', 'y', 'z']:
+            angle = np.random.choice([0, 90, 180, 270])
+            final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
         translated_points = point_cloud - reference_point
         rotated_points = translated_points @ final_rotation_matrix.T
@@ -142,8 +141,8 @@ class SparseFASERCALDatasetEnc(Dataset):
     def _rotate(self, coords, momentum1, momentum2, prim_vertex):
         """Random rotation along"""
         angle_limits = torch.tensor([
-            [-torch.pi/8, -torch.pi/8, -torch.pi],  # Min angles for X, Y, Z
-            [torch.pi/8, torch.pi/8,  torch.pi]   # Max angles for X, Y, Z
+            [-torch.pi/8, -torch.pi/8, -torch.pi],
+            [torch.pi/8, torch.pi/8,  torch.pi]
         ])
         if (angle_limits==0).all():
             # no rotation at all
@@ -464,7 +463,6 @@ class SparseFASERCALDatasetEnc(Dataset):
                 out_lepton_momentum_dir, jet_momentum_dir,
                 prim_vertex, round_coords=False
             )
-            #coords, feats, primlepton_labels, seg_labels, out_lepton_momentum_dir, jet_momentum_dir = self._augment(coords, feats, primlepton_labels, seg_labels, out_lepton_momentum_dir, jet_momentum_dir, prim_vertex, round_coords=False)
             primlepton_labels = self.add_gaussian_noise(primlepton_labels)
             seg_labels = self.add_gaussian_noise(seg_labels)
 
