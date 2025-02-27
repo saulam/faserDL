@@ -29,8 +29,8 @@ Z_POS = 6
 MODULE = 7
 ENERGY = 8
 
-MUONIC_PDGS = {-13, 13}
-ELECTROMAGNETIC_PDGS = {-11, 11, -15, 15, 22}
+MUONIC_PDGS = [-13, 13]
+ELECTROMAGNETIC_PDGS = [-11, 11, -15, 15, 22]
 
 def get_true_hits(tcal_event):
     """
@@ -161,7 +161,7 @@ def process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc):
         # Compute energy depositions
         m_edepo = matched_hits[np.isin(all_pdgs, MUONIC_PDGS), ENERGY].sum()
         e_edepo = matched_hits[np.isin(all_pdgs, ELECTROMAGNETIC_PDGS), ENERGY].sum()
-        h_edepo = matched_hits[~np.isin(all_pdgs, MUONIC_PDGS | ELECTROMAGNETIC_PDGS), ENERGY].sum()
+        h_edepo = matched_hits[~np.isin(all_pdgs, list(MUONIC_PDGS) + list(ELECTROMAGNETIC_PDGS)), ENERGY].sum()
         
         primlepton_labels[i] = contains_primary_lepton(matched_hits, out_lepton_pdg, is_cc)
         seg_labels[i] = [0, m_edepo + e_edepo, h_edepo]
