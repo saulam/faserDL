@@ -6,3 +6,4 @@ lightning_logs/
 core
 notebooks/
 checkpoint*/
+*db

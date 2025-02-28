@@ -1,9 +1,16 @@
-#!pip install matplotlib
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description: script to generate metadata.
+"""
+
+
 from tqdm.notebook import tqdm
 import torch
 import os
 import numpy as np
-#import MinkowskiEngine as ME
 from glob import glob
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
@@ -21,7 +28,6 @@ class SparseFASERCALDataset(Dataset):
         self.data_files = self.processed_file_names
         self.train = False
         self.total_events = self.__len__
-        self.charge_range = (0.5, 389.8885154724121)
 
     @property
     def processed_dir(self):
@@ -108,14 +114,14 @@ class SparseFASERCALDataset(Dataset):
         reco_hits_true = data['reco_hits_true']
         true_hits = data['true_hits']
         reco_hits = data['reco_hits']
-        evis = data['evis'].item()
-        ptmiss = data['ptmiss'].item()
-        rearcal_energydeposit = data['rearcal_energydeposit'].item()
-        rearhcal_energydeposit = data['rearhcal_energydeposit'].item()
-        rearmucal_energydeposit = data['rearmucal_energydeposit'].item()
-        fasercal_energydeposit = data['fasercal_energydeposit'].item()
-        rearhcalmodules = data['rearhcalmodules']
-        fasercalmodules = data['fasercalmodules']
+        e_vis = data['e_vis'].item()
+        pt_miss = data['pt_miss'].item()
+        rear_cal_energy = data['rear_cal_energy'].item()
+        rear_hcal_modules = data['rear_hcal_modules'].item()
+        rear_mucal_energy = data['rear_mucal_energy'].item()
+        faser_cal_energy = data['faser_cal_energy'].item()
+        rear_hcal_modules = data['rear_hcal_modules']
+        faser_cal_modules = data['faser_cal_modules']
         out_lepton_momentum = data['out_lepton_momentum']
         out_lepton_energy = data['out_lepton_energy'].item()
         jet_momentum = data['jet_momentum']
@@ -125,13 +131,13 @@ class SparseFASERCALDataset(Dataset):
             print(f"File '{idx}' has been deleted successfully.")
             aux = np.array([])
             return {"pdg": aux, "x": aux, "y": aux, "z": aux.reshape(0, 2), "q": aux,
-                    "evis": aux, "ptmiss": aux,
-                    "rearcal_energydeposit": aux,
-                    "rearhcal_energydeposit": aux,
-                    "rearmucal_energydeposit": aux,
-                    "fasercal_energydeposit": aux,
-                    "rearhcalmodules": aux,
-                    "fasercalmodules": aux,
+                    "e_vis": aux, "pt_miss": aux,
+                    "rear_cal_energy": aux,
+                    "rear_hcal_modules": aux,
+                    "rear_mucal_energy": aux,
+                    "faser_cal_energy": aux,
+                    "rear_hcal_modules": aux,
+                    "faser_cal_modules": aux,
                     "out_lepton_momentum": aux.reshape(0, 3),
                     "out_lepton_energy": aux,
                     "jet_momentum": aux.reshape(0, 3),
@@ -147,12 +153,12 @@ class SparseFASERCALDataset(Dataset):
         z = np.unique(np.stack((data['reco_hits'][:, 2], data['reco_hits'][:, 3]), axis=1), axis=0)
         #q = np.log(data['reco_hits'][:, 4])
         q = data['reco_hits'][:, 4]
-        evis = np.array([evis])
-        ptmiss = np.array([ptmiss])
-        rearcal_energydeposit = np.array([rearcal_energydeposit])
-        rearhcal_energydeposit = np.array([rearhcal_energydeposit])
-        rearmucal_energydeposit = np.array([rearmucal_energydeposit])
-        fasercal_energydeposit = np.array([fasercal_energydeposit])
+        e_vis = np.array([e_vis])
+        pt_miss = np.array([pt_miss])
+        rear_cal_energy = np.array([rear_cal_energy])
+        rear_hcal_modules = np.array([rear_hcal_modules])
+        rear_mucal_energy = np.array([rear_mucal_energy])
+        faser_cal_energy = np.array([faser_cal_energy])
         out_lepton_momentum = out_lepton_momentum.reshape(1, 3)
         out_lepton_energy = np.array([out_lepton_energy])
         jet_momentum = jet_momentum.reshape(1, 3)
@@ -161,13 +167,13 @@ class SparseFASERCALDataset(Dataset):
             print(idx)
             assert False
 
-        return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, "evis": evis, "ptmiss": ptmiss,
-                "rearcal_energydeposit": rearcal_energydeposit,
-                "rearhcal_energydeposit": rearhcal_energydeposit,
-                "rearmucal_energydeposit": rearmucal_energydeposit,
-                "fasercal_energydeposit": fasercal_energydeposit,
-                "rearhcalmodules": rearhcalmodules,
-                "fasercalmodules": fasercalmodules,
+        return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, "e_vis": e_vis, "pt_miss": pt_miss,
+                "rear_cal_energy": rear_cal_energy,
+                "rear_hcal_modules": rear_hcal_modules,
+                "rear_mucal_energy": rear_mucal_energy,
+                "faser_cal_energy": faser_cal_energy,
+                "rear_hcal_modules": rear_hcal_modules,
+                "faser_cal_modules": faser_cal_modules,
                 "out_lepton_momentum": out_lepton_momentum,
                 "out_lepton_energy": out_lepton_energy,
                 "jet_momentum": jet_momentum
@@ -181,25 +187,25 @@ def collate(batch):
     y = np.unique(np.concatenate([x['y'] for x in batch]))
     z = np.unique(np.concatenate([x['z'] for x in batch]), axis=0)
     q = np.concatenate([x['q'] for x in batch])
-    evis = np.concatenate([x['evis'] for x in batch])
-    ptmiss = np.concatenate([x['ptmiss'] for x in batch])
-    rearcal_energydeposit = np.concatenate([x['rearcal_energydeposit'] for x in batch])
-    rearhcal_energydeposit = np.concatenate([x['rearhcal_energydeposit'] for x in batch])
-    rearmucal_energydeposit = np.concatenate([x['rearmucal_energydeposit'] for x in batch])
-    fasercal_energydeposit = np.concatenate([x['fasercal_energydeposit'] for x in batch])
-    rearhcalmodules = np.concatenate([x['rearhcalmodules'] for x in batch])
-    fasercalmodules = np.concatenate([x['fasercalmodules'] for x in batch])
+    e_vis = np.concatenate([x['e_vis'] for x in batch])
+    pt_miss = np.concatenate([x['pt_miss'] for x in batch])
+    rear_cal_energy = np.concatenate([x['rear_cal_energy'] for x in batch])
+    rear_hcal_modules = np.concatenate([x['rear_hcal_modules'] for x in batch])
+    rear_mucal_energy = np.concatenate([x['rear_mucal_energy'] for x in batch])
+    faser_cal_energy = np.concatenate([x['faser_cal_energy'] for x in batch])
+    rear_hcal_modules = np.concatenate([x['rear_hcal_modules'] for x in batch])
+    faser_cal_modules = np.concatenate([x['faser_cal_modules'] for x in batch])
     out_lepton_momentum = np.concatenate([x['out_lepton_momentum'] for x in batch])
     out_lepton_energy = np.concatenate([x['out_lepton_energy'] for x in batch])
     jet_momentum = np.concatenate([x['jet_momentum'] for x in batch])
     
-    return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, "evis": evis, "ptmiss": ptmiss,
-            "rearcal_energydeposit": rearcal_energydeposit,
-            "rearhcal_energydeposit": rearhcal_energydeposit,
-            "rearmucal_energydeposit": rearmucal_energydeposit,
-            "fasercal_energydeposit": fasercal_energydeposit,
-            "rearhcalmodules": rearhcalmodules,
-            "fasercalmodules": fasercalmodules,
+    return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, "e_vis": e_vis, "pt_miss": pt_miss,
+            "rear_cal_energy": rear_cal_energy,
+            "rear_hcal_modules": rear_hcal_modules,
+            "rear_mucal_energy": rear_mucal_energy,
+            "faser_cal_energy": faser_cal_energy,
+            "rear_hcal_modules": rear_hcal_modules,
+            "faser_cal_modules": faser_cal_modules,
             "out_lepton_momentum": out_lepton_momentum,
             "out_lepton_energy": out_lepton_energy,
             "jet_momentum": jet_momentum
@@ -212,14 +218,14 @@ x = []
 y = []
 z = []
 q = []
-evis = []
-ptmiss = []
-rearcal_energydeposit = []
-rearhcal_energydeposit = []
-rearmucal_energydeposit = []
-fasercal_energydeposit = []
-rearhcalmodules = []
-fasercalmodules = []
+e_vis = []
+pt_miss = []
+rear_cal_energy = []
+rear_hcal_modules = []
+rear_mucal_energy = []
+faser_cal_energy = []
+rear_hcal_modules = []
+faser_cal_modules = []
 out_lepton_momentum = []
 out_lepton_energy = []
 jet_momentum = []
@@ -231,14 +237,14 @@ for i, batch in t:
     y.append(batch["y"])
     z.append(batch["z"])
     q.append(batch["q"])
-    evis.append(batch["evis"])
-    ptmiss.append(batch["ptmiss"])
-    rearcal_energydeposit.append(batch["rearcal_energydeposit"])
-    rearhcal_energydeposit.append(batch["rearhcal_energydeposit"])
-    rearmucal_energydeposit.append(batch["rearmucal_energydeposit"])
-    fasercal_energydeposit.append(batch["fasercal_energydeposit"])
-    rearhcalmodules.append(batch["rearhcalmodules"])
-    fasercalmodules.append(batch["fasercalmodules"])
+    e_vis.append(batch["e_vis"])
+    pt_miss.append(batch["pt_miss"])
+    rear_cal_energy.append(batch["rear_cal_energy"])
+    rear_hcal_modules.append(batch["rear_hcal_modules"])
+    rear_mucal_energy.append(batch["rear_mucal_energy"])
+    faser_cal_energy.append(batch["faser_cal_energy"])
+    rear_hcal_modules.append(batch["rear_hcal_modules"])
+    faser_cal_modules.append(batch["faser_cal_modules"])
     out_lepton_momentum.append(batch["out_lepton_momentum"])
     out_lepton_energy.append(batch["out_lepton_energy"])
     jet_momentum.append(batch["jet_momentum"])
@@ -248,14 +254,14 @@ x = np.unique(np.concatenate(x))
 y = np.unique(np.concatenate(y))
 z = np.unique(np.concatenate(z), axis=0)
 q = np.concatenate(q)
-evis = np.concatenate(evis)
-ptmiss = np.concatenate(ptmiss)
-rearcal_energydeposit = np.concatenate(rearcal_energydeposit)
-rearhcal_energydeposit = np.concatenate(rearhcal_energydeposit)
-rearmucal_energydeposit = np.concatenate(rearmucal_energydeposit)
-fasercal_energydeposit = np.concatenate(fasercal_energydeposit)
-rearhcalmodules = np.concatenate(rearhcalmodules)
-fasercalmodules = np.concatenate(fasercalmodules)
+e_vis = np.concatenate(e_vis)
+pt_miss = np.concatenate(pt_miss)
+rear_cal_energy = np.concatenate(rear_cal_energy)
+rear_hcal_modules = np.concatenate(rear_hcal_modules)
+rear_mucal_energy = np.concatenate(rear_mucal_energy)
+faser_cal_energy = np.concatenate(faser_cal_energy)
+rear_hcal_modules = np.concatenate(rear_hcal_modules)
+faser_cal_modules = np.concatenate(faser_cal_modules)
 out_lepton_momentum = np.concatenate(out_lepton_momentum)
 out_lepton_energy = np.concatenate(out_lepton_energy)
 jet_momentum = np.concatenate(jet_momentum)
@@ -272,20 +278,20 @@ hadronic_pdg = [x for x in hadronic_pdg if x not in muonic_pdg]
 hadronic_pdg = [x for x in hadronic_pdg if x not in electromagnetic_pdg]
 
 dic = {'x': x, 'y': y, 'z': z,
-       'rearcal_energydeposit': get_dict(rearcal_energydeposit),
-       'rearhcal_energydeposit': get_dict(rearhcal_energydeposit),
-       'rearmucal_energydeposit': get_dict(rearmucal_energydeposit),
-       'fasercal_energydeposit': get_dict(fasercal_energydeposit),
-       'rearhcalmodules': get_dict(rearhcalmodules),
-       'fasercalmodules': get_dict(fasercalmodules),
+       'rear_cal_energy': get_dict(rear_cal_energy),
+       'rear_hcal_modules': get_dict(rear_hcal_modules),
+       'rear_mucal_energy': get_dict(rear_mucal_energy),
+       'faser_cal_energy': get_dict(faser_cal_energy),
+       'rear_hcal_modules': get_dict(rear_hcal_modules),
+       'faser_cal_modules': get_dict(faser_cal_modules),
        'out_lepton_momentum': get_dict(out_lepton_momentum),
        'out_lepton_momentum_magnitude': get_dict(out_lepton_momentum_magnitude),
        'out_lepton_energy': get_dict(out_lepton_energy),
        'jet_momentum': get_dict(jet_momentum),
        'jet_momentum_magnitude': get_dict(jet_momentum_magnitude),
        'q': get_dict(q),
-       'evis': get_dict(evis),
-       'ptmiss': get_dict(ptmiss),
+       'e_vis': get_dict(e_vis),
+       'pt_miss': get_dict(pt_miss),
        'ghost_pdg': set(ghost_pdg),
        'muonic_pdg': set(muonic_pdg), 
        'electromagnetic_pdg': set(electromagnetic_pdg),

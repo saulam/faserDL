@@ -1,0 +1,1 @@
+pip install torchvision==0.13.1 --no-deps

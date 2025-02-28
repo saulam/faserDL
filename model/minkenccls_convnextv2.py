@@ -1,3 +1,12 @@
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description: PyTorch model - stage 2: flavour classification.
+"""
+
+
 import torch
 import torch.nn as nn
 from torch.optim import SGD

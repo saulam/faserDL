@@ -1,3 +1,12 @@
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description: PyTorch model - stage 1: semantic segmentation.
+"""
+
+
 import numpy as np
 import torch
 import torch.nn as nn

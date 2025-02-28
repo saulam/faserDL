@@ -1,9 +1,9 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 09.24
+Date: 01.25
 
-Description: Training script.
+Description: Optuna hyperparameter optimisation (needs update).
 """
 
 

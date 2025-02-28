@@ -4,9 +4,9 @@
 dataset_path="/raid/monsals/faser/events_v3.5"
 sets_path="/raid/monsals/faser/events_v3.5/sets.pkl"
 eps=1e-12
-batch_size=6
+batch_size=4
 epochs=50
-num_workers=16
+num_workers=4
 lr=2e-4
 accum_grad_batches=1
 warmup_steps=1
@@ -16,15 +16,16 @@ beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
 save_dir="/raid/monsals/faser/logs_final"
-name="enc_cls_v1"
+name="enc_remove"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/raid/monsals/faser/checkpoints_final"
-checkpoint_name="enc_cls_v1"
-gpus=(0)
+checkpoint_name="enc_remove"
+gpus=(2 3)
 
 python -m train.train_enc_cls \
     --train \
+    --stage2 \
     --load_seg \
     --dataset_path $dataset_path \
     --sets_path $sets_path \

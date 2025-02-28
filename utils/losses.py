@@ -1,3 +1,13 @@
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description:
+    Custom loss functions.
+"""
+
+
 import torch
 from torch.nn import functional as F
 

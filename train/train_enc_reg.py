@@ -1,9 +1,9 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 09.24
+Date: 01.25
 
-Description: Training script.
+Description: Training script - stage 2: regression tasks.
 """
 
 
@@ -12,7 +12,7 @@ import torch
 import pytorch_lightning as pl
 from functools import partial
 from utils import CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
-from dataset import SparseFASERCALDatasetEnc
+from dataset import SparseFASERCALDataset
 from model import MinkEncRegConvNeXtV2, SparseEncRegLightningModel
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
@@ -46,7 +46,7 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
  
     # Dataset
-    dataset = SparseFASERCALDatasetEnc(args)
+    dataset = SparseFASERCALDataset(args)
     print("- Dataset size: {} events".format(len(dataset)))
     
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3]) 
@@ -82,8 +82,8 @@ def main():
     # Initialize PyTorch Lightning trainer
     trainer = pl.Trainer(
         #num_sanity_val_steps=0,
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm='norm',
+        #gradient_clip_val=1.0,
+        #gradient_clip_algorithm='value',
         max_epochs=args.epochs,
         callbacks=callbacks,
         accelerator="gpu",

@@ -1,3 +1,13 @@
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description:
+    Auxiliary functions definitions.
+"""
+
+
 import copy
 import pickle as pkl
 import numpy as np
@@ -76,134 +86,47 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
 
 
 def collate_test(batch):
-    coords = [d['coords'] for d in batch]
-    feats = torch.cat([d['feats'] for d in batch])
-    feats_global = torch.stack([d['feats_global'] for d in batch])
-
     ret = {
-        'f': feats,
-        'f_glob': feats_global,
-        'c': coords,
+        'f': torch.cat([d['feats'] for d in batch]),
+        'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        'c': [d['coords'] for d in batch],
     }
-
-    if 'prim_vertex' in batch[0]:
-        prim_vertex = [d['prim_vertex'] for d in batch]
-        ret['prim_vertex'] = prim_vertex
-
-    if 'in_neutrino_pdg' in batch[0]:
-        in_neutrino_pdg = [d['in_neutrino_pdg'] for d in batch]
-        ret['in_neutrino_pdg'] = in_neutrino_pdg
-
-    if 'in_neutrino_energy' in batch[0]:
-        in_neutrino_energy = [d['in_neutrino_energy'] for d in batch]
-        ret['in_neutrino_energy'] = in_neutrino_energy
-
-    if 'primlepton_labels' in batch[0]:
-        primlepton_labels = [d['primlepton_labels'].numpy() for d in batch]
-        ret['primlepton_labels'] = primlepton_labels
-
-    if 'seg_labels' in batch[0]:
-        seg_labels = [d['seg_labels'].numpy() for d in batch]
-        ret['seg_labels'] = seg_labels
-
-    if 'flavour_label' in batch[0]:
-        flavour_label = [d['flavour_label'].unsqueeze(0).numpy() for d in batch]
-        ret['flavour_label'] = flavour_label
-
-    if 'evis' in batch[0]:
-        evis = [d['evis'].item() for d in batch]
-        ret['evis'] = evis
-
-    if 'ptmiss' in batch[0]:
-        ptmiss = [d['ptmiss'].item() for d in batch]
-        ret['ptmiss'] = ptmiss
-
-    if 'out_lepton_momentum_mag' in batch[0]:
-        out_lepton_momentum_mag = [d['out_lepton_momentum_mag'] for d in batch]
-        ret['out_lepton_momentum_mag'] = out_lepton_momentum_mag
-
-    if 'out_lepton_momentum_dir' in batch[0]:
-        out_lepton_momentum_dir = [d['out_lepton_momentum_dir'] for d in batch]
-        ret['out_lepton_momentum_dir'] = out_lepton_momentum_dir
-
-    if 'jet_momentum_mag' in batch[0]:
-        jet_momentum_mag = [d['jet_momentum_mag'] for d in batch]
-        ret['jet_momentum_mag'] = jet_momentum_mag
-
-    if 'jet_momentum_dir' in batch[0]:
-        jet_momentum_dir = [d['jet_momentum_dir'] for d in batch]
-        ret['jet_momentum_dir'] = jet_momentum_dir
-
+    
+    optional_keys = [
+        'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
+        'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
+        'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
+        'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
+    ]
+    
+    for key in optional_keys:
+        if key in batch[0]:
+            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'flavour_label']
+                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss']
+                        else [d[key] for d in batch])
+    
     return ret
 
 
 def collate_sparse_minkowski(batch):
-    coords = [d['coords'] for d in batch]
-    feats = torch.cat([d['feats'] for d in batch])
-    feats_global = torch.stack([d['feats_global'] for d in batch])
-
     ret = {
-        'f': feats,
-        'f_glob': feats_global,
-        'c': coords,
+        'f': torch.cat([d['feats'] for d in batch]),
+        'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        'c': [d['coords'] for d in batch],
     }
-
-    if 'prim_vertex' in batch[0]:
-        prim_vertex = [d['prim_vertex'] for d in batch]
-        ret['prim_vertex'] = prim_vertex
-
-    if 'in_neutrino_pdg' in batch[0]:
-        in_neutrino_pdg = [d['in_neutrino_pdg'] for d in batch]
-        ret['in_neutrino_pdg'] = in_neutrino_pdg
-
-    if 'in_neutrino_energy' in batch[0]:
-        in_neutrino_energy = [d['in_neutrino_energy'] for d in batch]
-        ret['in_neutrino_energy'] = in_neutrino_energy
-
-    if 'y' in batch[0]:
-        y = torch.cat([d['labels'] for d in batch])
-        ret['y'] = y
-
-    if 'primlepton_labels' in batch[0]:
-        primlepton_labels = torch.cat([d['primlepton_labels'] for d in batch])
-        ret['primlepton_labels'] = primlepton_labels
-
-    if 'seg_labels' in batch[0]:
-        seg_labels = torch.cat([d['seg_labels'] for d in batch])
-        ret['seg_labels'] = seg_labels
-
-    if 'flavour_label' in batch[0]:
-        flavour_label = torch.cat([d['flavour_label'] for d in batch])
-        ret['flavour_label'] = flavour_label
-
-    if 'evis' in batch[0]:
-        evis = torch.cat([d['evis'] for d in batch])
-        ret['evis'] = evis
-
-    if 'ptmiss' in batch[0]:
-        ptmiss = torch.cat([d['ptmiss'] for d in batch])
-        ret['ptmiss'] = ptmiss
-
-    if 'out_lepton_momentum_mag' in batch[0]:
-        out_lepton_momentum_mag = torch.stack([d['out_lepton_momentum_mag'] for d in batch])
-        ret['out_lepton_momentum_mag'] = out_lepton_momentum_mag
-
-    if 'out_lepton_momentum_dir' in batch[0]:
-        out_lepton_momentum_dir = torch.stack([d['out_lepton_momentum_dir'] for d in batch])
-        ret['out_lepton_momentum_dir'] = out_lepton_momentum_dir
-
-    if 'jet_momentum_mag' in batch[0]:
-        jet_momentum_mag = torch.stack([d['jet_momentum_mag'] for d in batch])
-        ret['jet_momentum_mag'] = jet_momentum_mag
-
-    if 'jet_momentum_dir' in batch[0]:
-        jet_momentum_dir = torch.stack([d['jet_momentum_dir'] for d in batch])
-        ret['jet_momentum_dir'] = jet_momentum_dir
-
-    if 'global_feats' in batch[0]:
-        global_labels = torch.stack([d['global_feats'] for d in batch])
-        ret['global_feats'] = global_labels
-
+    
+    optional_keys = {
+        'primlepton_labels', 'seg_labels', 'flavour_label',
+        'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
+        'jet_momentum_mag', 'jet_momentum_dir',
+    }
+    
+    for key in optional_keys:
+        if key in batch[0]:
+            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'flavour_label', 'e_vis', 'pt_miss']
+                        else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_mag', 'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir']
+                        else [d[key] for d in batch])
+    
     return ret
 
 
@@ -217,24 +140,21 @@ def arrange_sparse_minkowski(data, device):
 
     return tensor, tensor_global
 
-
 def arrange_truth(data):
-    output = {'coords': [x.detach().cpu().numpy() for x in data['c']],
-              'prim_vertex': data['prim_vertex'],
-              'in_neutrino_pdg': data['in_neutrino_pdg'],
-              'in_neutrino_energy': data['in_neutrino_energy'],
-              'primlepton_labels': data['primlepton_labels'] if 'primlepton_labels' in data else None,
-              'seg_labels': data['seg_labels'] if 'seg_labels' in data else None,
-              'flavour_label': data['flavour_label'],
-              'evis': data['evis'],
-              'ptmiss': data['ptmiss'],
-              'out_lepton_momentum_mag': data['out_lepton_momentum_mag'] if 'out_lepton_momentum_mag' in data else None,
-              'out_lepton_momentum_dir': data['out_lepton_momentum_dir'] if 'out_lepton_momentum_dir' in data else None,
-              'jet_momentum_mag': data['jet_momentum_mag'] if 'jet_momentum_mag' in data else None,
-              'jet_momentum_dir': data['jet_momentum_dir'] if 'jet_momentum_dir' in data else None,
-             }
+    output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}
+    
+    optional_keys = [
+        'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
+        'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
+        'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
+        'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
+    ]
+    
+    for key in optional_keys:
+        if key in data:
+            output[key] = data[key]
+    
     return output
-
 
 def argsort_coords(coordinates):
     # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
@@ -336,8 +256,8 @@ class CombinedScheduler(_LRScheduler):
             'start_cosine_step': self.start_cosine_step,
             'step_num': self.step_num,
             'lr_decay': self.lr_decay,
-            'scheduler1': self.scheduler1.state_dict(),
-            'scheduler2': self.scheduler2.state_dict()
+            'scheduler1': self.scheduler1.state_dict() if self.scheduler1 else None,
+            'scheduler2': self.scheduler2.state_dict() if self.scheduler2 else None,
         }
 
     def load_state_dict(self, state_dict):
@@ -346,6 +266,8 @@ class CombinedScheduler(_LRScheduler):
         self.start_cosine_step = state_dict['start_cosine_step']
         self.step_num = state_dict['step_num']
         self.lr_decay = state_dict['lr_decay']
-        self.scheduler1.load_state_dict(state_dict['scheduler1'])
-        self.scheduler2.load_state_dict(state_dict['scheduler2'])
+        if self.scheduler1:
+            self.scheduler1.load_state_dict(state_dict['scheduler1'])
+        if self.scheduler2:
+            self.scheduler2.load_state_dict(state_dict['scheduler2'])
 

@@ -1,3 +1,12 @@
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description: PyTorch Lightning model - stage 1: semantic segmentation.
+"""
+
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,7 +20,6 @@ class SparseSegLightningModel(pl.LightningModule):
         super(SparseSegLightningModel, self).__init__()
 
         self.model = model
-        self.sigmoid = args.sigmoid
         self.loss_primlepton = nn.BCEWithLogitsLoss()
         self.loss_seg= nn.CrossEntropyLoss() 
         self.warmup_steps = args.warmup_steps
@@ -21,9 +29,6 @@ class SparseSegLightningModel(pl.LightningModule):
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
-        self.contrastive = args.contrastive
-        self.finetuning = args.finetuning
-        self.chunk_size = args.chunk_size
 
 
     def on_train_start(self):
@@ -36,29 +41,29 @@ class SparseSegLightningModel(pl.LightningModule):
         train_loader = self.trainer.train_dataloader
         if isinstance(train_loader.dataset, CombinedDataset):
             if getattr(train_loader.dataset.datasets, "dataset", None) is not None:
-                train_loader.dataset.datasets.dataset.set_training_mode(True)
+                train_loader.dataset.datasets.dataset.set_augmentations_on()
             else:
-                train_loader.dataset.datasets.set_training_mode(True)
+                train_loader.dataset.datasets.set_augmentations_on()
         else:
-            train_loader.dataset.set_training_mode(True)
+            train_loader.dataset.set_augmentations_on()
 
 
     def on_validation_epoch_start(self):
         """Hook to be called at the start of each validation epoch."""
         val_loader = self.trainer.val_dataloaders[0]
         if getattr(val_loader.dataset, "dataset", None) is not None:
-            val_loader.dataset.dataset.set_training_mode(False)
+            val_loader.dataset.dataset.set_augmentations_off()
         else:
-            val_loader.dataset.set_training_mode(False)
+            val_loader.dataset.set_augmentations_off()
 
 
     def on_test_epoch_start(self):
         """Hook to be called at the start of each test epoch."""
         test_loader = self.trainer.test_dataloaders[0]
         if getattr(val_loader.dataset, "dataset", None) is not None:
-            test_loader.dataset.dataset.set_training_mode(False)
+            test_loader.dataset.dataset.set_augmentations_off()
         else:
-            test_loader.dataset.set_training_mode(False)
+            test_loader.dataset.set_augmentations_off()
  
 
     def forward(self, x, x_glob):

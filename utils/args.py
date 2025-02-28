@@ -1,7 +1,7 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 09.24
+Date: 01.25
 
 Description:
     Arguments.
@@ -16,20 +16,8 @@ def ini_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", default=True, help="set if training")
     parser.add_argument("--test", action="store_false", dest="train", help="set if testing")
-    parser.add_argument("--sigmoid", action="store_true", default=True, help="set if sigmoid (binary-class)")
-    parser.add_argument("--softmax", action="store_false", dest="sigmoid", help="set if softmax (multi-class) ")
-    parser.add_argument("--glob", action="store_true", default=True, help="if to use rearCal info for classification")
-    parser.add_argument("--contrastive", action="store_true", default=False, help="set if contrastive learning")
-    parser.add_argument("--finetuning", action="store_true", default=False, help="set if fine-tune a pre-trained contrastive model")
-    parser.add_argument("--pretrained_path", type=str, default="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints/v1/last.ckpt", help="Contrastive pretrained model path")
-    parser.add_argument("--unfreeze_at_epoch", type=int, default=1, help="epoch to start unfreezing the model weights if fine-tuning")
-    parser.add_argument("--gradual_unfreeze_steps", type=int, default=1, help="layers to unfreeze at once if fine-tuning")
-    parser.add_argument("--lr_factor", type=float, default=0.1, help="factor to multiply the learning rate of unfrozen layers if fine-tuning")
-    parser.add_argument("--unfreeze_all", action="store_true", default=False, help="set if all layers should be unfrozen at once if fine-tuning")
-    parser.add_argument('--label_weights', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
-                        default=None,  # Default list
-                        help='label weights for loss computation'
-                        )
+    parser.add_argument("--stage1", action="store_true", default=True, help="set if stage 1 (voxel tagging)")
+    parser.add_argument("--stage2", action="store_false", dest="stage1", help="set if stage 2 (flavour/regression)")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
     parser.add_argument("--sets_path", type=str, default=None, help="Path of pickle file with training/val/test splits")
     parser.add_argument("--load_seg", action="store_true", default=False, help="Whether to load results from segmentation network.")

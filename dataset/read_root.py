@@ -1,4 +1,12 @@
-#!pip install uproot
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description: script to generate numpy files.
+"""
+
+
 from ROOT import TFile, TTree, std
 import ROOT
 import glob

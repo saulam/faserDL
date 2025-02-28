@@ -1,3 +1,12 @@
+"""
+Author: Dr. Saul Alonso-Monsalve
+Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
+Date: 01.25
+
+Description: PyTorch model - stage 2: regression tasks.
+"""
+
+
 import torch
 import torch.nn as nn
 from torch.optim import SGD
@@ -99,7 +108,7 @@ class MinkEncRegConvNeXtV2(nn.Module):
 
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
-        self.evis_head = nn.Sequential(
+        self.e_vis_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
             MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
@@ -107,7 +116,7 @@ class MinkEncRegConvNeXtV2(nn.Module):
             MinkowskiLinear(dims[-1]//4, 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         ) 
-        self.ptmiss_head = nn.Sequential(
+        self.pt_miss_head = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]//2),
             MinkowskiLeakyReLU(0.1),
             MinkowskiLinear(dims[-1]//2, dims[-1]//4),
@@ -172,15 +181,15 @@ class MinkEncRegConvNeXtV2(nn.Module):
         
         # event predictions
         x_pooled = self.global_pool(x)
-        out_evis = self.evis_head(x_pooled)
-        out_ptmiss = self.ptmiss_head(x_pooled)
+        out_e_vis = self.e_vis_head(x_pooled)
+        out_pt_miss = self.pt_miss_head(x_pooled)
         out_lepton_momentum_mag = self.out_lepton_momentum_mag_head(x_pooled)
         out_lepton_momentum_dir = self.out_lepton_momentum_dir_head(x_pooled)
         out_jet_momentum_mag = self.jet_momentum_mag_head(x_pooled)
         out_jet_momentum_dir = self.jet_momentum_dir_head(x_pooled)
 
-        output = {"out_evis": out_evis.F,
-                  "out_ptmiss": out_ptmiss.F,
+        output = {"out_e_vis": out_e_vis.F,
+                  "out_pt_miss": out_pt_miss.F,
                   "out_lepton_momentum_mag": out_lepton_momentum_mag.F,
                   "out_lepton_momentum_dir": out_lepton_momentum_dir.F,
                   "out_jet_momentum_mag": out_lepton_momentum_mag.F,
