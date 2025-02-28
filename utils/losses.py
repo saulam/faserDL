@@ -86,7 +86,7 @@ class SphericalAngularLoss(torch.nn.Module):
         Returns:
             torch.Tensor: The computed loss.
         """
-        mask = torch.all(target != 0, dim=1)
+        mask = ~torch.all(target == 0, dim=1)
 
         pred_norm = torch.nn.functional.normalize(pred, dim=-1, eps=self.eps)
         target_norm = torch.nn.functional.normalize(target, dim=-1, eps=self.eps)
