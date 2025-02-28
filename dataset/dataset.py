@@ -393,7 +393,8 @@ class SparseFASERCALDataset(Dataset):
         
         # ptmiss
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
-        
+        pt_miss = self.divide_by_std(pt_miss, 'pt_miss')
+
         # output
         output = {}
         if not self.train:
