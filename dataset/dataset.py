@@ -347,9 +347,9 @@ class SparseFASERCALDataset(Dataset):
         seg_labels = self.get_param(data, 'seg_labels')
         if self.load_seg:
             # load labels from pretrained model predictions
-            file_name = self.data_files[idx].replace("events_v3.5_sample", "events_v3.5_seg_results")
+            file_name = self.data_files[idx].replace("events_v3.5", "events_v3.5_seg_results")
             predictions = np.load(file_name)
-            primlepton_labels_pred, seg_labels_pred = predictions['primlepton_labels'], predictions['seg_labels']
+            primlepton_labels_pred, seg_labels_pred = predictions['out_primlepton'], predictions['out_seg']
             
             # convert electromagnetic and hadronic probabilities to energy desposits (using truth info)
             seg_labels_pred[:, 1:] *= (seg_labels[:, 1:].sum(axis=1, keepdims=True) + 1e-8)            
