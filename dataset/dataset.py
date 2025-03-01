@@ -387,8 +387,9 @@ class SparseFASERCALDataset(Dataset):
             # merge duplicated coordinates and finalise with augmentations
             coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
             seg_labels = self.normalise_seg_labels(seg_labels)
-            primlepton_labels = add_gaussian_noise(primlepton_labels)
-            seg_labels = add_gaussian_noise(seg_labels)
+            if not self.stage1:
+                primlepton_labels = add_gaussian_noise(primlepton_labels, shuffle_prob=0.)
+                seg_labels = add_gaussian_noise(seg_labels, shuffle_prob=0.)
             feats_global = add_noise_global_params(feats_global)
         
         # ptmiss
