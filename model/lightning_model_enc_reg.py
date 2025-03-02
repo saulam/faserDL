@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import MAPE, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 from pytorch_lightning.trainer.supporters import CombinedDataset
 
 
@@ -20,12 +20,12 @@ class SparseEncRegLightningModel(pl.LightningModule):
         super(SparseEncRegLightningModel, self).__init__()
 
         self.model = model
-        self.loss_evis = MAPE()
-        self.loss_ptmiss = MAPE()
-        self.loss_lepton_momentum_mag = MAPE()
-        self.loss_lepton_momentum_dir = SphericalAngularLoss()
-        self.loss_jet_momentum_mag = MAPE()
-        self.loss_jet_momentum_dir = SphericalAngularLoss()
+        self.loss_evis = nn.MSELoss()  #MAPE()
+        self.loss_ptmiss = nn.MSELoss()  #MAPE()
+        self.loss_lepton_momentum_mag = nn.MSELoss() #MAPE()
+        self.loss_lepton_momentum_dir = CosineLoss()  #SphericalAngularLoss()
+        self.loss_jet_momentum_mag = nn.MSELoss()  #MAPE()
+        self.loss_jet_momentum_dir = CosineLoss()  #SphericalAngularLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -96,6 +96,13 @@ class SparseEncRegLightningModel(pl.LightningModule):
         targ_lepton_momentum_dir = target['out_lepton_momentum_dir']
         targ_jet_momentum_mag = target['jet_momentum_mag']
         targ_jet_momentum_dir = target['jet_momentum_dir']
+
+        # Mask primary lepton momentum for NC events
+        mask = targ_lepton_momentum_mag.squeeze() > 0
+        out_lepton_momentum_mag = out_lepton_momentum_mag[mask]
+        out_lepton_momentum_dir = out_lepton_momentum_dir[mask]
+        targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask]
+        targ_lepton_momentum_dir = targ_lepton_momentum_dir[mask]
 
         # losses
         loss_e_vis = self.loss_evis(out_e_vis, targ_e_vis)

@@ -60,6 +60,55 @@ class MAPE(torch.nn.Module):
             return percentage_error  # No reduction
 
 
+class CosineLoss(torch.nn.Module):
+    """
+    Custom loss function that computes the cosine loss between predicted and target 3D vectors.
+    
+    The loss is defined as:
+        loss = 1 - cosine_similarity(pred, target)
+        
+    This loss emphasizes directional alignment by normalizing both vectors first.
+    
+    Args:
+        reduction (str): 'mean' (default) to average over the batch, or 'sum' for total loss.
+        eps (float): Small value to avoid division by zero in normalization.
+    """
+    def __init__(self, reduction='mean', eps=1e-6):
+        super(CosineLoss, self).__init__()
+        self.reduction = reduction
+        self.eps = eps
+
+    def forward(self, pred, target):
+        """
+        Computes the cosine loss given predicted and target 3D vectors.
+
+        Args:
+            pred (torch.Tensor): Predicted 3D vectors (batch_size, 3).
+            target (torch.Tensor): True 3D vectors (batch_size, 3).
+
+        Returns:
+            torch.Tensor: The computed loss.
+        """
+        mask = torch.any(target != 0, dim=1)
+        
+        pred_norm = F.normalize(pred, dim=-1, eps=self.eps)
+        target_norm = F.normalize(target, dim=-1, eps=self.eps)
+        
+        # Compute cosine similarity and convert to loss
+        cosine_similarity = F.cosine_similarity(pred_norm, target_norm, dim=-1)
+        cosine_loss = 1.0 - cosine_similarity
+        
+        cosine_loss = cosine_loss * mask.float()
+        
+        if self.reduction == 'mean':
+            valid_loss_count = mask.sum()
+            cosine_loss = cosine_loss.sum() / (valid_loss_count + self.eps)
+        elif self.reduction == 'sum':
+            cosine_loss = cosine_loss.sum()
+            
+        return cosine_loss
+
+
 class SphericalAngularLoss(torch.nn.Module):
     """
     Custom loss function that combines:
@@ -98,7 +147,6 @@ class SphericalAngularLoss(torch.nn.Module):
         angular_loss = torch.acos(dot_product)  # Returns angles in radians
         angular_loss = torch.nan_to_num(angular_loss, nan=0.0) * mask.float()
 
-        # Apply reduction method (default: mean)
         if self.reduction == 'mean':
             valid_loss_count = mask.sum()
             angular_loss = angular_loss.sum() / (valid_loss_count + self.eps)
