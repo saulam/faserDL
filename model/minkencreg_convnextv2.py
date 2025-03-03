@@ -192,8 +192,8 @@ class MinkEncRegConvNeXtV2(nn.Module):
                   "out_pt_miss": out_pt_miss.F,
                   "out_lepton_momentum_mag": out_lepton_momentum_mag.F,
                   "out_lepton_momentum_dir": out_lepton_momentum_dir.F,
-                  "out_jet_momentum_mag": out_lepton_momentum_mag.F,
-                  "out_jet_momentum_dir": out_lepton_momentum_dir.F,
+                  "out_jet_momentum_mag": out_jet_momentum_mag.F,
+                  "out_jet_momentum_dir": out_jet_momentum_dir.F,
                   }
         
         return output
