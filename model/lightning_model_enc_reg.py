@@ -20,12 +20,12 @@ class SparseEncRegLightningModel(pl.LightningModule):
         super(SparseEncRegLightningModel, self).__init__()
 
         self.model = model
-        self.loss_evis = nn.MSELoss()  #MAPE()
-        self.loss_ptmiss = nn.MSELoss()  #MAPE()
-        self.loss_lepton_momentum_mag = nn.MSELoss() #MAPE()
-        self.loss_lepton_momentum_dir = CosineLoss()  #SphericalAngularLoss()
-        self.loss_jet_momentum_mag = nn.MSELoss()  #MAPE()
-        self.loss_jet_momentum_dir = CosineLoss()  #SphericalAngularLoss()
+        self.loss_evis = MAPE()
+        self.loss_ptmiss = MAPE()
+        self.loss_lepton_momentum_mag = MAPE()
+        self.loss_lepton_momentum_dir = SphericalAngularLoss()
+        self.loss_jet_momentum_mag = MAPE()
+        self.loss_jet_momentum_dir = SphericalAngularLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
