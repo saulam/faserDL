@@ -15,12 +15,13 @@ import tqdm
 import argparse
 
 
-path = "/scratch2/salonso/faser/FASERCALDATA_v3.5/"
-true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v3.5/*")
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v3.5/*")
-output_dir = '/scratch2/salonso/faser/events_v3.5'
+version = "5.1"
+path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
+true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version))
+output_dir = '/scratch2/salonso/faser/events_v{}'.format(version)
 
-ROOT.gSystem.Load("/scratch5/FASER/V3.1/FASER/Python_io/lib/ClassesDict.so")
+ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
 
 # Placeholder for class objects
 tcal_event = ROOT.TcalEvent()
@@ -189,7 +190,24 @@ def divide_list_into_chunks(input_list, num_chunks=1):
         start = end
     
     return chunks
-    
+   
+def th2d_to_numpy(hist):
+    root_array = hist.GetArray()
+    n_bins_x = hist.GetNbinsX()
+    n_bins_y = hist.GetNbinsY()
+
+    # Convert the ROOT C-style array to a NumPy array, skipping the first bin (underflow)
+    np_array = np.frombuffer(root_array, dtype=np.float64, count=(n_bins_y + 2) * (n_bins_x + 2))
+
+    reshaped_array = np_array.reshape((n_bins_y + 2, n_bins_x + 2)).astype(np.float32)
+    final_array = reshaped_array[1:-1, 1:-1]
+
+    nonzero_indices = np.nonzero(final_array)
+    nonzero_values = final_array[nonzero_indices]
+    nonzero_coords_and_values = np.column_stack((nonzero_indices[0], nonzero_indices[1], nonzero_values))
+
+    return nonzero_coords_and_values
+ 
 def generate_events(number, chunks, disable):
     chunks = divide_list_into_chunks(reco_paths, num_chunks=chunks)
     chunk = chunks[number]
@@ -232,6 +250,13 @@ def generate_events(number, chunks, disable):
             xz_view = tporeco_event.Get2DViewXPS()
             yz_view = tporeco_event.Get2DViewYPS()
             z_view = tporeco_event.zviewPS
+            xz_proj = th2d_to_numpy(xz_view)
+            yz_proj = th2d_to_numpy(yz_view)
+            xy_projs = []
+            for layer in range(len(z_view)):
+                view = z_view[layer]
+                proj = th2d_to_numpy(view)
+                xy_projs.append(proj)
 
             # Extract track data
             tk_tracks = get_tracks(tporeco_event.fTKTracks)
@@ -242,7 +267,7 @@ def generate_events(number, chunks, disable):
             rear_hcal_energy = tporeco_event.rearCals.rearHCalDeposit
             rear_mucal_energy = tporeco_event.rearCals.rearMuCalDeposit
             rear_hcal_modules = np.zeros(9)
-            faser_cal_modules = np.zeros(15)
+            faser_cal_modules = np.zeros(10) 
             for module in tporeco_event.rearCals.rearHCalModule:
                 rear_hcal_modules[module.moduleID] = module.energyDeposit
             for module in tporeco_event.faserCals:
@@ -250,7 +275,6 @@ def generate_events(number, chunks, disable):
             faser_cal_energy = faser_cal_modules.sum()
 
             # Retrieve corresponding true event
-            po_event_address = ROOT.AddressOf(po_event)
             event_mask = 0
             tcal_event.Load_event(path, run_number, event_id, event_mask, po_event)
 
@@ -275,9 +299,9 @@ def generate_events(number, chunks, disable):
                 true_hits=true_hits,
                 reco_hits=reco_hits,
                 reco_hits_true=np.array(reco_hits_true, dtype=object),
-                #xz_proj = xz_proj,
-                #yz_proj = yz_proj,
-                #xy_projs = np.array(xy_projs, dtype=object),
+                xz_proj = xz_proj,
+                yz_proj = yz_proj,
+                xy_projs = np.array(xy_projs, dtype=object),
                 tk_tracks=np.array(tk_tracks, dtype=object),
                 ps_tracks=ps_tracks,
                 in_neutrino_pdg=in_neutrino_pdg,
