@@ -12,7 +12,8 @@ import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
 from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
-from pytorch_lightning.trainer.supporters import CombinedDataset
+# from pytorch_lightning.trainer.supporters import CombinedDataset  # WRONG
+from pytorch_lightning.utilities import CombinedLoader
 
 
 class SparseSegLightningModel(pl.LightningModule):
@@ -39,7 +40,7 @@ class SparseSegLightningModel(pl.LightningModule):
     def on_train_epoch_start(self):
         """Hook to be called at the start of each training epoch."""
         train_loader = self.trainer.train_dataloader
-        if isinstance(train_loader.dataset, CombinedDataset):
+        if isinstance(train_loader.dataset, CombinedLoader):
             if getattr(train_loader.dataset.datasets, "dataset", None) is not None:
                 train_loader.dataset.datasets.dataset.set_augmentations_on()
             else:
@@ -50,7 +51,7 @@ class SparseSegLightningModel(pl.LightningModule):
 
     def on_validation_epoch_start(self):
         """Hook to be called at the start of each validation epoch."""
-        val_loader = self.trainer.val_dataloaders[0]
+        val_loader = self.trainer.val_dataloaders #[0]
         if getattr(val_loader.dataset, "dataset", None) is not None:
             val_loader.dataset.dataset.set_augmentations_off()
         else:

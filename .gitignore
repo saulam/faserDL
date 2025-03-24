@@ -7,4 +7,5 @@ core
 notebooks/
 checkpoint*/
 Plots/
+Plotsv5_1/
 *db

@@ -80,8 +80,11 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 parser = ini_argparse()
 args = parser.parse_args()
 # args.dataset_path = "/scratch3/salonso/faser/events_v3.5" #spaceml4
-args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
-plot_folder = "/home/fcufino/faserDL/Plots"
+# args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
+
+args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
+
+plot_folder = "/home/fcufino/faserDL/Plotsv5_1"
 
 # Set GPU settings
 nb_gpus = len(args.gpus)
