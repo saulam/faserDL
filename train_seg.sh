@@ -1,12 +1,13 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/raid/monsals/faser/events_v3.5"
-sets_path="/raid/monsals/faser/events_v3.5/sets.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v3.5"
+sets_path="/scratch/salonso/sparse-nns/faser/events_v3.5/sets.pkl"
+
 eps=1e-12
-batch_size=4
+batch_size=32
 epochs=50
-num_workers=8
+num_workers=32
 lr=2e-4
 accum_grad_batches=1
 warmup_steps=1
@@ -15,13 +16,13 @@ weight_decay=1e-4
 beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
-save_dir="/raid/monsals/faser/logs_final"
-name="seg_v1"
+save_dir="/scratch3/fcufino/logs_final"
+name="seg_v7"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="/raid/monsals/faser/checkpoints_final"
-checkpoint_name="seg_v1"
-gpus=(1 2)
+checkpoint_path="/scratch3/fcufino/checkpoints_final"
+checkpoint_name="seg_v7"
+gpus=(0)
 
 python -m train.train_seg \
     --train \
