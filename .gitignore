@@ -6,4 +6,5 @@ lightning_logs/
 core
 notebooks/
 checkpoint*/
+Plots/
 *db
