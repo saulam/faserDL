@@ -26,7 +26,19 @@ FASER_CAL_START = 13
 FASER_CAL_END = 28  # 15 values (13:28)
 
 
-def rotate_90(point_cloud, dirs, primary_vertex, metadata):
+def mirror(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    axes = ['x', 'y', 'z']
+    for axis in range(3):
+        if axes[axis] in selected_axes and np.random.choice([True, False]):
+            point_cloud[:, axis] = metadata[axes[axis]].shape[0] - point_cloud[:, axis]
+            primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis]
+            for x in dirs:
+                x[axis] *= -1
+
+    return point_cloud, dirs, primary_vertex
+
+
+def rotate_90(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     # Rotation matrices for 90, 180, and 270 degrees on each axis
     rotations = {
         'x': {0: np.eye(3),
@@ -46,8 +58,9 @@ def rotate_90(point_cloud, dirs, primary_vertex, metadata):
     final_rotation_matrix = np.eye(3)
 
     for axis in ['x', 'y', 'z']:
-        angle = np.random.choice([0, 90, 180, 270])
-        final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
+        if axis in selected_axes:
+            angle = np.random.choice([0, 90, 180, 270])
+            final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
     translated_points = point_cloud - primary_vertex
     rotated_points = translated_points @ final_rotation_matrix
@@ -67,21 +80,26 @@ def rotate(coords, dirs, primary_vertex):
     if (angle_limits==0).all():
         # no rotation at all
         return coords, dirs
+
     return random_rotation_saul(coords=coords,
                                 dirs=dirs,
                                 angle_limits=angle_limits,
                                 origin=primary_vertex)
 
 
-def translate(coords, primary_vertex):
-    shift_x, shift_y = np.random.uniform(low=-50, high=50, size=(2,))
-    shift_z = np.random.uniform(low=-150, high=150)
-    coords[:, 0] += shift_x
-    coords[:, 1] += shift_y
-    coords[:, 2] += shift_z
-    primary_vertex[0] += shift_x
-    primary_vertex[1] += shift_y
-    primary_vertex[2] += shift_z
+def translate(coords, primary_vertex, selected_axes=['x', 'y', 'z']):
+    shift_x, shift_y = np.random.randint(low=-5, high=5+1, size=(2,))
+    shift_z = np.random.randint(low=-15, high=15+1)
+    if 'x' in selected_axes:
+        coords[:, 0] += shift_x
+        primary_vertex[0] += shift_x
+    if 'y' in selected_axes: 
+        coords[:, 1] += shift_y
+        primary_vertex[1] += shift_y
+    if 'z' in selected_axes:
+        coords[:, 2] += shift_z
+        primary_vertex[2] += shift_z
+
     return coords, primary_vertex
 
 
