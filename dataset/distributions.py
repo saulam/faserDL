@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 import torch
 from utils.plot import configure_matplotlib_fabio
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 # -------------------------------------------------------------------------
 # Custom dataset class
@@ -205,27 +206,36 @@ for batch in dataloader:
         if n_ev % 1000 == 0:
             print(f"- Progress: {n_ev}/{total_events} ({n_ev/total_events:.1%})")
 
-# Plot the energy distributions
+
+
+## PREPARATION ------------------------------------------------
 configure_matplotlib_fabio(theme='dark')
 
 # Define neutrino types for plotting
 neutrino_pdg_map = {12: 'nue', 14: 'numu', 16: 'nutau'}
 
+# Define a function for parallel concatenation
+def concat(arrays):
+    return np.concatenate(arrays, axis=0)
 
-## temporat plot 
-all_module_lepton_vox_e = np.concatenate(module_lepton_vox_e_vertex_z) 
-all_energy_lepton_vox_e = np.concatenate(energy_lepton_vox_e_vertex_z)  
-all_coord_vertex_z = np.concatenate(coord_vertex_z)
-
-print(all_module_lepton_vox_e.shape,all_energy_lepton_vox_e.shape,all_coord_vertex_z.shape)
+# -------------------------------------------------------------
 
 
-# Plot histogram of energy per module
+
+
+# -------------------------------------------------------------------------
+# Plot histogram of energy per module for different modules, with z range [0,200)
+# -------------------------------------------------------------------------
+
+data_lists = [module_lepton_vox_e_vertex_z, energy_lepton_vox_e_vertex_z, coord_vertex_z]
+with ThreadPoolExecutor() as executor:
+    all_module_lepton_vox_e, all_energy_lepton_vox_e, all_coord_vertex_z = executor.map(concat, data_lists)
+
+
 plt.figure(figsize=(8, 6))
 for i in range(6,10):  # Assuming 3 modules
     mask = all_module_lepton_vox_e == i  # Boolean mask
     plt.hist(all_energy_lepton_vox_e[mask] ,bins=100, label=f"Module {i}", histtype='step', lw = 2)
-
 
 plt.legend()
 plt.savefig(f'{plot_folder}/vox_energy_module1.png')
@@ -240,8 +250,10 @@ plt.legend()
 plt.savefig(f'{plot_folder}/vox_energy_module2.png')
 plt.close()
 
+# -------------------------------------------------------------------------
+# Plot 2D histogram grid for projection distribution: ONLY mod 7
+# -------------------------------------------------------------------------
 
-# Only for module 7
 mask_a = all_module_lepton_vox_e == 7
 all_energy_lepton_vox_e = all_energy_lepton_vox_e[mask_a]
 all_coord_vertex_z = all_coord_vertex_z[mask_a]
@@ -295,7 +307,7 @@ fig.colorbar(mesh3, ax=axes[2], label="Energy Deposited")
 plt.tight_layout()
 plt.savefig(f'{plot_folder}/event_projections_grid.png')
 plt.show()
-
+plt.close()
 
 # -------------------------------------------------------------------------
 # Plot the MIN_Z distribution
@@ -348,14 +360,31 @@ plt.close()
 # -------------------------------------------------------------------------
 # Plot Vox lep energy vs Vox non lep energy
 # -------------------------------------------------------------------------
-all_hist_energy_lepton_vox_e = np.concatenate(energy_lepton_vox_e)
-all_hist_energy_non_lepton_vox_e = np.concatenate(energy_non_lepton_vox_e)
 
-all_hist_energy_lepton_vox_mu = np.concatenate(energy_lepton_vox_mu)
-all_hist_energy_non_lepton_vox_mu = np.concatenate(energy_non_lepton_vox_mu)
+# Define datasets
+data_groups = [
+    (energy_lepton_vox_e, energy_non_lepton_vox_e),
+    (energy_lepton_vox_mu, energy_non_lepton_vox_mu),
+    (energy_lepton_vox_tau, energy_non_lepton_vox_tau),
+]
 
-all_hist_energy_lepton_vox_tau = np.concatenate(energy_lepton_vox_tau)
-all_hist_energy_non_lepton_vox_tau = np.concatenate(energy_non_lepton_vox_tau)
+# Define a function for concatenation
+def concat(arrays):
+    return np.concatenate(arrays, axis=0)
+
+# Run all concatenations in parallel
+with ThreadPoolExecutor() as executor:
+    results = list(executor.map(concat, [pair for group in data_groups for pair in group]))
+
+# Unpack results
+(all_hist_energy_lepton_vox_e, all_hist_energy_non_lepton_vox_e,
+ all_hist_energy_lepton_vox_mu, all_hist_energy_non_lepton_vox_mu,
+ all_hist_energy_lepton_vox_tau, all_hist_energy_non_lepton_vox_tau) = results
+
+# Print shapes
+print(all_hist_energy_lepton_vox_e.shape, all_hist_energy_non_lepton_vox_e.shape,
+      all_hist_energy_lepton_vox_mu.shape, all_hist_energy_non_lepton_vox_mu.shape,
+      all_hist_energy_lepton_vox_tau.shape, all_hist_energy_non_lepton_vox_tau.shape)
 
 # Define the number of bins
 num_bins = 100
@@ -466,17 +495,31 @@ plt.close()
 
 
 # -------------------------------------------------------------------------
-all_hist_energy_EM_e = np.concatenate(energy_EM_e)
-all_hist_energy_GH_e = np.concatenate(energy_GH_e)
-all_hist_energy_HAD_e = np.concatenate(energy_HAD_e)
 
-all_hist_energy_EM_mu = np.concatenate(energy_EM_mu)
-all_hist_energy_GH_mu = np.concatenate(energy_GH_mu)
-all_hist_energy_HAD_mu = np.concatenate(energy_HAD_mu)
+# Define datasets in groups
+data_groups = [
+    (energy_EM_e, energy_GH_e, energy_HAD_e),
+    (energy_EM_mu, energy_GH_mu, energy_HAD_mu),
+    (energy_EM_tau, energy_GH_tau, energy_HAD_tau),
+]
 
-all_hist_energy_EM_tau = np.concatenate(energy_EM_tau)
-all_hist_energy_GH_tau = np.concatenate(energy_GH_tau)
-all_hist_energy_HAD_tau = np.concatenate(energy_HAD_tau)
+# Define a function for concatenation
+def concat(arrays):
+    return np.concatenate(arrays, axis=0)
+
+# Run all concatenations in parallel
+with ThreadPoolExecutor() as executor:
+    results = list(executor.map(concat, [item for group in data_groups for item in group]))
+
+# Unpack results
+(all_hist_energy_EM_e, all_hist_energy_GH_e, all_hist_energy_HAD_e,
+ all_hist_energy_EM_mu, all_hist_energy_GH_mu, all_hist_energy_HAD_mu,
+ all_hist_energy_EM_tau, all_hist_energy_GH_tau, all_hist_energy_HAD_tau) = results
+
+# Print shapes
+print(all_hist_energy_EM_e.shape, all_hist_energy_GH_e.shape, all_hist_energy_HAD_e.shape,
+      all_hist_energy_EM_mu.shape, all_hist_energy_GH_mu.shape, all_hist_energy_HAD_mu.shape,
+      all_hist_energy_EM_tau.shape, all_hist_energy_GH_tau.shape, all_hist_energy_HAD_tau.shape)
 
 # Create and save the plots for summed histograms
 # nue
