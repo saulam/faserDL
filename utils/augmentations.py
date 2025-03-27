@@ -26,19 +26,33 @@ FASER_CAL_START = 13
 FASER_CAL_END = 28  # 15 values (13:28)
 
 
-def mirror(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def is_escaping(coords, metadata):
+    """
+    Check whether hits are on the edge(s) of the volume
+    (potential escaping particles)
+    """
+    on_boundary = (
+        (coords[:, 0] <= 0) | (coords[:, 0] >= metadata['x'].shape[0] - 1),
+        (coords[:, 1] <= 0) | (coords[:, 1] >= metadata['y'].shape[0] - 1),
+        (coords[:, 2] <= 0) | (coords[:, 2] >= metadata['z'].shape[0] - 1)
+    )
+
+    return np.any(on_boundary, axis=1)
+
+
+def mirror(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     axes = ['x', 'y', 'z']
     for axis in range(3):
         if axes[axis] in selected_axes and np.random.choice([True, False]):
-            point_cloud[:, axis] = metadata[axes[axis]].shape[0] - point_cloud[:, axis]
-            primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis]
+            coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
+            primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis] - 1
             for x in dirs:
                 x[axis] *= -1
 
-    return point_cloud, dirs, primary_vertex
+    return coords, dirs, primary_vertex
 
 
-def rotate_90(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     # Rotation matrices for 90, 180, and 270 degrees on each axis
     rotations = {
         'x': {0: np.eye(3),
@@ -56,22 +70,31 @@ def rotate_90(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', '
     }
 
     final_rotation_matrix = np.eye(3)
+    reference_point = np.array([
+        (metadata['x'].shape[0] - 1) / 2.,
+        (metadata['y'].shape[0] - 1) / 2.,
+        (metadata['z'].shape[0] - 1) / 2.
+    ])  
 
     for axis in ['x', 'y', 'z']:
         if axis in selected_axes:
             angle = np.random.choice([0, 90, 180, 270])
             final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
-    translated_points = point_cloud - primary_vertex
+    translated_points = coords - reference_point
     rotated_points = translated_points @ final_rotation_matrix
-    final_points = rotated_points + primary_vertex
+    final_points = rotated_points + reference_point
     rotated_dirs = [x @ final_rotation_matrix for x in dirs]
 
     return final_points, rotated_dirs
 
 
-def rotate(coords, dirs, primary_vertex):
-    """Random rotation along"""
+def rotate(coords, dirs, metadata, primary_vertex):
+    """Random rotation"""
+    escaping = is_escaping(coords, metadata)
+    if np.all(escaping):
+        return coords, primary_vertex
+
     angle_limits = torch.tensor([
         [-torch.pi/180, -torch.pi/180, -torch.pi],
         [torch.pi/180, torch.pi/180,  torch.pi]
@@ -87,9 +110,14 @@ def rotate(coords, dirs, primary_vertex):
                                 origin=primary_vertex)
 
 
-def translate(coords, primary_vertex, selected_axes=['x', 'y', 'z']):
-    shift_x, shift_y = np.random.randint(low=-5, high=5+1, size=(2,))
-    shift_z = np.random.randint(low=-15, high=15+1)
+def translate(coords, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    escaping = is_escaping(coords, metadata)
+    if np.all(escaping):
+        return coords, primary_vertex
+ 
+    shift_x = np.random.randint(low=-5, high=5+1) if not escaping[0] else 0.
+    shift_y = np.random.randint(low=-5, high=5+1) if not escaping[1] else 0.
+    shift_z = np.random.randint(low=-15, high=15+1) if not escaping[2] else 0.
     if 'x' in selected_axes:
         coords[:, 0] += shift_x
         primary_vertex[0] += shift_x

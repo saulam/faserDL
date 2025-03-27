@@ -44,14 +44,16 @@ class SparseFASERCALDataset(Dataset):
             
     def set_augmentations_on(self):
         """Sets augmentations on dinamically."""
-        print("Setting augmentations: ON.")
-        self.augmentations_active = True
+        if self.augmentations_enabled:
+            print("Setting augmentations: ON.")
+            self.augmentations_active = True
     
     
     def set_augmentations_off(self):
         """Sets augmentations off dinamically."""
-        print("Setting augmentations: OFF.")
-        self.augmentations_active = False
+        if self.augmentations_enabled:
+            print("Setting augmentations: OFF.")
+            self.augmentations_active = False
  
 
     @property
@@ -97,7 +99,7 @@ class SparseFASERCALDataset(Dataset):
         #coords, dirs = rotate(coords, dirs, primary_vertex)
         coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
         # translate
-        coords, primary_vertex = translate(coords, primary_vertex, selected_axes=['x', 'y'])
+        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # drop voxels
         coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
