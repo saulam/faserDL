@@ -79,18 +79,18 @@ class SparseFASERCALDataset(Dataset):
         dirs = [x.copy() for x in dirs_ori]
  
         # mirror
-        coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+        coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # rotate
         #coords, dirs = rotate(coords, dirs, primary_vertex)
-        coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+        coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
         # translate
-        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # drop voxels
         coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
         feats = shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
-        #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
+        coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         
         if coords.shape[0] < 2:
             return coords_ori, feats_ori, labels_ori, dirs_ori

@@ -39,43 +39,6 @@ class SparseSegLightningModel(pl.LightningModule):
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
 
 
-    def _set_training_mode(self, loader, mode: bool):
-        """Handles dataset training mode setting for both PL 1.x and 2.x."""
-        dataset = loader.dataset
-    
-        if version.parse(pl_version) < version.parse("2.0.0"):
-            # PyTorch Lightning 1.x
-            if hasattr(dataset, "datasets") and hasattr(dataset.datasets, "dataset"):
-                if mode:
-                    dataset.datasets.dataset.set_augmentations_on()
-                else:
-                    dataset.dataset.dataset.set_augmentations_off()
-        else:
-            # PyTorch Lightning 2.x
-            if hasattr(dataset, "dataset"):
-                if mode:
-                    dataset.dataset.set_augmentations_on()
-                else:
-                    dataset.dataset.set_augmentations_off()
-
-    
-    def on_train_epoch_start(self):
-        """Hook to be called at the start of each training epoch."""
-        self._set_training_mode(self.trainer.train_dataloader, True)
-
-    
-    def on_validation_epoch_start(self):
-        """Hook to be called at the start of each validation epoch."""
-        val_loader = self.trainer.val_dataloaders[0] if version.parse(pl_version) < version.parse("2.0.0") else self.trainer.val_dataloaders
-        self._set_training_mode(val_loader, False)
-
-
-    def on_test_epoch_start(self):
-        """Hook to be called at the start of each test epoch."""
-        test_loader = self.trainer.test_dataloaders[0] if version.parse(pl_version) < version.parse("2.0.0") else self.trainer.test_dataloaders
-        self._set_training_mode(test_loader, False)
-
-
     def forward(self, x, x_glob):
         return self.model(x, x_glob)
 

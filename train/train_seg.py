@@ -71,7 +71,6 @@ def main():
     for loss_name in monitored_losses:
         checkpoint = ModelCheckpoint(
             dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss_name.replace('/', '_')}",
-            #filename=f"{loss_name.replace('/', '_')}" + "-{epoch:02d}-{"+loss_name+":.2f}",
             save_top_k=args.save_top_k,
             monitor=loss_name,
             mode="min",
