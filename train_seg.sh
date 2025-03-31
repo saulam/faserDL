@@ -5,9 +5,9 @@ dataset_path="/scratch/salonso/sparse-nns/faser/events_v3.5"
 sets_path="/scratch/salonso/sparse-nns/faser/events_v3.5/sets.pkl"
 
 eps=1e-12
-batch_size=32
+batch_size=14
 epochs=50
-num_workers=32
+num_workers=8
 lr=2e-4
 accum_grad_batches=1
 warmup_steps=1
@@ -17,11 +17,11 @@ beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
 save_dir="/scratch3/fcufino/logs_final"
-name="seg_v7"
+name="seg_v13"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch3/fcufino/checkpoints_final"
-checkpoint_name="seg_v7"
+checkpoint_name="seg_v13"
 gpus=(0)
 
 python -m train.train_seg \
@@ -47,5 +47,6 @@ python -m train.train_seg \
     --save_top_k $save_top_k \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
-    --gpus "${gpus[@]}"
+    --gpus "${gpus[@]}" \
+    --augmentations_enabled 
 

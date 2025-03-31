@@ -48,7 +48,7 @@ def configure_matplotlib_fabio(theme="light"):
 
 
     # Define custom color palette 
-    custom_colors = ["#00A6FB", "#A559AA", "#14A76C", "#4634B2", "#FF4D80"]  # Add more colors as needed
+    custom_colors = ["#00A6FB", "#A559AA", "#14A76C", "#4634B2", "#FF4D80"]  
     plt.rcParams['axes.prop_cycle'] = cycler.cycler(color=custom_colors)
 
     # Basic font and figure settings
@@ -109,7 +109,7 @@ def configure_matplotlib_fabio(theme="light"):
 
 
 def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical', primary_vertex=None, lepton_direction=None,
-                 pdg=None, energy=None, ghost=False, s=1.1, plot_label=False, name_save_html=None):
+                 pdg=None, energy=None, ghost=False, s=1.8, plot_label=False, name_save_html=None):
     """
     Plots hits with an interactive 3D plot using Plotly.
     - 'categorical': Uses a colormap for different types of hits.
@@ -134,7 +134,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             fig.add_trace(go.Scatter3d(
                 x=z[mask_em], y=x[mask_em], z=y[mask_em],
                 mode='markers',
-                marker=dict(size=(s * 1), color='red', opacity=0.3),
+                marker=dict(size=(s * 1), color='red', opacity=0.8),
                 name='EM'
             ))
 
@@ -143,7 +143,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             fig.add_trace(go.Scatter3d(
                 x=z[mask_ghost], y=x[mask_ghost], z=y[mask_ghost],
                 mode='markers',
-                marker=dict(size=(s * 1), color='gray', opacity=0.3),
+                marker=dict(size=(s * 1), color='gray', opacity=0.4),
                 name='Ghost'
             ))
 
@@ -152,10 +152,11 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             fig.add_trace(go.Scatter3d(
                 x=z[mask_had], y=x[mask_had], z=y[mask_had],
                 mode='markers',
-                marker=dict(size=(s * 1), color='blue', opacity=0.3),
+                marker=dict(size=(s * 1), color='blue', opacity=0.8),
                 name='HAD'
             ))
 
+        # Plot predictions as well
         if len(pred_seg) != 0:
             mask_pred_seg = np.argmax(pred_seg, axis=1)
             color_map = {0: 'black', 1: 'yellow', 2: 'green'}
@@ -172,7 +173,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
                 fig.add_trace(go.Scatter3d(
                     x=z[mask_pred_em], y=x[mask_pred_em], z=y[mask_pred_em],
                     mode='markers',
-                    marker=dict(size=(s * 1), color='green', opacity=0.3),
+                    marker=dict(size=(s * 1), color='green', opacity=0.8),
                     name='Pred EM'
                 ))
 
@@ -181,7 +182,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
                 fig.add_trace(go.Scatter3d(
                     x=z[mask_pred_ghost], y=x[mask_pred_ghost], z=y[mask_pred_ghost],
                     mode='markers',
-                    marker=dict(size=(s * 1), color='black', opacity=0.3),
+                    marker=dict(size=(s * 1), color='gray', opacity=0.3),
                     name='Pred Ghost'
                 ))
 
@@ -190,7 +191,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
                 fig.add_trace(go.Scatter3d(
                     x=z[mask_pred_had], y=x[mask_pred_had], z=y[mask_pred_had],
                     mode='markers',
-                    marker=dict(size=(s * 1), color='yellow', opacity=0.3),
+                    marker=dict(size=(s * 1), color='yellow', opacity=0.8),
                     name='Pred HAD'
                 ))
                     
@@ -214,11 +215,13 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             fig.add_trace(go.Scatter3d(
                 x=z[mask_rest], y=x[mask_rest], z=y[mask_rest],
                 mode='markers',
-                marker=dict(size=s, color='gray', opacity=0.4),
+                marker=dict(size=s, color='white', opacity=0.3),
                 name='Rest'
             ))
 
+        # Plot predicitons as well
         if len(pred_lep) != 0:
+            print("-------", len(pred_lep))
             mask_pred = pred_lep > 0.5
             mask_pred_lepton = mask_pred == 1
             mask_pred_rest = mask_pred == 0
@@ -229,14 +232,14 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             fig.add_trace(go.Scatter3d(
                 x=z[mask_pred_lepton], y=x[mask_pred_lepton], z=y[mask_pred_lepton],
                 mode='markers',
-                marker=dict(size=(s + 0.5), color='green', opacity=0.4),
+                marker=dict(size=(s + 0.5), color='aquamarine', opacity=0.8),
                 name='Pred Lep'
             ))
 
             fig.add_trace(go.Scatter3d(
                 x=z[mask_pred_rest], y=x[mask_pred_rest], z=y[mask_pred_rest],
                 mode='markers',
-                marker=dict(size=s, color='black', opacity=0.4),
+                marker=dict(size=s, color='gray', opacity=0.3),
                 name='Pred Rest'
             ))
 
@@ -306,6 +309,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
 
     # 3D PLOT SETTINGS
     fig.update_layout(
+        template='plotly_dark',
         scene=dict(
             xaxis_title='Z',
             yaxis_title='X',
@@ -318,7 +322,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
         margin=dict(l=0, r=0, b=0, t=40),
         title='3D Hit Visualization',
         scene_camera=dict(
-            eye=dict(x=-2000, y=-2000, z=1200)  # KEEPING eye position
+            eye=dict(x=2000, y=-2000, z=1200)  # KEEPING eye position
         ),
         showlegend=True  # Ensure the legend is displayed
     )

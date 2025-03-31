@@ -1,516 +1,494 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from dataset import SparseFASERCALDataset
-from utils import ini_argparse
+import pickle as pk
 from torch.utils.data import DataLoader, Dataset
 import torch
-from utils.plot import configure_matplotlib_fabio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataset import SparseFASERCALDataset
+from utils import ini_argparse
+from torch.nn.utils.rnn import pad_sequence
+from utils.plot import configure_matplotlib_fabio
+from utils.augmentations import *
+
 
 # -------------------------------------------------------------------------
 # Custom dataset class
 # -------------------------------------------------------------------------
-class CustomDataset(Dataset):
-    def __init__(self, base_dataset):
-        self.base_dataset = base_dataset
+class CustomDataset(SparseFASERCALDataset):
+    def __init__(self, args):
+        super().__init__(args)  # This will call the __init__ method of SparseFASERCALDataset
+        
+        # Initialize other attributes specific to CustomDataset
+        self.plot_distributions = True
 
-    def __len__(self):
-        return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        data = np.load(self.base_dataset.data_files[idx], allow_pickle=True)
+        """
+        Retrieves a data sample by index and applies augmentations if needed.
+        """
+        data = super().__getitem__(idx)
 
-        mask_is_lepton = data['primlepton_labels'] == 1
-        mask_is_lepton = mask_is_lepton.flatten()
+        print('Metadata_values: ', self.metadata['x'], self.metadata['y'], self.metadata['z'] )
+
+
+        # Preprocessing 
+        data['coords']
+        
+
+        #fixig some stuff
+        data['primlepton_labels'] = data['feats'][:,1]
+        data['seg_labels'] = data['feats'][:,2:5]
+
+        data['rear_cal_energy'] = data['feats_global'][0]
+        data['rear_hcal_energy'] = data['feats_global'][1]
+        data['rear_mucal_energy'] = data['feats_global'][2]
+        data['faser_cal_energy'] = data['feats_global'][3]
+
+  
+        mask_is_lepton = (data['primlepton_labels'] == 1).flatten()
         mask_seg_lab = np.argmax(data['seg_labels'], axis=1)
 
-        # find the min/max of z component of reco hits for leptons and non-leptons
-        min_z_l = np.min(data['reco_hits'][mask_is_lepton, 2]) if mask_is_lepton.any() else np.nan
-        max_z_l = np.max(data['reco_hits'][mask_is_lepton, 2]) if mask_is_lepton.any() else np.nan
-        filtered_hits = data['reco_hits'][~mask_is_lepton, 2]
+        def get_z_range(mask):
+            if mask.any():
+                z_vals = data['coords'][mask, 2]
+                return torch.min(z_vals), torch.max(z_vals)
+            return np.nan, np.nan
 
-        min_z_nl = np.min(filtered_hits) if filtered_hits.size > 0 else np.nan
-        max_z_nl = np.max(filtered_hits) if filtered_hits.size > 0 else np.nan
+        min_z_l, max_z_l = get_z_range(mask_is_lepton)
+        min_z_nl, max_z_nl = get_z_range(~mask_is_lepton)
 
-        dist_trav_lep = np.abs(min_z_l - max_z_l)
-        dist_trav_non_lep = np.abs(min_z_nl - max_z_nl)
+        
+        output =  {
+            **{key: data[key] for key in [
+                'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
+                'in_neutrino_energy', 'out_lepton_momentum_dir', 'flavour_label',
+                'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag', 'jet_momentum_dir', 'coords', 'feats', 'feats_global',
+                'primlepton_labels', 'seg_labels',
+                'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy']},
 
-
-        result = {
-            # Scalars
-            'run_number': data['run_number'],
-            'event_id': data['event_id'],
-            'is_cc': data['is_cc'],
-            'in_neutrino_pdg': data['in_neutrino_pdg'],
-            'primary_vertex': data['primary_vertex'],
-            'in_neutrino_energy': data['in_neutrino_energy'],
-            # 'out_neutrino_energy': data['out_neutrino_energy'],
-            'dist_trav_lep': dist_trav_lep,
+            'energy_lepton_vox': data['feats'][mask_is_lepton, 0],
+            'energy_non_lepton_vox': data['feats'][~mask_is_lepton, 0],
+            'energy_GH_vox': data['feats'][mask_seg_lab == 0, 0],
+            'energy_EM_vox': data['feats'][mask_seg_lab == 1, 0],
+            'energy_HAD_vox': data['feats'][mask_seg_lab == 2, 0],
             'min_z_l': min_z_l,
             'max_z_l': max_z_l,
-            'dist_trav_non_lep': dist_trav_non_lep,
-            'e_vis':data['e_vis'],
-
-            # Non Scalar - per components
-            'jet_momentum': data['jet_momentum'],
-
-
-
-            # Non Scalars - per voxel
-            'coords_lep': data['reco_hits'][mask_is_lepton,:3],
-            'reco_module_lep': data['reco_hits'][mask_is_lepton, 3],
-            'energy_lepton_vox': data['reco_hits'][mask_is_lepton, 4],
-            'energy_non_lepton_vox': data['reco_hits'][~mask_is_lepton, 4],
-
-            'energy_GH_vox': data['reco_hits'][mask_seg_lab == 0, 4],
-            'energy_EM_vox': data['reco_hits'][mask_seg_lab == 1, 4], 
-            'energy_HAD_vox': data['reco_hits'][mask_seg_lab == 2, 4], 
+            'dist_trav_lep': abs(max_z_l - min_z_l),
+            'dist_trav_non_lep': abs(max_z_nl - min_z_nl),
         }
-        return result
+
+        # Clean up data variables to free memory before returning the output
+        del data
+        del mask_is_lepton, mask_seg_lab, min_z_l, max_z_l, min_z_nl, max_z_nl
+
+        return output
+
+
 
 # -------------------------------------------------------------------------
-# Main script
+# Setup and arguments
 # -------------------------------------------------------------------------
 torch.multiprocessing.set_sharing_strategy('file_system')
+args = ini_argparse().parse_args()
 
-# Parse arguments
-parser = ini_argparse()
-args = parser.parse_args()
 # args.dataset_path = "/scratch3/salonso/faser/events_v3.5" #spaceml4
 # args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
-
 args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
+
+args.train = False
+args.stage1 = False
+args.augmentations_enabled = False
+args.batch_size = 4
+args.num_workers = 32
 
 plot_folder = "/home/fcufino/faserDL/Plotsv5_1"
 
-# Set GPU settings
-nb_gpus = len(args.gpus)
-gpus = ', '.join(args.gpus) if nb_gpus > 1 else str(args.gpus[0])
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+# plot_folder = "/home/fcufino/faserDL/Plotsv3_5_AUG"
+# plot_folder = "/home/fcufino/faserDL/Plotsv3_5"
 
-# Load dataset
-base_dataset = SparseFASERCALDataset(args)
-dataset = CustomDataset(base_dataset)
 
-# Custom collate function
-def custom_collate_fn(batch):
-    return batch
+# GPU
+gpus = ','.join(args.gpus) if len(args.gpus) > 1 else str(args.gpus[0])
+os.environ.update({
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_VISIBLE_DEVICES": gpus
+})
 
-# DataLoader
-dataloader = DataLoader(
-    dataset,
-    batch_size=32,
-    num_workers=64,  
-    collate_fn=custom_collate_fn,
-    persistent_workers=True,
-)
 
+# Check if CUDA is available and select device (GPU or CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Print out the device being used
+if torch.cuda.is_available():
+    print(f"Running on GPU: {torch.cuda.get_device_name(0)}")
+else:
+    print("Running on CPU")
+
+
+
+# -------------------------------------------------------------------------
+# Loop over all the events: setup 
+# -------------------------------------------------------------------------
+
+def collate_test(batch):
+    """
+    Collate function for batching, handles tensor concatenation and other optional keys.
+    """
+    ret = {
+        # 'f': torch.cat([d['feats'] for d in batch]),
+        # 'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        # 'c': [d['coords'] for d in batch],  # Store coords as a list for later padding if needed
+    }
+    
+    # Optional keys to include in the batch
+    optional_keys = [
+        # Info ev
+        'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
+         
+        # Labels
+        'primlepton_labels', 'seg_labels', 'flavour_label',
+        
+        # Per event values
+        'in_neutrino_energy', 
+        'e_vis', 'pt_miss',
+        'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy',
+        'out_lepton_momentum_dir', 'jet_momentum_dir',
+        
+        # Per voxel values
+        'energy_lepton_vox','energy_non_lepton_vox','energy_GH_vox',
+        'energy_EM_vox','energy_HAD_vox','min_z_l','max_z_l','dist_trav_lep','dist_trav_non_lep'
+    ]
+
+    # Loop through optional keys and add to the return dict
+    for key in optional_keys:
+        if key in batch[0]:  # Check if the key exists in the batch
+            if key in ['primlepton_labels', 'seg_labels', 'flavour_label',
+                       'energy_lepton_vox','energy_non_lepton_vox','energy_GH_vox',
+                        'energy_EM_vox','energy_HAD_vox']:
+                # If it's a label, store as numpy array
+                ret[key] = [d[key].numpy() for d in batch]
+            elif key in ['e_vis', 'pt_miss', 
+                         'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy']:
+                # If it's a scalar value, use `.item()` to get the value
+                ret[key] = [d[key].item() for d in batch]
+            else:
+                # For all other keys, store the tensor as is
+                ret[key] = [d[key] for d in batch]
+
+    return ret
+
+
+
+# prefetch_factor=1 was important
+dataset = CustomDataset(args)
+dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+                        pin_memory=True, persistent_workers=True if args.num_workers > 0 else False, prefetch_factor=1,
+                        collate_fn=collate_test)
 print(f"- Dataset size: {len(dataset)} events total.")
 
 
-# Initialize storage for energy histograms, each initialized to zeros
+
 # -------------------------------------------------------------------------
-#arrays for aall the variables
-min_z_e = []
-max_z_e = []
-min_z_mu = []
-max_z_mu = []
-min_z_tau = []
-max_z_tau = []
-
-dist_trav_lep_e = []
-dist_trav_lep_mu = []
-dist_trav_lep_tau = []
-
-dist_trav_non_lep = []
-
-energy_lepton_vox_e = []
-energy_non_lepton_vox_e = []
-energy_lepton_vox_mu = []
-energy_non_lepton_vox_mu = []
-energy_lepton_vox_tau = []
-energy_non_lepton_vox_tau = []
-
-
-energy_EM_e = [] 
-energy_GH_e = []
-energy_HAD_e = []
-
-energy_EM_mu = []
-energy_GH_mu = []
-energy_HAD_mu = []
-
-energy_EM_tau = []
-energy_GH_tau = []
-energy_HAD_tau = []
-
-all_primary_vertex_z = []
-energy_lepton_vox_e_vertex_z = []
-module_lepton_vox_e_vertex_z = []
-coord_vertex_z = []
+# Storage setup using dictionary
+# -------------------------------------------------------------------------
+neutrino_data = {k: defaultdict(list) for k in ['e', 'mu', 'tau', 'NC', 'shared']}
+neutrino_map = {12: 'e', 14: 'mu', 16: 'tau'}
 
 n_ev = 0
-total_events = len(base_dataset)
 
-# Loop over dataloader
 for batch in dataloader:
-    # if n_ev > 100000:
-    #     break
+    if n_ev > 100:
+        break
 
-    for ev in batch:
+    len_batch = len(batch['run_number'])
+
+    for i in range(len_batch):
+        ev = {key: batch[key][i] for key in batch}
+        
         n_ev += 1
 
-        neutrino_pdg = np.abs(ev['in_neutrino_pdg'])
+        pdg = abs(ev['in_neutrino_pdg'])
+        key = neutrino_map.get(pdg, 'NC') if ev['is_cc'] else 'NC'
+        store = neutrino_data[key]
 
-        if ev['is_cc'] == 1:
-            if neutrino_pdg == 12:
-                energy_EM_e.append(ev['energy_EM_vox'])
-                energy_GH_e.append(ev['energy_GH_vox'])
-                energy_HAD_e.append(ev['energy_HAD_vox'])
-                min_z_e.append(ev['min_z_l'])
-                max_z_e.append(ev['max_z_l'])
-                dist_trav_lep_e.append(ev['dist_trav_lep'])
-                energy_lepton_vox_e.append(ev['energy_lepton_vox'])
-                energy_non_lepton_vox_e.append(ev['energy_non_lepton_vox'])
+        for var in [
+            'in_neutrino_energy', 'e_vis', 'pt_miss',
+            'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy',
+            'primary_vertex', 'jet_momentum_dir',
+            'out_lepton_momentum_dir']:
+            store[var].append(ev[var])
 
-                if 0 < ev['primary_vertex'][2] < 300:
-                    energy_lepton_vox_e_vertex_z.append(ev['energy_lepton_vox'])
-                    module_lepton_vox_e_vertex_z.append(ev['reco_module_lep'])
-                    coord_vertex_z.append(ev['coords_lep'])
+        if key != 'NC':
+            for var in [
+                'energy_EM_vox', 'energy_GH_vox', 'energy_HAD_vox',
+                'min_z_l', 'max_z_l', 'dist_trav_lep',
+                'energy_lepton_vox', 'energy_non_lepton_vox']:
+                store[var].append(ev[var])
 
+        if not ev['is_cc']:
+            neutrino_data['NC']['dist_trav_non_lep'].append(ev['dist_trav_non_lep'])
 
-            elif neutrino_pdg == 14:
-                energy_EM_mu.append(ev['energy_EM_vox'])
-                energy_GH_mu.append(ev['energy_GH_vox'])
-                energy_HAD_mu.append(ev['energy_HAD_vox'])
-                min_z_mu.append(ev['min_z_l'])
-                max_z_mu.append(ev['max_z_l'])
-                dist_trav_lep_mu.append(ev['dist_trav_lep'])
-                energy_lepton_vox_mu.append(ev['energy_lepton_vox'])
-                energy_non_lepton_vox_mu.append(ev['energy_non_lepton_vox'])
-            elif neutrino_pdg == 16:
-                energy_EM_tau.append(ev['energy_EM_vox'])
-                energy_GH_tau.append(ev['energy_GH_vox'])
-                energy_HAD_tau.append(ev['energy_HAD_vox'])
-                min_z_tau.append(ev['min_z_l'])
-                max_z_tau.append(ev['max_z_l'])
-                dist_trav_lep_tau.append(ev['dist_trav_lep'])
-                energy_lepton_vox_tau.append(ev['energy_lepton_vox'])
-                energy_non_lepton_vox_tau.append(ev['energy_non_lepton_vox'])
-        else:
-            dist_trav_non_lep.append(ev['dist_trav_non_lep'])
-        
-
-        # Print progress in percentage
         if n_ev % 1000 == 0:
-            print(f"- Progress: {n_ev}/{total_events} ({n_ev/total_events:.1%})")
+            print(f"- Progress: {n_ev}/{len(dataset)} ({n_ev/len(dataset):.1%})")
+
+        torch.cuda.empty_cache()
+    del batch
 
 
-
-## PREPARATION ------------------------------------------------
+# -------------------------------------------------------------
 configure_matplotlib_fabio(theme='dark')
-
-# Define neutrino types for plotting
-neutrino_pdg_map = {12: 'nue', 14: 'numu', 16: 'nutau'}
-
-# Define a function for parallel concatenation
-def concat(arrays):
-    return np.concatenate(arrays, axis=0)
-
 # -------------------------------------------------------------
 
 
 
 
-# -------------------------------------------------------------------------
-# Plot histogram of energy per module for different modules, with z range [0,200)
-# -------------------------------------------------------------------------
 
-data_lists = [module_lepton_vox_e_vertex_z, energy_lepton_vox_e_vertex_z, coord_vertex_z]
-with ThreadPoolExecutor() as executor:
-    all_module_lepton_vox_e, all_energy_lepton_vox_e, all_coord_vertex_z = executor.map(concat, data_lists)
+# -------------------------------------------------------------
+# Plotting functions
+# -------------------------------------------------------------
+def plot_1d(variable_data, variable_name, plot_filename, xlabel='Energy [GeV]', log_scale=False, n=4):
+    # Define colors for each dataset
+    colors = ["#00A6FB", "#A559AA", "#14A76C", "#4634B2"]
+    neutrino_types = ['NuE', 'NuMu', 'NuTau', 'NC']
+
+    plt.figure(figsize=(4 * n, 4))
+
+    # Ensure correct shape of data, flatten if necessary
+    for i, data in enumerate(variable_data):
+        # Convert data to numpy array if it's not already
+        data = np.array(data)
+        
+        if len(data.shape) > 1:
+            data = data.flatten()  # Flatten to 1D if it's multidimensional
+        
+        # Plot the data with the correct color
+        plt.subplot(1, n, i + 1)
+        plt.hist(data, bins=100, label=neutrino_types[i], color=colors[i])  # Provide the correct color
+        plt.title(f"{neutrino_types[i]} {variable_name}")
+        plt.xlabel(xlabel)
+        plt.ylabel('Counts')
+        if log_scale:
+            plt.yscale('log')
+        plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(f'{plot_folder}/{plot_filename}.png')
+    plt.close()
 
 
+# -------------------------------------------------------------
+# Call plotting functions for each variable
+# -------------------------------------------------------------
+plot_1d([
+    neutrino_data['e']['in_neutrino_energy'], neutrino_data['mu']['in_neutrino_energy'],
+    neutrino_data['tau']['in_neutrino_energy'], neutrino_data['NC']['in_neutrino_energy']
+], "Incoming Nu Energy", "in_neutrino_energy_1x4")
+
+
+plot_1d([
+    neutrino_data['e']['e_vis'], neutrino_data['mu']['e_vis'],
+    neutrino_data['tau']['e_vis'], neutrino_data['NC']['e_vis']
+], "E_vis", "e_vis_1x4")
+
+plot_1d([
+    neutrino_data['e']['pt_miss'], neutrino_data['mu']['pt_miss'],
+    neutrino_data['tau']['pt_miss'], neutrino_data['NC']['pt_miss']
+], "pt_miss", "pt_miss_1x4")
+
+plot_1d([
+    neutrino_data['e']['rear_cal_energy'], neutrino_data['mu']['rear_cal_energy'],
+    neutrino_data['tau']['rear_cal_energy'], neutrino_data['NC']['rear_cal_energy']
+], "Rear Cal Energy", "rear_cal_energy_1x4")
+
+plot_1d([
+    neutrino_data['e']['rear_hcal_energy'], neutrino_data['mu']['rear_hcal_energy'],
+    neutrino_data['tau']['rear_hcal_energy'], neutrino_data['NC']['rear_hcal_energy']
+], "Rear Hcal Energy", "rear_hcal_energy_1x4", log_scale=True)
+
+plot_1d([
+    neutrino_data['e']['rear_mucal_energy'], neutrino_data['mu']['rear_mucal_energy'],
+    neutrino_data['tau']['rear_mucal_energy'], neutrino_data['NC']['rear_mucal_energy']
+], "Rear Mucal Energy", "rear_mucal_energy_1x4", log_scale=True)
+
+plot_1d([
+    neutrino_data['e']['faser_cal_energy'], neutrino_data['mu']['faser_cal_energy'],
+    neutrino_data['tau']['faser_cal_energy'], neutrino_data['NC']['faser_cal_energy']
+], "Faser Cal Energy", "faser_cal_energy_1x4")
+
+# -------------------------------------------------------------
+# 3D plotting for spatial components (e.g., primary vertex, momentum)
+# -------------------------------------------------------------
+def plot_3d(variable_data, variable_name, plot_filename):
+    # Colors for each component (x, y, z)
+    colors = ["#00A6FB", "#A559AA", "#14A76C"]
+
+    # Iterate over each neutrino type (e, mu, tau, NC)
+    for i, data in enumerate(variable_data):
+        plt.figure(figsize=(12, 4))  # Create a new figure for each neutrino type
+
+        # Convert to numpy array if it's not already
+        data = np.array(data)
+
+        # Reshape 1D data if necessary
+        if data.ndim == 1:
+            data = data.reshape(-1, 3)  # Reshape to (n, 3) if it's 1D (flat array)
+
+        # Extract the x, y, z components
+        x_data = data[:, 0]
+        y_data = data[:, 1]
+        z_data = data[:, 2]
+
+        # Create a subplot for each component (x, y, z)
+        for j, component in enumerate([x_data, y_data, z_data]):
+            plt.subplot(1, 3, j + 1)  # 1x3 grid, plot component j in the correct position
+            plt.hist(component, bins=50, label=['X', 'Y', 'Z'][j], color=colors[j])
+            plt.title(f"{variable_name} ({['NuE', 'NuMu', 'NuTau', 'NC'][i]})")
+            plt.xlabel('Component Value')
+            plt.ylabel('Counts')
+            plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(f'{plot_folder}/{plot_filename}_{["NuE", "NuMu", "NuTau", "NC"][i]}.png')
+        plt.close()
+
+
+
+# -------------------------------------------------------------
+# Example 3D plot calls
+# -------------------------------------------------------------
+# Apply plot_3d function for all variables
+plot_3d([
+    neutrino_data['e']['primary_vertex'], 
+    neutrino_data['mu']['primary_vertex'],
+    neutrino_data['tau']['primary_vertex'], 
+    neutrino_data['NC']['primary_vertex']
+], "Primary Vertex", "primary_vertex_1x3")
+
+plot_3d([
+    neutrino_data['e']['jet_momentum_dir'], 
+    neutrino_data['mu']['jet_momentum_dir'],
+    neutrino_data['tau']['jet_momentum_dir'], 
+    neutrino_data['NC']['jet_momentum_dir']
+], "Jet Momentum", "jet_momentum_1x3")
+
+plot_3d([
+    neutrino_data['e']['out_lepton_momentum_dir'], 
+    neutrino_data['mu']['out_lepton_momentum_dir'],
+    neutrino_data['tau']['out_lepton_momentum_dir'], 
+    neutrino_data['NC']['out_lepton_momentum_dir']
+], "Out Lepton Momentum", "out_lepton_momentum_1x3")
+
+
+# -------------------------------------------------------------
+# Final visualizations for min_z and max_z distributions
+# -------------------------------------------------------------
 plt.figure(figsize=(8, 6))
-for i in range(6,10):  # Assuming 3 modules
-    mask = all_module_lepton_vox_e == i  # Boolean mask
-    plt.hist(all_energy_lepton_vox_e[mask] ,bins=100, label=f"Module {i}", histtype='step', lw = 2)
-
-plt.legend()
-plt.savefig(f'{plot_folder}/vox_energy_module1.png')
-plt.close()
-
-plt.figure(figsize=(8, 6))
-for i in range(10,14):  # Assuming 3 modules
-    mask = all_module_lepton_vox_e == i  # Boolean mask
-    plt.hist(all_energy_lepton_vox_e[mask] ,bins=100, label=f"Module {i}", histtype='step', lw = 2)
-
-plt.legend()
-plt.savefig(f'{plot_folder}/vox_energy_module2.png')
-plt.close()
-
-# -------------------------------------------------------------------------
-# Plot 2D histogram grid for projection distribution: ONLY mod 7
-# -------------------------------------------------------------------------
-
-mask_a = all_module_lepton_vox_e == 7
-all_energy_lepton_vox_e = all_energy_lepton_vox_e[mask_a]
-all_coord_vertex_z = all_coord_vertex_z[mask_a]
-
-x_coords = all_coord_vertex_z[:,0]
-y_coords = all_coord_vertex_z[:,1]
-z_coords = all_coord_vertex_z[:,2]
-
-def project_2d(x, y, energy, bin_size=25):
-    """ Create a 2D histogram grid for projection with custom bin size. """
-    x_min, x_max = np.min(x), np.max(x)
-    y_min, y_max = np.min(y), np.max(y)
-    
-    x_bins = np.arange(x_min, x_max + bin_size, bin_size)
-    y_bins = np.arange(y_min, y_max + bin_size, bin_size)
-
-    grid_energy, _, _ = np.histogram2d(x, y, bins=[x_bins, y_bins], weights=energy)
-
-    return x_bins, y_bins, grid_energy.T
-
-
-# Compute projections
-x_bins_xy, y_bins_xy, energy_proj_xy = project_2d(x_coords, y_coords, all_energy_lepton_vox_e)
-x_bins_xz, z_bins_xz, energy_proj_xz = project_2d(x_coords, z_coords, all_energy_lepton_vox_e)
-y_bins_yz, z_bins_yz, energy_proj_yz = project_2d(y_coords, z_coords, all_energy_lepton_vox_e)
-
-# Plot projections with a grid
-fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-# XY Projection
-mesh1 = axes[0].pcolormesh(x_bins_xy, y_bins_xy, energy_proj_xy, cmap='inferno', shading='auto')
-axes[0].set_xlabel("X")
-axes[0].set_ylabel("Y")
-axes[0].set_title("XY Projection (Summed over Z)")
-fig.colorbar(mesh1, ax=axes[0], label="Energy Deposited")
-
-# XZ Projection
-mesh2 = axes[1].pcolormesh(x_bins_xz, z_bins_xz, energy_proj_xz, cmap='inferno', shading='auto')
-axes[1].set_xlabel("X")
-axes[1].set_ylabel("Z")
-axes[1].set_title("XZ Projection (Summed over Y)")
-fig.colorbar(mesh2, ax=axes[1], label="Energy Deposited")
-
-# YZ Projection
-mesh3 = axes[2].pcolormesh(y_bins_yz, z_bins_yz, energy_proj_yz, cmap='inferno', shading='auto')
-axes[2].set_xlabel("Y")
-axes[2].set_ylabel("Z")
-axes[2].set_title("YZ Projection (Summed over X)")
-fig.colorbar(mesh3, ax=axes[2], label="Energy Deposited")
-
-plt.tight_layout()
-plt.savefig(f'{plot_folder}/event_projections_grid.png')
-plt.show()
-plt.close()
-
-# -------------------------------------------------------------------------
-# Plot the MIN_Z distribution
-# -------------------------------------------------------------------------
-# nue
-plt.figure(figsize=(8, 6))
-plt.hist(min_z_mu, bins=100,  label='numu')
-plt.hist(min_z_e, bins=100, label='nue')
-plt.hist(min_z_tau, bins=100,  label='nutau')
+plt.hist(neutrino_data['mu']['min_z_l'], bins=80, label='numu')
+plt.hist(neutrino_data['e']['min_z_l'], bins=80, label='nue')
+plt.hist(neutrino_data['tau']['min_z_l'], bins=80, label='nutau')
 plt.xlabel('$z_{min}$ [mm]')
 plt.ylabel('Counts')
 plt.yscale('log')
 plt.legend(loc='upper left')
 plt.savefig(f'{plot_folder}/min_z_distribution.png')
+plt.show()
 plt.close()
 
-
-# -------------------------------------------------------------------------
-# Plot the MAX_Z distribution
-# -------------------------------------------------------------------------
 plt.figure(figsize=(8, 6))
-plt.hist(max_z_mu, bins=100, label='numu')
-plt.hist(max_z_e, bins=100,  label='nue')
-plt.hist(max_z_tau, bins=100, label='nutau')
+plt.hist(neutrino_data['mu']['max_z_l'], bins=80, label='numu')
+plt.hist(neutrino_data['e']['max_z_l'], bins=80, label='nue')
+plt.hist(neutrino_data['tau']['max_z_l'], bins=80, label='nutau')
 plt.xlabel('$z_{max}$ [mm]')
 plt.ylabel('Counts')
 plt.yscale('log')
 plt.legend()
 plt.savefig(f'{plot_folder}/max_z_distribution.png')
+plt.show()
 plt.close()
 
-
-# -------------------------------------------------------------------------
-# Plot the DIST_TRAV_LEP vs NON TRAV distribution
-# -------------------------------------------------------------------------
+# -------------------------------------------------------------
+# Dist_trav_lep vs dist_trav_non_lep plot
+# -------------------------------------------------------------
 plt.figure(figsize=(8, 6))
-plt.hist(dist_trav_lep_mu, bins=110, range=(0,2000), label='numu')
-plt.hist(dist_trav_lep_e, bins=110, range=(0,2000),  label='nue')
-plt.hist(dist_trav_lep_tau, bins=110, range=(0,2000), label='nutau')
-#plot white line at max value of dist_trav_lep_mu orizzontal
+plt.hist(neutrino_data['mu']['dist_trav_lep'], bins=110, range=(0,300), label='numu')
+plt.hist(neutrino_data['e']['dist_trav_lep'], bins=110, range=(0,300), label='nue')
+plt.hist(neutrino_data['tau']['dist_trav_lep'], bins=110, range=(0,300), label='nutau')
 plt.axhline(y=800, color='white', linestyle='--', linewidth=2)
 plt.xlabel('$z_{dist} = |z_{max} - z_{min}|$ [mm]')
 plt.ylabel('Counts')
 plt.yscale('log')
-plt.legend(loc = 'lower right')
+plt.legend(loc='lower right')
 plt.savefig(f'{plot_folder}/dist_trav_lep_distribution.png')
+plt.show()
 plt.close()
 
+# -------------------------------------------------------------
+# Vox Energy for Leptons vs Non-Leptons (Energy Comparison)
+# -------------------------------------------------------------
+
+# Helper function to concatenate datasets
+def concat(arrays):
+    return np.concatenate(arrays, axis=0)
 
 # -------------------------------------------------------------------------
 # Plot Vox lep energy vs Vox non lep energy
 # -------------------------------------------------------------------------
 
-# Define datasets
 data_groups = [
-    (energy_lepton_vox_e, energy_non_lepton_vox_e),
-    (energy_lepton_vox_mu, energy_non_lepton_vox_mu),
-    (energy_lepton_vox_tau, energy_non_lepton_vox_tau),
+    (neutrino_data['e']['energy_lepton_vox'], neutrino_data['e']['energy_non_lepton_vox']),
+    (neutrino_data['mu']['energy_lepton_vox'], neutrino_data['mu']['energy_non_lepton_vox']),
+    (neutrino_data['tau']['energy_lepton_vox'], neutrino_data['tau']['energy_non_lepton_vox']),
 ]
 
-# Define a function for concatenation
-def concat(arrays):
-    return np.concatenate(arrays, axis=0)
 
-# Run all concatenations in parallel
+# Concatenate datasets in parallel
 with ThreadPoolExecutor() as executor:
     results = list(executor.map(concat, [pair for group in data_groups for pair in group]))
 
 # Unpack results
+
 (all_hist_energy_lepton_vox_e, all_hist_energy_non_lepton_vox_e,
  all_hist_energy_lepton_vox_mu, all_hist_energy_non_lepton_vox_mu,
  all_hist_energy_lepton_vox_tau, all_hist_energy_non_lepton_vox_tau) = results
 
-# Print shapes
-print(all_hist_energy_lepton_vox_e.shape, all_hist_energy_non_lepton_vox_e.shape,
-      all_hist_energy_lepton_vox_mu.shape, all_hist_energy_non_lepton_vox_mu.shape,
-      all_hist_energy_lepton_vox_tau.shape, all_hist_energy_non_lepton_vox_tau.shape)
+# Define function to plot lepton vs non-lepton energy
+def plot_comparison_histograms(lepton_data, non_lepton_data, filename):
+    num_bins = 100
+    min_val = min(np.min(non_lepton_data), np.min(lepton_data))
+    max_val = max(np.max(non_lepton_data), np.max(lepton_data))
 
-# Define the number of bins
-num_bins = 100
+    #if 0, skip
+    if min_val == 0 or max_val == 0:
+        min_val = 1e-3
 
-# Compute log-spaced bins based only on primlepton E values
-min_val = np.min(all_hist_energy_lepton_vox_e)
-max_val = np.max(all_hist_energy_lepton_vox_e)
-bin_edges = np.logspace(np.log10(min_val), np.log10(max_val), num_bins + 1)
+    plt.hist(non_lepton_data, bins=np.logspace(np.log10(min_val), np.log10(max_val), num_bins + 1), label='Non Lepton', lw=2)
+    plt.hist(lepton_data, bins=np.logspace(np.log10(min_val), np.log10(max_val), num_bins + 1), label='Primlepton', lw=2)
+    plt.xlabel('Vox Energy [MeV]')
+    plt.ylabel('Counts')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.legend()
+    plt.savefig(f'{plot_folder}/{filename}.png')
+    plt.close()
 
-plt.figure(figsize=(8,6))
-# Plot only the primlepton E histogram
-plt.hist(all_hist_energy_lepton_vox_e, bins=bin_edges, label='primlepton E', color='purple')
-plt.axvline(66, 0, 3500, color = 'white', label = '66 MeV, Low-Gain ch')
-# Labels and scales
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.xscale('log')
-plt.legend()
-
-# Save the plot
-plt.savefig(f'{plot_folder}/vox_energy_distribution_primlepton.png')
-plt.close()
-
-num_bins = 100
-
-# Compute log-spaced bins based only on non-lepton values
-min_val = np.min(all_hist_energy_non_lepton_vox_e)
-max_val = np.max(all_hist_energy_non_lepton_vox_e)
-bin_edges = np.logspace(np.log10(min_val), np.log10(max_val), num_bins + 1)
-
-plt.figure(figsize=(8,6))
-# Plot only the non-lepton histogram
-plt.hist(all_hist_energy_non_lepton_vox_e, bins=bin_edges, label='non lepton')
-plt.axvline(66, 0, 2500000, color = 'white', label = '66 MeV, Low-Gain ch')
-# Labels and scales
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.xscale('log')
-plt.legend()
-
-# Save the plot
-plt.savefig(f'{plot_folder}/vox_energy_distribution_non_lepton.png')
-plt.close()
-
-# nue
-# Define the number of bins
-num_bins = 100
-
-# Plot histograms using predefined bins
-plt.hist(all_hist_energy_non_lepton_vox_e,
-          bins=np.logspace(np.log10(min(np.min(all_hist_energy_non_lepton_vox_e), np.min(all_hist_energy_lepton_vox_e))),
-                           np.log10(max(np.max(all_hist_energy_non_lepton_vox_e), np.max(all_hist_energy_lepton_vox_e))),
-                           num_bins + 1),
-          label='non lepton',
-          lw=2)
-plt.hist(all_hist_energy_lepton_vox_e,
-          bins=np.logspace(np.log10(min(np.min(all_hist_energy_non_lepton_vox_e), np.min(all_hist_energy_lepton_vox_e))),
-                           np.log10(max(np.max(all_hist_energy_non_lepton_vox_e), np.max(all_hist_energy_lepton_vox_e))),
-                           num_bins + 1),
-          label='primlepton E',
-          lw=2)
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.xscale('log')
-plt.yscale('log')
-plt.legend()
-plt.savefig(f'{plot_folder}/vox_energy_distribution_nue.png')
-plt.close()
-
-# numu
-plt.hist(all_hist_energy_non_lepton_vox_mu,
-          bins=np.logspace(np.log10(min(np.min(all_hist_energy_non_lepton_vox_mu), np.min(all_hist_energy_lepton_vox_mu))),
-                           np.log10(max(np.max(all_hist_energy_non_lepton_vox_mu), np.max(all_hist_energy_lepton_vox_mu))),
-                           num_bins + 1),
-          label='non lepton')
-plt.hist(all_hist_energy_lepton_vox_mu,
-          bins=np.logspace(np.log10(min(np.min(all_hist_energy_non_lepton_vox_mu), np.min(all_hist_energy_lepton_vox_mu))),
-                           np.log10(max(np.max(all_hist_energy_non_lepton_vox_mu), np.max(all_hist_energy_lepton_vox_mu))),
-                           num_bins + 1),
-          label='primlepton Mu')
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.xscale('log')
-plt.yscale('log')
-plt.legend()
-plt.savefig(f'{plot_folder}/vox_energy_distribution_numu.png')
-plt.close()
-
-# nutau
-plt.hist(all_hist_energy_non_lepton_vox_tau,
-          bins=np.logspace(np.log10(min(np.min(all_hist_energy_non_lepton_vox_tau), np.min(all_hist_energy_lepton_vox_tau))),
-                           np.log10(max(np.max(all_hist_energy_non_lepton_vox_tau), np.max(all_hist_energy_lepton_vox_tau))),
-                           num_bins + 1),
-          label='non lepton')
-plt.hist(all_hist_energy_lepton_vox_tau,
-          bins=np.logspace(np.log10(min(np.min(all_hist_energy_non_lepton_vox_tau), np.min(all_hist_energy_lepton_vox_tau))),
-                           np.log10(max(np.max(all_hist_energy_non_lepton_vox_tau), np.max(all_hist_energy_lepton_vox_tau))),
-                           num_bins + 1),
-          label='primlepton Tau')
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.xscale('log')
-plt.yscale('log')
-plt.legend()
-plt.savefig(f'{plot_folder}/vox_energy_distribution_nutau.png')
-plt.close()
-
+# Plot for each neutrino type
+plot_comparison_histograms(all_hist_energy_lepton_vox_e, all_hist_energy_non_lepton_vox_e, 'vox_energy_distribution_nue')
+plot_comparison_histograms(all_hist_energy_lepton_vox_mu, all_hist_energy_non_lepton_vox_mu, 'vox_energy_distribution_numu')
+plot_comparison_histograms(all_hist_energy_lepton_vox_tau, all_hist_energy_non_lepton_vox_tau, 'vox_energy_distribution_nutau')
 
 
 # -------------------------------------------------------------------------
-
-# Define datasets in groups
+# Summed Histograms for EM, GH, and HAD Energy
+# -------------------------------------------------------------------------
 data_groups = [
-    (energy_EM_e, energy_GH_e, energy_HAD_e),
-    (energy_EM_mu, energy_GH_mu, energy_HAD_mu),
-    (energy_EM_tau, energy_GH_tau, energy_HAD_tau),
+    (neutrino_data['e']['energy_EM_vox'], neutrino_data['e']['energy_GH_vox'], neutrino_data['e']['energy_HAD_vox']),
+    (neutrino_data['mu']['energy_EM_vox'], neutrino_data['mu']['energy_GH_vox'], neutrino_data['mu']['energy_HAD_vox']),
+    (neutrino_data['tau']['energy_EM_vox'], neutrino_data['tau']['energy_GH_vox'], neutrino_data['tau']['energy_HAD_vox']),
 ]
 
-# Define a function for concatenation
-def concat(arrays):
-    return np.concatenate(arrays, axis=0)
-
-# Run all concatenations in parallel
+# Concatenate datasets in parallel
 with ThreadPoolExecutor() as executor:
     results = list(executor.map(concat, [item for group in data_groups for item in group]))
 
@@ -519,43 +497,25 @@ with ThreadPoolExecutor() as executor:
  all_hist_energy_EM_mu, all_hist_energy_GH_mu, all_hist_energy_HAD_mu,
  all_hist_energy_EM_tau, all_hist_energy_GH_tau, all_hist_energy_HAD_tau) = results
 
-# Print shapes
-print(all_hist_energy_EM_e.shape, all_hist_energy_GH_e.shape, all_hist_energy_HAD_e.shape,
-      all_hist_energy_EM_mu.shape, all_hist_energy_GH_mu.shape, all_hist_energy_HAD_mu.shape,
-      all_hist_energy_EM_tau.shape, all_hist_energy_GH_tau.shape, all_hist_energy_HAD_tau.shape)
+# Define function to plot summed energy distributions
+def plot_energy_distribution(lepton_data, had_data, gh_data, neutrino_type):
+    plt.hist(lepton_data, bins=100,range = (0,1), label='EM', histtype='step')
+    plt.hist(had_data, bins=100, range = (0,1),label='HAD', histtype='step')
+    plt.hist(gh_data, bins=100, range = (0,1),label='GH', histtype='step')
+    plt.xlabel('Vox Energy [MeV]')
+    plt.ylabel('Counts')
+    plt.yscale('log')
+    plt.legend()
+    plt.savefig(f'{plot_folder}/energy_distributions_{neutrino_type}.png')
+    plt.close()
 
-# Create and save the plots for summed histograms
-# nue
-plt.figure()
-plt.hist(all_hist_energy_EM_e, bins=100,  label='EM')
-plt.hist(all_hist_energy_HAD_e, bins=100,  label='HAD')
-plt.hist(all_hist_energy_GH_e, bins=100,  label='GH') 
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.yscale('log')
-plt.legend()
-plt.savefig(f'{plot_folder}/energy_distributions_nue.png')
-plt.close()
+# Plot for each neutrino type
+plot_energy_distribution(all_hist_energy_EM_e, all_hist_energy_HAD_e, all_hist_energy_GH_e, 'nue')
+plot_energy_distribution(all_hist_energy_EM_mu, all_hist_energy_HAD_mu, all_hist_energy_GH_mu, 'numu')
+plot_energy_distribution(all_hist_energy_EM_tau, all_hist_energy_HAD_tau, all_hist_energy_GH_tau, 'nutau')
 
-# numu
-plt.hist(all_hist_energy_EM_mu, bins=100,   label='EM')
-plt.hist(all_hist_energy_HAD_mu, bins=100,  label='HAD')
-plt.hist(all_hist_energy_GH_mu, bins=100,  label='GH')
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.yscale('log')
-plt.legend()
-plt.savefig(f'{plot_folder}/energy_distributions_numu.png')
-plt.close()
 
-# nutau
-plt.figure()
-plt.hist(all_hist_energy_EM_tau, bins=100,   label='EM')
-plt.hist(all_hist_energy_HAD_tau, bins=100, label='HAD')
-plt.hist(all_hist_energy_GH_tau, bins=100,   label='GH')
-plt.xlabel('Vox Energy [MeV]')
-plt.ylabel('Counts')
-plt.yscale('log')
-plt.legend()
-plt.savefig(f'{plot_folder}/energy_distributions_nutau.png')
-plt.close()
+# -------------------------------------------------------------
+# Saving progress and closing
+# -------------------------------------------------------------
+print("Processing completed.")

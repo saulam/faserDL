@@ -8,4 +8,6 @@ notebooks/
 checkpoint*/
 Plots/
 Plotsv5_1/
+Plotsv3_5/
+Plotsv3_5_AUG/
 *db

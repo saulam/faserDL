@@ -33,8 +33,11 @@ class SparseFASERCALDataset(Dataset):
         self.stage1 = args.stage1
         self.train = args.train
         self.augmentations_enabled = args.augmentations_enabled
-        self.augmentations_active = False
+        self.augmentations_active = True
         self.total_events = self.__len__
+        
+        self.plot_distributions = False
+
         with open(self.root + "/metadata.pkl", "rb") as fd:
             self.metadata = pk.load(fd)
             self.metadata['x'] = np.array(self.metadata['x'])
@@ -44,14 +47,16 @@ class SparseFASERCALDataset(Dataset):
             
     def set_augmentations_on(self):
         """Sets augmentations on dinamically."""
-        print("Setting augmentations: ON.")
-        self.augmentations_active = True
+        if self.augmentations_enabled:
+            print("Setting augmentations: ON.")
+            self.augmentations_active = True
     
     
     def set_augmentations_off(self):
         """Sets augmentations off dinamically."""
-        print("Setting augmentations: OFF.")
-        self.augmentations_active = False
+        if self.augmentations_enabled:
+            print("Setting augmentations: OFF.")
+            self.augmentations_active = False
  
 
     @property
@@ -94,10 +99,10 @@ class SparseFASERCALDataset(Dataset):
         # mirror
         coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # rotate
-        #coords, dirs = rotate(coords, dirs, primary_vertex)
+        # coords, dirs = rotate(coords, dirs, self.metadata, primary_vertex)
         coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
         # translate
-        coords, primary_vertex = translate(coords, primary_vertex, selected_axes=['x', 'y'])
+        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # drop voxels
         coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
@@ -381,7 +386,7 @@ class SparseFASERCALDataset(Dataset):
             # merge duplicated coordinates and finalise with augmentations
             coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
             seg_labels = self.normalise_seg_labels(seg_labels)
-            if not self.stage1:
+            if not self.stage1 and not self.plot_distributions:
                 primlepton_labels = add_gaussian_noise(primlepton_labels, shuffle_prob=0.)
                 seg_labels = add_gaussian_noise(seg_labels, shuffle_prob=0.)
             feats_global = add_noise_global_params(feats_global)
