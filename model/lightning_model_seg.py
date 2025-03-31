@@ -12,7 +12,10 @@ import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
 from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
-from pytorch_lightning.trainer.supporters import CombinedDataset
+from packaging import version
+
+
+pl_version = pl.__version__
 
 
 class SparseSegLightningModel(pl.LightningModule):
@@ -34,37 +37,44 @@ class SparseSegLightningModel(pl.LightningModule):
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
- 
 
+
+    def _set_training_mode(self, loader, mode: bool):
+        """Handles dataset training mode setting for both PL 1.x and 2.x."""
+        dataset = loader.dataset
+    
+        if version.parse(pl_version) < version.parse("2.0.0"):
+            # PyTorch Lightning 1.x
+            if hasattr(dataset, "datasets") and hasattr(dataset.datasets, "dataset"):
+                if mode:
+                    dataset.datasets.dataset.set_augmentations_on()
+                else:
+                    dataset.dataset.dataset.set_augmentations_off()
+        else:
+            # PyTorch Lightning 2.x
+            if hasattr(dataset, "dataset"):
+                if mode:
+                    dataset.dataset.set_augmentations_on()
+                else:
+                    dataset.dataset.set_augmentations_off()
+
+    
     def on_train_epoch_start(self):
         """Hook to be called at the start of each training epoch."""
-        train_loader = self.trainer.train_dataloader
-        if isinstance(train_loader.dataset, CombinedDataset):
-            if getattr(train_loader.dataset.datasets, "dataset", None) is not None:
-                train_loader.dataset.datasets.dataset.set_augmentations_on()
-            else:
-                train_loader.dataset.datasets.set_augmentations_on()
-        else:
-            train_loader.dataset.set_augmentations_on()
+        self._set_training_mode(self.trainer.train_dataloader, True)
 
-
+    
     def on_validation_epoch_start(self):
         """Hook to be called at the start of each validation epoch."""
-        val_loader = self.trainer.val_dataloaders[0]
-        if getattr(val_loader.dataset, "dataset", None) is not None:
-            val_loader.dataset.dataset.set_augmentations_off()
-        else:
-            val_loader.dataset.set_augmentations_off()
+        val_loader = self.trainer.val_dataloaders[0] if version.parse(pl_version) < version.parse("2.0.0") else self.trainer.val_dataloaders
+        self._set_training_mode(val_loader, False)
 
 
     def on_test_epoch_start(self):
         """Hook to be called at the start of each test epoch."""
-        test_loader = self.trainer.test_dataloaders[0]
-        if getattr(val_loader.dataset, "dataset", None) is not None:
-            test_loader.dataset.dataset.set_augmentations_off()
-        else:
-            test_loader.dataset.set_augmentations_off()
- 
+        test_loader = self.trainer.test_dataloaders[0] if version.parse(pl_version) < version.parse("2.0.0") else self.trainer.test_dataloaders
+        self._set_training_mode(test_loader, False)
+
 
     def forward(self, x, x_glob):
         return self.model(x, x_glob)
@@ -115,9 +125,9 @@ class SparseSegLightningModel(pl.LightningModule):
 
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
-        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
+        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True,prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
+            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss
@@ -128,9 +138,9 @@ class SparseSegLightningModel(pl.LightningModule):
 
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
-        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
+        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
+            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 

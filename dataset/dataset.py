@@ -32,8 +32,7 @@ class SparseFASERCALDataset(Dataset):
         self.load_seg = args.load_seg
         self.stage1 = args.stage1
         self.train = args.train
-        self.augmentations_enabled = args.augmentations_enabled
-        self.augmentations_active = False
+        self.augmentations_enabled = False
         self.total_events = self.__len__
         with open(self.root + "/metadata.pkl", "rb") as fd:
             self.metadata = pk.load(fd)
@@ -42,20 +41,6 @@ class SparseFASERCALDataset(Dataset):
             self.metadata['z'] = np.array(self.metadata['z'])
 
             
-    def set_augmentations_on(self):
-        """Sets augmentations on dinamically."""
-        if self.augmentations_enabled:
-            print("Setting augmentations: ON.")
-            self.augmentations_active = True
-    
-    
-    def set_augmentations_off(self):
-        """Sets augmentations off dinamically."""
-        if self.augmentations_enabled:
-            print("Setting augmentations: OFF.")
-            self.augmentations_active = False
- 
-
     @property
     def processed_dir(self):
         """
@@ -94,18 +79,18 @@ class SparseFASERCALDataset(Dataset):
         dirs = [x.copy() for x in dirs_ori]
  
         # mirror
-        coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
+        coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # rotate
         #coords, dirs = rotate(coords, dirs, primary_vertex)
-        coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # translate
-        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y'])
+        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # drop voxels
         coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
         feats = shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
-        coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
+        #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         
         if coords.shape[0] < 2:
             return coords_ori, feats_ori, labels_ori, dirs_ori
@@ -364,7 +349,7 @@ class SparseFASERCALDataset(Dataset):
         seg_labels = seg_labels.reshape(-1, 3)
 
         augmented, feats = False, q
-        if self.augmentations_enabled and self.augmentations_active and np.random.rand() > 0.01:           
+        if self.augmentations_enabled and np.random.rand() > 0.01:           
             # augmented event
             (
                 coords, feats, (primlepton_labels, seg_labels),
@@ -378,7 +363,7 @@ class SparseFASERCALDataset(Dataset):
             augmented = True
         else:
             seg_labels = self.normalise_seg_labels(seg_labels)
-           
+          
         if augmented:
             # merge duplicated coordinates and finalise with augmentations
             coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)

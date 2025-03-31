@@ -16,7 +16,8 @@ from dataset import SparseFASERCALDataset
 from model import MinkUNetConvNeXtV2, SparseSegLightningModel
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
+
 
 class CustomProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):
@@ -44,7 +45,7 @@ def main():
     # Manually specify the GPUs to use
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
- 
+
     # Dataset
     dataset = SparseFASERCALDataset(args)
     print("- Dataset size: {} events".format(len(dataset)))
@@ -65,13 +66,33 @@ def main():
     # Define logger and checkpoint
     logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
-    checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_path + "/" + args.checkpoint_name,
-        save_last=True, save_top_k=args.save_top_k, monitor="loss/val_total")
+    callbacks = []
+    monitored_losses = ["loss/val_primlepton", "loss/val_seg", "loss/val_total"]
+    for loss_name in monitored_losses:
+        checkpoint = ModelCheckpoint(
+            dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss_name.replace('/', '_')}",
+            #filename=f"{loss_name.replace('/', '_')}" + "-{epoch:02d}-{"+loss_name+":.2f}",
+            save_top_k=args.save_top_k,
+            monitor=loss_name,
+            mode="min",
+            save_last=True if "total" in loss_name else False 
+        )
+        callbacks.append(checkpoint)    
+
     progress_bar = CustomProgressBar()
-    callbacks = [checkpoint_callback, progress_bar]
+    callbacks.append(progress_bar)
+    if args.early_stop_patience > 0:
+        early_stop_callback = EarlyStopping(
+            monitor='loss/val_total',
+            patience=args.early_stop_patience,
+            verbose=True,
+            mode='min' 
+        )
+        callbacks.append(early_stop_callback)
 
     # Lightning model
-    lightning_model = SparseSegLightningModel(model=model,
+    lightning_model = SparseSegLightningModel(
+        model=model,
         args=args)
 
     # Log the hyperparameters
@@ -85,7 +106,8 @@ def main():
         callbacks=callbacks,
         accelerator="gpu",
         devices=nb_gpus,
-        strategy="ddp" if nb_gpus > 1 else None,
+        precision="bf16-mixed",
+        strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
         deterministic=True,
