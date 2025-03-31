@@ -33,6 +33,7 @@ class SparseFASERCALDataset(Dataset):
         self.stage1 = args.stage1
         self.train = args.train
         self.augmentations_enabled = False
+        self.is_v5 = True if 'v5' in args.dataset_path else False 
         self.total_events = self.__len__
         with open(self.root + "/metadata.pkl", "rb") as fd:
             self.metadata = pk.load(fd)
@@ -308,7 +309,7 @@ class SparseFASERCALDataset(Dataset):
         faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocess=True)
         primary_vertex = data['primary_vertex']
         
-        if not is_cc:
+        if not self.is_v5 and not is_cc:
             # Fix jet momentum and no outgoing lepton momentum for NC events
             jet_momentum = jet_momentum + out_lepton_momentum
             out_lepton_momentum.fill(0)
@@ -338,7 +339,7 @@ class SparseFASERCALDataset(Dataset):
             # predictions become labels
             primlepton_labels = primlepton_labels_pred
             seg_labels = seg_labels_pred
-         
+        
         # voxelise coordinates and prepare global features and labels
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
@@ -347,6 +348,14 @@ class SparseFASERCALDataset(Dataset):
         flavour_label = self.pdg2label(in_neutrino_pdg, is_cc)
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)
+
+        if self.is_v5:
+            # mask out voxels between modules
+            mask = ~(coords[:, 2] % 24 >= 20)
+            coords = coords[mask]
+            q = q[mask]
+            primlepton_labels = primlepton_labels[mask]
+            seg_labels = seg_labels[mask]
 
         augmented, feats = False, q
         if self.augmentations_enabled and np.random.rand() > 0.01:           
