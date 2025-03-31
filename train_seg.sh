@@ -3,16 +3,15 @@
 # Default arguments
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v3.5"
 sets_path="/scratch/salonso/sparse-nns/faser/events_v3.5/sets.pkl"
-
 eps=1e-12
-batch_size=14
+batch_size=32
 epochs=50
-num_workers=8
+num_workers=16
 lr=2e-4
 accum_grad_batches=1
 warmup_steps=1
 cosine_annealing_steps=20
-weight_decay=1e-4
+weight_decay=1e-5
 beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
@@ -27,6 +26,7 @@ gpus=(0)
 python -m train.train_seg \
     --train \
     --stage1 \
+    --augmentations_enabled \
     --dataset_path $dataset_path \
     --sets_path $sets_path \
     --eps $eps \
@@ -47,6 +47,6 @@ python -m train.train_seg \
     --save_top_k $save_top_k \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
-    --gpus "${gpus[@]}" \
-    --augmentations_enabled 
+    --early_stop_patience $early_stop_patience \
+    --gpus "${gpus[@]}"
 
