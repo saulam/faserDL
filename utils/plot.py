@@ -268,7 +268,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
                         tickvals=[0, 1],  # Show color scale ticks at 0 and 1
                         ticktext=[f'{min_energy:.2f}', f'{max_energy:.2f}']  # Display min and max energy
                     ),
-                    opacity=0.7
+                    opacity=0.7,
                 ),
                 name='Energy-Based Coloring'
             ))

@@ -29,12 +29,6 @@ class CustomDataset(SparseFASERCALDataset):
         Retrieves a data sample by index and applies augmentations if needed.
         """
         data = super().__getitem__(idx)
-
-        print('Metadata_values: ', self.metadata['x'], self.metadata['y'], self.metadata['z'] )
-
-
-        # Preprocessing 
-        data['coords']
         
 
         #fixig some stuff
@@ -94,8 +88,8 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 args = ini_argparse().parse_args()
 
 # args.dataset_path = "/scratch3/salonso/faser/events_v3.5" #spaceml4
-# args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
-args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
+args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
+# args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
 
 args.train = False
 args.stage1 = False
@@ -103,9 +97,9 @@ args.augmentations_enabled = False
 args.batch_size = 4
 args.num_workers = 32
 
-plot_folder = "/home/fcufino/faserDL/Plotsv5_1"
+# plot_folder = "/home/fcufino/faserDL/Plotsv5_1"
 
-# plot_folder = "/home/fcufino/faserDL/Plotsv3_5_AUG"
+plot_folder = "/home/fcufino/faserDL/Plotsv3_5_AUG"
 # plot_folder = "/home/fcufino/faserDL/Plotsv3_5"
 
 
@@ -199,8 +193,8 @@ neutrino_map = {12: 'e', 14: 'mu', 16: 'tau'}
 n_ev = 0
 
 for batch in dataloader:
-    if n_ev > 100:
-        break
+    # if n_ev > 100:
+    #     break
 
     len_batch = len(batch['run_number'])
 
@@ -265,7 +259,7 @@ def plot_1d(variable_data, variable_name, plot_filename, xlabel='Energy [GeV]', 
         
         # Plot the data with the correct color
         plt.subplot(1, n, i + 1)
-        plt.hist(data, bins=100, label=neutrino_types[i], color=colors[i])  # Provide the correct color
+        plt.hist(data, bins=40, label=neutrino_types[i], color=colors[i])  # Provide the correct color
         plt.title(f"{neutrino_types[i]} {variable_name}")
         plt.xlabel(xlabel)
         plt.ylabel('Counts')
