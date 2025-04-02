@@ -65,6 +65,7 @@ def _init_weights(m):
 class MinkEncRegConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
         nn.Module.__init__(self)
+        self.is_v5 = True if 'v5' in args.dataset_path else False 
 
         """Encoder"""
         #depths=[2, 4, 4, 8, 8, 8]
@@ -89,7 +90,7 @@ class MinkEncRegConvNeXtV2(nn.Module):
 
         # Linear transformation for glibal features
         self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + 15, dims[0]),
+            nn.Linear(1 + 1 + 1 + 1 + 9 + (10 if self.is_v5 else 15), dims[0]),
         )
 
         for i in range(self.nb_elayers):
