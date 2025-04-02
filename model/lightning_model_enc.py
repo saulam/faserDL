@@ -3,7 +3,7 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 01.25
 
-Description: PyTorch Lightning model - stage 2: regression tasks.
+Description: PyTorch Lightning model - stage 2: classification and regression tasks.
 """
 
 
@@ -14,11 +14,12 @@ import pytorch_lightning as pl
 from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 
 
-class SparseEncRegLightningModel(pl.LightningModule):
+class SparseLightningModel(pl.LightningModule):
     def __init__(self, model, args):
-        super(SparseEncRegLightningModel, self).__init__()
+        super(SparseLightningModel, self).__init__()
 
         self.model = model
+        self.loss_flavour = nn.CrossEntropyLoss()
         self.loss_evis = MAPE()
         self.loss_ptmiss = MAPE()
         self.loss_lepton_momentum_mag = MAPE()
@@ -51,6 +52,7 @@ class SparseEncRegLightningModel(pl.LightningModule):
 
     def compute_losses(self, batch_output, target):
         # pred
+        out_flavour = batch_output['out_flavour']
         out_e_vis = batch_output['out_e_vis'].view(-1)
         out_pt_miss = batch_output['out_pt_miss'].view(-1)
         out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag']
@@ -59,6 +61,7 @@ class SparseEncRegLightningModel(pl.LightningModule):
         out_jet_momentum_dir = batch_output['out_jet_momentum_dir']
 
         # true
+        targ_flavour = target['flavour_label']
         targ_e_vis = target['e_vis']
         targ_pt_miss = target['pt_miss']
         targ_lepton_momentum_mag = target['out_lepton_momentum_mag']
@@ -74,6 +77,7 @@ class SparseEncRegLightningModel(pl.LightningModule):
         targ_lepton_momentum_dir = targ_lepton_momentum_dir[mask]
 
         # losses
+        loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_e_vis = self.loss_evis(out_e_vis, targ_e_vis)
         loss_pt_miss = self.loss_ptmiss(out_pt_miss, targ_pt_miss)
         loss_lepton_momentum_mag = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
@@ -81,14 +85,15 @@ class SparseEncRegLightningModel(pl.LightningModule):
         loss_jet_momentum_mag = self.loss_jet_momentum_mag(out_jet_momentum_mag, targ_jet_momentum_mag)
         loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
         
-        part_losses = {'e_vis': loss_e_vis,
+        part_losses = {'flavour': loss_flavour,
+                       'e_vis': loss_e_vis,
                        'pt_miss': loss_pt_miss,
                        'lepton_momentum_mag': loss_lepton_momentum_mag,
                        'lepton_momentum_dir': loss_lepton_momentum_dir,
                        'jet_momentum_mag': loss_jet_momentum_mag,
                        'jet_momentum_dir': loss_jet_momentum_dir,
                        }
-        total_loss = loss_e_vis + loss_pt_miss + loss_lepton_momentum_mag + loss_lepton_momentum_dir + loss_jet_momentum_mag + loss_jet_momentum_dir
+        total_loss = loss_flavour + loss_e_vis + loss_pt_miss + loss_lepton_momentum_mag + loss_lepton_momentum_dir + loss_jet_momentum_mag + loss_jet_momentum_dir
 
         return total_loss, part_losses
 
