@@ -327,18 +327,6 @@ class SparseFASERCALDataset(Dataset):
         # process labels
         primlepton_labels = self.get_param(data, 'primlepton_labels')
         seg_labels = self.get_param(data, 'seg_labels')
-        if self.load_seg:
-            # load labels from pretrained model predictions
-            file_name = self.data_files[idx].replace("events_v3.5", "events_v3.5_seg_results")
-            predictions = np.load(file_name)
-            primlepton_labels_pred, seg_labels_pred = predictions['out_primlepton'], predictions['out_seg']
-            
-            # convert electromagnetic and hadronic probabilities to energy desposits (using truth info)
-            seg_labels_pred[:, 1:] *= (seg_labels[:, 1:].sum(axis=1, keepdims=True) + 1e-8)            
-            
-            # predictions become labels
-            primlepton_labels = primlepton_labels_pred
-            seg_labels = seg_labels_pred
         
         # voxelise coordinates and prepare global features and labels
         coords = self.voxelise(coords)
@@ -356,6 +344,20 @@ class SparseFASERCALDataset(Dataset):
             q = q[mask]
             primlepton_labels = primlepton_labels[mask]
             seg_labels = seg_labels[mask]
+
+        if self.load_seg:
+            # load labels from pretrained model predictions
+            version = "v5.1" if self.is_v5 else "v3.5"
+            file_name = self.data_files[idx].replace(f"events_{version}", f"events_{version}_seg_results")
+            predictions = np.load(file_name)
+            primlepton_labels_pred, seg_labels_pred = predictions['out_primlepton'], predictions['out_seg']
+            
+            # convert electromagnetic and hadronic probabilities to energy desposits (using truth info)
+            seg_labels_pred[:, 1:] *= (seg_labels[:, 1:].sum(axis=1, keepdims=True) + 1e-8)            
+            
+            # predictions become labels
+            primlepton_labels = primlepton_labels_pred
+            seg_labels = seg_labels_pred
 
         augmented, feats = False, q
         if self.augmentations_enabled and np.random.rand() > 0.01:           

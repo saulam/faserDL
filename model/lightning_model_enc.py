@@ -14,9 +14,9 @@ import pytorch_lightning as pl
 from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 
 
-class SparseLightningModel(pl.LightningModule):
+class SparseEncLightningModel(pl.LightningModule):
     def __init__(self, model, args):
-        super(SparseLightningModel, self).__init__()
+        super(SparseEncLightningModel, self).__init__()
 
         self.model = model
         self.loss_flavour = nn.CrossEntropyLoss()

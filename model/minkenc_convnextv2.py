@@ -28,10 +28,12 @@ from MinkowskiEngine import (
     MinkowskiDepthwiseConvolution,
     MinkowskiLinear,
     MinkowskiGlobalMaxPooling,
+    MinkowskiGlobalAvgPooling,
     MinkowskiReLU,
     MinkowskiGELU,
     MinkowskiLeakyReLU,
     MinkowskiSoftplus,
+    MinkowskiDropout,
 )
 
 
@@ -108,59 +110,48 @@ class MinkEncConvNeXtV2(nn.Module):
                 self.downsample_layers.append(downsample_layer)
 
         """Classification/regression layers"""
-        self.global_pool = MinkowskiGlobalMaxPooling()
+        self.global_max_pool = MinkowskiGlobalMaxPooling()
+        self.global_avg_pool = MinkowskiGlobalAvgPooling()
         self.flavour_layer = nn.Sequential(
             MinkowskiLinear(dims[-1], dims[-1]),
             MinkowskiGELU(),
+            #MinkowskiDropout(0.1),
             MinkowskiLinear(dims[-1], 4)
         )
         self.e_vis_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//4, 1),
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         ) 
         self.pt_miss_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//4, 1),
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.out_lepton_momentum_mag_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//4, 1),
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 1),
             MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.out_lepton_momentum_dir_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//4, 3),
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 3),
         )
         self.jet_momentum_mag_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//4, 1),
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 1),  
             MinkowskiSoftplus(beta=1, threshold=20),
         )
         self.jet_momentum_dir_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]//2),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//2, dims[-1]//4),
-            MinkowskiLeakyReLU(0.1),
-            MinkowskiLinear(dims[-1]//4, 3),
+            MinkowskiLinear(dims[-1], dims[-1]),
+            MinkowskiGELU(),
+            MinkowskiLinear(dims[-1], 3),
         )
-
 
         """ Initialise weights """
         self.apply(_init_weights)
@@ -186,14 +177,15 @@ class MinkEncConvNeXtV2(nn.Module):
                 x = self.downsample_layers[i](x)
         
         # event predictions
-        x_pooled = self.global_pool(x)
-        out_flavour = self.flavour_layer(x_pooled)
-        out_e_vis = self.e_vis_head(x_pooled)
-        out_pt_miss = self.pt_miss_head(x_pooled)
-        out_lepton_momentum_mag = self.out_lepton_momentum_mag_head(x_pooled)
-        out_lepton_momentum_dir = self.out_lepton_momentum_dir_head(x_pooled)
-        out_jet_momentum_mag = self.jet_momentum_mag_head(x_pooled)
-        out_jet_momentum_dir = self.jet_momentum_dir_head(x_pooled)
+        x_max_pooled = self.global_max_pool(x)
+        x_avg_pooled = self.global_avg_pool(x)
+        out_flavour = self.flavour_layer(x_max_pooled)
+        out_e_vis = self.e_vis_head(x_avg_pooled)
+        out_pt_miss = self.pt_miss_head(x_avg_pooled)
+        out_lepton_momentum_mag = self.out_lepton_momentum_mag_head(x_avg_pooled)
+        out_lepton_momentum_dir = self.out_lepton_momentum_dir_head(x_avg_pooled)
+        out_jet_momentum_mag = self.jet_momentum_mag_head(x_avg_pooled)
+        out_jet_momentum_dir = self.jet_momentum_dir_head(x_avg_pooled)
 
         output = {"out_flavour": out_flavour.F,
                   "out_e_vis": out_e_vis.F,
