@@ -82,7 +82,7 @@ class SparseSegLightningModel(pl.LightningModule):
                        'seg_ce': loss_seg_ce,
                        'seg_dice': loss_seg_dice,
                        }
-        total_loss = loss_primlepton_dice + loss_primlepton_dice + loss_seg_ce + loss_seg_dice
+        total_loss = loss_primlepton_ce + loss_primlepton_dice + loss_seg_ce + loss_seg_dice
 
         return total_loss, part_losses
 
