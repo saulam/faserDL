@@ -58,7 +58,7 @@ def main():
     args.start_cosine_step = (nb_batches * args.epochs // (args.accum_grad_batches * nb_gpus)) - args.scheduler_steps
 
     # Initialize the model
-    model = MinkEncConvNeXtV2(in_channels=5, out_channels=3, D=3, args=args)
+    model = MinkEncConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
@@ -66,10 +66,30 @@ def main():
     # Define logger and checkpoint
     logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
-    checkpoint_callback = ModelCheckpoint(dirpath=args.checkpoint_path + "/" + args.checkpoint_name,
-        save_last=True, save_top_k=args.save_top_k, monitor="loss/val_total")
     progress_bar = CustomProgressBar()
-    callbacks = [checkpoint_callback, progress_bar]
+
+    monitor_losses = [
+        "loss/val_total",
+        "loss/val_flavour",
+        "loss/val_e_vis",
+        "loss/val_jet_momentum_dir",
+        "loss/val_jet_momentum_mag",
+        "loss/val_lepton_momentum_dir",
+        "loss/val_lepton_momentum_mag",
+        "loss/val_pt_miss"
+    ]
+
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss.replace('/', '_')}",
+            save_top_k=args.save_top_k,
+            monitor=loss,
+            mode="min",  # assuming you want to minimize these losses
+            save_last=True if loss=="loss/val_total" else False
+        )
+        for loss in monitor_losses
+    ]
+    callbacks.append(progress_bar)
 
     # Lightning model
     lightning_model = SparseEncLightningModel(model=model,
@@ -97,9 +117,12 @@ def main():
     )
 
     # Train and validate the model
-    trainer.fit(model=lightning_model,
+    trainer.fit(
+        model=lightning_model,
         train_dataloaders=train_loader,
-        val_dataloaders=valid_loader)
+        val_dataloaders=valid_loader,
+        ckpt_path=args.load_checkpoint if args.load_checkpoint else None,
+    )
 
 
 if __name__ == "__main__":
