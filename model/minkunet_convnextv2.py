@@ -155,7 +155,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         self.primlepton_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
             Block(dim=decoder_dims[-1], kernel_size=(3, 3, 7), drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 2, kernel_size=1, stride=1, dimension=D),
+            MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
         )
         self.seg_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),

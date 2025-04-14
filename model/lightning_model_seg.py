@@ -7,6 +7,7 @@ Description: PyTorch Lightning model - stage 1: semantic segmentation.
 """
 
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,7 +26,7 @@ class SparseSegLightningModel(pl.LightningModule):
 
         self.model = model
         self.loss_primlepton_ce = nn.BCEWithLogitsLoss()
-        self.loss_primlepton_dice = partial(dice_loss, sigmoid=False, reduction="mean") 
+        self.loss_primlepton_dice = partial(dice_loss, sigmoid=True, reduction="mean") 
         self.loss_seg_ce = nn.CrossEntropyLoss()
         self.loss_seg_dice = partial(dice_loss, sigmoid=False, reduction="mean")
         self.warmup_steps = args.warmup_steps
