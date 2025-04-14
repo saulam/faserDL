@@ -6,7 +6,7 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 2: classification and regression tasks.
 """
 
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -20,11 +20,11 @@ class SparseEncLightningModel(pl.LightningModule):
 
         self.model = model
         self.loss_flavour = nn.CrossEntropyLoss()
-        self.loss_evis = MAPE()
-        self.loss_ptmiss = MAPE()
-        self.loss_lepton_momentum_mag = MAPE()
+        self.loss_evis = nn.MSELoss() #MAPE()
+        self.loss_ptmiss = nn.MSELoss() #MAPE()
+        self.loss_lepton_momentum_mag = nn.MSELoss() #MAPE()
         self.loss_lepton_momentum_dir = SphericalAngularLoss()
-        self.loss_jet_momentum_mag = MAPE()
+        self.loss_jet_momentum_mag = nn.MSELoss() #MAPE()
         self.loss_jet_momentum_dir = SphericalAngularLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
@@ -38,6 +38,16 @@ class SparseEncLightningModel(pl.LightningModule):
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+
+
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
+        # Calculate progress p: global step / max_steps
+        # Make sure self.trainer is set (it usually is after a few batches)
+        if self.trainer.max_steps:
+            total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
+            p = float(self.global_step) / total_steps
+            # Here, gamma = 10 is a typical choice, modify as needed
+            self.model.global_weight = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
  
 
     def forward(self, x, x_glob):
@@ -123,6 +133,7 @@ class SparseEncLightningModel(pl.LightningModule):
         self.log(f"loss/train_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
+        self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss

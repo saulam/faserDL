@@ -1,207 +1,208 @@
 """
-Author: Dr. Saul Alonso-Monsalve
+Author: Dr. Saul Alonso-Monsalve (modified)
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 04.25
 
-Description: PyTorch model - stage 2: classification and regression tasks.
+Description: PyTorch model - stage 2: event-level classification and regression tasks.
 """
-
 
 import torch
 import torch.nn as nn
-from torch.optim import SGD
-import MinkowskiEngine as ME
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 
-from .utils import (
-    Block,
-    LayerNorm,
-    MinkowskiLayerNorm,
-    MinkowskiGRN,
-    MinkowskiDropPath
-)
-
+import MinkowskiEngine as ME
 from MinkowskiEngine import (
     MinkowskiConvolution,
-    MinkowskiConvolutionTranspose,
-    MinkowskiDepthwiseConvolution,
-    MinkowskiLinear,
     MinkowskiGlobalMaxPooling,
     MinkowskiGlobalAvgPooling,
-    MinkowskiReLU,
-    MinkowskiGELU,
-    MinkowskiLeakyReLU,
+    MinkowskiLinear,
     MinkowskiSoftplus,
-    MinkowskiDropout,
+    MinkowskiGELU,
 )
 
+from .utils import Block, MinkowskiLayerNorm, MinkowskiSE
 
-# Custom weight initialization function
+
 def _init_weights(m):
+    """Custom weight initialization for supported layers."""
     if isinstance(m, MinkowskiConvolution):
-        trunc_normal_(m.kernel, std=.02)
+        trunc_normal_(m.kernel, std=0.02)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
-    if isinstance(m, MinkowskiConvolutionTranspose):
-        trunc_normal_(m.kernel, std=.02)
+    elif isinstance(m, ME.MinkowskiDepthwiseConvolution):
+        trunc_normal_(m.kernel, std=0.02)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
-    if isinstance(m, MinkowskiDepthwiseConvolution):
-        trunc_normal_(m.kernel, std=.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    if isinstance(m, MinkowskiLinear):
-        trunc_normal_(m.linear.weight, std=.02)
+    elif isinstance(m, MinkowskiLinear):
+        trunc_normal_(m.linear.weight, std=0.02)
         if m.linear.bias is not None:
             nn.init.constant_(m.linear.bias, 0)
-    if isinstance(m, nn.Linear):
-        trunc_normal_(m.weight, std=.02)
+    elif isinstance(m, nn.Linear):
+        trunc_normal_(m.weight, std=0.02)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
-    if isinstance(m, nn.LayerNorm):
+    elif isinstance(m, nn.LayerNorm):
         nn.init.constant_(m.bias, 0)
         nn.init.constant_(m.weight, 1.0)
 
 
 class MinkEncConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
-        nn.Module.__init__(self)
-        self.is_v5 = True if 'v5' in args.dataset_path else False 
+        """
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            D (int): Spatial dimension.
+            args: Arguments namespace with at least a `dataset_path` attribute.
+        """
+        super().__init__()
+        # Determine the version flag based on the dataset_path in args.
+        self.is_v5 = "v5" in args.dataset_path if args is not None and hasattr(args, "dataset_path") else False
 
-        """Encoder"""
-        #depths=[2, 4, 4, 8, 8, 8]
-        #dims = (16, 32, 64, 128, 256, 512)
-        depths=[3, 3, 9, 3]
-        dims=[96, 192, 384, 768]     
-        kernel_size = 5
-        drop_path_rate=0.
+        # Define channel dimensions.
+        #dims = [96, 192, 384, 768]
+        dims = [96, 160, 256, 384]
 
-        assert len(depths) == len(dims)
+        ###############################################
+        # Shared Backbone
+        ###############################################
+        
+        # Stem
+        self.stem = nn.Sequential(
+            MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D),
+            MinkowskiLayerNorm(dims[0], eps=1e-6),
+        )
 
-        self.nb_elayers = len(dims)
-
-        self.encoder_layers = nn.ModuleList()
-        self.downsample_layers = nn.ModuleList()
-        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        cur = 0
-
-        # stem
-        self.stem = MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D)
-        self.stem_ln = MinkowskiLayerNorm(dims[0], eps=1e-6)
-
-        # Linear transformation for glibal features
+        # Global features
+        global_input_dim = 1 + 1 + 1 + 1 + 9 + (10 if self.is_v5 else 15)
+        self.global_weight = 1  # Scalar controlling global parameter contribution
         self.global_mlp = nn.Sequential(
-            nn.Linear(1 + 1 + 1 + 1 + 9 + (10 if self.is_v5 else 15), dims[0]),
+            nn.Linear(global_input_dim, dims[0]),
+            nn.GELU(),
+            nn.Dropout(0.1),
         )
 
-        for i in range(self.nb_elayers):
-            encoder_layer = nn.Sequential(
-                *[Block(dim=dims[i], kernel_size=kernel_size, drop_path=dp_rates[cur + j], D=D) for j in range(depths[i])]
+        # Backbone
+        backbone_depths = [3, 3, 9]
+        backbone_channels = dims[:-1]
+        self.shared_encoders = nn.ModuleList()
+        self.shared_se_layers = nn.ModuleList()
+        self.shared_downsamples = nn.ModuleList()
+        for i, depth in enumerate(backbone_depths):
+            # Encoder layer
+            encoder = nn.Sequential(
+                *[Block(dim=backbone_channels[i], kernel_size=(3, 3, 7), drop_path=0.0, D=D)
+                  for _ in range(depth)]
             )
-            self.encoder_layers.append(encoder_layer)
-            cur += depths[i]
+            self.shared_encoders.append(encoder)
 
-            if i < self.nb_elayers - 1:  
-                downsample_layer = nn.Sequential(
-                    MinkowskiLayerNorm(dims[i], eps=1e-6),                
-                    MinkowskiConvolution(dims[i], dims[i+1], kernel_size=2, stride=2, bias=True, dimension=D),
+            # SE layer
+            se_layer = MinkowskiSE(channels=backbone_channels[i], glob_dim=dims[0], reduction=16)
+            self.shared_se_layers.append(se_layer)
+
+            # Downsampling layer
+            if i < len(backbone_depths) - 1:
+                downsample = nn.Sequential(
+                    MinkowskiLayerNorm(backbone_channels[i], eps=1e-6),
+                    MinkowskiConvolution(
+                        backbone_channels[i],
+                        dims[i + 1],
+                        kernel_size=(2, 2, 3),
+                        stride=(2, 2, 3),
+                        bias=True,
+                        dimension=D
+                    ),
                 )
-                self.downsample_layers.append(downsample_layer)
+                self.shared_downsamples.append(downsample)
 
-        """Classification/regression layers"""
-        self.global_max_pool = MinkowskiGlobalMaxPooling()
-        self.global_avg_pool = MinkowskiGlobalAvgPooling()
-        self.flavour_layer = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            #MinkowskiDropout(0.1),
-            MinkowskiLinear(dims[-1], 4)
-        )
-        self.e_vis_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=20),
-        ) 
-        self.pt_miss_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=20),
-        )
-        self.out_lepton_momentum_mag_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            MinkowskiLinear(dims[-1], 1),
-            MinkowskiSoftplus(beta=1, threshold=20),
-        )
-        self.out_lepton_momentum_dir_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            MinkowskiLinear(dims[-1], 3),
-        )
-        self.jet_momentum_mag_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            MinkowskiLinear(dims[-1], 1),  
-            MinkowskiSoftplus(beta=1, threshold=20),
-        )
-        self.jet_momentum_dir_head = nn.Sequential(
-            MinkowskiLinear(dims[-1], dims[-1]),
-            MinkowskiGELU(),
-            MinkowskiLinear(dims[-1], 3),
-        )
+        ###############################################
+        # Branch-Specific Modules
+        ###############################################
+        
+        branch_names = [
+            "flavour",
+            "e_vis",
+            "pt_miss",
+            "lepton_momentum_mag",
+            "lepton_momentum_dir",
+            "jet_momentum_mag",
+            "jet_momentum_dir"
+        ]
+        branch_out_channels = {
+            "flavour": 4,
+            "e_vis": 1,
+            "pt_miss": 1,
+            "lepton_momentum_mag": 1,
+            "lepton_momentum_dir": 3,
+            "jet_momentum_mag": 1,
+            "jet_momentum_dir": 3,
+        }
+        
+        self.branches = nn.ModuleDict()
+        for name in branch_names:
+            branch = {}
+            branch["downsample"] = nn.Sequential(
+                MinkowskiLayerNorm(dims[2], eps=1e-6),
+                MinkowskiConvolution(dims[2], dims[3], kernel_size=(2, 2, 3), stride=(2, 2, 3), bias=True, dimension=D),
+            )
+            branch["encoder"] = nn.Sequential(
+                *[Block(dim=dims[3], kernel_size=(5, 5, 7), drop_path=0.0, D=D) for _ in range(3)]
+            )
+            branch["se"] = MinkowskiSE(channels=dims[3], glob_dim=dims[0], reduction=16)
+            branch["global_pool"] = (
+                MinkowskiGlobalMaxPooling() if name == "flavour" else MinkowskiGlobalAvgPooling()
+            )
+            branch["head"] = nn.Sequential(
+                MinkowskiLinear(dims[3], branch_out_channels[name]),
+            )
+            self.branches[name] = nn.ModuleDict(branch)
 
-        """ Initialise weights """
+        # Initialise weights
         self.apply(_init_weights)
-
+    
     def forward(self, x, x_glob):
-        """Encoder"""
-        # stem
+        """
+        Forward pass through the shared backbone and branch-specific modules.
+        
+        Args:
+            x: Input sparse tensor.
+            x_glob: Global feature tensor.
+            
+        Returns:
+            A dictionary mapping branch names prefixed with 'out_' to their outputs.
+        """
+        # Shared backbone
         x = self.stem(x)
         x_glob = self.global_mlp(x_glob)
 
-        # add global to voxel features
-        batch_indices = x.C[:, 0].long()  # batch idx
-        x_glob_expanded = x_glob[batch_indices]
-        new_feats = x.F + x_glob_expanded
-        x = ME.SparseTensor(features=new_feats, coordinates=x.C)
-
-        # encoder layers
-        x_enc = []
-        for i in range(self.nb_elayers):
-            x = self.encoder_layers[i](x)
-            if i < self.nb_elayers - 1:
-                x_enc.append(x)
-                x = self.downsample_layers[i](x)
+        # Process each backbone stage in a loop.
+        for i in range(len(self.shared_encoders)):
+            x = self.shared_encoders[i](x)
+            x = self.shared_se_layers[i](x, x_glob, self.global_weight)
+            if i < len(self.shared_downsamples):
+                x = self.shared_downsamples[i](x)
         
-        # event predictions
-        x_max_pooled = self.global_max_pool(x)
-        x_avg_pooled = self.global_avg_pool(x)
-        out_flavour = self.flavour_layer(x_max_pooled)
-        out_e_vis = self.e_vis_head(x_avg_pooled)
-        out_pt_miss = self.pt_miss_head(x_avg_pooled)
-        out_lepton_momentum_mag = self.out_lepton_momentum_mag_head(x_avg_pooled)
-        out_lepton_momentum_dir = self.out_lepton_momentum_dir_head(x_avg_pooled)
-        out_jet_momentum_mag = self.jet_momentum_mag_head(x_avg_pooled)
-        out_jet_momentum_dir = self.jet_momentum_dir_head(x_avg_pooled)
-
-        output = {"out_flavour": out_flavour.F,
-                  "out_e_vis": out_e_vis.F,
-                  "out_pt_miss": out_pt_miss.F,
-                  "out_lepton_momentum_mag": out_lepton_momentum_mag.F,
-                  "out_lepton_momentum_dir": out_lepton_momentum_dir.F,
-                  "out_jet_momentum_mag": out_jet_momentum_mag.F,
-                  "out_jet_momentum_dir": out_jet_momentum_dir.F,
-                  }
-        
-        return output
+        # Branch-specific processing
+        outputs = {}
+        for name, branch in self.branches.items():
+            xb = x 
+            xb = branch["downsample"](xb)
+            xb = branch["encoder"](xb)
+            xb = branch["se"](xb, x_glob, self.global_weight)
+            xb_gp = branch["global_pool"](xb)
+            xb_head = branch["head"](xb_gp)
+            outputs[f"out_{name}"] = xb_head.F
+        return outputs
 
     def replace_depthwise_with_channelwise(self):
+        """
+        Replace all MinkowskiDepthwiseConvolution modules with
+        MinkowskiChannelwiseConvolution modules preserving the parameters.
+        """
         for name, module in self.named_modules():
             if isinstance(module, ME.MinkowskiDepthwiseConvolution):
-                # Get the parameters of the current depthwise convolution
+                # Retrieve parameters of the current depthwise convolution
                 in_channels = module.in_channels
                 kernel_size = module.kernel_generator.kernel_size
                 stride = module.kernel_generator.kernel_stride
@@ -209,7 +210,7 @@ class MinkEncConvNeXtV2(nn.Module):
                 bias = module.bias is not None
                 dimension = module.dimension
                 
-                # Create a new MinkowskiChannelwiseConvolution with the same parameters
+                # Create a new channelwise convolution with the same parameters
                 new_conv = ME.MinkowskiChannelwiseConvolution(
                     in_channels=in_channels,
                     kernel_size=kernel_size,
@@ -222,16 +223,24 @@ class MinkEncConvNeXtV2(nn.Module):
                 if bias:
                     new_conv.bias = module.bias
                 
-                # Replace the old depthwise convolution with the new channelwise convolution
+                # Replace the old module with the new one
                 parent_module, attr_name = self._get_parent_module(name)
                 setattr(parent_module, attr_name, new_conv)
         
         return
     
     def _get_parent_module(self, layer_name):
+        """
+        Retrieve the parent module and attribute name for a given layer.
+        
+        Args:
+            layer_name (str): Dot-separated module path.
+        
+        Returns:
+            Tuple of (parent_module, attribute_name)
+        """
         components = layer_name.split('.')
         parent = self
         for comp in components[:-1]:
             parent = getattr(parent, comp)
         return parent, components[-1]
-

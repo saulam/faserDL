@@ -17,8 +17,57 @@ from MinkowskiEngine import (
     MinkowskiConvolution,
     MinkowskiDepthwiseConvolution,
     MinkowskiLinear,
-    MinkowskiGELU
+    MinkowskiGELU,
+    MinkowskiGlobalAvgPooling,
 )
+
+
+class MinkowskiSE(nn.Module):
+    def __init__(self, channels, glob_dim, reduction=16):
+        """
+        Squeeze-and-excitation block which combines voxel with global features
+        Args:
+            channels (int): The number of channels in the voxel features.
+            glob_dim (int): The dimension of the global feature vector.
+            reduction (int): Reduction ratio in the SE module.
+        """
+        super(MinkowskiSE, self).__init__()
+        self.glob_transform = nn.Linear(glob_dim, channels)
+        # The SE MLP: takes concatenated pooled branch features and transformed global features.
+        self.fc = nn.Sequential(
+            nn.Linear(2 * channels, channels // reduction, bias=True),
+            nn.GELU(),
+            nn.Linear(channels // reduction, channels, bias=True),
+            nn.Sigmoid()
+        )
+        self.global_pool = MinkowskiGlobalAvgPooling()
+
+    def forward(self, voxel_feature, global_feature, global_weight):
+        """
+        Args:
+            voxel_feature (ME.SparseTensor): Voxel pecific features.
+            global_feature (torch.Tensor): Dense tensor from global features, shape [B, glob_dim].
+        Returns:
+            (ME.SparseTensor): SE–modulated features.
+        """
+        # Pool voxel features to get per-sample statistics.
+        pooled = self.global_pool(voxel_feature)  # [B, channels]
+        pooled_dense = pooled.F  # [B, channels]
+        global_transformed = self.glob_transform(global_feature)  # [B, channels]
+        global_transformed = global_weight * global_transformed
+        combined = torch.cat([pooled_dense, global_transformed], dim=1)  # [B, 2 * channels]
+        
+        # Compute the channel scaling factors.
+        scaling = self.fc(combined)  # [B, channels] with values in (0,1)
+        batch_indices = voxel_feature.C[:, 0].long()  # shape [N_voxels]
+        scaling_expanded = scaling[batch_indices]  # [N_voxels, channels]
+        new_features = voxel_feature.F * scaling_expanded
+        
+        return SparseTensor(
+            new_features, 
+            coordinate_manager=voxel_feature.coordinate_manager,
+            coordinate_map_key=voxel_feature.coordinate_map_key,
+        )
 
 
 class Block(nn.Module):

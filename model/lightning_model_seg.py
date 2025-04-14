@@ -11,7 +11,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import dice_loss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from functools import partial
 from packaging import version
 
 
@@ -23,8 +24,10 @@ class SparseSegLightningModel(pl.LightningModule):
         super(SparseSegLightningModel, self).__init__()
 
         self.model = model
-        self.loss_primlepton = nn.BCEWithLogitsLoss()
-        self.loss_seg= nn.CrossEntropyLoss() 
+        self.loss_primlepton_ce = nn.BCEWithLogitsLoss()
+        self.loss_primlepton_dice = partial(dice_loss, sigmoid=False, reduction="mean") 
+        self.loss_seg_ce = nn.CrossEntropyLoss()
+        self.loss_seg_dice = partial(dice_loss, sigmoid=False, reduction="mean")
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -37,6 +40,16 @@ class SparseSegLightningModel(pl.LightningModule):
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+
+
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
+        # Calculate progress p: global step / max_steps
+        # Make sure self.trainer is set (it usually is after a few batches)
+        if self.trainer.max_steps:
+            total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
+            p = float(self.global_step) / total_steps
+            # Here, gamma = 10 is a typical choice, modify as needed
+            self.model.global_weight = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
 
 
     def forward(self, x, x_glob):
@@ -59,12 +72,16 @@ class SparseSegLightningModel(pl.LightningModule):
         targ_seg = target['seg_labels']
 
         # losses
-        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
-        loss_seg = self.loss_seg(out_seg, targ_seg)
-        part_losses = {'primlepton': loss_primlepton,
-                       'seg': loss_seg,
+        loss_primlepton_ce = self.loss_primlepton_ce(out_primlepton, targ_primlepton)
+        loss_primlepton_dice = self.loss_primlepton_dice(out_primlepton, targ_primlepton)
+        loss_seg_ce = self.loss_seg_ce(out_seg, targ_seg)
+        loss_seg_dice = self.loss_seg_dice(out_seg, targ_seg)
+        part_losses = {'primlepton_ce': loss_primlepton_ce,
+                       'primlepton_dice': loss_primlepton_dice,
+                       'seg_ce': loss_seg_ce,
+                       'seg_dice': loss_seg_dice,
                        }
-        total_loss = loss_primlepton + loss_seg
+        total_loss = loss_primlepton_dice + loss_primlepton_dice + loss_seg_ce + loss_seg_dice
 
         return total_loss, part_losses
 
@@ -91,6 +108,7 @@ class SparseSegLightningModel(pl.LightningModule):
         self.log(f"loss/train_total", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True,prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss

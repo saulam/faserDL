@@ -10,6 +10,7 @@ Description:
 
 import torch
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 from utils import ini_argparse, random_rotation_saul
 
 
@@ -88,7 +89,7 @@ def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', '
 
     return final_points, rotated_dirs
 
-
+'''
 def rotate(coords, dirs, metadata, primary_vertex):
     """Random rotation"""
     escaping = is_escaping(coords, metadata)
@@ -108,25 +109,119 @@ def rotate(coords, dirs, metadata, primary_vertex):
                                 dirs=dirs,
                                 angle_limits=angle_limits,
                                 origin=primary_vertex)
+'''
+
+def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z'], max_attempts=10):
+    escaping = is_escaping(coords, metadata)
+    #if np.all(escaping):
+    #    return coords, dirs, primary_vertex
+
+    # Compute center of volume as rotation reference point
+    reference_point = np.array([
+        (metadata['x'].shape[0] - 1) / 2.,
+        (metadata['y'].shape[0] - 1) / 2.,
+        (metadata['z'].shape[0] - 1) / 2.
+    ])
+
+    # Shift coords and primary vertex relative to the center
+    shifted_coords = coords - reference_point
+    shifted_primary = primary_vertex - reference_point
+
+    if dirs is not None:
+        dirs = np.asarray(dirs)
+        rotated_dirs = dirs.copy()
+    else:
+        rotated_dirs = None
+
+    axes_indices = {'x': 0, 'y': 1, 'z': 2}
+    affected_axes = {
+        'x': ['y', 'z'],
+        'y': ['x', 'z'],
+        'z': ['x', 'y'],
+    }
+
+    for axis in selected_axes:
+        affected = affected_axes[axis]
+        #if any(escaping[axes_indices[a]] for a in affected):
+        #    continue
+
+        for attempt in range(max_attempts):
+            angle_deg = np.random.uniform(0, 360)  # You can adjust this range
+            rotation = R.from_euler(axis, angle_deg, degrees=True)
+
+            rotated_coords = rotation.apply(shifted_coords) + reference_point
+
+            # Check bounds
+            #if (
+            #    np.all(rotated_coords[:, 0] >= 0) and np.all(rotated_coords[:, 0] < metadata['x'].shape[0]) and
+            #    np.all(rotated_coords[:, 1] >= 0) and np.all(rotated_coords[:, 1] < metadata['y'].shape[0]) and
+            #    np.all(rotated_coords[:, 2] >= 0) and np.all(rotated_coords[:, 2] < metadata['z'].shape[0])
+            #):
+            if True:
+                # Valid rotation found → apply it
+                shifted_coords = rotation.apply(shifted_coords)
+                shifted_primary = rotation.apply(shifted_primary[np.newaxis, :])[0]
+
+                if rotated_dirs is not None:
+                    rotated_dirs = rotation.apply(rotated_dirs)
+
+                break  # Stop attempting after success
+
+    # Recenter coordinates back
+    coords = shifted_coords + reference_point
+    primary_vertex = shifted_primary + reference_point
+
+    return coords, rotated_dirs, primary_vertex
 
 
 def translate(coords, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     escaping = is_escaping(coords, metadata)
     if np.all(escaping):
         return coords, primary_vertex
- 
-    shift_x = np.random.randint(low=-5, high=5+1) if not escaping[0] else 0.
-    shift_y = np.random.randint(low=-5, high=5+1) if not escaping[1] else 0.
-    shift_z = np.random.randint(low=-15, high=15+1) if not escaping[2] else 0.
-    if 'x' in selected_axes:
-        coords[:, 0] += shift_x
-        primary_vertex[0] += shift_x
-    if 'y' in selected_axes: 
-        coords[:, 1] += shift_y
-        primary_vertex[1] += shift_y
-    if 'z' in selected_axes:
-        coords[:, 2] += shift_z
-        primary_vertex[2] += shift_z
+
+    if 'x' in selected_axes and not escaping[0]:
+        x_axis_len = metadata['x'].shape[0]
+        valid_shift_x = [
+            shift for shift in range(-5, 6)
+            if 0 <= coords[:, 0].min() + shift and coords[:, 0].max() + shift < x_axis_len
+        ]
+        if valid_shift_x:
+            shift_x = np.random.choice(valid_shift_x)
+            coords[:, 0] += shift_x
+            primary_vertex[0] += shift_x
+
+    if 'y' in selected_axes and not escaping[1]:
+        y_axis_len = metadata['y'].shape[0]
+        valid_shift_y = [
+            shift for shift in range(-5, 6)
+            if 0 <= coords[:, 1].min() + shift and coords[:, 1].max() + shift < y_axis_len
+        ]
+        if valid_shift_y:
+            shift_y = np.random.choice(valid_shift_y)
+            coords[:, 1] += shift_y
+            primary_vertex[1] += shift_y
+
+    # For Z, shift by multiple of module size
+    if 'z' in selected_axes and not escaping[2]:
+        z_axis_len = metadata['z'].shape[0]
+
+        module_size = (metadata['z'][:, 1] == 0).sum()
+        max_module_shift = (z_axis_len // module_size) - 1
+
+        possible_shifts = np.array([
+            i * module_size for i in range(-max_module_shift, max_module_shift + 1)
+        ])
+
+        z_coords = coords[:, 2]
+        valid_shifts = [
+            shift for shift in possible_shifts
+            if 0 <= z_coords.min() + shift and z_coords.max() + shift < z_axis_len
+        ]
+
+        if valid_shifts:
+            shift_z = np.random.choice(valid_shifts)
+            coords[:, 2] += shift_z
+            primary_vertex[2] += shift_z
 
     return coords, primary_vertex
 
