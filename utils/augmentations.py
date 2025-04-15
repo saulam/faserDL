@@ -83,33 +83,132 @@ def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', '
             final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
     translated_points = coords - reference_point
+    translated_vertex = primary_vertex - reference_point
     rotated_points = translated_points @ final_rotation_matrix
+    rotated_vertex = translated_vertex @ final_rotation_matrix
     final_points = rotated_points + reference_point
+    final_vertex = rotated_vertex + reference_point
     rotated_dirs = [x @ final_rotation_matrix for x in dirs]
 
-    return final_points, rotated_dirs
+    return final_points, rotated_dirs, final_vertex
 
-'''
-def rotate(coords, dirs, metadata, primary_vertex):
-    """Random rotation"""
-    escaping = is_escaping(coords, metadata)
-    if np.all(escaping):
-        return coords, primary_vertex
 
-    angle_limits = torch.tensor([
-        [-torch.pi/180, -torch.pi/180, -torch.pi],
-        [torch.pi/180, torch.pi/180,  torch.pi]
-    ])
+def shear_rotation_2d(points_2d, theta):
+    """
+    Applies the shear-based rotation in 2D (for points in one plane).
+    
+    This implements the three-shear algorithm for 2D rotation:
+      1. x = x - tan(theta/2) * y
+      2. y = y + sin(theta) * x
+      3. x = x - tan(theta/2) * y
+    
+    Parameters:
+      points_2d (np.ndarray): Array of shape (N, 2) containing points in 2D.
+      theta (float): Rotation angle in radians.
+    
+    Returns:
+      np.ndarray: Rotated points (rounded after each shear).
+    """
+    pts = points_2d.copy()
+    pts[:, 0] = np.round(pts[:, 0] - np.tan(theta / 2) * pts[:, 1])
+    pts[:, 1] = np.round(pts[:, 1] + np.sin(theta) * pts[:, 0])
+    pts[:, 0] = np.round(pts[:, 0] - np.tan(theta / 2) * pts[:, 1])
+    
+    return pts
 
-    if (angle_limits==0).all():
-        # no rotation at all
-        return coords, dirs
 
-    return random_rotation_saul(coords=coords,
-                                dirs=dirs,
-                                angle_limits=angle_limits,
-                                origin=primary_vertex)
-'''
+def shear_rotation_axis(points, axis, theta):
+    """
+    Applies a shear-based rotation about a single axis in 3D.
+    
+    The function extracts the appropriate 2D plane, applies the shear rotation,
+    and then puts the points back together.
+    
+    Parameters:
+      points (np.ndarray): The input point cloud of shape (N, 3).
+      axis (str): The axis to rotate about ("x", "y", or "z").
+      theta (float): The rotation angle (in radians) to apply.
+    
+    Returns:
+      np.ndarray: The transformed point cloud.
+    """
+    pts = points.copy()
+    
+    if axis == "z":
+        pts_xy = pts[:, [0, 1]]  # get x, y
+        pts_rot = shear_rotation_2d(pts_xy, theta)
+        pts[:, 0] = pts_rot[:, 0]
+        pts[:, 1] = pts_rot[:, 1]
+        
+    elif axis == "x":
+        pts_yz = pts[:, [1, 2]]
+        pts_rot = shear_rotation_2d(pts_yz, theta)
+        pts[:, 1] = pts_rot[:, 0]
+        pts[:, 2] = pts_rot[:, 1]
+        
+    elif axis == "y":
+        pts_zx = pts[:, [2, 0]]
+        pts_rot = shear_rotation_2d(pts_zx, theta)
+        pts[:, 2] = pts_rot[:, 0]
+        pts[:, 0] = pts_rot[:, 1]
+        
+    else:
+        raise ValueError("Invalid axis: choose 'x', 'y', or 'z'.")
+    
+    return pts
+
+
+def shear_rotation_random(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    """
+    Applies shear-based rotations about each specified axis sequentially.
+       
+    For each axis specified in selected_axes, a random rotation angle is chosen
+    (from fixed values based on: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf)
+    and the shear rotation (decomposed into 3 shear steps) is applied. Rounding is performed 
+    after each shear to ensure that the mapping is exactly grid-preserving (assuming the input points, 
+    or their rounded version, are on an integer grid).
+    
+    Parameters:
+      coords (np.ndarray): Input point cloud, shape (N, 3).
+      dirs (np.ndarray): Direction vectors to be rotated. Can be None.
+      primary_vertex (np.ndarray): Primary vertex that is rotated.
+      metadata: Dataset metadata. Expects 'x', 'y', 'z' keys with shape information.
+      selected_axes (list, optional): List of axes (e.g., ["x", "y", "z"]) to rotate about.
+      
+    Returns:
+      np.ndarray: Transformed point cloud after all shear rotations.
+    """
+    pts = coords.copy()
+    primary_vertex = primary_vertex.copy()
+    if dirs is not None:
+        dirs = dirs.copy() 
+
+    reference_point = np.array([
+        (metadata['x'].shape[0] - 1) / 2.,
+        (metadata['y'].shape[0] - 1) / 2.,
+        (metadata['z'].shape[0] - 1) / 2.
+    ]).astype(int)
+
+    pts -= reference_point
+    primary_vertex -= reference_point
+
+    for axis in selected_axes:
+        # Why no more than 45 degrees: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf
+        #angle = np.deg2rad(np.random.uniform(-45, 45))
+        angle_deg = np.random.choice([0, 22.62, 28.07, 36.87, 53.13, 67.38, 73.74])  # values from link above
+        angle = np.deg2rad(angle_deg)
+        if angle == 0:
+            continue
+        pts = shear_rotation_axis(pts, axis, angle)
+        rotation = R.from_euler(axis, angle_deg, degrees=True)
+        primary_vertex = rotation.apply(primary_vertex)
+        if dirs is not None:
+            dirs = rotation.apply(dirs) 
+
+    pts += reference_point
+    primary_vertex += reference_point
+    return pts, dirs, primary_vertex
+
 
 def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z'], max_attempts=10):
     escaping = is_escaping(coords, metadata)

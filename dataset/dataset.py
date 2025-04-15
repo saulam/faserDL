@@ -82,13 +82,8 @@ class SparseFASERCALDataset(Dataset):
         # mirror
         coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # rotate
-        if self.stage1:
-            coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
-        else:
-            if np.random.rand() > 0.25:
-                coords, dirs, primary_vertex = rotate(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'], max_attempts=10)
-            else:
-                coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        coords, dirs, primary_vertex = shear_rotation_random(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
         # translate
         coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # drop voxels
@@ -101,7 +96,7 @@ class SparseFASERCALDataset(Dataset):
         if coords.shape[0] < 2:
             return coords_ori, feats_ori, labels_ori, dirs_ori
 
-        return coords, feats, labels, dirs
+        return coords, feats, labels, dirs, primary_vertex
     
     
     def within_limits(self, coords, feats=None, labels=None, voxelised=False, mask_axes=(0, 1, 2)):
@@ -377,7 +372,7 @@ class SparseFASERCALDataset(Dataset):
             # augmented event
             (
                 coords, feats, (primlepton_labels, seg_labels),
-                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum)
+                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum), primary_vertex
             ) = self._augment(
                 coords, feats, (primlepton_labels, seg_labels),
                 (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum),
