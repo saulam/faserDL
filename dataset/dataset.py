@@ -94,7 +94,7 @@ class SparseFASERCALDataset(Dataset):
         #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         
         if coords.shape[0] < 2:
-            return coords_ori, feats_ori, labels_ori, dirs_ori
+            return coords_ori, feats_ori, labels_ori, dirs_ori, primary_vertex
 
         return coords, feats, labels, dirs, primary_vertex
     
