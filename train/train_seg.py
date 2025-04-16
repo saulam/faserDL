@@ -67,7 +67,12 @@ def main():
     logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
     callbacks = []
-    monitored_losses = ["loss/val_primlepton", "loss/val_seg", "loss/val_total"]
+    monitored_losses = [
+            "loss/val_primlepton_ce", 
+            "loss/val_primlepton_dice",
+            "loss/val_seg_ce",
+            "loss/val_seg_dice",
+            "loss/val_total"]
     for loss_name in monitored_losses:
         checkpoint = ModelCheckpoint(
             dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss_name.replace('/', '_')}",
