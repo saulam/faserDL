@@ -25,12 +25,14 @@ class MAPE(torch.nn.Module):
     Args:
         epsilon (float): Small value to prevent division by zero. Default is 1e-8.
         reduction (str): Specifies the reduction method ('mean' or 'sum'). Default is 'mean'.
+        from_log_space (bool): If True, applies exp(x) - 1 to pred and target before computing MAPE.
     """
 
-    def __init__(self, eps=1e-8, reduction='mean'):
+    def __init__(self, eps=1e-8, reduction='mean', from_log_scale=False):
         super(MAPE, self).__init__()
         self.eps = eps
         self.reduction = reduction
+        self.from_log_space = from_log_scale
 
     def forward(self, pred, target):
         """
@@ -43,6 +45,10 @@ class MAPE(torch.nn.Module):
         Returns:
             torch.Tensor: Computed MAPE loss, considering only target values > 0.
         """
+        if self.from_log_space:
+            pred = torch.exp(pred) - 1.0
+            target = torch.exp(target) - 1.0
+
         # Create a mask to only compute the loss where target > 0
         mask = target > 0
 
@@ -455,14 +461,23 @@ def dice_loss(inputs: torch.Tensor or list[torch.Tensor],
         # multi-class
         for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)):
             ipt = torch.softmax(ipt, 1)
-            score, nb_labels = 0., ipt.size(1)
-            for i in range(nb_labels):
-                ipt_i = ipt[:, i]
-                tgt_i = (tgt[:, 0] == i).float()
-                score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
+            nb_labels = ipt.size(1)
+            score = 0.
+            # Check target shape: if the target has the same number of dimensions as ipt,
+            # assume it is one-hot encoded, otherwise assume it's class IDs.
+            if tgt.ndim == ipt.ndim:
+                for i in range(nb_labels):
+                    ipt_i = ipt[:, i]
+                    tgt_i = tgt[:, i].float()
+                    score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
+            else:
+                for i in range(nb_labels):
+                    ipt_i = ipt[:, i]
+                    tgt_i = (tgt == i).float()
+                    score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
             score /= nb_labels
             scores[batch_idx] = score
-
+        
     loss = 1 - scores
 
     if reduction == 'mean':
