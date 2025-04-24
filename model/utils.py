@@ -22,6 +22,84 @@ from MinkowskiEngine import (
 )
 
 
+import torch
+import torch.nn as nn
+
+
+class GlobalFeatureEncoder(nn.Module):
+    """
+    Encodes a set of global features consisting of four scalar energies and two small sequences.
+
+    Inputs:
+      - x: Tensor of shape (batch_size, 23) or (batch_size, 28)
+        Order:
+          [0]    rear_cal_energy
+          [1]    rear_hcal_energy
+          [2]    rear_mucal_energy
+          [3]    faser_cal_energy
+          [4:13] 9-module energy sequence (rear_hcal_modules)
+          [13:]  10-or-15-module energy sequence (faser_cal_modules)
+
+    Args:
+      encoder_dim: int, dimensionality of the final embedding
+      hidden_dim: int, hidden size for intermediate heads (defaults to encoder_dim)
+      dropout: float, dropout probability
+    """
+    def __init__(self,
+                 encoder_dim: int,
+                 hidden_dim: int = None,
+                 dropout: float = 0.3):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = encoder_dim
+
+        self.scalar_mlp = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        self.seqA_lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=hidden_dim,
+            batch_first=True,
+        )
+
+        self.seqB_lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=hidden_dim,
+            batch_first=True,
+        )
+
+        fused_dim = hidden_dim * 3
+        self.global_mlp = nn.Sequential(
+            nn.Linear(fused_dim, encoder_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, total_dim)
+        batch_size, total_dim = x.shape
+        
+        # Split scalars and sequences
+        scalars = x[:, :4]
+        seqA = x[:, 4:13].unsqueeze(-1)  # (batch, 9, 1)
+        seqB = x[:, 13:].unsqueeze(-1)  # (batch, 10 or 15, 1)
+
+        # Embeddings
+        emb_scalars = self.scalar_mlp(scalars)  # (batch, hidden_dim)
+        outA, (hA, _) = self.seqA_lstm(seqA)
+        embA = hA.squeeze(0)                    # (batch, hidden_dim)
+        outB, (hB, _) = self.seqB_lstm(seqB)
+        embB = hB.squeeze(0)                    # (batch, hidden_dim)
+
+        # Fuse and project
+        fused = torch.cat([emb_scalars, embA, embB], dim=-1)  # (batch, hidden_dim*3)
+        out = self.global_mlp(fused)                          # (batch, encoder_dim)
+        return out
+
+
 class MinkowskiSE(nn.Module):
     def __init__(self, channels, glob_dim, reduction=16):
         """
@@ -48,7 +126,7 @@ class MinkowskiSE(nn.Module):
             voxel_feature (ME.SparseTensor): Voxel pecific features.
             global_feature (torch.Tensor): Dense tensor from global features, shape [B, glob_dim].
         Returns:
-            (ME.SparseTensor): SE–modulated features.
+            (ME.SparseTensor): SE-modulated features.
         """
         # Pool voxel features to get per-sample statistics.
         pooled = self.global_pool(voxel_feature)  # [B, channels]
@@ -79,10 +157,15 @@ class Block(nn.Module):
         drop_path (float): Stochastic depth rate. Default: 0.0
         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
     """
-    def __init__(self, dim, kernel_size=7, drop_path=0., D=3):
+    def __init__(self, dim, kernel_size=7, dilation=1, drop_path=0., D=3):
         super().__init__()
         
-        self.dwconv = MinkowskiDepthwiseConvolution(dim, kernel_size=kernel_size, bias=True, dimension=D)
+        self.dwconv = MinkowskiDepthwiseConvolution(
+            dim, 
+            kernel_size=kernel_size,
+            dilation=dilation,
+            bias=True,
+            dimension=D)
         self.norm = MinkowskiLayerNorm(dim, 1e-6)
         self.pwconv1 = MinkowskiLinear(dim, 4 * dim)   
         self.act = MinkowskiGELU()
@@ -122,6 +205,7 @@ class MinkowskiGRN(nn.Module):
                 coordinate_map_key=in_key,
                 coordinate_manager=cm)
 
+
 class MinkowskiDropPath(nn.Module):
     """ Drop Path for sparse tensors.
     """
@@ -148,10 +232,10 @@ class MinkowskiDropPath(nn.Module):
                 coordinate_map_key=in_key,
                 coordinate_manager=cm)
 
+
 class MinkowskiLayerNorm(nn.Module):
     """ Channel-wise layer normalization for sparse tensors.
     """
-
     def __init__(
         self,
         normalized_shape,
@@ -165,7 +249,8 @@ class MinkowskiLayerNorm(nn.Module):
             output,
             coordinate_map_key=input.coordinate_map_key,
             coordinate_manager=input.coordinate_manager)
-            
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
@@ -192,6 +277,7 @@ class LayerNorm(nn.Module):
             x = self.weight[:, None, None] * x + self.bias[:, None, None]
             return x
 
+
 class GRN(nn.Module):
     """ GRN (Global Response Normalization) layer
     """
@@ -204,3 +290,4 @@ class GRN(nn.Module):
         Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
+

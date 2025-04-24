@@ -21,7 +21,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import Block, MinkowskiLayerNorm, MinkowskiSE
+from .utils import GlobalFeatureEncoder, Block, MinkowskiLayerNorm, MinkowskiSE
 
 
 def _init_weights(m):
@@ -59,62 +59,67 @@ class MinkEncConvNeXtV2(nn.Module):
         super().__init__()
         # Determine the version flag based on the dataset_path in args.
         self.is_v5 = "v5" in args.dataset_path if args is not None and hasattr(args, "dataset_path") else False
-
-        # Define channel dimensions.
-        #dims = [96, 192, 384, 768]
-        dims = [96, 160, 256, 384]
-
+        self.module_size = 24 if self.is_v5 else 20
+        
+        # Encoder configuration
+        encoder_depths = [3, 3, 9, 3]
+        encoder_dims = [96, 192, 384, 768]
+        se_block_reds = [16, 16, 16, 16]
+        kernel_size_ds = (2, 2, 2)
+        dilation_ds = (1, 1, 2)
+        block_kernel = (5, 5, 5)
+        drop_path_rate = 0.1
+        assert len(encoder_depths) == len(encoder_dims)
+        self.nb_bblayers = len(encoder_dims) - 1
+        total_depth = sum(encoder_depths)
+        dp_rates_enc = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
+        dp_cur = 0
+        
         ###############################################
         # Shared Backbone
         ###############################################
         
         # Stem
-        self.stem = nn.Sequential(
-            MinkowskiConvolution(in_channels, dims[0], kernel_size=1, stride=1, dimension=D),
-            MinkowskiLayerNorm(dims[0], eps=1e-6),
-        )
+        self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
+        self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
+        self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
 
         # Global features
-        global_input_dim = 1 + 1 + 1 + 1 + 9 + (10 if self.is_v5 else 15)
-        self.global_weight = 1  # Scalar controlling global parameter contribution
-        self.global_mlp = nn.Sequential(
-            nn.Linear(global_input_dim, dims[0]),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
+        self.register_buffer("global_weight", torch.tensor(1.0))  # Scalar controlling global parameter contribution
+        self.global_feats_encoder = GlobalFeatureEncoder(encoder_dim=encoder_dims[0], dropout=0.3)
 
         # Backbone
-        backbone_depths = [3, 3, 9]
-        backbone_channels = dims[:-1]
         self.shared_encoders = nn.ModuleList()
-        self.shared_se_layers = nn.ModuleList()
         self.shared_downsamples = nn.ModuleList()
-        for i, depth in enumerate(backbone_depths):
+        self.shared_se_layers = nn.ModuleList()
+        for i in range(self.nb_bblayers):
             # Encoder layer
-            encoder = nn.Sequential(
-                *[Block(dim=backbone_channels[i], kernel_size=(3, 3, 7), drop_path=0.0, D=D)
-                  for _ in range(depth)]
+            encoder_layer = nn.Sequential(
+                *[Block(dim=encoder_dims[i], kernel_size=block_kernel, dilation=dilation_ds,
+                        drop_path=dp_rates_enc[dp_cur + j], D=D)
+                  for j in range(encoder_depths[i])]
             )
-            self.shared_encoders.append(encoder)
-
+            self.shared_encoders.append(encoder_layer)
+            dp_cur += encoder_depths[i]
+            
             # SE layer
-            se_layer = MinkowskiSE(channels=backbone_channels[i], glob_dim=dims[0], reduction=16)
+            se_layer = MinkowskiSE(channels=encoder_dims[i], glob_dim=encoder_dims[0], reduction=se_block_reds[i])
             self.shared_se_layers.append(se_layer)
 
             # Downsampling layer
-            if i < len(backbone_depths) - 1:
-                downsample = nn.Sequential(
-                    MinkowskiLayerNorm(backbone_channels[i], eps=1e-6),
+            if i < self.nb_bblayers - 1:
+                downsample_layer = nn.Sequential(
+                    MinkowskiLayerNorm(encoder_dims[i], eps=1e-6),
                     MinkowskiConvolution(
-                        backbone_channels[i],
-                        dims[i + 1],
-                        kernel_size=(2, 2, 3),
-                        stride=(2, 2, 3),
+                        encoder_dims[i],
+                        encoder_dims[i + 1],
+                        kernel_size=kernel_size_ds, 
+                        stride=kernel_size_ds,
                         bias=True,
                         dimension=D
                     ),
                 )
-                self.shared_downsamples.append(downsample)
+                self.shared_downsamples.append(downsample_layer)
 
         ###############################################
         # Branch-Specific Modules
@@ -143,18 +148,26 @@ class MinkEncConvNeXtV2(nn.Module):
         for name in branch_names:
             branch = {}
             branch["downsample"] = nn.Sequential(
-                MinkowskiLayerNorm(dims[2], eps=1e-6),
-                MinkowskiConvolution(dims[2], dims[3], kernel_size=(2, 2, 3), stride=(2, 2, 3), bias=True, dimension=D),
+                MinkowskiLayerNorm(encoder_dims[i], eps=1e-6),
+                MinkowskiConvolution(
+                    encoder_dims[i],
+                    encoder_dims[i+1],
+                    kernel_size=kernel_size_ds, 
+                    stride=kernel_size_ds,
+                    bias=True,
+                    dimension=D),
             )
+            
             branch["encoder"] = nn.Sequential(
-                *[Block(dim=dims[3], kernel_size=(5, 5, 7), drop_path=0.0, D=D) for _ in range(3)]
+                *[Block(dim=encoder_dims[i+1], kernel_size=block_kernel, dilation=dilation_ds,
+                        drop_path=dp_rates_enc[dp_cur + j], D=D) for j in range(encoder_depths[i+1])]
             )
-            branch["se"] = MinkowskiSE(channels=dims[3], glob_dim=dims[0], reduction=16)
+            branch["se"] = MinkowskiSE(channels=encoder_dims[i+1], glob_dim=encoder_dims[0], reduction=se_block_reds[i+1])
             branch["global_pool"] = (
                 MinkowskiGlobalMaxPooling() if name == "flavour" else MinkowskiGlobalAvgPooling()
             )
             branch["head"] = nn.Sequential(
-                MinkowskiLinear(dims[3], branch_out_channels[name]),
+                MinkowskiLinear(encoder_dims[i+1], branch_out_channels[name]),
             )
             self.branches[name] = nn.ModuleDict(branch)
 
@@ -172,9 +185,20 @@ class MinkEncConvNeXtV2(nn.Module):
         Returns:
             A dictionary mapping branch names prefixed with 'out_' to their outputs.
         """
-        # Shared backbone
-        x = self.stem(x)
-        x_glob = self.global_mlp(x_glob)
+        coords, charge = x.C, x.F    # feats: [N,2]
+        mod_id = (coords[:, 3] % self.module_size).long()  # [N]
+        
+        # Stem and global feature MLP transformation.
+        charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
+        mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
+        new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
+        x = ME.SparseTensor(
+            new_feats, 
+            coordinate_manager=x.coordinate_manager,
+            coordinate_map_key=x.coordinate_map_key,
+        )        
+        x = self.stem_ln(x)
+        x_glob = self.global_feats_encoder(x_glob)
 
         # Process each backbone stage in a loop.
         for i in range(len(self.shared_encoders)):

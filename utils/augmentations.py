@@ -194,7 +194,7 @@ def shear_rotation_random(coords, dirs, primary_vertex, metadata, selected_axes=
 
     for axis in selected_axes:
         # Why no more than 45 degrees: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf
-        #angle = np.deg2rad(np.random.uniform(-45, 45))
+        #angle_deg = np.random.uniform(-45, 45)
         angle_deg = np.random.choice([0, 22.62, 28.07, 36.87, 53.13, 67.38, 73.74])  # values from link above
         angle = np.deg2rad(angle_deg)
         if angle == 0:
@@ -275,25 +275,25 @@ def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']
 
 def translate(coords, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     escaping = is_escaping(coords, metadata)
-    if np.all(escaping):
-        return coords, primary_vertex
+    #if np.all(escaping):
+    #    return coords, primary_vertex
 
-    if 'x' in selected_axes and not escaping[0]:
+    if 'x' in selected_axes:# and not escaping[0]:
         x_axis_len = metadata['x'].shape[0]
         valid_shift_x = [
             shift for shift in range(-5, 6)
-            if 0 <= coords[:, 0].min() + shift and coords[:, 0].max() + shift < x_axis_len
+            #if 0 <= coords[:, 0].min() + shift and coords[:, 0].max() + shift < x_axis_len
         ]
         if valid_shift_x:
             shift_x = np.random.choice(valid_shift_x)
             coords[:, 0] += shift_x
             primary_vertex[0] += shift_x
 
-    if 'y' in selected_axes and not escaping[1]:
+    if 'y' in selected_axes:# and not escaping[1]:
         y_axis_len = metadata['y'].shape[0]
         valid_shift_y = [
             shift for shift in range(-5, 6)
-            if 0 <= coords[:, 1].min() + shift and coords[:, 1].max() + shift < y_axis_len
+            #if 0 <= coords[:, 1].min() + shift and coords[:, 1].max() + shift < y_axis_len
         ]
         if valid_shift_y:
             shift_y = np.random.choice(valid_shift_y)

@@ -21,7 +21,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import Block, MinkowskiLayerNorm, MinkowskiSE
+from .utils import GlobalFeatureEncoder, Block, MinkowskiLayerNorm, MinkowskiSE
 
 
 def _init_weights(m):
@@ -63,12 +63,16 @@ class MinkUNetConvNeXtV2(nn.Module):
         super().__init__()
         # Determine the version flag based on the dataset_path in args.
         self.is_v5 = "v5" in args.dataset_path if args is not None and hasattr(args, "dataset_path") else False
-
+        self.module_size = 24 if self.is_v5 else 20
+        
         # Encoder configuration
         encoder_depths = [3, 3, 9, 3]
         encoder_dims = [96, 192, 384, 768]
-        kernel_size_ds = (2, 2, 3)
-        drop_path_rate = 0.0
+        se_block_reds = [16, 16, 16, 16]
+        kernel_size_ds = (2, 2, 2)
+        dilation_ds = (1, 1, 2)
+        block_kernel = (5, 5, 5)
+        drop_path_rate = 0.1
         assert len(encoder_depths) == len(encoder_dims)
         self.nb_elayers = len(encoder_dims)
         total_depth = sum(encoder_depths)
@@ -76,19 +80,13 @@ class MinkUNetConvNeXtV2(nn.Module):
         dp_cur = 0
 
         # Stem
-        self.stem = nn.Sequential(
-            MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D),
-            MinkowskiLayerNorm(encoder_dims[0], eps=1e-6),
-        )
+        self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
+        self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
+        self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
 
         # Global features
-        global_input_dim = 1 + 1 + 1 + 1 + 9 + (10 if self.is_v5 else 15)
-        self.global_weight = 1  # Scalar controlling global parameter contribution
-        self.global_mlp = nn.Sequential(
-            nn.Linear(global_input_dim, encoder_dims[0]),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
+        self.register_buffer("global_weight", torch.tensor(1.0))  # Scalar controlling global parameter contribution
+        self.global_feats_encoder = GlobalFeatureEncoder(encoder_dim=encoder_dims[0], dropout=0.3)
 
         # Build encoder
         self.encoder_layers = nn.ModuleList()
@@ -96,17 +94,17 @@ class MinkUNetConvNeXtV2(nn.Module):
         self.se_layers = nn.ModuleList()
         for i in range(self.nb_elayers):
             # Encoder layer
-            block_kernel = (3, 3, 7) if i < self.nb_elayers - 1 else (5, 5, 7)  # differnt kernel for last layer
             encoder_layer = nn.Sequential(
-                *[Block(dim=encoder_dims[i], kernel_size=block_kernel, drop_path=dp_rates_enc[dp_cur + j], D=D)
+                *[Block(dim=encoder_dims[i], kernel_size=block_kernel, dilation=dilation_ds,
+                        drop_path=dp_rates_enc[dp_cur + j], D=D)
                   for j in range(encoder_depths[i])]
             )
             self.encoder_layers.append(encoder_layer)
+            dp_cur += encoder_depths[i]
 
             # SE layer
-            se_layer = MinkowskiSE(channels=encoder_dims[i], glob_dim=encoder_dims[0], reduction=16)
+            se_layer = MinkowskiSE(channels=encoder_dims[i], glob_dim=encoder_dims[0], reduction=se_block_reds[i])
             self.se_layers.append(se_layer)
-            dp_cur += encoder_depths[i]
 
             # Downsampling layer
             if i < self.nb_elayers - 1:
@@ -127,6 +125,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         decoder_depths = [2] * len(encoder_depths)
         decoder_dims = list(reversed(encoder_dims))
         kernel_size_us = kernel_size_ds
+        dilation_us = dilation_ds
         self.nb_dlayers = len(decoder_dims) - 1
         total_depth_dec = sum(decoder_depths)
         dp_rates_dec = [x.item() for x in torch.linspace(dp_rates_enc[-encoder_depths[-1]], 0, total_depth_dec)]
@@ -145,7 +144,8 @@ class MinkUNetConvNeXtV2(nn.Module):
             self.upsample_layers.append(upsample_layer)
 
             decoder_layer = nn.Sequential(
-                *[Block(dim=decoder_dims[i + 1], kernel_size=(3, 3, 7), drop_path=dp_rates_dec[dp_cur_dec + j], D=D)
+                *[Block(dim=decoder_dims[i + 1], kernel_size=block_kernel, dilation=dilation_us,
+                        drop_path=dp_rates_dec[dp_cur_dec + j], D=D)
                   for j in range(decoder_depths[i])]
             )
             self.decoder_layers.append(decoder_layer)
@@ -154,12 +154,12 @@ class MinkUNetConvNeXtV2(nn.Module):
         # Semantic segmentation prediction layers.
         self.primlepton_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=(3, 3, 7), drop_path=0.0, D=D),
+            Block(dim=decoder_dims[-1], kernel_size=block_kernel, dilation=dilation_us, drop_path=0.0, D=D),
             MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
         )
         self.seg_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=(3, 3, 7), drop_path=0.0, D=D),
+            Block(dim=decoder_dims[-1], kernel_size=block_kernel, dilation=dilation_us, drop_path=0.0, D=D),
             MinkowskiConvolution(decoder_dims[-1], 3, kernel_size=1, stride=1, dimension=D),
         )
 
@@ -177,9 +177,20 @@ class MinkUNetConvNeXtV2(nn.Module):
         Returns:
             A dictionary with voxel predictions.
         """
+        coords, charge = x.C, x.F    # feats: [N,2]
+        mod_id = (coords[:, 3] % self.module_size).long()  # [N]
+        
         # Stem and global feature MLP transformation.
-        x = self.stem(x)
-        x_glob = self.global_mlp(x_glob)
+        charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
+        mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
+        new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
+        x = ME.SparseTensor(
+            new_feats, 
+            coordinate_manager=x.coordinate_manager,
+            coordinate_map_key=x.coordinate_map_key,
+        )        
+        x = self.stem_ln(x)
+        x_glob = self.global_feats_encoder(x_glob)
 
         # Encoder path with SE block integration.
         x_enc = []

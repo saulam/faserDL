@@ -368,7 +368,7 @@ class SparseFASERCALDataset(Dataset):
             seg_labels = seg_labels_pred
 
         augmented, feats = False, q
-        if self.augmentations_enabled and np.random.rand() > 0.01:           
+        if self.augmentations_enabled:           
             # augmented event
             (
                 coords, feats, (primlepton_labels, seg_labels),
@@ -410,7 +410,8 @@ class SparseFASERCALDataset(Dataset):
             output['primlepton_labels'] = torch.from_numpy(primlepton_labels).float()
             output['seg_labels'] = torch.from_numpy(seg_labels).float()
         else:
-            #feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
+            if self.load_seg:
+                feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
             output['flavour_label'] = torch.tensor([flavour_label]).long()
             output['e_vis'] = torch.from_numpy(e_vis).float()
             output['pt_miss'] = torch.from_numpy(pt_miss).float()

@@ -69,9 +69,9 @@ def main():
     callbacks = []
     monitored_losses = [
             "loss/val_primlepton_ce", 
-            "loss/val_primlepton_dice",
+            #"loss/val_primlepton_dice",
             "loss/val_seg_ce",
-            "loss/val_seg_dice",
+            #"loss/val_seg_dice",
             "loss/val_total"]
     for loss_name in monitored_losses:
         checkpoint = ModelCheckpoint(
@@ -119,9 +119,12 @@ def main():
     )
 
     # Train and validate the model
-    trainer.fit(model=lightning_model,
+    trainer.fit(
+        model=lightning_model,
         train_dataloaders=train_loader,
-        val_dataloaders=valid_loader)
+        val_dataloaders=valid_loader,
+        ckpt_path=args.load_checkpoint if args.load_checkpoint else None,
+    )
 
 
 if __name__ == "__main__":

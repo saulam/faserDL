@@ -50,8 +50,9 @@ class SparseSegLightningModel(pl.LightningModule):
             total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
             p = float(self.global_step) / total_steps
             # Here, gamma = 10 is a typical choice, modify as needed
-            self.model.global_weight = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
-
+            new_value = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
+            with torch.no_grad():
+                self.model.global_weight.fill_(new_value)
 
     def forward(self, x, x_glob):
         return self.model(x, x_glob)
@@ -78,11 +79,12 @@ class SparseSegLightningModel(pl.LightningModule):
         loss_seg_ce = self.loss_seg_ce(out_seg, targ_seg)
         loss_seg_dice = self.loss_seg_dice(out_seg, targ_seg)
         part_losses = {'primlepton_ce': loss_primlepton_ce,
-                       'primlepton_dice': loss_primlepton_dice,
+                       #'primlepton_dice': loss_primlepton_dice,
                        'seg_ce': loss_seg_ce,
-                       'seg_dice': loss_seg_dice,
+                       #'seg_dice': loss_seg_dice,
                        }
-        total_loss = loss_primlepton_ce + loss_primlepton_dice + loss_seg_ce + loss_seg_dice
+        #total_loss = loss_primlepton_ce + loss_primlepton_dice + loss_seg_ce + loss_seg_dice
+        total_loss = loss_primlepton_ce + loss_seg_ce
 
         return total_loss, part_losses
 

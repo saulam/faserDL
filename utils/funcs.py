@@ -276,3 +276,26 @@ class CombinedScheduler(_LRScheduler):
         if self.scheduler2:
             self.scheduler2.load_state_dict(state_dict['scheduler2'])
 
+
+def transfer_weights(model_seg, model_enc):
+    """
+    Load weights from segmentation model to encoder model
+    """
+    model_enc.stem_ch.load_state_dict(model_seg.stem_ch.state_dict())
+    model_enc.stem_mod.load_state_dict(model_seg.stem_mod.state_dict())
+    model_enc.stem_ln.load_state_dict(model_seg.stem_ln.state_dict())
+    model_enc.global_feats_encoder.load_state_dict(model_seg.global_feats_encoder.state_dict())
+    N_bb = len(model_enc.shared_encoders)
+    for i in range(N_bb):
+        model_enc.shared_encoders[i].load_state_dict(model_seg.encoder_layers[i].state_dict())
+        model_enc.shared_se_layers[i].load_state_dict(model_seg.se_layers[i].state_dict())
+        if i < N_bb - 1:
+            model_enc.shared_downsamples[i].load_state_dict(model_seg.downsample_layers[i].state_dict())
+
+    last = N_bb  # index in model_seg: encoder_layers[last], se_layers[last], downsample_layers[last]
+    for name, branch in model_enc.branches.items():
+        # branch is an nn.ModuleDict, so indexing by string
+        branch["downsample"].load_state_dict(model_seg.downsample_layers[last - 1].state_dict())
+        branch["encoder"].load_state_dict(model_seg.encoder_layers[last].state_dict())
+        branch["se"].load_state_dict(model_seg.se_layers[last].state_dict())
+
