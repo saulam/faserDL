@@ -70,7 +70,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         encoder_dims = [96, 192, 384, 768]
         se_block_reds = [16, 16, 16, 16]
         kernel_size_ds = (2, 2, 2)
-        dilation_ds = (1, 1, 2)
+        dilation_ds = (2, 2, 2)
         block_kernel = (5, 5, 5)
         drop_path_rate = 0.1
         assert len(encoder_depths) == len(encoder_dims)
@@ -80,9 +80,13 @@ class MinkUNetConvNeXtV2(nn.Module):
         dp_cur = 0
 
         # Stem
-        self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
-        self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
-        self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
+        self.stem = nn.Sequential(
+             MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D),
+             MinkowskiLayerNorm(encoder_dims[0], eps=1e-6),
+         )
+        #self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
+        #self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
+        #self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
 
         # Global features
         self.register_buffer("global_weight", torch.tensor(1.0))  # Scalar controlling global parameter contribution
@@ -155,7 +159,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         self.primlepton_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
             Block(dim=decoder_dims[-1], kernel_size=block_kernel, dilation=dilation_us, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
+            MinkowskiConvolution(decoder_dims[-1], 2, kernel_size=1, stride=1, dimension=D),
         )
         self.seg_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
@@ -176,20 +180,20 @@ class MinkUNetConvNeXtV2(nn.Module):
 
         Returns:
             A dictionary with voxel predictions.
-        """
-        coords, charge = x.C, x.F    # feats: [N,2]
-        mod_id = (coords[:, 3] % self.module_size).long()  # [N]
-        
+        """        
         # Stem and global feature MLP transformation.
-        charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
-        mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
-        new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
-        x = ME.SparseTensor(
-            new_feats, 
-            coordinate_manager=x.coordinate_manager,
-            coordinate_map_key=x.coordinate_map_key,
-        )        
-        x = self.stem_ln(x)
+        #coords, charge = x.C, x.F    # feats: [N,2]
+        #mod_id = (coords[:, 3] % self.module_size).long()  # [N]
+        #charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
+        #mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
+        #new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
+        #x = ME.SparseTensor(
+        #    new_feats, 
+        #    coordinate_manager=x.coordinate_manager,
+        #    coordinate_map_key=x.coordinate_map_key,
+        #)        
+        #x = self.stem_ln(x)
+        x = self.stem(x)
         x_glob = self.global_feats_encoder(x_glob)
 
         # Encoder path with SE block integration.

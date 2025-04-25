@@ -78,16 +78,27 @@ class SparseFASERCALDataset(Dataset):
         coords, feats = coords_ori.copy(), feats_ori.copy()
         labels = [x.copy() for x in labels_ori]
         dirs = [x.copy() for x in dirs_ori]
- 
-        # mirror
-        coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
-        # rotate
-        coords, dirs, primary_vertex = shear_rotation_random(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
-        coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+
+        if self.stage1:
+            # mirror
+            coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+            # rotate
+            if np.random.rand() > 0.5:
+                coords, dirs, primary_vertex = shear_rotation_random(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+            else:
+                coords, dirs, primary_vertex = rotate(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+            coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+        else:        
+            # mirror
+            coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
+            # rotate
+            coords, dirs, primary_vertex = shear_rotation_random(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+            coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        
         # translate
         coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # drop voxels
-        #coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
+        coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
         feats = shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
@@ -394,7 +405,7 @@ class SparseFASERCALDataset(Dataset):
         
         # ptmiss
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
-        pt_miss = self.log(pt_miss) #self.divide_by_std(pt_miss, 'pt_miss')
+        pt_miss = self.log(pt_miss)
 
         # output
         output = {}
@@ -405,9 +416,10 @@ class SparseFASERCALDataset(Dataset):
             output['is_cc'] = is_cc
             output['in_neutrino_pdg'] = in_neutrino_pdg
             output['in_neutrino_energy'] = in_neutrino_energy
+            output['vis_sp_momentum'] = vis_sp_momentum
             output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir).float()
         if self.stage1:
-            output['primlepton_labels'] = torch.from_numpy(primlepton_labels).float()
+            output['primlepton_labels'] = torch.from_numpy(primlepton_labels.reshape(-1)).long()
             output['seg_labels'] = torch.from_numpy(seg_labels).float()
         else:
             if self.load_seg:
@@ -424,3 +436,4 @@ class SparseFASERCALDataset(Dataset):
         output['feats_global'] = torch.from_numpy(feats_global).float()
 
         return output
+

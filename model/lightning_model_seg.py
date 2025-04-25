@@ -25,9 +25,9 @@ class SparseSegLightningModel(pl.LightningModule):
         super(SparseSegLightningModel, self).__init__()
 
         self.model = model
-        self.loss_primlepton_ce = nn.BCEWithLogitsLoss()
+        self.loss_primlepton_ce = nn.CrossEntropyLoss(label_smoothing=0.1) #nn.BCEWithLogitsLoss()
         self.loss_primlepton_dice = partial(dice_loss, sigmoid=True, reduction="mean") 
-        self.loss_seg_ce = nn.CrossEntropyLoss()
+        self.loss_seg_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.loss_seg_dice = partial(dice_loss, sigmoid=False, reduction="mean")
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
@@ -75,9 +75,9 @@ class SparseSegLightningModel(pl.LightningModule):
 
         # losses
         loss_primlepton_ce = self.loss_primlepton_ce(out_primlepton, targ_primlepton)
-        loss_primlepton_dice = self.loss_primlepton_dice(out_primlepton, targ_primlepton)
+        #loss_primlepton_dice = self.loss_primlepton_dice(out_primlepton, targ_primlepton)
         loss_seg_ce = self.loss_seg_ce(out_seg, targ_seg)
-        loss_seg_dice = self.loss_seg_dice(out_seg, targ_seg)
+        #loss_seg_dice = self.loss_seg_dice(out_seg, targ_seg)
         part_losses = {'primlepton_ce': loss_primlepton_ce,
                        #'primlepton_dice': loss_primlepton_dice,
                        'seg_ce': loss_seg_ce,

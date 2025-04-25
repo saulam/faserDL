@@ -210,7 +210,7 @@ def shear_rotation_random(coords, dirs, primary_vertex, metadata, selected_axes=
     return pts, dirs, primary_vertex
 
 
-def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z'], max_attempts=10):
+def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     escaping = is_escaping(coords, metadata)
     #if np.all(escaping):
     #    return coords, dirs, primary_vertex
@@ -244,33 +244,23 @@ def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']
         #if any(escaping[axes_indices[a]] for a in affected):
         #    continue
 
-        for attempt in range(max_attempts):
-            angle_deg = np.random.uniform(0, 360)  # You can adjust this range
-            rotation = R.from_euler(axis, angle_deg, degrees=True)
+        angle_deg = np.random.uniform(-45, 45)  # You can adjust this range
+        rotation = R.from_euler(axis, angle_deg, degrees=True)
 
-            rotated_coords = rotation.apply(shifted_coords) + reference_point
+        shifted_coords = rotation.apply(shifted_coords)
+        shifted_primary = rotation.apply(shifted_primary[np.newaxis, :])[0]
 
-            # Check bounds
-            #if (
-            #    np.all(rotated_coords[:, 0] >= 0) and np.all(rotated_coords[:, 0] < metadata['x'].shape[0]) and
-            #    np.all(rotated_coords[:, 1] >= 0) and np.all(rotated_coords[:, 1] < metadata['y'].shape[0]) and
-            #    np.all(rotated_coords[:, 2] >= 0) and np.all(rotated_coords[:, 2] < metadata['z'].shape[0])
-            #):
-            if True:
-                # Valid rotation found → apply it
-                shifted_coords = rotation.apply(shifted_coords)
-                shifted_primary = rotation.apply(shifted_primary[np.newaxis, :])[0]
-
-                if rotated_dirs is not None:
-                    rotated_dirs = rotation.apply(rotated_dirs)
-
-                break  # Stop attempting after success
+        if rotated_dirs is not None:
+            rotated_dirs = rotation.apply(rotated_dirs)
 
     # Recenter coordinates back
-    coords = shifted_coords + reference_point
-    primary_vertex = shifted_primary + reference_point
+    rotated_coords = (shifted_coords + reference_point).round()
+    rotated_vertex = shifted_primary + reference_point
 
-    return coords, rotated_dirs, primary_vertex
+    if len(np.unique(rotated_coords, axis=0)) < 2:
+        return coords, dirs, primary_vertex
+
+    return rotated_coords, rotated_dirs, rotated_vertex
 
 
 def translate(coords, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
@@ -330,7 +320,7 @@ def drop(coords, feats, labels, std_dev=0.1):
         return coords, feats, labels
     p = abs(np.random.randn(1) * std_dev)
     mask = np.random.rand(coords.shape[0]) > p
-    if mask.sum() < 2:
+    if mask.sum() < 2 or len(np.unique(coords[mask], axis=0)) < 2:
         #don't drop all coordinates
         return coords, feats, labels
     return coords[mask], feats[mask], [x[mask] for x in labels]
