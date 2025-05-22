@@ -3,24 +3,29 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 01.25
 
-Description: PyTorch Lightning model - stage 2: flavour classification.
+Description: PyTorch Lightning model - stage 2: classification and regression tasks.
 """
 
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
-from pytorch_lightning.trainer.supporters import CombinedDataset
+from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 
 
-class SparseEncClsLightningModel(pl.LightningModule):
+class SparseEncLightningModel(pl.LightningModule):
     def __init__(self, model, args):
-        super(SparseEncClsLightningModel, self).__init__()
+        super(SparseEncLightningModel, self).__init__()
 
         self.model = model
         self.loss_flavour = nn.CrossEntropyLoss()
+        self.loss_evis = [nn.MSELoss(), MAPE(from_log_scale=True)]
+        self.loss_ptmiss = [nn.MSELoss(), MAPE(from_log_scale=True)]
+        self.loss_lepton_momentum_mag = [nn.MSELoss(), MAPE(from_log_scale=True)]
+        self.loss_lepton_momentum_dir = SphericalAngularLoss()
+        self.loss_jet_momentum_mag = [nn.MSELoss(), MAPE(from_log_scale=True)]
+        self.loss_jet_momentum_dir = SphericalAngularLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -33,37 +38,17 @@ class SparseEncClsLightningModel(pl.LightningModule):
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+
+
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
+        # Calculate progress p: global step / max_steps
+        # Make sure self.trainer is set (it usually is after a few batches)
+        if self.trainer.max_steps:
+            total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
+            p = float(self.global_step) / total_steps
+            # Here, gamma = 10 is a typical choice, modify as needed
+            self.model.global_weight = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
  
-
-    def on_train_epoch_start(self):
-        """Hook to be called at the start of each training epoch."""
-        train_loader = self.trainer.train_dataloader
-        if isinstance(train_loader.dataset, CombinedDataset):
-            if getattr(train_loader.dataset.datasets, "dataset", None) is not None:
-                train_loader.dataset.datasets.dataset.set_augmentations_on()
-            else:
-                train_loader.dataset.datasets.set_augmentations_on()
-        else:
-            train_loader.dataset.set_augmentations_on()
-
-
-    def on_validation_epoch_start(self):
-        """Hook to be called at the start of each validation epoch."""
-        val_loader = self.trainer.val_dataloaders[0]
-        if getattr(val_loader.dataset, "dataset", None) is not None:
-            val_loader.dataset.dataset.set_augmentations_off()
-        else:
-            val_loader.dataset.set_augmentations_off()
-
-
-    def on_test_epoch_start(self):
-        """Hook to be called at the start of each test epoch."""
-        test_loader = self.trainer.test_dataloaders[0]
-        if getattr(val_loader.dataset, "dataset", None) is not None:
-            test_loader.dataset.dataset.set_augmentations_off()
-        else:
-            test_loader.dataset.set_augmentations_off()
-
 
     def forward(self, x, x_glob):
         return self.model(x, x_glob)
@@ -78,14 +63,51 @@ class SparseEncClsLightningModel(pl.LightningModule):
     def compute_losses(self, batch_output, target):
         # pred
         out_flavour = batch_output['out_flavour']
+        out_e_vis = batch_output['out_e_vis'].view(-1)
+        out_pt_miss = batch_output['out_pt_miss'].view(-1)
+        out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag']
+        out_lepton_momentum_dir = batch_output['out_lepton_momentum_dir']
+        out_jet_momentum_mag = batch_output['out_jet_momentum_mag']
+        out_jet_momentum_dir = batch_output['out_jet_momentum_dir']
 
         # true
         targ_flavour = target['flavour_label']
+        targ_e_vis = target['e_vis']
+        targ_pt_miss = target['pt_miss']
+        targ_lepton_momentum_mag = target['out_lepton_momentum_mag']
+        targ_lepton_momentum_dir = target['out_lepton_momentum_dir']
+        targ_jet_momentum_mag = target['jet_momentum_mag']
+        targ_jet_momentum_dir = target['jet_momentum_dir']
+
+        # Mask primary lepton momentum for NC events
+        mask = targ_lepton_momentum_mag.squeeze() > 0
+        out_lepton_momentum_mag = out_lepton_momentum_mag[mask]
+        out_lepton_momentum_dir = out_lepton_momentum_dir[mask]
+        targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask]
+        targ_lepton_momentum_dir = targ_lepton_momentum_dir[mask]
 
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
-        part_losses = {'flavour': loss_flavour}
-        total_loss = loss_flavour
+        loss_e_vis = self.loss_evis[0](out_e_vis, targ_e_vis)
+        loss_e_vis += 0.1 * self.loss_evis[1](out_e_vis, targ_e_vis)
+        loss_pt_miss = self.loss_ptmiss[0](out_pt_miss, targ_pt_miss)
+        loss_pt_miss += 0.1 * self.loss_ptmiss[1](out_pt_miss, targ_pt_miss)
+        loss_lepton_momentum_mag = self.loss_lepton_momentum_mag[0](out_lepton_momentum_mag, targ_lepton_momentum_mag)
+        loss_lepton_momentum_mag += 0.1 * self.loss_lepton_momentum_mag[1](out_lepton_momentum_mag, targ_lepton_momentum_mag)
+        loss_lepton_momentum_dir = self.loss_lepton_momentum_dir(out_lepton_momentum_dir, targ_lepton_momentum_dir)
+        loss_jet_momentum_mag = self.loss_jet_momentum_mag[0](out_jet_momentum_mag, targ_jet_momentum_mag)
+        loss_jet_momentum_mag += 0.1 * self.loss_jet_momentum_mag[1](out_jet_momentum_mag, targ_jet_momentum_mag)
+        loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
+        
+        part_losses = {'flavour': loss_flavour,
+                       'e_vis': loss_e_vis,
+                       'pt_miss': loss_pt_miss,
+                       'lepton_momentum_mag': loss_lepton_momentum_mag,
+                       'lepton_momentum_dir': loss_lepton_momentum_dir,
+                       'jet_momentum_mag': loss_jet_momentum_mag,
+                       'jet_momentum_dir': loss_jet_momentum_dir,
+                       }
+        total_loss = loss_flavour + loss_e_vis + loss_pt_miss + loss_lepton_momentum_mag + loss_lepton_momentum_dir + loss_jet_momentum_mag + loss_jet_momentum_dir
 
         return total_loss, part_losses
 
@@ -109,9 +131,13 @@ class SparseEncClsLightningModel(pl.LightningModule):
 
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
+        if torch.isnan(loss):
+            return None
+
         self.log(f"loss/train_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
+        self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss

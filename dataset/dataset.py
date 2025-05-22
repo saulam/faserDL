@@ -32,8 +32,8 @@ class SparseFASERCALDataset(Dataset):
         self.load_seg = args.load_seg
         self.stage1 = args.stage1
         self.train = args.train
-        self.augmentations_enabled = args.augmentations_enabled
-        self.augmentations_active = False
+        self.augmentations_enabled = False
+        self.is_v5 = True if 'v5' in args.dataset_path else False 
         self.total_events = self.__len__
         with open(self.root + "/metadata.pkl", "rb") as fd:
             self.metadata = pk.load(fd)
@@ -42,18 +42,6 @@ class SparseFASERCALDataset(Dataset):
             self.metadata['z'] = np.array(self.metadata['z'])
 
             
-    def set_augmentations_on(self):
-        """Sets augmentations on dinamically."""
-        print("Setting augmentations: ON.")
-        self.augmentations_active = True
-    
-    
-    def set_augmentations_off(self):
-        """Sets augmentations off dinamically."""
-        print("Setting augmentations: OFF.")
-        self.augmentations_active = False
- 
-
     @property
     def processed_dir(self):
         """
@@ -90,25 +78,36 @@ class SparseFASERCALDataset(Dataset):
         coords, feats = coords_ori.copy(), feats_ori.copy()
         labels = [x.copy() for x in labels_ori]
         dirs = [x.copy() for x in dirs_ori]
- 
-        # mirror
-        coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
-        # rotate
-        #coords, dirs = rotate(coords, dirs, primary_vertex)
-        coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+
+        if self.stage1:
+            # mirror
+            coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+            # rotate
+            if np.random.rand() > 0.5:
+                coords, dirs, primary_vertex = shear_rotation_random(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+            else:
+                coords, dirs, primary_vertex = rotate(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+            coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+        else:        
+            # mirror
+            coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
+            # rotate
+            coords, dirs, primary_vertex = shear_rotation_random(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+            coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        
         # translate
-        coords, primary_vertex = translate(coords, primary_vertex, selected_axes=['x', 'y'])
+        coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # drop voxels
         coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
         feats = shift_q_gaussian(feats, std_dev=0.01)
         # keep within limits
-        coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
+        #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         
         if coords.shape[0] < 2:
-            return coords_ori, feats_ori, labels_ori, dirs_ori
+            return coords_ori, feats_ori, labels_ori, dirs_ori, primary_vertex
 
-        return coords, feats, labels, dirs
+        return coords, feats, labels, dirs, primary_vertex
     
     
     def within_limits(self, coords, feats=None, labels=None, voxelised=False, mask_axes=(0, 1, 2)):
@@ -273,16 +272,24 @@ class SparseFASERCALDataset(Dataset):
     
     def divide_by_std(self, x, param_name):
         return x / self.metadata[param_name]['std']
-    
-    
-    def get_param(self, data, param_name, preprocess=False):
+   
+
+    def log(self, x):
+        return np.log(1 + x)
+   
+
+    def get_param(self, data, param_name, preprocess=None):
         if param_name not in data:
             return None
 
         param = data[param_name]
         if param.ndim == 0:
             param = param.reshape(1,) if preprocess else param.item()
-        param = self.divide_by_std(param, param_name) if preprocess else param
+
+        if preprocess == "std":
+            param = self.divide_by_std(param, param_name)
+        elif preprocess == "log":
+            param = self.log(param)
         
         return param
 
@@ -307,51 +314,39 @@ class SparseFASERCALDataset(Dataset):
         in_neutrino_pdg = self.get_param(data, 'in_neutrino_pdg')
         in_neutrino_energy = self.get_param(data, 'in_neutrino_energy')
         out_lepton_pdg = self.get_param(data, 'out_lepton_pdg')
-        out_lepton_momentum = self.get_param(data, 'out_lepton_momentum', preprocess=False)
-        vis_sp_momentum = self.get_param(data, 'vis_sp_momentum', preprocess=False)
+        out_lepton_momentum = self.get_param(data, 'out_lepton_momentum', preprocess=None)
+        vis_sp_momentum = self.get_param(data, 'vis_sp_momentum', preprocess=None)
         jet_momentum = self.get_param(data, 'jet_momentum', preprocess=False)
         is_cc = self.get_param(data, 'is_cc')
-        e_vis = self.get_param(data, 'e_vis', preprocess=True)
-        pt_miss = self.get_param(data, 'pt_miss', preprocess=False)
-        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocess=True)
-        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocess=True)
-        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocess=True)
-        faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocess=True)
-        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocess=True)
-        faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocess=True)
+        e_vis = self.get_param(data, 'e_vis', preprocess="log")
+        pt_miss = self.get_param(data, 'pt_miss', preprocess="log")
+        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocess="log")
+        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocess="log")
+        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocess="log")
+        faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocess="log")
+        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocess="log")
+        faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocess="log")
         primary_vertex = data['primary_vertex']
         
-        if not is_cc:
+        if not self.is_v5 and not is_cc:
             # Fix jet momentum and no outgoing lepton momentum for NC events
             jet_momentum = jet_momentum + out_lepton_momentum
             out_lepton_momentum.fill(0)
         
         # momentum -> direction + magnitude
         out_lepton_momentum_mag, out_lepton_momentum_dir = self.decompose_momentum(out_lepton_momentum)
-        out_lepton_momentum_mag = self.divide_by_std(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude')
+        out_lepton_momentum_mag = self.log(out_lepton_momentum_mag) #self.divide_by_std(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude')
         jet_momentum_mag, jet_momentum_dir = self.decompose_momentum(jet_momentum)
-        jet_momentum_mag = self.divide_by_std(jet_momentum_mag, 'jet_momentum_magnitude')
+        jet_momentum_mag = self.log(jet_momentum_mag) #self.divide_by_std(jet_momentum_mag, 'jet_momentum_magnitude')
         
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
-        q = self.divide_by_std(reco_hits[:, 4].reshape(-1, 1), 'q')
+        q = self.log(reco_hits[:, 4].reshape(-1, 1))#self.divide_by_std(reco_hits[:, 4].reshape(-1, 1), 'q')
         
         # process labels
         primlepton_labels = self.get_param(data, 'primlepton_labels')
         seg_labels = self.get_param(data, 'seg_labels')
-        if self.load_seg:
-            # load labels from pretrained model predictions
-            file_name = self.data_files[idx].replace("events_v3.5", "events_v3.5_seg_results")
-            predictions = np.load(file_name)
-            primlepton_labels_pred, seg_labels_pred = predictions['out_primlepton'], predictions['out_seg']
-            
-            # convert electromagnetic and hadronic probabilities to energy desposits (using truth info)
-            seg_labels_pred[:, 1:] *= (seg_labels[:, 1:].sum(axis=1, keepdims=True) + 1e-8)            
-            
-            # predictions become labels
-            primlepton_labels = primlepton_labels_pred
-            seg_labels = seg_labels_pred
-         
+        
         # voxelise coordinates and prepare global features and labels
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
@@ -361,12 +356,34 @@ class SparseFASERCALDataset(Dataset):
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)
 
+        if self.is_v5:
+            # mask out voxels between modules
+            mask = ~(coords[:, 2] % 24 >= 20)
+            coords = coords[mask]
+            q = q[mask]
+            primlepton_labels = primlepton_labels[mask]
+            seg_labels = seg_labels[mask]
+
+        if self.load_seg:
+            # load labels from pretrained model predictions
+            version = "v5.1" if self.is_v5 else "v3.5"
+            file_name = self.data_files[idx].replace(f"events_{version}", f"events_{version}_seg_results")
+            predictions = np.load(file_name)
+            primlepton_labels_pred, seg_labels_pred = predictions['out_primlepton'], predictions['out_seg']
+            
+            # convert electromagnetic and hadronic probabilities to energy desposits (using truth info)
+            seg_labels_pred[:, 1:] *= (seg_labels[:, 1:].sum(axis=1, keepdims=True) + 1e-8)            
+            
+            # predictions become labels
+            primlepton_labels = primlepton_labels_pred
+            seg_labels = seg_labels_pred
+
         augmented, feats = False, q
-        if self.augmentations_enabled and self.augmentations_active and np.random.rand() > 0.01:           
+        if self.augmentations_enabled:           
             # augmented event
             (
                 coords, feats, (primlepton_labels, seg_labels),
-                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum)
+                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum), primary_vertex
             ) = self._augment(
                 coords, feats, (primlepton_labels, seg_labels),
                 (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum),
@@ -376,7 +393,7 @@ class SparseFASERCALDataset(Dataset):
             augmented = True
         else:
             seg_labels = self.normalise_seg_labels(seg_labels)
-           
+          
         if augmented:
             # merge duplicated coordinates and finalise with augmentations
             coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
@@ -388,7 +405,7 @@ class SparseFASERCALDataset(Dataset):
         
         # ptmiss
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
-        pt_miss = self.divide_by_std(pt_miss, 'pt_miss')
+        pt_miss = self.log(pt_miss)
 
         # output
         output = {}
@@ -399,12 +416,14 @@ class SparseFASERCALDataset(Dataset):
             output['is_cc'] = is_cc
             output['in_neutrino_pdg'] = in_neutrino_pdg
             output['in_neutrino_energy'] = in_neutrino_energy
+            output['vis_sp_momentum'] = vis_sp_momentum
             output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir).float()
         if self.stage1:
-            output['primlepton_labels'] = torch.from_numpy(primlepton_labels).float()
+            output['primlepton_labels'] = torch.from_numpy(primlepton_labels.reshape(-1)).long()
             output['seg_labels'] = torch.from_numpy(seg_labels).float()
         else:
-            feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
+            if self.load_seg:
+                feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
             output['flavour_label'] = torch.tensor([flavour_label]).long()
             output['e_vis'] = torch.from_numpy(e_vis).float()
             output['pt_miss'] = torch.from_numpy(pt_miss).float()
@@ -417,3 +436,4 @@ class SparseFASERCALDataset(Dataset):
         output['feats_global'] = torch.from_numpy(feats_global).float()
 
         return output
+

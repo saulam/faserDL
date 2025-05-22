@@ -1,9 +1,9 @@
 """
-Author: Dr. Saul Alonso-Monsalve
+Author: Dr. Saul Alonso-Monsalve (modified)
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 04.25
 
-Description: PyTorch model - stage 1: semantic segmentation.
+Description: PyTorch model - stage 2: event-level classification and regression tasks.
 """
 
 import torch
@@ -14,10 +14,10 @@ from timm.models.layers import trunc_normal_
 import MinkowskiEngine as ME
 from MinkowskiEngine import (
     MinkowskiConvolution,
-    MinkowskiConvolutionTranspose,
-    MinkowskiLinear,
     MinkowskiGlobalMaxPooling,
-    MinkowskiReLU,
+    MinkowskiGlobalAvgPooling,
+    MinkowskiLinear,
+    MinkowskiSoftplus,
     MinkowskiGELU,
 )
 
@@ -25,12 +25,8 @@ from .utils import GlobalFeatureEncoder, Block, MinkowskiLayerNorm, MinkowskiSE
 
 
 def _init_weights(m):
-    """Custom weight initialization for various layers."""
+    """Custom weight initialization for supported layers."""
     if isinstance(m, MinkowskiConvolution):
-        trunc_normal_(m.kernel, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, MinkowskiConvolutionTranspose):
         trunc_normal_(m.kernel, std=0.02)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
@@ -51,7 +47,7 @@ def _init_weights(m):
         nn.init.constant_(m.weight, 1.0)
 
 
-class MinkUNetConvNeXtV2(nn.Module):
+class MinkEncConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
         """
         Args:
@@ -70,52 +66,52 @@ class MinkUNetConvNeXtV2(nn.Module):
         encoder_dims = [96, 192, 384, 768]
         se_block_reds = [16, 16, 16, 16]
         kernel_size_ds = (2, 2, 2)
-        dilation_ds = (2, 2, 2)
+        dilation_ds = (1, 1, 2)
         block_kernel = (5, 5, 5)
         drop_path_rate = 0.1
         assert len(encoder_depths) == len(encoder_dims)
-        self.nb_elayers = len(encoder_dims)
+        self.nb_bblayers = len(encoder_dims) - 1
         total_depth = sum(encoder_depths)
         dp_rates_enc = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
         dp_cur = 0
-
+        
+        ###############################################
+        # Shared Backbone
+        ###############################################
+        
         # Stem
-        self.stem = nn.Sequential(
-             MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D),
-             MinkowskiLayerNorm(encoder_dims[0], eps=1e-6),
-         )
-        #self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
-        #self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
-        #self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
+        self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
+        self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
+        self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
 
         # Global features
         self.register_buffer("global_weight", torch.tensor(1.0))  # Scalar controlling global parameter contribution
         self.global_feats_encoder = GlobalFeatureEncoder(encoder_dim=encoder_dims[0], dropout=0.3)
 
-        # Build encoder
-        self.encoder_layers = nn.ModuleList()
-        self.downsample_layers = nn.ModuleList()
-        self.se_layers = nn.ModuleList()
-        for i in range(self.nb_elayers):
+        # Backbone
+        self.shared_encoders = nn.ModuleList()
+        self.shared_downsamples = nn.ModuleList()
+        self.shared_se_layers = nn.ModuleList()
+        for i in range(self.nb_bblayers):
             # Encoder layer
             encoder_layer = nn.Sequential(
                 *[Block(dim=encoder_dims[i], kernel_size=block_kernel, dilation=dilation_ds,
                         drop_path=dp_rates_enc[dp_cur + j], D=D)
                   for j in range(encoder_depths[i])]
             )
-            self.encoder_layers.append(encoder_layer)
+            self.shared_encoders.append(encoder_layer)
             dp_cur += encoder_depths[i]
-
+            
             # SE layer
             se_layer = MinkowskiSE(channels=encoder_dims[i], glob_dim=encoder_dims[0], reduction=se_block_reds[i])
-            self.se_layers.append(se_layer)
+            self.shared_se_layers.append(se_layer)
 
             # Downsampling layer
-            if i < self.nb_elayers - 1:
+            if i < self.nb_bblayers - 1:
                 downsample_layer = nn.Sequential(
                     MinkowskiLayerNorm(encoder_dims[i], eps=1e-6),
                     MinkowskiConvolution(
-                        encoder_dims[i], 
+                        encoder_dims[i],
                         encoder_dims[i + 1],
                         kernel_size=kernel_size_ds, 
                         stride=kernel_size_ds,
@@ -123,99 +119,105 @@ class MinkUNetConvNeXtV2(nn.Module):
                         dimension=D
                     ),
                 )
-                self.downsample_layers.append(downsample_layer)
+                self.shared_downsamples.append(downsample_layer)
 
-        # Decoder configuration (reversing the encoder dimensions)
-        decoder_depths = [2] * len(encoder_depths)
-        decoder_dims = list(reversed(encoder_dims))
-        kernel_size_us = kernel_size_ds
-        dilation_us = dilation_ds
-        self.nb_dlayers = len(decoder_dims) - 1
-        total_depth_dec = sum(decoder_depths)
-        dp_rates_dec = [x.item() for x in torch.linspace(dp_rates_enc[-encoder_depths[-1]], 0, total_depth_dec)]
-        dp_cur_dec = 0
-
-        # Build decoder
-        self.decoder_layers = nn.ModuleList()
-        self.upsample_layers = nn.ModuleList()
-        for i in range(self.nb_dlayers):
-            upsample_layer = nn.Sequential(
-                MinkowskiLayerNorm(decoder_dims[i], eps=1e-6),
-                MinkowskiConvolutionTranspose(decoder_dims[i], decoder_dims[i + 1],
-                                              kernel_size=kernel_size_us, stride=kernel_size_us,
-                                              bias=True, dimension=D),
+        ###############################################
+        # Branch-Specific Modules
+        ###############################################
+        
+        branch_names = [
+            "flavour",
+            "e_vis",
+            "pt_miss",
+            "lepton_momentum_mag",
+            "lepton_momentum_dir",
+            "jet_momentum_mag",
+            "jet_momentum_dir"
+        ]
+        branch_out_channels = {
+            "flavour": 4,
+            "e_vis": 1,
+            "pt_miss": 1,
+            "lepton_momentum_mag": 1,
+            "lepton_momentum_dir": 3,
+            "jet_momentum_mag": 1,
+            "jet_momentum_dir": 3,
+        }
+        
+        self.branches = nn.ModuleDict()
+        for name in branch_names:
+            branch = {}
+            branch["downsample"] = nn.Sequential(
+                MinkowskiLayerNorm(encoder_dims[i], eps=1e-6),
+                MinkowskiConvolution(
+                    encoder_dims[i],
+                    encoder_dims[i+1],
+                    kernel_size=kernel_size_ds, 
+                    stride=kernel_size_ds,
+                    bias=True,
+                    dimension=D),
             )
-            self.upsample_layers.append(upsample_layer)
-
-            decoder_layer = nn.Sequential(
-                *[Block(dim=decoder_dims[i + 1], kernel_size=block_kernel, dilation=dilation_us,
-                        drop_path=dp_rates_dec[dp_cur_dec + j], D=D)
-                  for j in range(decoder_depths[i])]
+            
+            branch["encoder"] = nn.Sequential(
+                *[Block(dim=encoder_dims[i+1], kernel_size=block_kernel, dilation=dilation_ds,
+                        drop_path=dp_rates_enc[dp_cur + j], D=D) for j in range(encoder_depths[i+1])]
             )
-            self.decoder_layers.append(decoder_layer)
-            dp_cur_dec += decoder_depths[i]
-
-        # Semantic segmentation prediction layers.
-        self.primlepton_layer = nn.Sequential(
-            MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=block_kernel, dilation=dilation_us, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 2, kernel_size=1, stride=1, dimension=D),
-        )
-        self.seg_layer = nn.Sequential(
-            MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=block_kernel, dilation=dilation_us, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 3, kernel_size=1, stride=1, dimension=D),
-        )
+            branch["se"] = MinkowskiSE(channels=encoder_dims[i+1], glob_dim=encoder_dims[0], reduction=se_block_reds[i+1])
+            branch["global_pool"] = (
+                MinkowskiGlobalMaxPooling() if name == "flavour" else MinkowskiGlobalAvgPooling()
+            )
+            branch["head"] = nn.Sequential(
+                MinkowskiLinear(encoder_dims[i+1], branch_out_channels[name]),
+            )
+            self.branches[name] = nn.ModuleDict(branch)
 
         # Initialise weights
         self.apply(_init_weights)
-
+    
     def forward(self, x, x_glob):
         """
-        Forward pass through the encoder-decoder network.
-
+        Forward pass through the shared backbone and branch-specific modules.
+        
         Args:
             x: Input sparse tensor.
             x_glob: Global feature tensor.
-
+            
         Returns:
-            A dictionary with voxel predictions.
-        """        
+            A dictionary mapping branch names prefixed with 'out_' to their outputs.
+        """
+        coords, charge = x.C, x.F    # feats: [N,2]
+        mod_id = (coords[:, 3] % self.module_size).long()  # [N]
+        
         # Stem and global feature MLP transformation.
-        #coords, charge = x.C, x.F    # feats: [N,2]
-        #mod_id = (coords[:, 3] % self.module_size).long()  # [N]
-        #charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
-        #mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
-        #new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
-        #x = ME.SparseTensor(
-        #    new_feats, 
-        #    coordinate_manager=x.coordinate_manager,
-        #    coordinate_map_key=x.coordinate_map_key,
-        #)        
-        #x = self.stem_ln(x)
-        x = self.stem(x)
+        charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
+        mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
+        new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
+        x = ME.SparseTensor(
+            new_feats, 
+            coordinate_manager=x.coordinate_manager,
+            coordinate_map_key=x.coordinate_map_key,
+        )        
+        x = self.stem_ln(x)
         x_glob = self.global_feats_encoder(x_glob)
 
-        # Encoder path with SE block integration.
-        x_enc = []
-        for i in range(self.nb_elayers):
-            x = self.encoder_layers[i](x)
-            x = self.se_layers[i](x, x_glob, self.global_weight)
-            if i < self.nb_elayers - 1:
-                x_enc.append(x)
-                x = self.downsample_layers[i](x)
-
-        # Decoder path with skip connections
-        x_enc = x_enc[::-1]
-        out_cls = []
-        for i in range(self.nb_dlayers):
-            x = self.upsample_layers[i](x)
-            x = x + x_enc[i]
-            x = self.decoder_layers[i](x)
-
-        out_primlepton = self.primlepton_layer(x)
-        out_seg = self.seg_layer(x)
-        return {"out_primlepton": out_primlepton, "out_seg": out_seg}
+        # Process each backbone stage in a loop.
+        for i in range(len(self.shared_encoders)):
+            x = self.shared_encoders[i](x)
+            x = self.shared_se_layers[i](x, x_glob, self.global_weight)
+            if i < len(self.shared_downsamples):
+                x = self.shared_downsamples[i](x)
+        
+        # Branch-specific processing
+        outputs = {}
+        for name, branch in self.branches.items():
+            xb = x 
+            xb = branch["downsample"](xb)
+            xb = branch["encoder"](xb)
+            xb = branch["se"](xb, x_glob, self.global_weight)
+            xb_gp = branch["global_pool"](xb)
+            xb_head = branch["head"](xb_gp)
+            outputs[f"out_{name}"] = xb_head.F
+        return outputs
 
     def replace_depthwise_with_channelwise(self):
         """
@@ -266,4 +268,3 @@ class MinkUNetConvNeXtV2(nn.Module):
         for comp in components[:-1]:
             parent = getattr(parent, comp)
         return parent, components[-1]
-

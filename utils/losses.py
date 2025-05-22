@@ -25,12 +25,14 @@ class MAPE(torch.nn.Module):
     Args:
         epsilon (float): Small value to prevent division by zero. Default is 1e-8.
         reduction (str): Specifies the reduction method ('mean' or 'sum'). Default is 'mean'.
+        from_log_space (bool): If True, applies exp(x) - 1 to pred and target before computing MAPE.
     """
 
-    def __init__(self, eps=1e-8, reduction='mean'):
+    def __init__(self, eps=1e-8, reduction='mean', from_log_scale=False):
         super(MAPE, self).__init__()
         self.eps = eps
         self.reduction = reduction
+        self.from_log_space = from_log_scale
 
     def forward(self, pred, target):
         """
@@ -43,6 +45,10 @@ class MAPE(torch.nn.Module):
         Returns:
             torch.Tensor: Computed MAPE loss, considering only target values > 0.
         """
+        if self.from_log_space:
+            pred = torch.exp(pred) - 1.0
+            target = torch.exp(target) - 1.0
+
         # Create a mask to only compute the loss where target > 0
         mask = target > 0
 
@@ -392,13 +398,14 @@ def sigmoid_focal_loss_star(
 
 def dice_score(inputs: torch.Tensor,
                targets: torch.Tensor,
-               eps: float = 1e-6):
+               smooth_num: float = 0,
+               smooth_den: float = 1e-12):
     """
     Args:
         inputs: A float tensor of arbitrary shape.
                 The predictions for each example.
         targets: A float tensor with the same shape as inputs.
-        eps: A smoothing constant to avoid division by zero. 
+        smooth: A smoothing constant to smooth gradients. 
     Returns:
         dice_score: Dice loss value.
     """    
@@ -406,7 +413,7 @@ def dice_score(inputs: torch.Tensor,
     intersection = torch.sum(targets * inputs, dim=reduce_axes)
     union = torch.sum(targets, dim=reduce_axes) + torch.sum(inputs, dim=reduce_axes)
 
-    dice_score = (2. * intersection + eps) / (union + eps)
+    dice_score = (2. * intersection + smooth_num) / (union + smooth_den)
     
     return torch.mean(dice_score)
 
@@ -414,7 +421,8 @@ def dice_score(inputs: torch.Tensor,
 def dice_loss(inputs: torch.Tensor or list[torch.Tensor],
               targets: torch.Tensor or list[torch.Tensor],
               sigmoid: bool = True,
-              eps: float = 1e-6,
+              smooth_num: float = 0,
+              smooth_den: float = 1e-12,
               reduction: str = "none",
 ) -> torch.Tensor:
     """
@@ -423,7 +431,7 @@ def dice_loss(inputs: torch.Tensor or list[torch.Tensor],
                 The predictions for each example.
         targets: A float tensor with the same shape as inputs.
         sigmoid: A boolean indicating binary or multi-class.
-        eps: A smoothing constant to avoid division by zero. 
+        smooth: A smoothing constant to avoid division by zero. 
     Returns:
         dice_loss: Dice loss value.
 
@@ -442,21 +450,34 @@ def dice_loss(inputs: torch.Tensor or list[torch.Tensor],
     scores = torch.zeros(batch_size, device=inputs[0].device)
     if sigmoid:
         # binary
-        for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)): 
+        for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)):
+            if ipt.size(-1) == 1:
+                ipt = ipt.squeeze(-1)
+            if tgt.size(-1) == 1:
+                tgt = tgt.squeeze(-1) 
             ipt = torch.sigmoid(ipt)
-            scores[batch_idx] = dice_score(ipt, tgt, eps)
+            scores[batch_idx] = dice_score(ipt, tgt, smooth_num, smooth_den)
     else:
         # multi-class
         for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)):
             ipt = torch.softmax(ipt, 1)
-            score, nb_labels = 0., ipt.size(1)
-            for i in range(nb_labels):
-                ipt_i = ipt[:, i]
-                tgt_i = (tgt[:, 0] == i).float()
-                score += dice_score(ipt_i, tgt_i, eps)
+            nb_labels = ipt.size(1)
+            score = 0.
+            # Check target shape: if the target has the same number of dimensions as ipt,
+            # assume it is one-hot encoded, otherwise assume it's class IDs.
+            if tgt.ndim == ipt.ndim:
+                for i in range(nb_labels):
+                    ipt_i = ipt[:, i]
+                    tgt_i = tgt[:, i].float()
+                    score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
+            else:
+                for i in range(nb_labels):
+                    ipt_i = ipt[:, i]
+                    tgt_i = (tgt == i).float()
+                    score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
             score /= nb_labels
             scores[batch_idx] = score
-
+        
     loss = 1 - scores
 
     if reduction == 'mean':

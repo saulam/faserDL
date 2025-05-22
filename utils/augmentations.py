@@ -10,6 +10,7 @@ Description:
 
 import torch
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 from utils import ini_argparse, random_rotation_saul
 
 
@@ -26,19 +27,33 @@ FASER_CAL_START = 13
 FASER_CAL_END = 28  # 15 values (13:28)
 
 
-def mirror(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def is_escaping(coords, metadata):
+    """
+    Check whether hits are on the edge(s) of the volume
+    (potential escaping particles)
+    """
+    on_boundary = (
+        (coords[:, 0] <= 0) | (coords[:, 0] >= metadata['x'].shape[0] - 1),
+        (coords[:, 1] <= 0) | (coords[:, 1] >= metadata['y'].shape[0] - 1),
+        (coords[:, 2] <= 0) | (coords[:, 2] >= metadata['z'].shape[0] - 1)
+    )
+
+    return np.any(on_boundary, axis=1)
+
+
+def mirror(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     axes = ['x', 'y', 'z']
     for axis in range(3):
         if axes[axis] in selected_axes and np.random.choice([True, False]):
-            point_cloud[:, axis] = metadata[axes[axis]].shape[0] - point_cloud[:, axis]
-            primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis]
+            coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
+            primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis] - 1
             for x in dirs:
                 x[axis] *= -1
 
-    return point_cloud, dirs, primary_vertex
+    return coords, dirs, primary_vertex
 
 
-def rotate_90(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     # Rotation matrices for 90, 180, and 270 degrees on each axis
     rotations = {
         'x': {0: np.eye(3),
@@ -56,49 +71,246 @@ def rotate_90(point_cloud, dirs, primary_vertex, metadata, selected_axes=['x', '
     }
 
     final_rotation_matrix = np.eye(3)
+    reference_point = np.array([
+        (metadata['x'].shape[0] - 1) / 2.,
+        (metadata['y'].shape[0] - 1) / 2.,
+        (metadata['z'].shape[0] - 1) / 2.
+    ])  
 
     for axis in ['x', 'y', 'z']:
         if axis in selected_axes:
             angle = np.random.choice([0, 90, 180, 270])
             final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
-    translated_points = point_cloud - primary_vertex
+    translated_points = coords - reference_point
+    translated_vertex = primary_vertex - reference_point
     rotated_points = translated_points @ final_rotation_matrix
-    final_points = rotated_points + primary_vertex
+    rotated_vertex = translated_vertex @ final_rotation_matrix
+    final_points = rotated_points + reference_point
+    final_vertex = rotated_vertex + reference_point
     rotated_dirs = [x @ final_rotation_matrix for x in dirs]
 
-    return final_points, rotated_dirs
+    return final_points, rotated_dirs, final_vertex
 
 
-def rotate(coords, dirs, primary_vertex):
-    """Random rotation along"""
-    angle_limits = torch.tensor([
-        [-torch.pi/180, -torch.pi/180, -torch.pi],
-        [torch.pi/180, torch.pi/180,  torch.pi]
+def shear_rotation_2d(points_2d, theta):
+    """
+    Applies the shear-based rotation in 2D (for points in one plane).
+    
+    This implements the three-shear algorithm for 2D rotation:
+      1. x = x - tan(theta/2) * y
+      2. y = y + sin(theta) * x
+      3. x = x - tan(theta/2) * y
+    
+    Parameters:
+      points_2d (np.ndarray): Array of shape (N, 2) containing points in 2D.
+      theta (float): Rotation angle in radians.
+    
+    Returns:
+      np.ndarray: Rotated points (rounded after each shear).
+    """
+    pts = points_2d.copy()
+    pts[:, 0] = np.round(pts[:, 0] - np.tan(theta / 2) * pts[:, 1])
+    pts[:, 1] = np.round(pts[:, 1] + np.sin(theta) * pts[:, 0])
+    pts[:, 0] = np.round(pts[:, 0] - np.tan(theta / 2) * pts[:, 1])
+    
+    return pts
+
+
+def shear_rotation_axis(points, axis, theta):
+    """
+    Applies a shear-based rotation about a single axis in 3D.
+    
+    The function extracts the appropriate 2D plane, applies the shear rotation,
+    and then puts the points back together.
+    
+    Parameters:
+      points (np.ndarray): The input point cloud of shape (N, 3).
+      axis (str): The axis to rotate about ("x", "y", or "z").
+      theta (float): The rotation angle (in radians) to apply.
+    
+    Returns:
+      np.ndarray: The transformed point cloud.
+    """
+    pts = points.copy()
+    
+    if axis == "z":
+        pts_xy = pts[:, [0, 1]]  # get x, y
+        pts_rot = shear_rotation_2d(pts_xy, theta)
+        pts[:, 0] = pts_rot[:, 0]
+        pts[:, 1] = pts_rot[:, 1]
+        
+    elif axis == "x":
+        pts_yz = pts[:, [1, 2]]
+        pts_rot = shear_rotation_2d(pts_yz, theta)
+        pts[:, 1] = pts_rot[:, 0]
+        pts[:, 2] = pts_rot[:, 1]
+        
+    elif axis == "y":
+        pts_zx = pts[:, [2, 0]]
+        pts_rot = shear_rotation_2d(pts_zx, theta)
+        pts[:, 2] = pts_rot[:, 0]
+        pts[:, 0] = pts_rot[:, 1]
+        
+    else:
+        raise ValueError("Invalid axis: choose 'x', 'y', or 'z'.")
+    
+    return pts
+
+
+def shear_rotation_random(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    """
+    Applies shear-based rotations about each specified axis sequentially.
+       
+    For each axis specified in selected_axes, a random rotation angle is chosen
+    (from fixed values based on: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf)
+    and the shear rotation (decomposed into 3 shear steps) is applied. Rounding is performed 
+    after each shear to ensure that the mapping is exactly grid-preserving (assuming the input points, 
+    or their rounded version, are on an integer grid).
+    
+    Parameters:
+      coords (np.ndarray): Input point cloud, shape (N, 3).
+      dirs (np.ndarray): Direction vectors to be rotated. Can be None.
+      primary_vertex (np.ndarray): Primary vertex that is rotated.
+      metadata: Dataset metadata. Expects 'x', 'y', 'z' keys with shape information.
+      selected_axes (list, optional): List of axes (e.g., ["x", "y", "z"]) to rotate about.
+      
+    Returns:
+      np.ndarray: Transformed point cloud after all shear rotations.
+    """
+    pts = coords.copy()
+    primary_vertex = primary_vertex.copy()
+    if dirs is not None:
+        dirs = dirs.copy() 
+
+    reference_point = np.array([
+        (metadata['x'].shape[0] - 1) / 2.,
+        (metadata['y'].shape[0] - 1) / 2.,
+        (metadata['z'].shape[0] - 1) / 2.
+    ]).astype(int)
+
+    pts -= reference_point
+    primary_vertex -= reference_point
+
+    for axis in selected_axes:
+        # Why no more than 45 degrees: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf
+        #angle_deg = np.random.uniform(-45, 45)
+        angle_deg = np.random.choice([0, 22.62, 28.07, 36.87, 53.13, 67.38, 73.74])  # values from link above
+        angle = np.deg2rad(angle_deg)
+        if angle == 0:
+            continue
+        pts = shear_rotation_axis(pts, axis, angle)
+        rotation = R.from_euler(axis, angle_deg, degrees=True)
+        primary_vertex = rotation.apply(primary_vertex)
+        if dirs is not None:
+            dirs = rotation.apply(dirs) 
+
+    pts += reference_point
+    primary_vertex += reference_point
+    return pts, dirs, primary_vertex
+
+
+def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    escaping = is_escaping(coords, metadata)
+    #if np.all(escaping):
+    #    return coords, dirs, primary_vertex
+
+    # Compute center of volume as rotation reference point
+    reference_point = np.array([
+        (metadata['x'].shape[0] - 1) / 2.,
+        (metadata['y'].shape[0] - 1) / 2.,
+        (metadata['z'].shape[0] - 1) / 2.
     ])
 
-    if (angle_limits==0).all():
-        # no rotation at all
-        return coords, dirs
+    # Shift coords and primary vertex relative to the center
+    shifted_coords = coords - reference_point
+    shifted_primary = primary_vertex - reference_point
 
-    return random_rotation_saul(coords=coords,
-                                dirs=dirs,
-                                angle_limits=angle_limits,
-                                origin=primary_vertex)
+    if dirs is not None:
+        dirs = np.asarray(dirs)
+        rotated_dirs = dirs.copy()
+    else:
+        rotated_dirs = None
+
+    axes_indices = {'x': 0, 'y': 1, 'z': 2}
+    affected_axes = {
+        'x': ['y', 'z'],
+        'y': ['x', 'z'],
+        'z': ['x', 'y'],
+    }
+
+    for axis in selected_axes:
+        affected = affected_axes[axis]
+        #if any(escaping[axes_indices[a]] for a in affected):
+        #    continue
+
+        angle_deg = np.random.uniform(-45, 45)  # You can adjust this range
+        rotation = R.from_euler(axis, angle_deg, degrees=True)
+
+        shifted_coords = rotation.apply(shifted_coords)
+        shifted_primary = rotation.apply(shifted_primary[np.newaxis, :])[0]
+
+        if rotated_dirs is not None:
+            rotated_dirs = rotation.apply(rotated_dirs)
+
+    # Recenter coordinates back
+    rotated_coords = (shifted_coords + reference_point).round()
+    rotated_vertex = shifted_primary + reference_point
+
+    if len(np.unique(rotated_coords, axis=0)) < 2:
+        return coords, dirs, primary_vertex
+
+    return rotated_coords, rotated_dirs, rotated_vertex
 
 
-def translate(coords, primary_vertex, selected_axes=['x', 'y', 'z']):
-    shift_x, shift_y = np.random.randint(low=-5, high=5+1, size=(2,))
-    shift_z = np.random.randint(low=-15, high=15+1)
-    if 'x' in selected_axes:
-        coords[:, 0] += shift_x
-        primary_vertex[0] += shift_x
-    if 'y' in selected_axes: 
-        coords[:, 1] += shift_y
-        primary_vertex[1] += shift_y
-    if 'z' in selected_axes:
-        coords[:, 2] += shift_z
-        primary_vertex[2] += shift_z
+def translate(coords, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    escaping = is_escaping(coords, metadata)
+    #if np.all(escaping):
+    #    return coords, primary_vertex
+
+    if 'x' in selected_axes:# and not escaping[0]:
+        x_axis_len = metadata['x'].shape[0]
+        valid_shift_x = [
+            shift for shift in range(-5, 6)
+            #if 0 <= coords[:, 0].min() + shift and coords[:, 0].max() + shift < x_axis_len
+        ]
+        if valid_shift_x:
+            shift_x = np.random.choice(valid_shift_x)
+            coords[:, 0] += shift_x
+            primary_vertex[0] += shift_x
+
+    if 'y' in selected_axes:# and not escaping[1]:
+        y_axis_len = metadata['y'].shape[0]
+        valid_shift_y = [
+            shift for shift in range(-5, 6)
+            #if 0 <= coords[:, 1].min() + shift and coords[:, 1].max() + shift < y_axis_len
+        ]
+        if valid_shift_y:
+            shift_y = np.random.choice(valid_shift_y)
+            coords[:, 1] += shift_y
+            primary_vertex[1] += shift_y
+
+    # For Z, shift by multiple of module size
+    if 'z' in selected_axes and not escaping[2]:
+        z_axis_len = metadata['z'].shape[0]
+
+        module_size = (metadata['z'][:, 1] == 0).sum()
+        max_module_shift = (z_axis_len // module_size) - 1
+
+        possible_shifts = np.array([
+            i * module_size for i in range(-max_module_shift, max_module_shift + 1)
+        ])
+
+        z_coords = coords[:, 2]
+        valid_shifts = [
+            shift for shift in possible_shifts
+            if 0 <= z_coords.min() + shift and z_coords.max() + shift < z_axis_len
+        ]
+
+        if valid_shifts:
+            shift_z = np.random.choice(valid_shifts)
+            coords[:, 2] += shift_z
+            primary_vertex[2] += shift_z
 
     return coords, primary_vertex
 
@@ -108,7 +320,7 @@ def drop(coords, feats, labels, std_dev=0.1):
         return coords, feats, labels
     p = abs(np.random.randn(1) * std_dev)
     mask = np.random.rand(coords.shape[0]) > p
-    if mask.sum() < 2:
+    if mask.sum() < 2 or len(np.unique(coords[mask], axis=0)) < 2:
         #don't drop all coordinates
         return coords, feats, labels
     return coords[mask], feats[mask], [x[mask] for x in labels]

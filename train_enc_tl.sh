@@ -1,32 +1,37 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/raid/monsals/faser/events_v3.5"
-sets_path="/raid/monsals/faser/events_v3.5/sets.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1"
+sets_path="/scratch/salonso/sparse-nns/faser/events_v5.1/sets.pkl"
 eps=1e-12
-batch_size=4
+batch_size=32
 epochs=50
-num_workers=4
+phase1_epochs=2
+phase2_epochs=8
+phase3_epochs=15
+num_workers=16
 lr=2e-4
-accum_grad_batches=2
+accum_grad_batches=1
 warmup_steps=1
-cosine_annealing_steps=20
+cosine_annealing_steps=25
 weight_decay=1e-4
 beta1=0.9
-beta2=0.95
+beta2=0.999
 losses=("focal" "dice")
-save_dir="/raid/monsals/faser/logs_final"
-name="enc_remove"
+save_dir="logs_final"
+name="enc_v5.1_tl_v1"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="/raid/monsals/faser/checkpoints_final"
-checkpoint_name="enc_remove"
-gpus=(2 3)
+checkpoint_path="checkpoints_final"
+checkpoint_name="enc_v5.1_tl_v1"
+early_stop_patience=10
+load_checkpoint="checkpoints_final/seg_v5.1_new7/loss_val_primlepton_ce/epoch=32-step=69300.ckpt"
+gpus=(1)
 
-python -m train.train_enc_reg \
+python -m train.train_enc_tl \
     --train \
     --stage2 \
-    --load_seg \
+    --augmentations_enabled \
     --dataset_path $dataset_path \
     --sets_path $sets_path \
     --eps $eps \
@@ -47,5 +52,7 @@ python -m train.train_enc_reg \
     --save_top_k $save_top_k \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
+    --early_stop_patience $early_stop_patience \
+    --load_checkpoint $load_checkpoint \
     --gpus "${gpus[@]}"
 

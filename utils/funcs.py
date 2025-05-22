@@ -23,66 +23,71 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     Splits the dataset into training, validation, and test sets based on the given splits.
 
     Parameters:
-    dataset (torch.utils.data.Dataset): The dataset to split.
-    args (Namespace): Arguments containing batch_size and num_workers.
-    splits (list): A list of three floats representing the split ratio for train, validation, and test sets.
-                   The sum of these ratios must be 1. Default is [0.6, 0.1, 0.3].
-    collate_fn (callable, optional): A function to merge a list of samples to form a mini-batch. Default is None.
-    seed (int): The seed for random number generation to ensure reproducibility. Default is 7.
+        dataset (torch.utils.data.Dataset): The dataset to split.
+        args (Namespace): Arguments containing batch_size, num_workers, and optionally sets_path and dataset_path.
+        splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
+        seed (int): Seed for reproducibility. Default is 7.
+        test (bool): Whether to use collate_test or collate_sparse_minkowski. Default is False.
 
     Returns:
-    tuple: DataLoader objects for training, validation, and test sets.
+        tuple: DataLoader objects for training, validation, and test sets.
     """
 
     if args.sets_path is not None:
-        # Load saved sets
         with open(args.sets_path, "rb") as fd:
             sets = pkl.load(fd)
-        sets["train_files"] = np.char.replace(sets["train_files"], "path", args.dataset_path, count=1)
-        sets["valid_files"] = np.char.replace(sets["valid_files"], "path", args.dataset_path, count=1)
-        sets["test_files"] = np.char.replace(sets["test_files"], "path", args.dataset_path, count=1)
-        train_set = copy.deepcopy(dataset)
-        val_set = copy.deepcopy(dataset)
-        test_set = copy.deepcopy(dataset)
-        train_set.data_files = sets["train_files"]
-        val_set.data_files = sets["valid_files"]
-        test_set.data_files = sets["test_files"]
+        
+        def update_path(files):
+            return np.char.replace(files, "path", args.dataset_path, count=1)
+
+        train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
+        train_set.data_files = update_path(sets["train_files"])
+        val_set.data_files = update_path(sets["valid_files"])
+        test_set.data_files = update_path(sets["test_files"])
         print("Loaded saved splits!")
     else:
-        # Ensure the splits sum up to 1
         assert sum(splits) == 1, "The splits should sum up to 1."
 
-        # Calculate the lengths of each split
         fulllen = len(dataset)
         train_len = int(fulllen * splits[0])
         val_len = int(fulllen * splits[1])
         test_len = fulllen - train_len - val_len  # Remaining length for the test set
 
-        # Split the dataset into train, validation, and test sets
-        train_set, val_set, test_set = random_split(
+        # Split the dataset
+        train_split, val_split, test_split = random_split(
             dataset, 
             [train_len, val_len, test_len], 
             generator=torch.Generator().manual_seed(seed)
-        )   
+        )
 
-    # Create DataLoader for each split
-    train_loader = DataLoader(
-        train_set, batch_size=args.batch_size, num_workers=args.num_workers,
-        shuffle=True, pin_memory=True, persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_test if test else collate_sparse_minkowski
-    )
-    valid_loader = DataLoader(
-        val_set, batch_size=args.batch_size, num_workers=args.num_workers,
-        shuffle=False, pin_memory=True, persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_test if test else collate_sparse_minkowski
-    )
-    test_loader = DataLoader(
-        test_set, batch_size=args.batch_size, num_workers=args.num_workers,
-        shuffle=False, pin_memory=True, persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_test if test else collate_sparse_minkowski
-    )
+        def extract_files(indices):
+            return [dataset.data_files[i] for i in indices]
 
-    return train_loader, valid_loader, test_loader
+        train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
+        train_set.data_files = extract_files(train_split.indices)
+        val_set.data_files = extract_files(val_split.indices)
+        test_set.data_files = extract_files(test_split.indices)
+    
+    train_set.augmentations_enabled = args.augmentations_enabled
+    collate_fn = collate_test if test else collate_sparse_minkowski
+    persistent = args.num_workers > 0
+
+    def create_loader(ds, shuffle):
+        return DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle=shuffle,
+            pin_memory=True,
+            persistent_workers=persistent,
+            collate_fn=collate_fn
+        )
+
+    return (
+        create_loader(train_set, shuffle=True),
+        create_loader(val_set, shuffle=False),
+        create_loader(test_set, shuffle=False),
+    )
 
 
 def collate_test(batch):
@@ -270,4 +275,27 @@ class CombinedScheduler(_LRScheduler):
             self.scheduler1.load_state_dict(state_dict['scheduler1'])
         if self.scheduler2:
             self.scheduler2.load_state_dict(state_dict['scheduler2'])
+
+
+def transfer_weights(model_seg, model_enc):
+    """
+    Load weights from segmentation model to encoder model
+    """
+    model_enc.stem_ch.load_state_dict(model_seg.stem_ch.state_dict())
+    model_enc.stem_mod.load_state_dict(model_seg.stem_mod.state_dict())
+    model_enc.stem_ln.load_state_dict(model_seg.stem_ln.state_dict())
+    model_enc.global_feats_encoder.load_state_dict(model_seg.global_feats_encoder.state_dict())
+    N_bb = len(model_enc.shared_encoders)
+    for i in range(N_bb):
+        model_enc.shared_encoders[i].load_state_dict(model_seg.encoder_layers[i].state_dict())
+        model_enc.shared_se_layers[i].load_state_dict(model_seg.se_layers[i].state_dict())
+        if i < N_bb - 1:
+            model_enc.shared_downsamples[i].load_state_dict(model_seg.downsample_layers[i].state_dict())
+
+    last = N_bb  # index in model_seg: encoder_layers[last], se_layers[last], downsample_layers[last]
+    for name, branch in model_enc.branches.items():
+        # branch is an nn.ModuleDict, so indexing by string
+        branch["downsample"].load_state_dict(model_seg.downsample_layers[last - 1].state_dict())
+        branch["encoder"].load_state_dict(model_seg.encoder_layers[last].state_dict())
+        branch["se"].load_state_dict(model_seg.se_layers[last].state_dict())
 
