@@ -140,6 +140,7 @@ class MinkUNetConvNeXtV2(nn.Module):
             MinkowskiLayerNorm(dims[-1], eps=1e-6),
             Block(dim=dims[-1], kernel_size=5, drop_path=0., D=D),
             MinkowskiConvolution(dims[-1], 1, kernel_size=1, stride=1, dimension=D),
+            # MinkowskiConvolution(dims[-1], 2, kernel_size=1, stride=1, dimension=D),  # SEE: <-- 2 classes
         )
         self.seg_layer = nn.Sequential(
             MinkowskiLayerNorm(dims[-1], eps=1e-6),

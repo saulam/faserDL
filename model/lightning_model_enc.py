@@ -15,7 +15,7 @@ from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arr
 
 
 class SparseLightningModel(pl.LightningModule):
-    def __init__(self, model, args):
+    def __init__(self, model, args): 
         super(SparseLightningModel, self).__init__()
 
         self.model = model

@@ -38,7 +38,7 @@ def configure_matplotlib():
     plt.rcParams["axes.formatter.use_mathtext"] = True
     plt.rcParams.update({'mathtext.default': 'regular'})
 
-def configure_matplotlib_fabio(theme="light"):
+def configure_matplotlib_fabio(theme="light", figsize=(8,6)):
     """Configures Matplotlib with a publication-friendly style.
     
     Parameters:
@@ -59,7 +59,7 @@ def configure_matplotlib_fabio(theme="light"):
         'ytick.labelsize': 18,
         'lines.linewidth': 2,
         'lines.markersize': 6,
-        'figure.figsize': [8, 6],
+        'figure.figsize': [figsize[0], figsize[1]],
         'savefig.dpi': 300,
         'figure.dpi': 100,
         'figure.autolayout': True,
@@ -143,7 +143,7 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             fig.add_trace(go.Scatter3d(
                 x=z[mask_ghost], y=x[mask_ghost], z=y[mask_ghost],
                 mode='markers',
-                marker=dict(size=(s * 1), color='gray', opacity=0.4),
+                marker=dict(size=(s * 1), color='white', opacity=0.4),
                 name='Ghost'
             ))
 
@@ -246,29 +246,24 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
 
     # ENERGY MODE (Color by sum of second and third column of q)
     elif q_mode == 'energy':
-        energy_vals = q[:, 1] + q[:, 2]  # Sum second and third column
+        energy_vals = q  # Sum second and third column
         min_energy, max_energy = np.min(energy_vals), np.max(energy_vals)
-        
-        # Normalize between 0 and 1
-        norm_energy = (energy_vals - min_energy) / (max_energy - min_energy + 1e-6)
 
         # Get colors from the Viridis colormap
-        color_scale = px.colors.sequential.Viridis[::-1]
-        colors = [color_scale[int(val * (len(color_scale) - 1))] for val in norm_energy]
+        color_scale = px.colors.sequential.Plotly3
 
         fig.add_trace(go.Scatter3d(
                 x=z, y=x, z=y,
                 mode='markers',
                 marker=dict(
                     size=s, 
-                    color=norm_energy,  # Use normalized energy values for color mapping
+                    color=energy_vals.flatten(),  # Use normalized energy values for color mapping
                     colorscale=color_scale,
                     colorbar=dict(
                         title='Energy',  # Title for the color scale
-                        tickvals=[0, 1],  # Show color scale ticks at 0 and 1
                         ticktext=[f'{min_energy:.2f}', f'{max_energy:.2f}']  # Display min and max energy
                     ),
-                    opacity=0.7,
+                    opacity=0.4,
                 ),
                 name='Energy-Based Coloring'
             ))
@@ -314,9 +309,9 @@ def plot_hits_3D(x, y, z, q, pred_lep = [], pred_seg = [], q_mode='categorical',
             xaxis_title='Z',
             yaxis_title='X',
             zaxis_title='Y',
-            xaxis=dict(range=[-1528, 1523]),
-            yaxis=dict(range=[-235, 235]),
-            zaxis=dict(range=[-235, 235]),
+            # xaxis=dict(range=[-1528, 1523]),
+            # yaxis=dict(range=[-235, 235]),
+            # zaxis=dict(range=[-235, 235]),
             aspectratio=dict(x=100, y=20, z=20)  # KEEPING aspect ratio
         ),
         margin=dict(l=0, r=0, b=0, t=40),

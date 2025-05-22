@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/raid/monsals/faser/events_v3.5"
-sets_path="/raid/monsals/faser/events_v3.5/sets.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v3.5"
+sets_path="/scratch/salonso/sparse-nns/faser/events_v3.5/sets.pkl"
 eps=1e-12
-batch_size=4
-epochs=50
-num_workers=4
+batch_size=32
+epochs=70
+num_workers=16
 lr=2e-4
 accum_grad_batches=2
 warmup_steps=1
@@ -15,17 +15,19 @@ weight_decay=1e-4
 beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
-save_dir="/raid/monsals/faser/logs_final"
-name="enc_remove"
+save_dir="/scratch3/fcufino/logs_final"
+name="enc_reg_v1_shear"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="/raid/monsals/faser/checkpoints_final"
-checkpoint_name="enc_remove"
-gpus=(2 3)
+checkpoint_path="/scratch3/fcufino/checkpoints_final"
+checkpoint_name="enc_reg_v1_shear"
+early_stop_patience=10
+gpus=(0)
 
 python -m train.train_enc_reg \
     --train \
     --stage2 \
+    --augmentations_enabled \
     --load_seg \
     --dataset_path $dataset_path \
     --sets_path $sets_path \
@@ -47,5 +49,6 @@ python -m train.train_enc_reg \
     --save_top_k $save_top_k \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
+    --early_stop_patience $early_stop_patience \
     --gpus "${gpus[@]}"
 

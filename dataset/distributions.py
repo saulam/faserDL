@@ -88,8 +88,8 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 args = ini_argparse().parse_args()
 
 # args.dataset_path = "/scratch3/salonso/faser/events_v3.5" #spaceml4
-args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
-# args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
+# args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
+args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
 
 args.train = False
 args.stage1 = False
@@ -97,10 +97,10 @@ args.augmentations_enabled = False
 args.batch_size = 4
 args.num_workers = 32
 
-# plot_folder = "/home/fcufino/faserDL/Plotsv5_1"
+plot_folder = "/home/fcufino/faserDL/Plots/Plotsv5_1"
 
-plot_folder = "/home/fcufino/faserDL/Plotsv3_5_AUG"
-# plot_folder = "/home/fcufino/faserDL/Plotsv3_5"
+# plot_folder = "/home/fcufino/faserDL/Plots/Plotsv3_5_AUG"
+# plot_folder = "/home/fcufino/faserDL/Plots/Plotsv3_5"
 
 
 # GPU
@@ -193,8 +193,8 @@ neutrino_map = {12: 'e', 14: 'mu', 16: 'tau'}
 n_ev = 0
 
 for batch in dataloader:
-    # if n_ev > 100:
-    #     break
+    if n_ev > 5000:
+        break
 
     len_batch = len(batch['run_number'])
 
@@ -275,10 +275,10 @@ def plot_1d(variable_data, variable_name, plot_filename, xlabel='Energy [GeV]', 
 # -------------------------------------------------------------
 # Call plotting functions for each variable
 # -------------------------------------------------------------
-plot_1d([
-    neutrino_data['e']['in_neutrino_energy'], neutrino_data['mu']['in_neutrino_energy'],
-    neutrino_data['tau']['in_neutrino_energy'], neutrino_data['NC']['in_neutrino_energy']
-], "Incoming Nu Energy", "in_neutrino_energy_1x4")
+# plot_1d([
+#     neutrino_data['e']['in_neutrino_energy'], neutrino_data['mu']['in_neutrino_energy'],
+#     neutrino_data['tau']['in_neutrino_energy'], neutrino_data['NC']['in_neutrino_energy']
+# ], "Incoming Nu Energy", "in_neutrino_energy_1x4")
 
 
 plot_1d([
@@ -290,6 +290,8 @@ plot_1d([
     neutrino_data['e']['pt_miss'], neutrino_data['mu']['pt_miss'],
     neutrino_data['tau']['pt_miss'], neutrino_data['NC']['pt_miss']
 ], "pt_miss", "pt_miss_1x4")
+
+print('---- Done')
 
 plot_1d([
     neutrino_data['e']['rear_cal_energy'], neutrino_data['mu']['rear_cal_energy'],
@@ -493,13 +495,29 @@ with ThreadPoolExecutor() as executor:
 
 # Define function to plot summed energy distributions
 def plot_energy_distribution(lepton_data, had_data, gh_data, neutrino_type):
-    plt.hist(lepton_data, bins=100,range = (0,1), label='EM', histtype='step')
-    plt.hist(had_data, bins=100, range = (0,1),label='HAD', histtype='step')
-    plt.hist(gh_data, bins=100, range = (0,1),label='GH', histtype='step')
+    # Filter out non-positive values
+    lepton_data = lepton_data[lepton_data > 0]
+    had_data = had_data[had_data > 0]
+    gh_data = gh_data[gh_data > 0]
+
+    # Combine all data to determine global min/max for binning
+    all_data = np.concatenate([lepton_data, had_data, gh_data])
+    min_val = all_data.min()
+    max_val = all_data.max()
+
+    # Define log-spaced bins
+    bins = np.logspace(np.log10(min_val), np.log10(max_val), 100)
+
+    # Plot
+    plt.hist(lepton_data, bins=bins, label='EM', histtype='step')
+    plt.hist(had_data, bins=bins, label='HAD', histtype='step')
+    plt.hist(gh_data, bins=bins, label='GH', histtype='step')
+    plt.xscale('log')
+    plt.yscale('log')
     plt.xlabel('Vox Energy [MeV]')
     plt.ylabel('Counts')
-    plt.yscale('log')
     plt.legend()
+    plt.tight_layout()
     plt.savefig(f'{plot_folder}/energy_distributions_{neutrino_type}.png')
     plt.close()
 

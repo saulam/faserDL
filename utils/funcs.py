@@ -70,7 +70,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     
     train_set.augmentations_enabled = args.augmentations_enabled
     collate_fn = collate_test if test else collate_sparse_minkowski
-    persistent = args.num_workers > 0
+    persistent = args.num_workers > 0 
 
     def create_loader(ds, shuffle):
         return DataLoader(
@@ -109,7 +109,6 @@ def collate_test(batch):
             ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'flavour_label']
                         else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss']
                         else [d[key] for d in batch])
-    
     return ret
 
 

@@ -84,15 +84,24 @@ class SparseFASERCALDataset(Dataset):
  
         # mirror
         coords, dirs, primary_vertex = mirror(coords, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
-        # rotate
-        # coords, dirs = rotate(coords, dirs, self.metadata, primary_vertex)
-        coords, dirs = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        # rotate 90
+        coords, dirs, primary_vertex = rotate_90(coords,dirs, primary_vertex, self.metadata, selected_axes = ['z'])
+
+        # coords, dirs, primary_vertex = shear_rotation_random(coords,dirs, primary_vertex, self.metadata, selected_axes=['z'], range_angle=45)
+
         # translate
         coords, primary_vertex = translate(coords, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # drop voxels
-        coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
+        # coords, feats, labels = drop(coords, feats, labels, std_dev=0.1)
         # shift feature values
         feats = shift_q_gaussian(feats, std_dev=0.01)
+
+        # FABIO: add nose to feature 
+        coords, feats, labels = modif_vox_energy(coords, feats, labels, primleton_shift_std=5)
+        # coords, feats, labels =  apply_random_cuboid_mask(coords, feats, labels[0], mask_prob=0.8, mask_size=300)
+
+        coords = translate_z_regions(coords, self.metadata, max_translation=(3,3), N_reg=5)
+
         # keep within limits
         coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         
@@ -159,31 +168,31 @@ class SparseFASERCALDataset(Dataset):
         return mapped.round()  # round needed only for augmentations
         
         
-    def aggregate_duplicate_coords(self, coords, feats, primlepton_labels, seg_labels):
-        """
-        Aggregate duplicate coordinates by:
-        - Keeping unique 3D coordinates.
-        - Prioritising primary leptons when handling collisions, as primlepton_labels indicate primary lepton presence.
-        - Handling seg_labels as follows:
-            - The first column corresponds to ghost identification, meaning ghosts disappear if they collide with non-ghosts.
-            - The second and third columns represent total energy deposits from electromagnetic and hadronic particles, respectively,
-            which should be summed in case of collisions.
-        """
-        coords_tuple = [tuple(row) for row in coords]
-        unique_coords, indices = np.unique(coords_tuple, axis=0, return_inverse=True)
+    # def aggregate_duplicate_coords(self, coords, feats, primlepton_labels, seg_labels):
+    #     """
+    #     Aggregate duplicate coordinates by:
+    #     - Keeping unique 3D coordinates.
+    #     - Prioritising primary leptons when handling collisions, as primlepton_labels indicate primary lepton presence.
+    #     - Handling seg_labels as follows:
+    #         - The first column corresponds to ghost identification, meaning ghosts disappear if they collide with non-ghosts.
+    #         - The second and third columns represent total energy deposits from electromagnetic and hadronic particles, respectively,
+    #         which should be summed in case of collisions.
+    #     """
+    #     coords_tuple = [tuple(row) for row in coords]
+    #     unique_coords, indices = np.unique(coords_tuple, axis=0, return_inverse=True)
 
-        unique_feats = np.zeros((len(unique_coords), 1))
-        unique_primlepton_labels = np.zeros((len(unique_coords), 1))
-        unique_seg_labels = np.zeros((len(unique_coords), 3))
+    #     unique_feats = np.zeros((len(unique_coords), 1))
+    #     unique_primlepton_labels = np.zeros((len(unique_coords), 1))
+    #     unique_seg_labels = np.zeros((len(unique_coords), 3))
 
-        for i, idx in enumerate(indices):
-            unique_feats[idx, 0] += feats[i, 0]
-            unique_primlepton_labels[idx] = max(unique_primlepton_labels[idx], primlepton_labels[i])
-            unique_seg_labels[idx, 0] = min(unique_seg_labels[idx, 0], seg_labels[i, 0]) if unique_seg_labels[idx, 0] != 0 else seg_labels[i, 0]
-            unique_seg_labels[idx, 1] += seg_labels[i, 1]
-            unique_seg_labels[idx, 2] += seg_labels[i, 2]
+    #     for i, idx in enumerate(indices):
+    #         unique_feats[idx, 0] += feats[i, 0]
+    #         unique_primlepton_labels[idx] = max(unique_primlepton_labels[idx], primlepton_labels[i])
+    #         unique_seg_labels[idx, 0] = min(unique_seg_labels[idx, 0], seg_labels[i, 0]) if unique_seg_labels[idx, 0] != 0 else seg_labels[i, 0]
+    #         unique_seg_labels[idx, 1] += seg_labels[i, 1]
+    #         unique_seg_labels[idx, 2] += seg_labels[i, 2]
 
-        return unique_coords, unique_feats, unique_primlepton_labels, unique_seg_labels
+    #     return unique_coords, unique_feats, unique_primlepton_labels, unique_seg_labels
     
     
     def normalise_seg_labels(self, seg_labels, eps=1e-8):
@@ -326,6 +335,7 @@ class SparseFASERCALDataset(Dataset):
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
         q = self.divide_by_std(reco_hits[:, 4].reshape(-1, 1), 'q')
+
         
         # process labels
         primlepton_labels = self.get_param(data, 'primlepton_labels')
@@ -378,7 +388,7 @@ class SparseFASERCALDataset(Dataset):
           
         if augmented:
             # merge duplicated coordinates and finalise with augmentations
-            coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
+            # coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
             seg_labels = self.normalise_seg_labels(seg_labels)
             if not self.stage1 and not self.plot_distributions:
                 primlepton_labels = add_gaussian_noise(primlepton_labels, shuffle_prob=0.)
@@ -414,5 +424,4 @@ class SparseFASERCALDataset(Dataset):
         output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
         output['feats'] = torch.from_numpy(feats).float()
         output['feats_global'] = torch.from_numpy(feats_global).float()
-
         return output

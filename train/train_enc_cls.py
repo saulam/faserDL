@@ -86,7 +86,7 @@ def main():
         callbacks=callbacks,
         accelerator="gpu",
         devices=nb_gpus,
-        strategy="ddp" if nb_gpus > 1 else None,
+        strategy="ddp" if nb_gpus > 1 else 'auto',
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
         deterministic=True,

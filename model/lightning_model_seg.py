@@ -24,7 +24,11 @@ class SparseSegLightningModel(pl.LightningModule):
 
         self.model = model
         self.loss_primlepton = nn.BCEWithLogitsLoss()
+        # self.loss_primlepton = nn.CrossEntropyLoss(label_smoothing=0.0)
         self.loss_seg= nn.CrossEntropyLoss() 
+        
+        self.seg_loss_weight = 1
+
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -58,13 +62,26 @@ class SparseSegLightningModel(pl.LightningModule):
         targ_primlepton = target['primlepton_labels']
         targ_seg = target['seg_labels']
 
-        # losses
-        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
         loss_seg = self.loss_seg(out_seg, targ_seg)
+
+
+        # remove the vexels on the target that are not in the input
+        
+        #if bce
+        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
+        # If cross entropy
+        # loss_primlepton = self.loss_primlepton(out_primlepton.view(-1, 2), targ_primlepton.T.view(-1).long())
+    
+        
+        # Apply weight to the seg loss to give it more importance
+        loss_seg_weighted = loss_seg * self.seg_loss_weight
+
+        # Return part-wise losses and total loss
         part_losses = {'primlepton': loss_primlepton,
-                       'seg': loss_seg,
-                       }
-        total_loss = loss_primlepton + loss_seg
+                       'seg': loss_seg_weighted}
+        
+        # The total loss is the sum of both losses
+        total_loss = loss_seg_weighted + loss_primlepton
 
         return total_loss, part_losses
 

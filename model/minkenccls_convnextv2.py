@@ -61,7 +61,7 @@ def _init_weights(m):
 
 
 class MinkEncClsConvNeXtV2(nn.Module):
-    def __init__(self, in_channels, out_channels, D=3, args=None):
+    def __init__(self, in_channels, out_channels, D=3, args=None): 
         nn.Module.__init__(self)
         self.is_v5 = True if 'v5' in args.dataset_path else False 
 

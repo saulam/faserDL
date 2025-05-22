@@ -16,11 +16,11 @@ beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
 save_dir="/scratch3/fcufino/logs_final"
-name="seg_v14"
+name="seg_v15_90deg_Eaug"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch3/fcufino/checkpoints_final"
-checkpoint_name="seg_v14"
+checkpoint_name="seg_v15_90deg_Eaug"
 early_stop_patience=10
 gpus=(0)
 
