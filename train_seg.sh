@@ -15,15 +15,15 @@ weight_decay=0.0001
 beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
-save_dir="logs_final"
-name="seg_v5.1_new7"
+save_dir="/scratch3/fcufino/logs_final"
+name="seg_v1Reb"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="checkpoints_final"
-checkpoint_name="seg_v5.1_new7"
+checkpoint_path="/scratch3/fcufino/checkpoints_final"
+checkpoint_name="seg_v1Reb"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/seg_v5.1_new4/loss_val_total/last.ckpt"
-gpus=(1)
+# load_checkpoint="checkpoints_final/seg_v5.1_new4/loss_val_total/last.ckpt"
+gpus=(0)
 
 python -m train.train_seg \
     --train \

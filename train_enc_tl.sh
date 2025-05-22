@@ -18,14 +18,14 @@ weight_decay=1e-4
 beta1=0.9
 beta2=0.999
 losses=("focal" "dice")
-save_dir="logs_final"
+save_dir="/scratch3/fcufino/logs_final"
 name="enc_v5.1_tl_v1"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="checkpoints_final"
+checkpoint_path="/scratch3/fcufino/checkpoints_final"
 checkpoint_name="enc_v5.1_tl_v1"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/seg_v5.1_new7/loss_val_primlepton_ce/epoch=32-step=69300.ckpt"
+# load_checkpoint="checkpoints_final/seg_v5.1_new7/loss_val_primlepton_ce/epoch=32-step=69300.ckpt"
 gpus=(1)
 
 python -m train.train_enc_tl \

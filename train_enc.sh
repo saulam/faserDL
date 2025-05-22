@@ -15,15 +15,15 @@ weight_decay=1e-4
 beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
-save_dir="logs_final"
+save_dir="/scratch3/fcufino/logs_final"
 name="enc_v5.1_se_msemape_v1"
 log_every_n_steps=10
 save_top_k=1
-checkpoint_path="checkpoints_final"
+checkpoint_path="/scratch3/fcufino/checkpoints_final"
 checkpoint_name="enc_v5.1_se_mse_msemape_v1"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/enc_v5.1_v4/loss_val_total/last.ckpt"
-gpus=(1)
+# load_checkpoint="checkpoints_final/enc_v5.1_v4/loss_val_total/last.ckpt"
+gpus=(0)
 
 python -m train.train_enc \
     --train \
