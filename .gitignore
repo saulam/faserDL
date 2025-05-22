@@ -3,6 +3,7 @@ __pycache__/
 log*/
 tb_logs/
 lightning_logs/
+Plots/
 core
 notebooks/
 checkpoint*/
