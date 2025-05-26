@@ -200,7 +200,7 @@ class MinkAttUNetConvNeXtV2(nn.Module):
         se_block_reds = [16, 16, 16, 16]
         kernel_size_ds = (2, 2, 2)
         dilation_ds = (2, 2, 2)
-        block_kernel = (5, 5, 5)
+        block_kernel = (3, 3, 3)
         drop_path_rate = 0.1
         assert len(encoder_depths) == len(encoder_dims)
         self.nb_elayers = len(encoder_dims)
@@ -295,7 +295,7 @@ class MinkAttUNetConvNeXtV2(nn.Module):
         self.primlepton_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
             Block(dim=decoder_dims[-1], kernel_size=block_kernel, dilation=dilation_us, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 2, kernel_size=1, stride=1, dimension=D),
+            MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
         )
         self.seg_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
