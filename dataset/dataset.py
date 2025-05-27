@@ -38,7 +38,10 @@ class SparseFASERCALDataset(Dataset):
         
         self.plot_distributions = False
 
-        with open(self.root + "/metadata.pkl", "rb") as fd:
+        # with open(self.root + "/metadata.pkl", "rb") as fd:
+        with open("/scratch2/salonso/faser/events_v5.1" + "/metadata.pkl", "rb") as fd:
+
+            
             self.metadata = pk.load(fd)
             self.metadata['x'] = np.array(self.metadata['x'])
             self.metadata['y'] = np.array(self.metadata['y'])

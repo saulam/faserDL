@@ -55,6 +55,7 @@ class CustomDataset(SparseFASERCALDataset):
 
         
         output =  {
+            #stuff altrady present in the dataset
             **{key: data[key] for key in [
                 'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
                 'in_neutrino_energy', 'out_lepton_momentum_dir', 'flavour_label',
@@ -62,6 +63,8 @@ class CustomDataset(SparseFASERCALDataset):
                 'primlepton_labels', 'seg_labels',
                 'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy']},
 
+
+            # Custom additions
             'energy_lepton_vox': data['feats'][mask_is_lepton, 0],
             'energy_non_lepton_vox': data['feats'][~mask_is_lepton, 0],
             'energy_GH_vox': data['feats'][mask_seg_lab == 0, 0],
@@ -71,6 +74,7 @@ class CustomDataset(SparseFASERCALDataset):
             'max_z_l': max_z_l,
             'dist_trav_lep': abs(max_z_l - min_z_l),
             'dist_trav_non_lep': abs(max_z_nl - min_z_nl),
+            'N_gh_voxels': (mask_seg_lab == 0).sum(),
         }
 
         # Clean up data variables to free memory before returning the output
@@ -89,7 +93,8 @@ args = ini_argparse().parse_args()
 
 # args.dataset_path = "/scratch3/salonso/faser/events_v3.5" #spaceml4
 # args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v3.5" #dlnu
-args.dataset_path = "/scratch2/salonso/faser/events_v5.1"
+args.dataset_path = "/scratch2/salonso/faser/events_v5.1b" 
+
 
 args.train = False
 args.stage1 = False
@@ -97,10 +102,7 @@ args.augmentations_enabled = False
 args.batch_size = 4
 args.num_workers = 32
 
-plot_folder = "/home/fcufino/faserDL/Plots/Plotsv5_1"
-
-# plot_folder = "/home/fcufino/faserDL/Plots/Plotsv3_5_AUG"
-# plot_folder = "/home/fcufino/faserDL/Plots/Plotsv3_5"
+plot_folder = "/home/fcufino/faserDL/Plots/Plotsv5_1b"
 
 
 # GPU
@@ -145,10 +147,9 @@ def collate_test(batch):
         'primlepton_labels', 'seg_labels', 'flavour_label',
         
         # Per event values
-        'in_neutrino_energy', 
-        'e_vis', 'pt_miss',
+        'in_neutrino_energy', 'e_vis', 'pt_miss',
         'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy',
-        'out_lepton_momentum_dir', 'jet_momentum_dir',
+        'out_lepton_momentum_dir', 'jet_momentum_dir', 'N_gh_voxels',
         
         # Per voxel values
         'energy_lepton_vox','energy_non_lepton_vox','energy_GH_vox',
@@ -164,7 +165,7 @@ def collate_test(batch):
                 # If it's a label, store as numpy array
                 ret[key] = [d[key].numpy() for d in batch]
             elif key in ['e_vis', 'pt_miss', 
-                         'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy']:
+                         'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy', 'N_gh_voxels']:
                 # If it's a scalar value, use `.item()` to get the value
                 ret[key] = [d[key].item() for d in batch]
             else:
@@ -193,7 +194,7 @@ neutrino_map = {12: 'e', 14: 'mu', 16: 'tau'}
 n_ev = 0
 
 for batch in dataloader:
-    if n_ev > 5000:
+    if n_ev > 1200:
         break
 
     len_batch = len(batch['run_number'])
@@ -211,7 +212,7 @@ for batch in dataloader:
             'in_neutrino_energy', 'e_vis', 'pt_miss',
             'rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy', 'faser_cal_energy',
             'primary_vertex', 'jet_momentum_dir',
-            'out_lepton_momentum_dir']:
+            'out_lepton_momentum_dir','N_gh_voxels']:
             store[var].append(ev[var])
 
         if key != 'NC':
@@ -236,7 +237,19 @@ configure_matplotlib_fabio(theme='dark')
 # -------------------------------------------------------------
 
 
-
+# Histogram of N_gh_voxels
+plt.figure(figsize=(6,4))
+plt.hist(neutrino_data['e']['N_gh_voxels'], bins=70, alpha=1, label='NuE', color='#00A6FB', histtype='step', linewidth = 2)
+plt.hist(neutrino_data['mu']['N_gh_voxels'], bins=70, alpha=1, label='NuMu', color='#A559AA', histtype='step', linewidth = 2)
+plt.hist(neutrino_data['tau']['N_gh_voxels'], bins=70, alpha=1, label='NuTau', color='#14A76C', histtype='step', linewidth = 2)
+plt.hist(neutrino_data['NC']['N_gh_voxels'], bins=70, alpha=1, label='NC', color='#4634B2', histtype='step', linewidth = 2)
+plt.xlabel('Number of GH Voxels')
+plt.ylabel('Counts')
+plt.title('Distribution of Number of GH Voxels')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f'{plot_folder}/N_gh_voxels_distribution.png')
+plt.close()
 
 
 # -------------------------------------------------------------
