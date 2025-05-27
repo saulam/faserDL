@@ -21,51 +21,53 @@ class SparseEncTlLightningModel(pl.LightningModule):
         
         # Loss functions
         self.loss_flavour = nn.CrossEntropyLoss()
-        self.loss_evis = [nn.MSELoss(), MAPE(from_log_scale=True)]
-        self.loss_ptmiss = [nn.MSELoss(), MAPE(from_log_scale=True)]
-        self.loss_lepton_momentum_mag = [nn.MSELoss(), MAPE(from_log_scale=True)]
+        self.loss_evis = nn.MSELoss()
+        self.loss_ptmiss = nn.MSELoss()
+        self.loss_lepton_momentum_mag = nn.MSELoss()
         self.loss_lepton_momentum_dir = SphericalAngularLoss()
-        self.loss_jet_momentum_mag = [nn.MSELoss(), MAPE(from_log_scale=True)]
+        self.loss_jet_momentum_mag = nn.MSELoss()
         self.loss_jet_momentum_dir = SphericalAngularLoss()
+
+        # One learnable log-sigma per head
+        self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
+        self.log_sigma_evis = nn.Parameter(torch.zeros(()))
+        self.log_sigma_ptmiss = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lepton_momentum_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_momentum_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_momentum_dir = nn.Parameter(torch.zeros(()))
         
         # Fine-tuning phases
-        self.phase1_epochs = args.phase1_epochs   # heads only
-        self.phase2_epochs = args.phase2_epochs   # + branch modules
-        self.phase3_epochs = args.phase3_epochs   # + last shared block
-        # Phase 4: full backbone for remaining epochs
-
-        # Learning rates for each phase
+        self.current_phase = 1
         self.lr = args.lr
-        self.lr_branch = self.lr * 0.1
-        self.lr_last_shared = self.lr * 0.01
-        self.lr_backbone = self.lr * 0.001
+        self.lr_mult_phase2 = 0.5
+        self.lr_mult_phase3 = 0.1
+        self.layer_decay = args.layer_decay
 
         # Optimiser params
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
 
+        # Placeholders for param lists
+        self.phase1_params = []
+        self.phase2_params = []
+        self.phase3_params = []
 
-    '''
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
-        # Calculate progress p: global step / max_steps
-        # Make sure self.trainer is set (it usually is after a few batches)
-        if self.trainer.max_steps:
-            total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
-            p = float(self.global_step) / total_steps
-            # Here, gamma = 10 is a typical choice, modify as needed
-            self.model.global_weight = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
-    '''
-
-
-    def forward(self, x, x_glob):
-        return self.model(x, x_glob)
+    def on_train_start(self):
+        "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
+        self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+        
+    
+    def forward(self, x, x_glob, module_to_event, module_pos):
+        return self.model(x, x_glob, module_to_event, module_pos)
 
 
     def _arrange_batch(self, batch):
         batch_input, batch_input_global = arrange_sparse_minkowski(batch, self.device)
+        batch_module_to_event, batch_module_pos = batch['module_to_event'], batch['module_pos']
         target = arrange_truth(batch)
-        return batch_input, batch_input_global, target
+        return batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target
 
 
     def compute_losses(self, batch_output, target):
@@ -96,15 +98,11 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
-        loss_e_vis = self.loss_evis[0](out_e_vis, targ_e_vis)
-        loss_e_vis += 0.1 * self.loss_evis[1](out_e_vis, targ_e_vis)
-        loss_pt_miss = self.loss_ptmiss[0](out_pt_miss, targ_pt_miss)
-        loss_pt_miss += 0.1 * self.loss_ptmiss[1](out_pt_miss, targ_pt_miss)
-        loss_lepton_momentum_mag = self.loss_lepton_momentum_mag[0](out_lepton_momentum_mag, targ_lepton_momentum_mag)
-        loss_lepton_momentum_mag += 0.1 * self.loss_lepton_momentum_mag[1](out_lepton_momentum_mag, targ_lepton_momentum_mag)
+        loss_e_vis = self.loss_evis(out_e_vis, targ_e_vis)
+        loss_pt_miss = self.loss_ptmiss(out_pt_miss, targ_pt_miss)
+        loss_lepton_momentum_mag = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
         loss_lepton_momentum_dir = self.loss_lepton_momentum_dir(out_lepton_momentum_dir, targ_lepton_momentum_dir)
-        loss_jet_momentum_mag = self.loss_jet_momentum_mag[0](out_jet_momentum_mag, targ_jet_momentum_mag)
-        loss_jet_momentum_mag += 0.1 * self.loss_jet_momentum_mag[1](out_jet_momentum_mag, targ_jet_momentum_mag)
+        loss_jet_momentum_mag = self.loss_jet_momentum_mag(out_jet_momentum_mag, targ_jet_momentum_mag)
         loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
         
         part_losses = {'flavour': loss_flavour,
@@ -122,10 +120,10 @@ class SparseEncTlLightningModel(pl.LightningModule):
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, batch_input_global, target = self._arrange_batch(batch)
+        batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global)
+        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
         loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
@@ -142,10 +140,9 @@ class SparseEncTlLightningModel(pl.LightningModule):
         if torch.isnan(loss):
             return None
 
-        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
+        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
-        self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
+            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss
@@ -156,83 +153,59 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
-        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
+        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
+            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 
 
     def configure_optimizers(self):
-        """Configure and initialize the optimizer and learning rate scheduler."""
-        # Determine current fine-tuning stage by max_epochs of this fit call
-        max_ep = self.trainer.max_epochs
-        e1 = self.phase1_epochs
-        e2 = e1 + self.phase2_epochs
-        e3 = e2 + self.phase3_epochs
-        if max_ep == e1:
-            phase = 1
-        elif max_ep == e2:
-            phase = 2
-        elif max_ep == e3:
-            phase = 3
-        else:
-            phase = 4
-
-        # Build param-groups and set requires_grad
-        specs = []
-        trainable = []
-        # Phase 1+: heads
-        heads = []
-        for branch in self.model.branches.values():
-            heads += list(branch['head'].parameters())
-        specs.append({'params': heads, 'lr': self.lr})
-        trainable += heads
-        # Phase 2+: branch modules
-        if phase >= 2:
-            branch_mods = []
-            for branch in self.model.branches.values():
-                for key in ('downsample', 'encoder', 'se'):
-                    branch_mods += list(branch[key].parameters())
-            specs.append({'params': branch_mods, 'lr': self.lr_branch})
-            trainable += branch_mods
-        # Phase 3+: last shared block
-        if phase >= 3:
-            last = len(self.model.shared_encoders) - 1
-            last_mods = []
-            for mod in (self.model.shared_encoders[last],
-                        self.model.shared_se_layers[last]):
-                last_mods += list(mod.parameters())
-            specs.append({'params': last_mods, 'lr': self.lr_last_shared})
-            trainable += last_mods
-        # Phase 4: full backbone
-        if phase >= 4:
-            backbone = []
-            # stem & global encoder
-            for mod in (self.model.stem_ch, self.model.stem_mod,
-                        self.model.stem_ln, self.model.global_feats_encoder):
-                backbone += list(mod.parameters())
-            # remaining shared blocks
-            for i in range(len(self.model.shared_encoders) - 1):
-                for mod in (self.model.shared_encoders[i],
-                            self.model.shared_se_layers[i],
-                            self.model.shared_downsamples[i]):
-                    backbone += list(mod.parameters())
-            specs.append({'params': backbone, 'lr': self.lr_backbone})
-            trainable += backbone
-
-        # Freeze all and unfreeze trainable ones
-        trainable_set = set(trainable)
-        for p in self.model.parameters():
-            p.requires_grad = p in trainable_set
-
-        # Create optimizer with phase-specific param groups
-        optimizer = torch.optim.AdamW(
-            specs,
-            betas=self.betas,
-            eps=self.eps,
-            weight_decay=self.weight_decay
-        )
+        """Configure optimizer with phase-aware LR groups, plus warmup & cosine schedulers."""
+        # ─── Print current phase & count trainable params ────────────────────────────
+        num_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"[Phase {self.current_phase}] Trainable parameters: {num_trainable:,}")
+    
+        # ─── Build optimizer with per-phase param groups ───────────────────────────────
+        if self.current_phase == 1:
+            # Phase 1: only heads & task‐transformer
+            optimizer = torch.optim.AdamW(
+                self.phase1_params,
+                lr=self.lr,
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
+    
+        elif self.current_phase == 2:
+            # Phase 2: heads @ base_lr, module+event layers @ base_lr * lr_mult_phase2
+            optimizer = torch.optim.AdamW(
+                [
+                    {'params': self.phase1_params, 'lr': self.lr},
+                    {'params': self.phase2_params, 'lr': self.lr * self.lr_mult_phase2},
+                ],
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
+    
+        else:  # current_phase == 3
+            # Phase 3: previously trained @ base_lr, CNN+stem @ base_lr * lr_mult_phase3
+            optimizer = torch.optim.AdamW(
+                [
+                    {
+                        'params': self.phase1_params + self.phase2_params,
+                        'lr': self.lr
+                    },
+                    {
+                        'params': self.phase3_params,
+                        'lr': self.lr * self.lr_mult_phase3
+                    },
+                ],
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
 
         if self.warmup_steps==0 and self.cosine_annealing_steps==0:
             return optimizer
@@ -264,6 +237,75 @@ class SparseEncTlLightningModel(pl.LightningModule):
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
+
+
+    
+    # ─── Phase 1: only branch heads + task‐transformer + cls_task ─────────────────
+    def freeze_phase1(self):
+        self.current_phase = 1
+
+        # 1) freeze everything
+        for p in self.parameters():
+            p.requires_grad = False
+
+        # 2) unfreeze branch‐specific heads
+        for head in self.model.branches.values():
+            for p in head.parameters():
+                p.requires_grad = True
+
+        # 3) unfreeze task‐level transformer
+        for p in self.model.task_transformer.parameters():
+            p.requires_grad = True
+
+        # 4) unfreeze cls_task
+        self.model.cls_task.requires_grad_(True)
+
+        # 5) unfreeze your learned uncertainty weights
+        #    (assumes you defined them on the LightningModule itself)
+        for name, p in self.named_parameters():
+            if 'log_sigma' in name:
+                p.requires_grad = True
+
+        # record these params
+        self.phase1_params = [p for p in self.parameters() if p.requires_grad]
+
+    
+    # ─── Phase 2: add in module + event‐level layers ─────────────────────────────
+    def unfreeze_phase2(self):
+        self.current_phase = 2
+
+        # modules to unfreeze
+        to_unfreeze = [
+            self.model.mod_layer,
+            self.model.global_feats_encoder,
+            self.model.event_transformer,
+            self.model.event_pos,
+        ]
+        # + cls_mod
+        self.model.cls_mod.requires_grad_(True)
+
+        # flip requires_grad on all parameters in those modules
+        for module in to_unfreeze:
+            for p in module.parameters():
+                p.requires_grad = True
+
+        # record newly trainable params (exclude those already in phase1)
+        all_trainable = set(p for p in self.parameters() if p.requires_grad)
+        self.phase2_params = [p for p in all_trainable if p not in set(self.phase1_params)]
+
+    
+    # ─── Phase 3: fine‐tune everything else (CNN, stem, encoder…) ───────────────
+    def unfreeze_phase3(self):
+        self.current_phase = 3
+
+        # unfreeze all remaining
+        for p in self.parameters():
+            p.requires_grad = True
+
+        # record the “new” ones outside of phase1+phase2
+        all_trainable = set(p for p in self.parameters() if p.requires_grad)
+        prev = set(self.phase1_params) | set(self.phase2_params)
+        self.phase3_params = [p for p in all_trainable if p not in prev]
 
 
     def lr_scheduler_step(self, scheduler, *args):

@@ -91,10 +91,24 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
 
 
 def collate_test(batch):
+    coords_list, feats_list = [], []
+    module_to_event, module_pos = [], []
+
+    for ev_idx, sample in enumerate(batch):
+        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
+        for m in torch.unique(mods):
+            mask = (mods == m)
+            coords_list.append(coords[mask])
+            feats_list.append(feats[mask])
+            module_to_event.append(ev_idx)
+            module_pos.append(int(m))
+
     ret = {
-        'f': torch.cat([d['feats'] for d in batch]),
+        'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'c': [d['coords'] for d in batch],
+        'c': coords_list,
+        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
+        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = [
@@ -114,10 +128,24 @@ def collate_test(batch):
 
 
 def collate_sparse_minkowski(batch):
+    coords_list, feats_list = [], []
+    module_to_event, module_pos = [], []
+
+    for ev_idx, sample in enumerate(batch):
+        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
+        for m in torch.unique(mods):
+            mask = (mods == m)
+            coords_list.append(coords[mask])
+            feats_list.append(feats[mask])
+            module_to_event.append(ev_idx)
+            module_pos.append(int(m))
+
     ret = {
-        'f': torch.cat([d['feats'] for d in batch]),
+        'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'c': [d['coords'] for d in batch],
+        'c': coords_list,
+        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
+        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = {
@@ -281,9 +309,7 @@ def transfer_weights(model_seg, model_enc):
     """
     Load weights from segmentation model to encoder model
     """
-    model_enc.stem_ch.load_state_dict(model_seg.stem_ch.state_dict())
-    model_enc.stem_mod.load_state_dict(model_seg.stem_mod.state_dict())
-    model_enc.stem_ln.load_state_dict(model_seg.stem_ln.state_dict())
+    model_enc.stem.load_state_dict(model_seg.stem.state_dict())
     model_enc.global_feats_encoder.load_state_dict(model_seg.global_feats_encoder.state_dict())
     N_bb = len(model_enc.shared_encoders)
     for i in range(N_bb):

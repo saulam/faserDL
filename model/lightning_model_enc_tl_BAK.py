@@ -3,7 +3,7 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 01.25
 
-Description: PyTorch Lightning model - stage 2: classification and regression tasks.
+Description: PyTorch Lightning model - stage 2 (transfer learning from stage 1): classification and regression tasks.
 """
 
 import numpy as np
@@ -14,11 +14,12 @@ import pytorch_lightning as pl
 from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 
 
-class SparseEncLightningModel(pl.LightningModule):
+class SparseEncTlLightningModel(pl.LightningModule):
     def __init__(self, model, args):
-        super(SparseEncLightningModel, self).__init__()
-
+        super(SparseEncTlLightningModel, self).__init__()
         self.model = model
+        
+        # Loss functions
         self.loss_flavour = nn.CrossEntropyLoss()
         self.loss_evis = [nn.MSELoss(), MAPE(from_log_scale=True)]
         self.loss_ptmiss = [nn.MSELoss(), MAPE(from_log_scale=True)]
@@ -26,29 +27,45 @@ class SparseEncLightningModel(pl.LightningModule):
         self.loss_lepton_momentum_dir = SphericalAngularLoss()
         self.loss_jet_momentum_mag = [nn.MSELoss(), MAPE(from_log_scale=True)]
         self.loss_jet_momentum_dir = SphericalAngularLoss()
-        self.warmup_steps = args.warmup_steps
-        self.start_cosine_step = args.start_cosine_step
-        self.cosine_annealing_steps = args.scheduler_steps
+        
+        # Fine-tuning phases
+        self.phase1_epochs = args.phase1_epochs   # heads only
+        self.phase2_epochs = args.phase2_epochs   # + branch modules
+        self.phase3_epochs = args.phase3_epochs   # + last shared block
+        # Phase 4: full backbone for remaining epochs
+
+        # Learning rates for each phase
         self.lr = args.lr
+        self.lr_branch = self.lr * 0.1
+        self.lr_last_shared = self.lr * 0.01
+        self.lr_backbone = self.lr * 0.001
+
+        # Optimiser params
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
 
 
-    def on_train_start(self):
-        "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
-        self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+    '''
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
+        # Calculate progress p: global step / max_steps
+        # Make sure self.trainer is set (it usually is after a few batches)
+        if self.trainer.max_steps:
+            total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
+            p = float(self.global_step) / total_steps
+            # Here, gamma = 10 is a typical choice, modify as needed
+            self.model.global_weight = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
+    '''
 
-    
-    def forward(self, x, x_glob, module_to_event, module_pos):
-        return self.model(x, x_glob, module_to_event, module_pos)
+
+    def forward(self, x, x_glob):
+        return self.model(x, x_glob)
 
 
     def _arrange_batch(self, batch):
         batch_input, batch_input_global = arrange_sparse_minkowski(batch, self.device)
-        batch_module_to_event, batch_module_pos = batch['module_to_event'], batch['module_pos']
         target = arrange_truth(batch)
-        return batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target
+        return batch_input, batch_input_global, target
 
 
     def compute_losses(self, batch_output, target):
@@ -105,10 +122,10 @@ class SparseEncLightningModel(pl.LightningModule):
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
+        batch_input, batch_input_global, target = self._arrange_batch(batch)
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
+        batch_output = self.forward(batch_input, batch_input_global)
         loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
@@ -125,9 +142,10 @@ class SparseEncLightningModel(pl.LightningModule):
         if torch.isnan(loss):
             return None
 
-        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
+        self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss
@@ -138,20 +156,79 @@ class SparseEncLightningModel(pl.LightningModule):
 
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
-        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, prog_bar=False, sync_dist=True)
 
         return loss
 
 
     def configure_optimizers(self):
         """Configure and initialize the optimizer and learning rate scheduler."""
-        # Optimiser
+        # Determine current fine-tuning stage by max_epochs of this fit call
+        max_ep = self.trainer.max_epochs
+        e1 = self.phase1_epochs
+        e2 = e1 + self.phase2_epochs
+        e3 = e2 + self.phase3_epochs
+        if max_ep == e1:
+            phase = 1
+        elif max_ep == e2:
+            phase = 2
+        elif max_ep == e3:
+            phase = 3
+        else:
+            phase = 4
+
+        # Build param-groups and set requires_grad
+        specs = []
+        trainable = []
+        # Phase 1+: heads
+        heads = []
+        for branch in self.model.branches.values():
+            heads += list(branch['head'].parameters())
+        specs.append({'params': heads, 'lr': self.lr})
+        trainable += heads
+        # Phase 2+: branch modules
+        if phase >= 2:
+            branch_mods = []
+            for branch in self.model.branches.values():
+                for key in ('downsample', 'encoder', 'se'):
+                    branch_mods += list(branch[key].parameters())
+            specs.append({'params': branch_mods, 'lr': self.lr_branch})
+            trainable += branch_mods
+        # Phase 3+: last shared block
+        if phase >= 3:
+            last = len(self.model.shared_encoders) - 1
+            last_mods = []
+            for mod in (self.model.shared_encoders[last],
+                        self.model.shared_se_layers[last]):
+                last_mods += list(mod.parameters())
+            specs.append({'params': last_mods, 'lr': self.lr_last_shared})
+            trainable += last_mods
+        # Phase 4: full backbone
+        if phase >= 4:
+            backbone = []
+            # stem & global encoder
+            for mod in (self.model.stem_ch, self.model.stem_mod,
+                        self.model.stem_ln, self.model.global_feats_encoder):
+                backbone += list(mod.parameters())
+            # remaining shared blocks
+            for i in range(len(self.model.shared_encoders) - 1):
+                for mod in (self.model.shared_encoders[i],
+                            self.model.shared_se_layers[i],
+                            self.model.shared_downsamples[i]):
+                    backbone += list(mod.parameters())
+            specs.append({'params': backbone, 'lr': self.lr_backbone})
+            trainable += backbone
+
+        # Freeze all and unfreeze trainable ones
+        trainable_set = set(trainable)
+        for p in self.model.parameters():
+            p.requires_grad = p in trainable_set
+
+        # Create optimizer with phase-specific param groups
         optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            #self.model.parameters(),
-            lr=self.lr,
+            specs,
             betas=self.betas,
             eps=self.eps,
             weight_decay=self.weight_decay

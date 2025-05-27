@@ -9,24 +9,31 @@ Description: PyTorch model - stage 2: event-level classification and regression 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
 from timm.models.layers import trunc_normal_
+from torch.nn.utils.rnn import pad_sequence
 
 import MinkowskiEngine as ME
 from MinkowskiEngine import (
     MinkowskiConvolution,
-    MinkowskiGlobalMaxPooling,
-    MinkowskiGlobalAvgPooling,
+    MinkowskiConvolutionTranspose,
     MinkowskiLinear,
-    MinkowskiSoftplus,
+    MinkowskiGlobalAvgPooling,
+    MinkowskiGlobalMaxPooling,
+    MinkowskiReLU,
     MinkowskiGELU,
 )
 
-from .utils import GlobalFeatureEncoder, Block, MinkowskiLayerNorm, MinkowskiSE
+from .utils import RelPosEncoderLayer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
 def _init_weights(m):
-    """Custom weight initialization for supported layers."""
+    """Custom weight initialization for various layers."""
     if isinstance(m, MinkowskiConvolution):
+        trunc_normal_(m.kernel, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, MinkowskiConvolutionTranspose):
         trunc_normal_(m.kernel, std=0.02)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
@@ -45,6 +52,22 @@ def _init_weights(m):
     elif isinstance(m, nn.LayerNorm):
         nn.init.constant_(m.bias, 0)
         nn.init.constant_(m.weight, 1.0)
+    elif isinstance(m, nn.LSTM):
+        # For each parameter tensor in the LSTM:
+        for name, param in m.named_parameters():
+            if 'weight_ih' in name:
+                # input-to-hidden weights: Xavier uniform
+                init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                # hidden-to-hidden (recurrent) weights: orthogonal
+                init.orthogonal_(param.data)
+            elif 'bias' in name:
+                # biases: zero, except forget-gate bias = 1
+                param.data.fill_(0)
+                # each bias is [b_ii | b_if | b_ig | b_io], so
+                hidden_size = m.hidden_size
+                # forget-gate slice is the 2nd quarter
+                param.data[hidden_size:2*hidden_size].fill_(1)
 
 
 class MinkEncConvNeXtV2(nn.Module):
@@ -54,77 +77,75 @@ class MinkEncConvNeXtV2(nn.Module):
             in_channels (int): Number of input channels.
             out_channels (int): Number of output channels.
             D (int): Spatial dimension.
+            num_tasks: Number of tasks.
             args: Arguments namespace with at least a `dataset_path` attribute.
         """
         super().__init__()
         # Determine the version flag based on the dataset_path in args.
         self.is_v5 = "v5" in args.dataset_path if args is not None and hasattr(args, "dataset_path") else False
         self.module_size = 24 if self.is_v5 else 20
+        self.num_modules = 10 if self.is_v5 else 15
         
         # Encoder configuration
         encoder_depths = [3, 3, 9, 3]
         encoder_dims = [96, 192, 384, 768]
-        se_block_reds = [16, 16, 16, 16]
         kernel_size_ds = (2, 2, 2)
-        dilation_ds = (1, 1, 2)
-        block_kernel = (5, 5, 5)
-        drop_path_rate = 0.1
+        block_kernel = (3, 3, 3)
+        
+        drop_path_rate = 0.2
+        
         assert len(encoder_depths) == len(encoder_dims)
-        self.nb_bblayers = len(encoder_dims) - 1
+        self.nb_elayers = len(encoder_dims)
         total_depth = sum(encoder_depths)
         dp_rates_enc = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
         dp_cur = 0
-        
-        ###############################################
-        # Shared Backbone
-        ###############################################
-        
+
         # Stem
-        self.stem_ch = nn.Linear(in_channels, encoder_dims[0])
-        self.stem_mod = nn.Embedding(self.module_size, encoder_dims[0]) 
-        self.stem_ln = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
+        self.stem = nn.Sequential(
+             MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D),
+             MinkowskiLayerNorm(encoder_dims[0], eps=1e-6),
+        )
 
-        # Global features
-        self.register_buffer("global_weight", torch.tensor(1.0))  # Scalar controlling global parameter contribution
-        self.global_feats_encoder = GlobalFeatureEncoder(encoder_dim=encoder_dims[0], dropout=0.3)
-
-        # Backbone
-        self.shared_encoders = nn.ModuleList()
-        self.shared_downsamples = nn.ModuleList()
-        self.shared_se_layers = nn.ModuleList()
-        for i in range(self.nb_bblayers):
+        # Build encoder
+        self.encoder_layers = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        for i in range(self.nb_elayers):
             # Encoder layer
             encoder_layer = nn.Sequential(
-                *[Block(dim=encoder_dims[i], kernel_size=block_kernel, dilation=dilation_ds,
-                        drop_path=dp_rates_enc[dp_cur + j], D=D)
+                *[Block(dim=encoder_dims[i], kernel_size=block_kernel, drop_path=dp_rates_enc[dp_cur + j], D=D)
                   for j in range(encoder_depths[i])]
             )
-            self.shared_encoders.append(encoder_layer)
+            self.encoder_layers.append(encoder_layer)
             dp_cur += encoder_depths[i]
-            
-            # SE layer
-            se_layer = MinkowskiSE(channels=encoder_dims[i], glob_dim=encoder_dims[0], reduction=se_block_reds[i])
-            self.shared_se_layers.append(se_layer)
 
             # Downsampling layer
-            if i < self.nb_bblayers - 1:
+            if i < self.nb_elayers - 1:
                 downsample_layer = nn.Sequential(
                     MinkowskiLayerNorm(encoder_dims[i], eps=1e-6),
                     MinkowskiConvolution(
-                        encoder_dims[i],
-                        encoder_dims[i + 1],
-                        kernel_size=kernel_size_ds, 
-                        stride=kernel_size_ds,
-                        bias=True,
-                        dimension=D
+                        encoder_dims[i], encoder_dims[i + 1],
+                        kernel_size=kernel_size_ds, stride=kernel_size_ds,
+                        bias=True, dimension=D
                     ),
                 )
-                self.shared_downsamples.append(downsample_layer)
+                self.downsample_layers.append(downsample_layer)
 
-        ###############################################
-        # Branch-Specific Modules
-        ###############################################
-        
+        # Module-level real-pos transformer
+        d_mod = encoder_dims[-1]
+        heads_m = 12
+        self.mod_layer = RelPosEncoderLayer(d_model=d_mod, nhead=heads_m, num_special_tokens=1)
+        self.cls_mod = nn.Parameter(torch.zeros(1, 1, d_mod))
+
+        # Global features encoder
+        self.global_feats_encoder = GlobalFeatureEncoder(encoder_dim=encoder_dims[-1])
+
+        # Event-level transformer (across modules)
+        heads_e = 12
+        evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
+        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=2)
+        self.event_pos = nn.Embedding(self.num_modules, d_mod)  # positional embedding for modules
+
+        # Task-level transformer (across modules)
         branch_names = [
             "flavour",
             "e_vis",
@@ -143,38 +164,20 @@ class MinkEncConvNeXtV2(nn.Module):
             "jet_momentum_mag": 1,
             "jet_momentum_dir": 3,
         }
-        
+        heads_e = 12
+        task_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
+        self.task_transformer = nn.TransformerEncoder(task_layer, num_layers=3)
+        self.num_tasks = len(branch_names)
+        self.cls_task = nn.Parameter(torch.zeros(1, self.num_tasks, d_mod))
         self.branches = nn.ModuleDict()
         for name in branch_names:
-            branch = {}
-            branch["downsample"] = nn.Sequential(
-                MinkowskiLayerNorm(encoder_dims[i], eps=1e-6),
-                MinkowskiConvolution(
-                    encoder_dims[i],
-                    encoder_dims[i+1],
-                    kernel_size=kernel_size_ds, 
-                    stride=kernel_size_ds,
-                    bias=True,
-                    dimension=D),
-            )
-            
-            branch["encoder"] = nn.Sequential(
-                *[Block(dim=encoder_dims[i+1], kernel_size=block_kernel, dilation=dilation_ds,
-                        drop_path=dp_rates_enc[dp_cur + j], D=D) for j in range(encoder_depths[i+1])]
-            )
-            branch["se"] = MinkowskiSE(channels=encoder_dims[i+1], glob_dim=encoder_dims[0], reduction=se_block_reds[i+1])
-            branch["global_pool"] = (
-                MinkowskiGlobalMaxPooling() if name == "flavour" else MinkowskiGlobalAvgPooling()
-            )
-            branch["head"] = nn.Sequential(
-                MinkowskiLinear(encoder_dims[i+1], branch_out_channels[name]),
-            )
-            self.branches[name] = nn.ModuleDict(branch)
+            branch = nn.Linear(d_mod, branch_out_channels[name])
+            self.branches[name] = branch
 
         # Initialise weights
         self.apply(_init_weights)
     
-    def forward(self, x, x_glob):
+    def forward(self, x, x_glob, module_to_event, module_pos):
         """
         Forward pass through the shared backbone and branch-specific modules.
         
@@ -185,38 +188,64 @@ class MinkEncConvNeXtV2(nn.Module):
         Returns:
             A dictionary mapping branch names prefixed with 'out_' to their outputs.
         """
-        coords, charge = x.C, x.F    # feats: [N,2]
-        mod_id = (coords[:, 3] % self.module_size).long()  # [N]
-        
-        # Stem and global feature MLP transformation.
-        charge_emb   = self.stem_ch(charge)  # [N, module_emb_dim]
-        mod_id_emb   = self.stem_mod(mod_id) # [N, module_emb_dim]
-        new_feats = charge_emb + mod_id_emb  # [N, module_emb_dim]
-        x = ME.SparseTensor(
-            new_feats, 
-            coordinate_manager=x.coordinate_manager,
-            coordinate_map_key=x.coordinate_map_key,
-        )        
-        x = self.stem_ln(x)
-        x_glob = self.global_feats_encoder(x_glob)
+        # Encoder
+        x = self.stem(x)
+        x_enc = []
+        for i in range(self.nb_elayers):
+            x = self.encoder_layers[i](x)
+            if i < self.nb_elayers - 1:
+                x_enc.append(x)
+                x = self.downsample_layers[i](x)
 
-        # Process each backbone stage in a loop.
-        for i in range(len(self.shared_encoders)):
-            x = self.shared_encoders[i](x)
-            x = self.shared_se_layers[i](x, x_glob, self.global_weight)
-            if i < len(self.shared_downsamples):
-                x = self.shared_downsamples[i](x)
+        # Module-level Transformer
+        coords_all = x.C[:, 1:].float()            # [N, 3]
+        feats_all = x.F                            # [N, d]
+        batch_ids = x.C[:, 0]                      # [N]
+        grouped_feats = [feats_all[batch_ids == m] for m in range(len(module_to_event))]
+        grouped_coords = [coords_all[batch_ids == m] for m in range(len(module_to_event))]
+        padded_feats = pad_sequence(grouped_feats, batch_first=True)   # [M, L, d]
+        padded_coords = pad_sequence(grouped_coords, batch_first=True) # [M, L, 3]
+        lengths = torch.tensor([g.size(0) for g in grouped_feats], device=padded_feats.device)
+        L = padded_feats.size(1)
+        pad_mask = torch.arange(L, device=lengths.device).unsqueeze(0) >= lengths.unsqueeze(1)
+        cls_mod = self.cls_mod.expand(len(grouped_feats), -1, -1)      # [M, 1, d]
+        seq_mod = torch.cat([cls_mod, padded_feats], dim=1)            # [M, L+1, d]
+        cls_pad = torch.zeros((len(grouped_feats), 1), dtype=torch.bool, device=pad_mask.device)
+        key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)          # [M, L+1]
+        zero_coord = torch.zeros((len(grouped_feats), 1, 3), device=padded_coords.device)
+        seq_coords = torch.cat([zero_coord, padded_coords], dim=1)    # [M, L+1, 3]
+        mod_out = self.mod_layer(seq_mod, seq_coords, key_mask_mod)
+        mod_emb = mod_out[:, 0, :]                                    # [M, d]     
+
+        # Event-level Transformer
+        B = module_to_event.max().item() + 1
+        evt_lists = [mod_emb[module_to_event == e] for e in range(B)]
+        pos_lists = [module_pos[module_to_event == e] for e in range(B)]
+        pad_evt = pad_sequence(evt_lists, batch_first=True)             # [B, M_max, d]
+        pad_pos = pad_sequence(pos_lists, batch_first=True)             # [B, M_max]
+        pos_emb = self.event_pos(pad_pos)                               # [B, M_max, d]
+        seq_evt = pad_evt + pos_emb
+        lengths_evt = torch.tensor([g.size(0) for g in evt_lists], device=seq_evt.device)
+        M_max = seq_evt.size(1)
+        evt_mask = torch.arange(M_max, device=lengths_evt.device).unsqueeze(0) >= lengths_evt.unsqueeze(1)
+        glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)   # [B, 1, d]
+        seq2 = torch.cat([glob_emb, seq_evt], dim=1)    # [B,K+1+M_max,d]
+        spec_mask = torch.zeros((B, 1), dtype=torch.bool, device=evt_mask.device)
+        key_mask = torch.cat([spec_mask, evt_mask], dim=1)          # [B,K+1+M_max]
+        evt_out = self.event_transformer(seq2, src_key_padding_mask=key_mask)
+
+        # Task-level Transformer
+        cls_tokens = self.cls_task.expand(B, self.num_tasks, -1)  # [B,K,d]
+        seq3 = torch.cat([cls_tokens, evt_out], dim=1)    # [B,K+1+M_max,d]
+        spec_mask = torch.zeros((B, self.num_tasks), dtype=torch.bool, device=evt_mask.device)
+        key_mask2 = torch.cat([spec_mask, key_mask], dim=1)          # [B,K+1+M_max]
+        evt_out = self.task_transformer(seq3, src_key_padding_mask=key_mask2)
+        evt_emb = evt_out[:, :self.num_tasks, :]
         
         # Branch-specific processing
         outputs = {}
-        for name, branch in self.branches.items():
-            xb = x 
-            xb = branch["downsample"](xb)
-            xb = branch["encoder"](xb)
-            xb = branch["se"](xb, x_glob, self.global_weight)
-            xb_gp = branch["global_pool"](xb)
-            xb_head = branch["head"](xb_gp)
-            outputs[f"out_{name}"] = xb_head.F
+        for i, (name, branch) in enumerate(self.branches.items()):
+            outputs[f"out_{name}"] = branch(evt_emb[:, i])
         return outputs
 
     def replace_depthwise_with_channelwise(self):

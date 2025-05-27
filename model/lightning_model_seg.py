@@ -12,7 +12,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from utils import dice_loss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+from utils import (
+    focal_loss, dice_loss, arrange_sparse_minkowski, argsort_sparse_tensor, 
+    arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+)
 from functools import partial
 from packaging import version
 
@@ -25,10 +28,16 @@ class SparseSegLightningModel(pl.LightningModule):
         super(SparseSegLightningModel, self).__init__()
 
         self.model = model
-        self.loss_primlepton_ce = nn.CrossEntropyLoss(label_smoothing=0.1) #nn.BCEWithLogitsLoss()
-        self.loss_primlepton_dice = partial(dice_loss, sigmoid=True, reduction="mean") 
-        self.loss_seg_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.loss_seg_dice = partial(dice_loss, sigmoid=False, reduction="mean")
+        #self.loss_primlepton_ce = nn.BCEWithLogitsLoss()
+        #self.loss_primlepton_dice = partial(dice_loss, sigmoid=True, reduction="mean") 
+        #self.loss_seg_ce = nn.BCEWithLogitsLoss() #nn.CrossEntropyLoss()
+        #self.loss_seg_dice = partial(dice_loss, sigmoid=False, reduction="mean")
+        #self.loss_sigmoid_focal = partial(focal_loss, gamma=2, reduction="mean", sigmoid=True)
+        #self.loss_softmax_focal = partial(focal_loss, gamma=2, reduction="mean", sigmoid=False)
+        #self.loss_sigmoid = partial(focal_loss, gamma=1, reduction="mean", sigmoid=True)
+        #self.loss_softmax = partial(focal_loss, gamma=1, alpha=[0.173, 0.079, 0.623, 0.125], reduction="mean", sigmoid=False)
+        self.loss_sigmoid = nn.BCEWithLogitsLoss()
+        self.loss_softmax = nn.CrossEntropyLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -43,25 +52,29 @@ class SparseSegLightningModel(pl.LightningModule):
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
 
 
+    '''
     def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
         # Calculate progress p: global step / max_steps
         # Make sure self.trainer is set (it usually is after a few batches)
         if self.trainer.max_steps:
-            total_steps = self.trainer.max_epochs * self.trainer.num_training_batches
+            total_steps = (self.trainer.max_epochs // 2) * self.trainer.num_training_batches  # div by 2 added
             p = float(self.global_step) / total_steps
             # Here, gamma = 10 is a typical choice, modify as needed
             new_value = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
             with torch.no_grad():
                 self.model.global_weight.fill_(new_value)
+    '''
 
-    def forward(self, x, x_glob):
-        return self.model(x, x_glob)
+    
+    def forward(self, x, x_glob, module_to_event, module_pos):
+        return self.model(x, x_glob, module_to_event, module_pos)
 
 
     def _arrange_batch(self, batch):
         batch_input, batch_input_global = arrange_sparse_minkowski(batch, self.device)
+        batch_module_to_event, batch_module_pos = batch['module_to_event'], batch['module_pos']
         target = arrange_truth(batch)
-        return batch_input, batch_input_global, target
+        return batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target
 
 
     def compute_losses(self, batch_output, target):
@@ -74,27 +87,23 @@ class SparseSegLightningModel(pl.LightningModule):
         targ_seg = target['seg_labels']
 
         # losses
-        loss_primlepton_ce = self.loss_primlepton_ce(out_primlepton, targ_primlepton)
-        #loss_primlepton_dice = self.loss_primlepton_dice(out_primlepton, targ_primlepton)
-        loss_seg_ce = self.loss_seg_ce(out_seg, targ_seg)
-        #loss_seg_dice = self.loss_seg_dice(out_seg, targ_seg)
-        part_losses = {'primlepton_ce': loss_primlepton_ce,
-                       #'primlepton_dice': loss_primlepton_dice,
-                       'seg_ce': loss_seg_ce,
-                       #'seg_dice': loss_seg_dice,
+        loss_primlepton = self.loss_sigmoid(out_primlepton, targ_primlepton)
+        loss_seg = self.loss_softmax(out_seg, targ_seg)
+
+        part_losses = {'primlepton': loss_primlepton,
+                       'seg': loss_seg,
                        }
-        #total_loss = loss_primlepton_ce + loss_primlepton_dice + loss_seg_ce + loss_seg_dice
-        total_loss = loss_primlepton_ce + loss_seg_ce
+        total_loss = sum(part_losses.values())
 
         return total_loss, part_losses
 
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, batch_input_global, target = self._arrange_batch(batch)
+        batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global)
+        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
         loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
@@ -111,7 +120,7 @@ class SparseSegLightningModel(pl.LightningModule):
         self.log(f"loss/train_total", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True,prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
+        #self.log(f"global_weight", self.model.global_weight, batch_size=batch_size, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         return loss
@@ -134,7 +143,6 @@ class SparseSegLightningModel(pl.LightningModule):
         # Optimiser
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
-            #self.model.parameters(),
             lr=self.lr,
             betas=self.betas,
             eps=self.eps,

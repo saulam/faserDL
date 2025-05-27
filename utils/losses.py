@@ -280,6 +280,9 @@ def softmax_focal_loss(
         c = inputs.shape[1]
         inputs = inputs.permute(0, *range(2, inputs.ndim), 1).reshape(-1, c)
         # (N, d1, d2, ..., dK) --> (N * d1 * ... * dK,)
+
+    if alpha is not None:
+        alpha = torch.tensor(alpha, device=inputs.device)
     
     targets = targets.view(-1)
 

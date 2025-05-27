@@ -27,11 +27,33 @@ class CustomProgressBar(TQDMProgressBar):
         bar.ascii = True
         return bar
 
+def compute_scheduler_args(
+    nb_batches: int,
+    accum_batches: int,
+    nb_gpus: int,
+    phase_epochs: int,
+    phase_warmup: int,
+    phase_cosine: int,
+):
+    """
+    Returns (total_steps, warmup_steps, cosine_steps, start_cosine_step)
+    for a single fine-tuning phase.
+    """
+    denom = accum_batches * nb_gpus
+    total_steps = nb_batches * phase_epochs // denom
+    warmup_steps = nb_batches * phase_warmup // denom
+    cosine_steps = nb_batches * phase_cosine // denom
+    start_cosine = total_steps - cosine_steps
+    return total_steps, warmup_steps, cosine_steps, start_cosine
+
 
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse()
     args = parser.parse_args()
+    print("\n- Arguments:")
+    for arg, value in vars(args).items():
+        print(f"  {arg}: {value}")
 
     # GPU setup
     nb_gpus = len(args.gpus)
@@ -45,7 +67,7 @@ def main():
 
     # Constants for scheduler calculation
     nb_batches = len(train_loader)
-    denom = args.accum_grad_batches * nb_gpus
+    accum = args.accum_grad_batches
 
     # Model and LightningModule
     pretrained_model = MinkUNetConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
@@ -56,63 +78,145 @@ def main():
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
     pretrained_model.load_state_dict(state_dict, strict=True)
-    transfer_weights(pretrained_model, base_model)
+    filtered = {k: v for k, v in pretrained_model.state_dict().items() if k in base_model.state_dict()}
+    mismatched = base_model.load_state_dict(filtered, strict=False)
+    print("missing keys:", mismatched.missing_keys)
+    print("unexpected keys:", mismatched.unexpected_keys)
     del pretrained_model
-    print("Weights transferred succesfully")    
+    print("Weights transferred succesfully")
 
-    # LightningModule
+    # 1) define the list of losses you want to monitor (same for all phases)
+    monitor_losses = [
+        "loss/val_total",
+        "loss/val_flavour",
+        "loss/val_e_vis",
+        "loss/val_jet_momentum_dir",
+        "loss/val_jet_momentum_mag",
+        "loss/val_lepton_momentum_dir",
+        "loss/val_lepton_momentum_mag",
+        "loss/val_pt_miss"
+    ]
+    
+    # 2) helper to build a fresh checkpoint callback list for each phase
+    def make_callbacks(phase_name):
+        cbs = []
+        for loss in monitor_losses:
+            cbs.append(
+                ModelCheckpoint(
+                    dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{phase_name}/{loss.replace('/', '_')}",
+                    save_top_k=args.save_top_k,
+                    monitor=loss,
+                    mode="min",
+                    save_last=(loss == "loss/val_total"),
+                )
+            )
+        progress_bar = CustomProgressBar()
+        cbs.append(progress_bar)
+        return cbs
+    
+    # 3) Instantiate your LightningModule
     lightning_model = SparseEncTlLightningModel(model=base_model, args=args)
 
-    # Logger & Checkpoint
-    logger = CSVLogger(save_dir=f"{args.save_dir}/logs", name=args.name)
-    tb_logger = TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=args.name)
-    checkpoint = ModelCheckpoint(
-        dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}",
-        save_top_k=1,
-        monitor='loss/val_total',
-        mode='min',
-        save_last=True
+    # 4) Phase 1: train only the new heads + task‐transformer
+    _, w1, c1, s1 = compute_scheduler_args(
+        nb_batches, accum, nb_gpus,
+        phase_epochs=args.phase1_epochs,
+        phase_warmup=1,
+        phase_cosine=args.phase1_epochs//2,
     )
-    progress_bar = CustomProgressBar()
-
-    # Define fine-tuning phases
-    phases = [
-        ('Phase 1: heads only', (args.phase1_epochs, 0.5)),
-        ('Phasee 2: + branch modules', (args.phase2_epochs, 0.25)),
-        ('Phase 3: + last shared block', (args.phase3_epochs, 0.25)),
-        ('Phase 4: full backbone',
-         args.epochs - (args.phase1_epochs + args.phase2_epochs + args.phase3_epochs), 0.25),
-    ]
-
-    total_epochs = 0
-    for name, (e, wu) in phases:
-        total_epochs += e
-        warmup_epochs = int(e * wu)
-        warmup_steps_phase = warmup_epochs * nb_batches // denom
-        scheduler_steps_phase = (e - warmup_epochs) * nb_batches // denom
-        start_cosine_step_phase = warmup_steps_phase
-        lightning_model.warmup_steps = warmup_steps_phase
-        lightning_model.cosine_annealing_steps = scheduler_steps_phase
-        lightning_model.start_cosine_step = start_cosine_step_phase
-
-        print(f"=== {name}: {e} epochs ===")
-        print(f"warmup_steps={warmup_steps_phase}, scheduler_steps={scheduler_steps_phase}, start_cosine_step={start_cosine_step_phase}")
-
-        trainer = pl.Trainer(
-            max_epochs=e,
-            accelerator='gpu', devices=nb_gpus,
-            strategy='ddp' if nb_gpus > 1 else 'auto',
-            logger=[logger, tb_logger],
-            callbacks=[checkpoint, progress_bar],
-            accumulate_grad_batches=args.accum_grad_batches,
-            log_every_n_steps=args.log_every_n_steps,
-            deterministic=True
-        )
-        trainer.fit(
-            lightning_model,
-            train_loader,
-            valid_loader
-        )
+    lightning_model.warmup_steps = w1
+    lightning_model.cosine_annealing_steps = c1
+    lightning_model.start_cosine_step = s1
+    lightning_model.freeze_phase1()
+    
+    logger1   = CSVLogger(save_dir=f"{args.save_dir}/logs",     name=f"{args.name}_phase1")
+    tb_logger1= TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=f"{args.name}_phase1")
+    callbacks1= make_callbacks("phase1")
+    
+    trainer1 = pl.Trainer(
+        max_epochs=args.phase1_epochs,  # e.g. 5
+        callbacks=callbacks1,
+        accelerator="gpu",
+        devices=nb_gpus,
+        strategy="ddp" if nb_gpus > 1 else "auto",
+        logger=[logger1, tb_logger1],
+        log_every_n_steps=args.log_every_n_steps,
+        deterministic=True,
+        accumulate_grad_batches=args.accum_grad_batches,
+    )
+    trainer1.fit(
+        model=lightning_model,
+        train_dataloaders=train_loader,
+        val_dataloaders=valid_loader,
+    )
+    
+    # 5) Phase 2: unfreeze module‐ & event‐level layers @ lower LR
+    _, w2, c2, s2 = compute_scheduler_args(
+        nb_batches, accum, nb_gpus,
+        phase_epochs=args.phase2_epochs,
+        phase_warmup=0,
+        phase_cosine=args.phase2_epochs//2,
+    )
+    lightning_model.warmup_steps = w2
+    lightning_model.cosine_annealing_steps = c2
+    lightning_model.start_cosine_step = s2
+    lightning_model.unfreeze_phase2()
+    
+    logger2    = CSVLogger(save_dir=f"{args.save_dir}/logs",     name=f"{args.name}_phase2")
+    tb_logger2 = TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=f"{args.name}_phase2")
+    callbacks2 = make_callbacks("phase2")
+    
+    trainer2 = pl.Trainer(
+        max_epochs=args.phase2_epochs,  # e.g. 10
+        callbacks=callbacks2,
+        accelerator="gpu",
+        devices=nb_gpus,
+        strategy="ddp" if nb_gpus > 1 else "auto",
+        logger=[logger2, tb_logger2],
+        log_every_n_steps=args.log_every_n_steps,
+        deterministic=True,
+        accumulate_grad_batches=args.accum_grad_batches,
+    )
+    trainer2.fit(
+        model=lightning_model,
+        train_dataloaders=train_loader,
+        val_dataloaders=valid_loader,
+    )
+    
+    # 6) Phase 3: unfreeze everything else @ even lower LR
+    args.batch_size =  args.batch_size // 2
+    train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
+    _, w3, c3, s3 = compute_scheduler_args(
+        nb_batches, accum, nb_gpus,
+        phase_epochs=args.phase2_epochs,
+        phase_warmup=0,
+        phase_cosine=args.phase2_epochs//2,
+    )
+    lightning_model.warmup_steps = w3
+    lightning_model.cosine_annealing_steps = c3
+    lightning_model.start_cosine_step = s3
+    lightning_model.unfreeze_phase3()
+    
+    logger3    = CSVLogger(save_dir=f"{args.save_dir}/logs",     name=f"{args.name}_phase3")
+    tb_logger3 = TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=f"{args.name}_phase3")
+    callbacks3 = make_callbacks("phase3")
+    
+    trainer3 = pl.Trainer(
+        max_epochs=args.phase3_epochs,  # e.g. 15
+        callbacks=callbacks3,
+        accelerator="gpu",
+        devices=nb_gpus,
+        strategy="ddp" if nb_gpus > 1 else "auto",
+        logger=[logger3, tb_logger3],
+        log_every_n_steps=args.log_every_n_steps,
+        deterministic=True,
+        accumulate_grad_batches=args.accum_grad_batches,
+    )
+    trainer3.fit(
+        model=lightning_model,
+        train_dataloaders=train_loader,
+        val_dataloaders=valid_loader,
+    )
         
 
 if __name__ == '__main__':

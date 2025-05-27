@@ -68,10 +68,12 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
     callbacks = []
     monitored_losses = [
-            "loss/val_primlepton_ce", 
-            #"loss/val_primlepton_dice",
-            "loss/val_seg_ce",
-            #"loss/val_seg_dice",
+            #"loss/val_flavour", 
+            "loss/val_primlepton", 
+            #'loss/val_ghost',
+            #'loss/val_elect',
+            #'loss/val_hadro',
+            'loss/val_seg',
             "loss/val_total"]
     for loss_name in monitored_losses:
         checkpoint = ModelCheckpoint(

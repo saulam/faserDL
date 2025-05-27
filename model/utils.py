@@ -26,6 +26,70 @@ import torch
 import torch.nn as nn
 
 
+class RelPosSelfAttention(nn.Module):
+    def __init__(self, d_model, nhead, num_special_tokens=1):
+        super().__init__()
+        self.nhead = nhead
+        self.scale = (d_model // nhead) ** -0.5
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out = nn.Linear(d_model, d_model)
+        self.bias_alpha = nn.Parameter(torch.zeros(1))
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(3, nhead * 4),
+            nn.GELU(),
+            nn.Linear(nhead * 4, nhead)
+        )
+        self.num_special_tokens = num_special_tokens
+
+    def forward(self, x, coords, key_padding_mask=None):
+        B, N, _ = x.size()
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
+
+        # relative positional bias
+        ci = coords.unsqueeze(2)  # [B,N,1,3]
+        cj = coords.unsqueeze(1)  # [B,1,N,3]
+        dpos = ci - cj            # [B,N,N,3]
+        bias = self.bias_mlp(dpos).permute(0, 3, 1, 2)  # [B,heads,N,N]
+        
+        # zero out bias for special tokens
+        ns = self.num_special_tokens
+        if ns > 0:
+            bias[:, :, :ns, :] = 0
+            bias[:, :, :, :ns] = 0
+
+        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        logits = dots + self.bias_alpha * bias
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            logits = logits.masked_fill(mask, float('-inf'))
+
+        attn = torch.softmax(logits, dim=-1)
+        out = torch.einsum('bhij,bhjd->bhid', attn, v)
+        out = out.transpose(1, 2).reshape(B, N, -1)
+        return self.out(out)
+
+
+class RelPosEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, num_special_tokens=1, dropout=0.1):
+        super().__init__()
+        self.self_attn = RelPosSelfAttention(d_model, nhead, num_special_tokens)
+        self.linear1 = nn.Linear(d_model, d_model * 4)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_model * 4, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.act = nn.GELU()
+
+    def forward(self, src, coords, key_padding_mask=None):
+        attn_out = self.self_attn(src, coords, key_padding_mask)
+        src = src + self.dropout(attn_out)
+        src = self.norm1(src)
+        ffn = self.linear2(self.dropout(self.act(self.linear1(src))))
+        src = src + self.dropout(ffn)
+        return self.norm2(src)
+
+        
 class GlobalFeatureEncoder(nn.Module):
     """
     Encodes a set of global features consisting of four scalar energies and two small sequences.
@@ -43,61 +107,43 @@ class GlobalFeatureEncoder(nn.Module):
     Args:
       encoder_dim: int, dimensionality of the final embedding
       hidden_dim: int, hidden size for intermediate heads (defaults to encoder_dim)
-      dropout: float, dropout probability
     """
-    def __init__(self,
-                 encoder_dim: int,
-                 hidden_dim: int = None,
-                 dropout: float = 0.3):
+    def __init__(self, encoder_dim, hidden_dim=None):
         super().__init__()
-        if hidden_dim is None:
-            hidden_dim = encoder_dim
+        hidden_dim = hidden_dim or encoder_dim
 
         self.scalar_mlp = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, encoder_dim),
         )
+        self.seqA_proj = nn.Linear(hidden_dim, encoder_dim)
+        self.seqB_proj = nn.Linear(hidden_dim, encoder_dim)
+        self.seqA_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
+        self.seqB_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
+        self.norm = nn.LayerNorm(encoder_dim)
 
-        self.seqA_lstm = nn.LSTM(
-            input_size=1,
-            hidden_size=hidden_dim,
-            batch_first=True,
-        )
-
-        self.seqB_lstm = nn.LSTM(
-            input_size=1,
-            hidden_size=hidden_dim,
-            batch_first=True,
-        )
-
-        fused_dim = hidden_dim * 3
-        self.global_mlp = nn.Sequential(
-            nn.Linear(fused_dim, encoder_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, total_dim)
-        batch_size, total_dim = x.shape
-        
-        # Split scalars and sequences
+    def forward(self, x):
         scalars = x[:, :4]
-        seqA = x[:, 4:13].unsqueeze(-1)  # (batch, 9, 1)
-        seqB = x[:, 13:].unsqueeze(-1)  # (batch, 10 or 15, 1)
+        seqA = x[:, 4:13].unsqueeze(-1)
+        seqB = x[:, 13:].unsqueeze(-1)
 
-        # Embeddings
-        emb_scalars = self.scalar_mlp(scalars)  # (batch, hidden_dim)
-        outA, (hA, _) = self.seqA_lstm(seqA)
-        embA = hA.squeeze(0)                    # (batch, hidden_dim)
-        outB, (hB, _) = self.seqB_lstm(seqB)
-        embB = hB.squeeze(0)                    # (batch, hidden_dim)
+        # Scalar path
+        emb_s = self.scalar_mlp(scalars)              # → (batch, encoder_dim)
 
-        # Fuse and project
-        fused = torch.cat([emb_scalars, embA, embB], dim=-1)  # (batch, hidden_dim*3)
-        out = self.global_mlp(fused)                          # (batch, encoder_dim)
-        return out
+        # Seq A
+        _, (hA, _) = self.seqA_lstm(seqA)
+        hA = hA.sum(0)                                # (batch, hidden_dim)
+        emb_A = self.seqA_proj(hA)                    # → (batch, encoder_dim)
+
+        # Seq B
+        _, (hB, _) = self.seqB_lstm(seqB)
+        hB = hB.sum(0)                                # (batch, hidden_dim)
+        emb_B = self.seqB_proj(hB)                    # → (batch, encoder_dim)
+
+        # Fuse into a single “token” and normalise
+        global_token = emb_s + emb_A + emb_B          # element-wise sum
+        return self.norm(global_token)                # matches transformer scale
 
 
 class MinkowskiSE(nn.Module):

@@ -41,16 +41,22 @@ def is_escaping(coords, metadata):
     return np.any(on_boundary, axis=1)
 
 
-def mirror(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def mirror(coords, modules, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     axes = ['x', 'y', 'z']
     for axis in range(3):
         if axes[axis] in selected_axes and np.random.choice([True, False]):
-            coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
+            if axis<2:
+                coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
+            else:
+                module_size = int((metadata['z'][:,1]==0).sum()) - 4
+                n_mod       = metadata['z'][:,1].max() + 1
+                coords[:, axis] = module_size - coords[:, axis] - 1
+                modules = n_mod - modules - 1
             primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis] - 1
             for x in dirs:
                 x[axis] *= -1
 
-    return coords, dirs, primary_vertex
+    return coords, modules, dirs, primary_vertex
 
 
 def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
@@ -74,7 +80,7 @@ def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', '
     reference_point = np.array([
         (metadata['x'].shape[0] - 1) / 2.,
         (metadata['y'].shape[0] - 1) / 2.,
-        (metadata['z'].shape[0] - 1) / 2.
+        (metadata['z'][:, 1] == 0).sum() / 2., #(metadata['z'].shape[0] - 1) / 2.
     ])  
 
     for axis in ['x', 'y', 'z']:
@@ -195,7 +201,8 @@ def shear_rotation_random(coords, dirs, primary_vertex, metadata, selected_axes=
     for axis in selected_axes:
         # Why no more than 45 degrees: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf
         #angle_deg = np.random.uniform(-45, 45)
-        angle_deg = np.random.choice([0, 22.62, 28.07, 36.87, 53.13, 67.38, 73.74])  # values from link above
+        #angle_deg = np.random.choice([0, 22.62, 28.07, 36.87, 53.13, 67.38, 73.74])  # values from link above
+        angle_deg = np.random.uniform(5, 5)
         angle = np.deg2rad(angle_deg)
         if angle == 0:
             continue
@@ -241,10 +248,7 @@ def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']
 
     for axis in selected_axes:
         affected = affected_axes[axis]
-        #if any(escaping[axes_indices[a]] for a in affected):
-        #    continue
-
-        angle_deg = np.random.uniform(-45, 45)  # You can adjust this range
+        angle_deg = np.random.uniform(-2, 2)  # You can adjust this range
         rotation = R.from_euler(axis, angle_deg, degrees=True)
 
         shifted_coords = rotation.apply(shifted_coords)
@@ -263,67 +267,55 @@ def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']
     return rotated_coords, rotated_dirs, rotated_vertex
 
 
-def translate(coords, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
-    escaping = is_escaping(coords, metadata)
-    #if np.all(escaping):
-    #    return coords, primary_vertex
+def translate(coords, modules, primary_vertex, metadata, shift=4, selected_axes=['x', 'y', 'z']):
+    """
+    coords[:,2] is assumed to be the *in-module* z (0..module_size-1).
+    modules[:] is the integer module index (0..n_mod-1).
+    primary_vertex[2] is also a module index.
 
-    if 'x' in selected_axes:# and not escaping[0]:
-        x_axis_len = metadata['x'].shape[0]
-        valid_shift_x = [
-            shift for shift in range(-5, 6)
-            #if 0 <= coords[:, 0].min() + shift and coords[:, 0].max() + shift < x_axis_len
-        ]
-        if valid_shift_x:
-            shift_x = np.random.choice(valid_shift_x)
-            coords[:, 0] += shift_x
-            primary_vertex[0] += shift_x
+    We allow X/Y shifts ±5 voxels,
+    and Z shifts by ±k modules (no partial modules).
+    """
 
-    if 'y' in selected_axes:# and not escaping[1]:
-        y_axis_len = metadata['y'].shape[0]
-        valid_shift_y = [
-            shift for shift in range(-5, 6)
-            #if 0 <= coords[:, 1].min() + shift and coords[:, 1].max() + shift < y_axis_len
-        ]
-        if valid_shift_y:
-            shift_y = np.random.choice(valid_shift_y)
-            coords[:, 1] += shift_y
-            primary_vertex[1] += shift_y
+    if 'x' in selected_axes:
+        shift_x = np.random.randint(-shift, shift+1)
+        coords[:, 0]       += shift_x
+        primary_vertex[0]  += shift_x
 
-    # For Z, shift by multiple of module size
-    if 'z' in selected_axes and not escaping[2]:
-        z_axis_len = metadata['z'].shape[0]
+    if 'y' in selected_axes:
+        shift_y = np.random.randint(-shift, shift+1)
+        coords[:, 1]       += shift_y
+        primary_vertex[1]  += shift_y
 
+    if 'z' in selected_axes:
         module_size = (metadata['z'][:, 1] == 0).sum()
-        max_module_shift = (z_axis_len // module_size) - 1
+        n_mod = int(metadata['z'][:,1].max() + 1)
 
-        possible_shifts = np.array([
-            i * module_size for i in range(-max_module_shift, max_module_shift + 1)
-        ])
-
-        z_coords = coords[:, 2]
+        # pick shifts (in module units) so that all (modules + s) stay in [0, n_mod-1]
+        cur_min, cur_max = int(modules.min()), int(modules.max())
         valid_shifts = [
-            shift for shift in possible_shifts
-            if 0 <= z_coords.min() + shift and z_coords.max() + shift < z_axis_len
+            s for s in range(-cur_min, n_mod - cur_max)
         ]
-
         if valid_shifts:
-            shift_z = np.random.choice(valid_shifts)
-            coords[:, 2] += shift_z
-            primary_vertex[2] += shift_z
+            s = np.random.choice(valid_shifts)
+            modules += s         # shift every hit’s module
 
-    return coords, primary_vertex
+        shift_z = np.random.randint(-shift, shift+1)
+        coords[:, 2]       += shift_z
+        primary_vertex[2]  += shift_z
+
+    return coords, modules, primary_vertex
 
 
-def drop(coords, feats, labels, std_dev=0.1):
+def drop(coords, modules, feats, labels, std_dev=0.1):
     if np.random.rand() > 0.5:
-        return coords, feats, labels
+        return coords, modules, feats, labels
     p = abs(np.random.randn(1) * std_dev)
     mask = np.random.rand(coords.shape[0]) > p
     if mask.sum() < 2 or len(np.unique(coords[mask], axis=0)) < 2:
         #don't drop all coordinates
-        return coords, feats, labels
-    return coords[mask], feats[mask], [x[mask] for x in labels]
+        return coords, modules, feats, labels
+    return coords[mask], modules[mask], feats[mask], [x[mask] for x in labels]
 
 
 def shift_q_uniform(feats, max_scale_factor=0.1):
