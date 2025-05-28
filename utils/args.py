@@ -18,6 +18,7 @@ def ini_argparse():
     parser.add_argument("--test", action="store_false", dest="train", help="set if testing")
     parser.add_argument("--stage1", action="store_true", default=True, help="set if stage 1 (voxel tagging)")
     parser.add_argument("--stage2", action="store_false", dest="stage1", help="set if stage 2 (flavour/regression)")
+    parser.add_argument("--preprocessing", type=str, default="log", help="data preprocessing (log or sqrt)")
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")

@@ -7,13 +7,15 @@ Description: script to generate metadata.
 """
 
 
-from tqdm import tqdm
 import torch
 import os
 import numpy as np
+from tqdm import tqdm
 from glob import glob
 from torch.utils.data import Dataset, DataLoader
+from collections import Counter
 import matplotlib.pyplot as plt
+
 
 class SparseFASERCALDataset(Dataset):
     def __init__(self, root, shuffle=False, **kwargs):
@@ -91,11 +93,9 @@ class SparseFASERCALDataset(Dataset):
         filtered_hits = hits[hits[:, 7] >= 0.5]
     
         if filtered_hits.shape[0] > 0:
-            # Save the filtered hits back to the file if there are any hits left
             np.savez(self.data_files[idx], filename=data['filename'], hits=filtered_hits)
             return filtered_hits[:, 7].max()
         else:
-            # Remove the file if no hits meet the energy threshold
             os.remove(self.data_files[idx])
             return 0
         
@@ -151,8 +151,7 @@ class SparseFASERCALDataset(Dataset):
         x = np.unique(data['reco_hits'][:, 0])
         y = np.unique(data['reco_hits'][:, 1])
         z = np.unique(np.stack((data['reco_hits'][:, 2], data['reco_hits'][:, 3]), axis=1), axis=0)
-        #q = np.log(data['reco_hits'][:, 4])
-        q = np.unique(data['reco_hits'][:, 4].astype(int))
+        q = data['reco_hits'][:, 4].round().astype(int)
         e_vis = np.array([e_vis])
         pt_miss = np.array([pt_miss])
         rear_cal_energy = np.array([rear_cal_energy])
@@ -181,14 +180,14 @@ class SparseFASERCALDataset(Dataset):
                 "jet_momentum": jet_momentum
                }
 
-dataset = SparseFASERCALDataset("/scratch2/salonso/faser/events_v5.1")
+dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v5.1")
 
 def collate(batch):
     pdg = np.unique(np.concatenate([x['pdg'] for x in batch]))
     x = np.unique(np.concatenate([x['x'] for x in batch]))
     y = np.unique(np.concatenate([x['y'] for x in batch]))
     z = np.unique(np.concatenate([x['z'] for x in batch]), axis=0)
-    q = np.unique(np.concatenate([x['q'] for x in batch]))
+    q = np.concatenate([x['q'] for x in batch])
     e_vis = np.concatenate([x['e_vis'] for x in batch])
     pt_miss = np.concatenate([x['pt_miss'] for x in batch])
     rear_cal_energy = np.concatenate([x['rear_cal_energy'] for x in batch])
@@ -219,7 +218,7 @@ pdg = []
 x = []
 y = []
 z = []
-q = []
+q_counter = Counter()  # otherwise it explodes
 e_vis = []
 pt_miss = []
 rear_cal_energy = []
@@ -238,7 +237,7 @@ for i, batch in t:
     x.append(batch["x"])
     y.append(batch["y"])
     z.append(batch["z"])
-    q.append(batch["q"])
+    q_counter.update(batch["q"])
     e_vis.append(batch["e_vis"])
     pt_miss.append(batch["pt_miss"])
     rear_cal_energy.append(batch["rear_cal_energy"])
@@ -257,7 +256,6 @@ pdg = np.unique(np.concatenate(pdg))
 x = np.unique(np.concatenate(x))
 y = np.unique(np.concatenate(y))
 z = np.unique(np.concatenate(z), axis=0)
-q = np.concatenate(q)
 e_vis = np.concatenate(e_vis)
 pt_miss = np.concatenate(pt_miss)
 rear_cal_energy = np.concatenate(rear_cal_energy)
@@ -275,46 +273,95 @@ jet_momentum_magnitude = np.linalg.norm(jet_momentum, axis=1)
 print("Done with concat")
 
 def get_dict(x):
-    dic = {'mean': x.mean(),
-           'median': np.median(x),
-           'std': x.std(),
-           'min': x.min(),
-           'max': x.max(),
-          }
-    return dic
+    return {'mean': x.mean(),
+            'median': np.median(x),
+            'std': x.std(),
+            'min': x.min(),
+            'max': x.max()}
 
+# assemble base metadata
+base_keys = ['rear_cal_energy', 'rear_hcal_energy', 'rear_mucal_energy',
+             'faser_cal_energy', 'rear_hcal_modules', 'faser_cal_modules',
+             'out_lepton_momentum_magnitude', 'out_lepton_energy',
+             'jet_momentum_magnitude', 'e_vis', 'pt_miss']
+metadata = {}
+for key in base_keys:
+    arr = locals()[key]
+    metadata[key] = get_dict(arr)
+    metadata[f"{key}_log1p"] = get_dict(np.log1p(arr))
+    metadata[f"{key}_sqrt"] = get_dict(np.sqrt(arr))
+
+# … inside your script, after “Done with loader” …
+# q_counter has been built via q_counter.update(batch["q"])
+total_hits = sum(q_counter.values())
+
+# 1) compute raw-q stats
+q_mean = sum(val * cnt for val, cnt in q_counter.items()) / total_hits
+q2_mean = sum((val**2) * cnt for val, cnt in q_counter.items()) / total_hits
+q_std = np.sqrt(q2_mean - q_mean**2)
+
+# find median, min, max
+cum = 0
+median_pos = total_hits / 2
+for val in sorted(q_counter):
+    cum += q_counter[val]
+    if cum >= median_pos:
+        q_median = val
+        break
+q_min = min(q_counter)
+q_max = max(q_counter)
+
+# 2) compute log1p-q stats
+#    E[log1p(q)], E[(log1p(q))^2], etc.
+q_lp_mean = sum(np.log1p(val)    * cnt for val, cnt in q_counter.items()) / total_hits
+q_lp2_mean= sum((np.log1p(val)**2)* cnt for val, cnt in q_counter.items()) / total_hits
+q_lp_std  = np.sqrt(q_lp2_mean - q_lp_mean**2)
+q_lp_median = np.log1p(q_median)
+q_lp_min    = np.log1p(q_min)
+q_lp_max    = np.log1p(q_max)
+
+# 3) compute sqrt-q stats
+#    E[sqrt(q)], E[(sqrt(q))^2], etc.
+q_s_mean = sum(np.sqrt(val)    * cnt for val, cnt in q_counter.items()) / total_hits
+q_s2_mean= sum((np.sqrt(val)**2)* cnt for val, cnt in q_counter.items()) / total_hits
+q_s_std   = np.sqrt(q_s2_mean - q_s_mean**2)
+q_s_median = np.sqrt(q_median)
+q_s_min    = np.sqrt(q_min)
+q_s_max    = np.sqrt(q_max)
+
+# 4) inject into your metadata dict
+metadata['q'] = {
+    'mean':   q_mean,
+    'median': q_median,
+    'std':    q_std,
+    'min':    q_min,
+    'max':    q_max
+}
+metadata['q_log1p'] = {
+    'mean':   q_lp_mean,
+    'median': q_lp_median,
+    'std':    q_lp_std,
+    'min':    q_lp_min,
+    'max':    q_lp_max
+}
+metadata['q_sqrt'] = {
+    'mean':   q_s_mean,
+    'median': q_s_median,
+    'std':    q_s_std,
+    'min':    q_s_min,
+    'max':    q_s_max
+}
+
+# include coordinate and pdg info
+metadata.update({'x': x, 'y': y, 'z': z,
+                 'ghost_pdg': set([-10000]),
+                 'muonic_pdg': set([-13,13]),
+                 'electromagnetic_pdg': set([-11,11,-15,15,22]),
+                 'hadronic_pdg': set([p for p in pdg if p not in [-10000,-13,13,-11,11,-15,15,22]])})
+
+# save metadata
 import pickle as pk
+with open("/scratch2/salonso/faser/events_v5.1/metadata2.pkl", "wb") as fd:
+    pk.dump(metadata, fd)
 
-ghost_pdg = [-10000]
-muonic_pdg = [-13, 13]
-electromagnetic_pdg = [-11, 11, -15, 15, 22]
-hadronic_pdg = [x for x in pdg if x not in ghost_pdg]
-hadronic_pdg = [x for x in hadronic_pdg if x not in muonic_pdg]
-hadronic_pdg = [x for x in hadronic_pdg if x not in electromagnetic_pdg]
-
-dic = {'x': x, 'y': y, 'z': z,
-       'rear_cal_energy': get_dict(rear_cal_energy),
-       'rear_hcal_energy': get_dict(rear_hcal_energy),
-       'rear_mucal_energy': get_dict(rear_mucal_energy),
-       'faser_cal_energy': get_dict(faser_cal_energy),
-       'rear_hcal_modules': get_dict(rear_hcal_modules),
-       'faser_cal_modules': get_dict(faser_cal_modules),
-       'out_lepton_momentum': get_dict(out_lepton_momentum),
-       'out_lepton_momentum_magnitude': get_dict(out_lepton_momentum_magnitude),
-       'out_lepton_energy': get_dict(out_lepton_energy),
-       'jet_momentum': get_dict(jet_momentum),
-       'jet_momentum_magnitude': get_dict(jet_momentum_magnitude),
-       'q': get_dict(q),
-       'e_vis': get_dict(e_vis),
-       'pt_miss': get_dict(pt_miss),
-       'ghost_pdg': set(ghost_pdg),
-       'muonic_pdg': set(muonic_pdg), 
-       'electromagnetic_pdg': set(electromagnetic_pdg),
-       'hadronic_pdg': set(hadronic_pdg)
-      }
-
-print("")
-
-with open("/scratch2/salonso/faser/events_v5.1/metadata.pkl", "wb") as fd:
-    pk.dump(dic, fd)
-
+print("Metadata with log1p and sqrt statistics saved.")
