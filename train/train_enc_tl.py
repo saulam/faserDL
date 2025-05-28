@@ -122,7 +122,7 @@ def main():
         nb_batches, accum, nb_gpus,
         phase_epochs=args.phase1_epochs,
         phase_warmup=1,
-        phase_cosine=args.phase1_epochs//2,
+        phase_cosine=0,
     )
     lightning_model.warmup_steps = w1
     lightning_model.cosine_annealing_steps = c1
@@ -150,7 +150,9 @@ def main():
         val_dataloaders=valid_loader,
     )
     
-    # 5) Phase 2: unfreeze module‐ & event‐level layers @ lower LR
+    # 5) Phase 2: unfreeze rest of the model
+    args.batch_size =  args.batch_size // 2
+    train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
     _, w2, c2, s2 = compute_scheduler_args(
         nb_batches, accum, nb_gpus,
         phase_epochs=args.phase2_epochs,
@@ -167,7 +169,7 @@ def main():
     callbacks2 = make_callbacks("phase2")
     
     trainer2 = pl.Trainer(
-        max_epochs=args.phase2_epochs,  # e.g. 10
+        max_epochs=args.phase2_epochs,
         callbacks=callbacks2,
         accelerator="gpu",
         devices=nb_gpus,
@@ -178,41 +180,6 @@ def main():
         accumulate_grad_batches=args.accum_grad_batches,
     )
     trainer2.fit(
-        model=lightning_model,
-        train_dataloaders=train_loader,
-        val_dataloaders=valid_loader,
-    )
-    
-    # 6) Phase 3: unfreeze everything else @ even lower LR
-    args.batch_size =  args.batch_size // 2
-    train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
-    _, w3, c3, s3 = compute_scheduler_args(
-        nb_batches, accum, nb_gpus,
-        phase_epochs=args.phase2_epochs,
-        phase_warmup=0,
-        phase_cosine=args.phase2_epochs//2,
-    )
-    lightning_model.warmup_steps = w3
-    lightning_model.cosine_annealing_steps = c3
-    lightning_model.start_cosine_step = s3
-    lightning_model.unfreeze_phase3()
-    
-    logger3    = CSVLogger(save_dir=f"{args.save_dir}/logs",     name=f"{args.name}_phase3")
-    tb_logger3 = TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=f"{args.name}_phase3")
-    callbacks3 = make_callbacks("phase3")
-    
-    trainer3 = pl.Trainer(
-        max_epochs=args.phase3_epochs,  # e.g. 15
-        callbacks=callbacks3,
-        accelerator="gpu",
-        devices=nb_gpus,
-        strategy="ddp" if nb_gpus > 1 else "auto",
-        logger=[logger3, tb_logger3],
-        log_every_n_steps=args.log_every_n_steps,
-        deterministic=True,
-        accumulate_grad_batches=args.accum_grad_batches,
-    )
-    trainer3.fit(
         model=lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=valid_loader,

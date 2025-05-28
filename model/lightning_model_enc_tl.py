@@ -28,20 +28,28 @@ class SparseEncTlLightningModel(pl.LightningModule):
         self.loss_jet_momentum_mag = nn.MSELoss()
         self.loss_jet_momentum_dir = SphericalAngularLoss()
 
-        # One learnable log-sigma per head
+        # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
-        self.log_sigma_evis = nn.Parameter(torch.zeros(()))
-        self.log_sigma_ptmiss = nn.Parameter(torch.zeros(()))
+        self.log_sigma_e_vis = nn.Parameter(torch.zeros(()))
+        self.log_sigma_pt_miss = nn.Parameter(torch.zeros(()))
         self.log_sigma_lepton_momentum_mag = nn.Parameter(torch.zeros(()))
         self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
         self.log_sigma_jet_momentum_mag = nn.Parameter(torch.zeros(()))
         self.log_sigma_jet_momentum_dir = nn.Parameter(torch.zeros(()))
+        self._uncertainty_params = [
+            self.log_sigma_flavour,
+            self.log_sigma_e_vis,
+            self.log_sigma_pt_miss,
+            self.log_sigma_lepton_momentum_mag,
+            self.log_sigma_lepton_momentum_dir,
+            self.log_sigma_jet_momentum_mag,
+            self.log_sigma_jet_momentum_dir,
+        ]
+        self.log_sigma_params = set(self._uncertainty_params)
         
         # Fine-tuning phases
         self.current_phase = 1
         self.lr = args.lr
-        self.lr_mult_phase2 = 0.5
-        self.lr_mult_phase3 = 0.1
         self.layer_decay = args.layer_decay
 
         # Optimiser params
@@ -51,8 +59,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         # Placeholders for param lists
         self.phase1_params = []
-        self.phase2_params = []
-        self.phase3_params = []
 
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
@@ -96,6 +102,15 @@ class SparseEncTlLightningModel(pl.LightningModule):
         targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask]
         targ_lepton_momentum_dir = targ_lepton_momentum_dir[mask]
 
+        def weighted_regression(L, s):
+            # (1/2) e^(–2s) L + s
+            return 0.5 * torch.exp(-2*s) * L + s
+        
+        def weighted_classification(L, s):
+            # different for classification since it's already a likelihood
+            # exp(-s) * L + s
+            return torch.exp(-1*s) * L + s
+
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_e_vis = self.loss_evis(out_e_vis, targ_e_vis)
@@ -113,7 +128,14 @@ class SparseEncTlLightningModel(pl.LightningModule):
                        'jet_momentum_mag': loss_jet_momentum_mag,
                        'jet_momentum_dir': loss_jet_momentum_dir,
                        }
-        total_loss = loss_flavour + loss_e_vis + loss_pt_miss + loss_lepton_momentum_mag + loss_lepton_momentum_dir + loss_jet_momentum_mag + loss_jet_momentum_dir
+        total_loss = ( weighted_classification(loss_flavour, self.log_sigma_flavour)
+                     + weighted_regression(loss_e_vis, self.log_sigma_e_vis)
+                     + weighted_regression(loss_pt_miss, self.log_sigma_pt_miss)
+                     + weighted_regression(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag)
+                     + weighted_regression(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir)
+                     + weighted_regression(loss_jet_momentum_mag, self.log_sigma_jet_momentum_mag)
+                     + weighted_regression(loss_jet_momentum_dir, self.log_sigma_jet_momentum_dir)
+                   )
 
         return total_loss, part_losses
 
@@ -144,6 +166,11 @@ class SparseEncTlLightningModel(pl.LightningModule):
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
+        
+        # log the actual sigmas (exp(log_sigma))
+        for name, param in self.named_parameters():
+            if 'log_sigma' in name:
+                self.log(f'uncertainty/{name}', torch.exp(param), on_step=False, on_epoch=True)
 
         return loss
 
@@ -165,47 +192,23 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # ─── Print current phase & count trainable params ────────────────────────────
         num_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"[Phase {self.current_phase}] Trainable parameters: {num_trainable:,}")
-    
-        # ─── Build optimizer with per-phase param groups ───────────────────────────────
+
         if self.current_phase == 1:
-            # Phase 1: only heads & task‐transformer
-            optimizer = torch.optim.AdamW(
-                self.phase1_params,
-                lr=self.lr,
-                betas=self.betas,
-                eps=self.eps,
-                weight_decay=self.weight_decay,
-            )
-    
-        elif self.current_phase == 2:
-            # Phase 2: heads @ base_lr, module+event layers @ base_lr * lr_mult_phase2
-            optimizer = torch.optim.AdamW(
-                [
-                    {'params': self.phase1_params, 'lr': self.lr},
-                    {'params': self.phase2_params, 'lr': self.lr * self.lr_mult_phase2},
-                ],
-                betas=self.betas,
-                eps=self.eps,
-                weight_decay=self.weight_decay,
-            )
-    
-        else:  # current_phase == 3
-            # Phase 3: previously trained @ base_lr, CNN+stem @ base_lr * lr_mult_phase3
-            optimizer = torch.optim.AdamW(
-                [
-                    {
-                        'params': self.phase1_params + self.phase2_params,
-                        'lr': self.lr
-                    },
-                    {
-                        'params': self.phase3_params,
-                        'lr': self.lr * self.lr_mult_phase3
-                    },
-                ],
-                betas=self.betas,
-                eps=self.eps,
-                weight_decay=self.weight_decay,
-            )
+            # Phase1: heads + task-transformer only
+            decay_params = [p for p in self.phase1_params if p not in self.log_sigma_params]
+            nodecay_params = [p for p in self.phase1_params if p in self.log_sigma_params]
+            param_groups = []
+            if decay_params:
+                param_groups.append({'params': decay_params, 'lr': self.lr, 'weight_decay': self.weight_decay})
+            if nodecay_params:
+                param_groups.append({'params': nodecay_params, 'lr': self.lr, 'weight_decay': 0.0})
+        else:
+            # Phase2: full unfreeze with layer-wise lr decay
+            param_groups = self._get_layerwise_param_groups()
+
+        optimizer = torch.optim.AdamW(
+            param_groups, betas=self.betas, eps=self.eps
+        )
 
         if self.warmup_steps==0 and self.cosine_annealing_steps==0:
             return optimizer
@@ -238,74 +241,70 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
 
-
     
-    # ─── Phase 1: only branch heads + task‐transformer + cls_task ─────────────────
     def freeze_phase1(self):
         self.current_phase = 1
-
-        # 1) freeze everything
         for p in self.parameters():
             p.requires_grad = False
-
-        # 2) unfreeze branch‐specific heads
+        # Unfreeze heads, task-transformer, cls_task, log_sigma
         for head in self.model.branches.values():
             for p in head.parameters():
                 p.requires_grad = True
-
-        # 3) unfreeze task‐level transformer
         for p in self.model.task_transformer.parameters():
             p.requires_grad = True
-
-        # 4) unfreeze cls_task
         self.model.cls_task.requires_grad_(True)
-
-        # 5) unfreeze your learned uncertainty weights
-        #    (assumes you defined them on the LightningModule itself)
-        for name, p in self.named_parameters():
-            if 'log_sigma' in name:
-                p.requires_grad = True
-
-        # record these params
+        for p in self._uncertainty_params:
+            p.requires_grad = True
         self.phase1_params = [p for p in self.parameters() if p.requires_grad]
 
     
-    # ─── Phase 2: add in module + event‐level layers ─────────────────────────────
     def unfreeze_phase2(self):
+        # unfreeze all remaining layers
         self.current_phase = 2
-
-        # modules to unfreeze
-        to_unfreeze = [
-            self.model.mod_layer,
-            self.model.global_feats_encoder,
-            self.model.event_transformer,
-            self.model.event_pos,
-        ]
-        # + cls_mod
-        self.model.cls_mod.requires_grad_(True)
-
-        # flip requires_grad on all parameters in those modules
-        for module in to_unfreeze:
-            for p in module.parameters():
-                p.requires_grad = True
-
-        # record newly trainable params (exclude those already in phase1)
-        all_trainable = set(p for p in self.parameters() if p.requires_grad)
-        self.phase2_params = [p for p in all_trainable if p not in set(self.phase1_params)]
-
-    
-    # ─── Phase 3: fine‐tune everything else (CNN, stem, encoder…) ───────────────
-    def unfreeze_phase3(self):
-        self.current_phase = 3
-
-        # unfreeze all remaining
         for p in self.parameters():
             p.requires_grad = True
 
-        # record the “new” ones outside of phase1+phase2
-        all_trainable = set(p for p in self.parameters() if p.requires_grad)
-        prev = set(self.phase1_params) | set(self.phase2_params)
-        self.phase3_params = [p for p in all_trainable if p not in prev]
+
+    def _get_layer_id(self, param_name: str) -> int:
+        # 0: stem
+        if param_name.startswith("model.stem"): return 0
+            
+        # 1..nb_elayers: encoder + downsamplers
+        for i in range(self.model.nb_elayers):
+            if name.startswith(f"model.encoder_layers.{i}") or name.startswith(f"model.downsample_layers.{i}"):
+                return i + 1
+                
+        # module-level transformer + its cls token
+        if name.startswith("model.mod_layer") or name.startswith("model.cls_mod"):
+            return self.model.nb_elayers + 1
+
+        # event-level transformer & embeddings
+        if name.startswith("model.global_feats_encoder") or name.startswith("model.event_transformer") or name.startswith("model.event_pos"):
+            return self.model.nb_elayers + 2
+
+        # task-level transformer, cls_task & branches
+        return self.model.nb_elayers + 3
+
+
+    def _get_layerwise_param_groups(self):
+        # Build parameter groups with layer-wise lr decay
+        max_layer_id = self.model.nb_elayers + 2
+        groups = {}
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            layer_id = self._get_layer_id(name)
+            scale = self.layer_decay ** (max_layer_id - layer_id)
+            decay = self.weight_decay if param not in self.log_sigma_params else 0.0
+            group_key = (layer_id, decay)
+            if group_key not in groups:
+                groups[group_key] = {
+                    'params': [],
+                    'lr': self.lr * scale,
+                    'weight_decay': decay
+                }
+            groups[group_key]['params'].append(param)
+        return list(groups.values())
 
 
     def lr_scheduler_step(self, scheduler, *args):

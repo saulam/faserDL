@@ -4,28 +4,28 @@
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1"
 sets_path="/scratch/salonso/sparse-nns/faser/events_v5.1/sets.pkl"
 eps=1e-12
-batch_size=32
-epochs=50
-phase1_epochs=2
-phase2_epochs=8
-phase3_epochs=15
+batch_size=128
+epochs=20
+phase1_epochs=5
+phase2_epochs=25
 num_workers=16
-lr=2e-4
+lr=1e-4
+lr_decay=0.9
 accum_grad_batches=1
-warmup_steps=1
-cosine_annealing_steps=25
-weight_decay=1e-4
+warmup_steps=5
+cosine_annealing_steps=10
+weight_decay=0.05
 beta1=0.9
 beta2=0.999
 losses=("focal" "dice")
 save_dir="logs_final"
-name="enc_v5.1_tl_v1"
+name="enc_v5.1_tl_att_v1"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="enc_v5.1_tl_v1"
+checkpoint_name="enc_v5.1_tl_att_v1"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/seg_v5.1_new7/loss_val_primlepton_ce/epoch=32-step=69300.ckpt"
+load_checkpoint="checkpoints_final/seg_v5.1_att2/loss_val_total/last.ckpt"
 gpus=(1)
 
 python -m train.train_enc_tl \
@@ -36,9 +36,11 @@ python -m train.train_enc_tl \
     --sets_path $sets_path \
     --eps $eps \
     --batch_size $batch_size \
-    --epochs $epochs \
+    --phase1_epochs $phase1_epochs \
+    --phase2_epochs $phase2_epochs \
     --num_workers $num_workers \
     --lr $lr \
+    --lr_decay $lr_decay \
     --accum_grad_batches $accum_grad_batches \
     --warmup_steps $warmup_steps \
     --cosine_annealing_steps $cosine_annealing_steps \
