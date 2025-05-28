@@ -1,9 +1,9 @@
 """
-Author: Dr. Saul Alonso-Monsalve
+Author: Dr. Saul Alonso-Monsalve, Fabio Cufino
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 04.25
+Date: 05.25
 
-Description: PyTorch model - stage 1: semantic segmentation.
+Description: PyTorch model - stage 1: semantic segmentation with Attention Layer 
 """
 
 import torch
@@ -75,6 +75,7 @@ class RelPosSelfAttention(nn.Module):
         self.dots = None
     
     def forward(self, x, coords, src_key_padding_mask=None):
+        self.coords = coords
         B, N, _ = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
