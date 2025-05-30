@@ -48,7 +48,7 @@ def configure_matplotlib_fabio(theme="light", figsize=(8,6)):
 
 
     # Define custom color palette 
-    custom_colors = ["#00A6FB", "#A559AA", "#14A76C", "#4634B2", "#FF4D80"]  
+    custom_colors = ["#00A2FF", "#A559AA", "#14A76C", "#4634B2", "#FF4D80"]  
     plt.rcParams['axes.prop_cycle'] = cycler.cycler(color=custom_colors)
 
     # Basic font and figure settings
