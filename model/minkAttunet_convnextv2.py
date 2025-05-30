@@ -75,7 +75,6 @@ class RelPosSelfAttention(nn.Module):
         self.dots = None
     
     def forward(self, x, coords, src_key_padding_mask=None):
-        self.coords = coords
         B, N, _ = x.shape
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
@@ -95,7 +94,8 @@ class RelPosSelfAttention(nn.Module):
             logits = logits.masked_fill(key_mask, float('-inf'))
         
         attn = torch.softmax(logits, dim=-1)
-        self.attn_weights = attn  # Store for debugging
+        # self.coords = coords
+        # self.attn_weights = attn  # Store for debugging
         
         out = torch.einsum('bhij,bhjd->bhid', attn, v)
         out = out.transpose(1, 2).reshape(B, N, -1)
@@ -132,7 +132,7 @@ class SparseRelPosAttentionAdapter(nn.Module):
         print("SparseRelPosAttentionAdapter initialized")
         self.layers = nn.ModuleList([                     
             RelPosEncoderLayer(d_model, nhead, dropout),
-            # RelPosEncoderLayer(d_model, nhead, dropout),
+            RelPosEncoderLayer(d_model, nhead, dropout),
         ])
     
     def forward(self, x: ME.SparseTensor):
