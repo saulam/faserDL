@@ -194,8 +194,8 @@ neutrino_map = {12: 'e', 14: 'mu', 16: 'tau'}
 n_ev = 0
 
 for batch in dataloader:
-    if n_ev > 1200:
-        break
+    # if n_ev > 1200:
+    #     break
 
     len_batch = len(batch['run_number'])
 
@@ -252,6 +252,13 @@ plt.savefig(f'{plot_folder}/N_gh_voxels_distribution.png')
 plt.close()
 
 
+#print the number of ghosts 
+print("# Ghosts e: ", sum(neutrino_data['e']['N_gh_voxels']))
+print("# Ghosts mu: ", sum(neutrino_data['mu']['N_gh_voxels']))
+print("# Ghosts tau: ", sum(neutrino_data['tau']['N_gh_voxels']))
+print("# Ghosts NC: ", sum(neutrino_data['NC']['N_gh_voxels']))
+
+
 # -------------------------------------------------------------
 # Plotting functions
 # -------------------------------------------------------------
@@ -288,10 +295,10 @@ def plot_1d(variable_data, variable_name, plot_filename, xlabel='Energy [GeV]', 
 # -------------------------------------------------------------
 # Call plotting functions for each variable
 # -------------------------------------------------------------
-# plot_1d([
-#     neutrino_data['e']['in_neutrino_energy'], neutrino_data['mu']['in_neutrino_energy'],
-#     neutrino_data['tau']['in_neutrino_energy'], neutrino_data['NC']['in_neutrino_energy']
-# ], "Incoming Nu Energy", "in_neutrino_energy_1x4")
+plot_1d([
+    neutrino_data['e']['in_neutrino_energy'], neutrino_data['mu']['in_neutrino_energy'],
+    neutrino_data['tau']['in_neutrino_energy'], neutrino_data['NC']['in_neutrino_energy']
+], "Incoming Nu Energy", "in_neutrino_energy_1x4")
 
 
 plot_1d([
