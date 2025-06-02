@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1"
-sets_path="/scratch/salonso/sparse-nns/faser/events_v5.1/sets.pkl"
+# dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
+# sets_path="/scratch/salonso/sparse-nns/faser/events_v5.1b/sets.pkl"
 eps=1e-12
 batch_size=32
 epochs=50
@@ -16,7 +17,7 @@ beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
 save_dir="/scratch3/fcufino/logs_final"
-name="seg_v1Reb"
+name="seg_v1_b"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch3/fcufino/checkpoints_final"
@@ -30,7 +31,6 @@ python -m train.train_seg \
     --stage1 \
     --augmentations_enabled \
     --dataset_path $dataset_path \
-    --sets_path $sets_path \
     --eps $eps \
     --batch_size $batch_size \
     --epochs $epochs \

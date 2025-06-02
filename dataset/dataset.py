@@ -35,7 +35,9 @@ class SparseFASERCALDataset(Dataset):
         self.augmentations_enabled = False
         self.is_v5 = True if 'v5' in args.dataset_path else False 
         self.total_events = self.__len__
-        with open(self.root + "/metadata.pkl", "rb") as fd:
+        # with open(self.root + "/metadata.pkl", "rb") as fd:
+        with open('/scratch/salonso/sparse-nns/faser/events_v5.1' + "/metadata.pkl", "rb") as fd:
+            
             self.metadata = pk.load(fd)
             self.metadata['x'] = np.array(self.metadata['x'])
             self.metadata['y'] = np.array(self.metadata['y'])
