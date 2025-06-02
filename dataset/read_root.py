@@ -16,10 +16,11 @@ import argparse
 
 
 version = "5.1"
+version_reco = version + "b"
 path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
 true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version))
-output_dir = '/scratch2/salonso/faser/events_v{}'.format(version)
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
+output_dir = '/scratch2/salonso/faser/events_v{}'.format(version_reco)
 
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
 

@@ -6,6 +6,7 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 2 (transfer learning from stage 1): classification and regression tasks.
 """
 
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,32 +19,29 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def __init__(self, model, args):
         super(SparseEncTlLightningModel, self).__init__()
         self.model = model
+        self.preprocessing = args.preprocessing
         
         # Loss functions
         self.loss_flavour = nn.CrossEntropyLoss()
-        self.loss_evis = nn.MSELoss()
-        self.loss_ptmiss = nn.MSELoss()
-        self.loss_lepton_momentum_mag = nn.MSELoss()
+        self.loss_evis = MAPE(preprocessing=args.preprocessing_output)
+        self.loss_ptmiss = MAPE(preprocessing=args.preprocessing_output)
+        self.loss_lepton_momentum_mag = MAPE(preprocessing=args.preprocessing_output)
         self.loss_lepton_momentum_dir = SphericalAngularLoss()
-        self.loss_jet_momentum_mag = nn.MSELoss()
+        self.loss_jet_momentum_mag = MAPE(preprocessing=args.preprocessing_output)
         self.loss_jet_momentum_dir = SphericalAngularLoss()
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
         self.log_sigma_e_vis = nn.Parameter(torch.zeros(()))
         self.log_sigma_pt_miss = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lepton_momentum_mag = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_momentum_mag = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_momentum_dir = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lepton_momentum = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_momentum = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = [
             self.log_sigma_flavour,
             self.log_sigma_e_vis,
             self.log_sigma_pt_miss,
-            self.log_sigma_lepton_momentum_mag,
-            self.log_sigma_lepton_momentum_dir,
-            self.log_sigma_jet_momentum_mag,
-            self.log_sigma_jet_momentum_dir,
+            self.log_sigma_lepton_momentum,
+            self.log_sigma_jet_momentum,
         ]
         self.log_sigma_params = set(self._uncertainty_params)
         
@@ -59,6 +57,12 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         # Placeholders for param lists
         self.phase1_params = []
+
+        # For layer-wise lr decay
+        self.encoder_block_counts = [
+            len(self.model.encoder_layers[i]) 
+            for i in range(self.model.nb_elayers)
+        ]
 
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
@@ -79,11 +83,11 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def compute_losses(self, batch_output, target):
         # pred
         out_flavour = batch_output['out_flavour']
-        out_e_vis = batch_output['out_e_vis'].view(-1)
-        out_pt_miss = batch_output['out_pt_miss'].view(-1)
-        out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag']
+        out_e_vis = batch_output['out_e_vis'].squeeze()
+        out_pt_miss = batch_output['out_pt_miss'].squeeze()
+        out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag'].squeeze()
         out_lepton_momentum_dir = batch_output['out_lepton_momentum_dir']
-        out_jet_momentum_mag = batch_output['out_jet_momentum_mag']
+        out_jet_momentum_mag = batch_output['out_jet_momentum_mag'].squeeze()
         out_jet_momentum_dir = batch_output['out_jet_momentum_dir']
 
         # true
@@ -94,14 +98,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         targ_lepton_momentum_dir = target['out_lepton_momentum_dir']
         targ_jet_momentum_mag = target['jet_momentum_mag']
         targ_jet_momentum_dir = target['jet_momentum_dir']
-
-        # Mask primary lepton momentum for NC events
-        mask = targ_lepton_momentum_mag.squeeze() > 0
-        out_lepton_momentum_mag = out_lepton_momentum_mag[mask]
-        out_lepton_momentum_dir = out_lepton_momentum_dir[mask]
-        targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask]
-        targ_lepton_momentum_dir = targ_lepton_momentum_dir[mask]
-
+        
         def weighted_regression(L, s):
             # (1/2) e^(–2s) L + s
             return 0.5 * torch.exp(-2*s) * L + s
@@ -131,10 +128,8 @@ class SparseEncTlLightningModel(pl.LightningModule):
         total_loss = ( weighted_classification(loss_flavour, self.log_sigma_flavour)
                      + weighted_regression(loss_e_vis, self.log_sigma_e_vis)
                      + weighted_regression(loss_pt_miss, self.log_sigma_pt_miss)
-                     + weighted_regression(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag)
-                     + weighted_regression(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir)
-                     + weighted_regression(loss_jet_momentum_mag, self.log_sigma_jet_momentum_mag)
-                     + weighted_regression(loss_jet_momentum_dir, self.log_sigma_jet_momentum_dir)
+                     + weighted_regression(loss_lepton_momentum_mag + loss_lepton_momentum_dir, self.log_sigma_lepton_momentum)
+                     + weighted_regression(loss_jet_momentum_mag + loss_jet_momentum_dir, self.log_sigma_jet_momentum)
                    )
 
         return total_loss, part_losses
@@ -170,7 +165,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # log the actual sigmas (exp(log_sigma))
         for name, param in self.named_parameters():
             if 'log_sigma' in name:
-                self.log(f'uncertainty/{name}', torch.exp(param), on_step=False, on_epoch=True)
+                self.log(f'uncertainty/{name}', torch.exp(param), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 
@@ -194,7 +189,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         print(f"[Phase {self.current_phase}] Trainable parameters: {num_trainable:,}")
 
         if self.current_phase == 1:
-            # Phase1: heads + task-transformer only
+            # Phase1: heads + cls tokens only
             decay_params = [p for p in self.phase1_params if p not in self.log_sigma_params]
             nodecay_params = [p for p in self.phase1_params if p in self.log_sigma_params]
             param_groups = []
@@ -250,8 +245,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
         for head in self.model.branches.values():
             for p in head.parameters():
                 p.requires_grad = True
-        for p in self.model.task_transformer.parameters():
-            p.requires_grad = True
         self.model.cls_task.requires_grad_(True)
         for p in self._uncertainty_params:
             p.requires_grad = True
@@ -264,46 +257,115 @@ class SparseEncTlLightningModel(pl.LightningModule):
         for p in self.parameters():
             p.requires_grad = True
 
+        
+    def _get_layer_id(self, name: str) -> int:
+        """
+        Assign a unique integer ID according to the exact forward‐pass order
+        """        
+        # 1) STEM (one ID = 0)
+        if name.startswith("model.stem"):
+            return 0
 
-    def _get_layer_id(self, param_name: str) -> int:
-        # 0: stem
-        if param_name.startswith("model.stem"): return 0
-            
-        # 1..nb_elayers: encoder + downsamplers
-        for i in range(self.model.nb_elayers):
-            if name.startswith(f"model.encoder_layers.{i}") or name.startswith(f"model.downsample_layers.{i}"):
-                return i + 1
-                
-        # module-level transformer + its cls token
+        nb_elayers = self.model.nb_elayers
+        counts = self.encoder_block_counts  # e.g. [3, 3, 9, 3]
+
+        # Helper: compute “base” = ID of mod_layer
+        def compute_base():
+            base = 1  # IDs start at 1 immediately after stem
+            for x in range(nb_elayers):
+                base += counts[x]
+                if x < nb_elayers - 1:
+                    base += 1  # one ID reserved for downsample_layers[x]
+            return base
+
+        # 2) ENCODER LAYERS (each Block) & DOWNSAMPLE LAYERS interleaved
+        #    encoder_layers[i][j] → ID = 1 + (all blocks+dowmsamples before it) + j
+        m = re.match(r"model\.encoder_layers\.(\d+)\.(\d+)\.", name)
+        if m:
+            i = int(m.group(1))
+            j = int(m.group(2))
+            used = 1  # the first available ID after stem = 1
+            for k in range(i):
+                used += counts[k]
+                if k < nb_elayers - 1:
+                    used += 1  # that downsample_layers[k]
+            return used + j
+
+        m = re.match(r"model\.downsample_layers\.(\d+)\.", name)
+        if m:
+            i = int(m.group(1))
+            used = 1
+            for k in range(i):
+                used += counts[k]
+                if k < nb_elayers - 1:
+                    used += 1
+            used += counts[i]
+            return used
+
+        # 3) MODULE‐LEVEL TRANSFORMER (mod_layer & its cls_mod) → next single ID
         if name.startswith("model.mod_layer") or name.startswith("model.cls_mod"):
-            return self.model.nb_elayers + 1
+            return compute_base()
 
-        # event-level transformer & embeddings
-        if name.startswith("model.global_feats_encoder") or name.startswith("model.event_transformer") or name.startswith("model.event_pos"):
-            return self.model.nb_elayers + 2
+        # 4) EVENT‐LEVEL TRANSFORMER (each of its 5 TransformerEncoderLayer’s)
+        m = re.match(r"model\.event_transformer\.layers\.(\d+)\.", name)
+        if m:
+            k = int(m.group(1))  # 0..4
+            base = compute_base()
+            return base + 1 + k  # IDs = base+1, base+2, …, base+5
 
-        # task-level transformer, cls_task & branches
-        return self.model.nb_elayers + 3
+        # 5) global_feats_encoder, event_pos, cls_task → ALL share ID = (base + 1 + num_evt_layers)
+        if (name.startswith("model.global_feats_encoder")
+            or name.startswith("model.event_pos")
+            or name.startswith("model.cls_task")):
+            base = compute_base()
+            num_evt_layers = len(self.model.event_transformer.layers)  # =5
+            return base + 1 + num_evt_layers
+
+        # 6) All branches (“model.branches.<any>.*”) → share ID = (base + 1 + num_evt_layers + 1)
+        if name.startswith("model.branches") or name.startswith("log_sigma"):
+            base = compute_base()
+            num_evt_layers = len(self.model.event_transformer.layers)
+            return base + 1 + num_evt_layers + 1
+
+        raise Exception("Parameter name undefined: {}".format(name))
 
 
     def _get_layerwise_param_groups(self):
-        # Build parameter groups with layer-wise lr decay
-        max_layer_id = self.model.nb_elayers + 2
+        nb_elayers = self.model.nb_elayers
+        counts = self.encoder_block_counts 
+        base = 1  # IDs start from 1 immediately after stem
+        for k in range(nb_elayers):
+            base += counts[k]
+            if k < nb_elayers - 1:
+                base += 1  # one ID for downsample_layers[k]
+    
+        # max layers
+        num_event_layers = len(self.model.event_transformer.layers)
+        branch_id = base + 1 + num_event_layers + 1
+        max_layer_id = branch_id
+    
         groups = {}
-        for name, param in self.model.named_parameters():
+        for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
             layer_id = self._get_layer_id(name)
-            scale = self.layer_decay ** (max_layer_id - layer_id)
-            decay = self.weight_decay if param not in self.log_sigma_params else 0.0
-            group_key = (layer_id, decay)
-            if group_key not in groups:
-                groups[group_key] = {
+            scale   = self.layer_decay ** (max_layer_id - layer_id)
+            if (name.endswith(".bias")
+                or "norm" in name.lower()         # any norm layer
+                or param in self.log_sigma_params # uncertainty tensors
+            ):
+                decay = 0.0
+            else:
+                decay = self.weight_decay
+            key = (layer_id, decay)
+            if key not in groups:
+                groups[key] = {
                     'params': [],
                     'lr': self.lr * scale,
                     'weight_decay': decay
                 }
-            groups[group_key]['params'].append(param)
+            groups[key]['params'].append(param)
+    
         return list(groups.values())
 
 

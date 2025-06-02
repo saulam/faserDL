@@ -24,7 +24,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import RelPosEncoderLayer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
+from .utils import PositionalEncoding, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
 def _init_weights(m):
@@ -132,7 +132,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         # Module-level real-pos transformer
         d_mod = encoder_dims[-1]
         heads_m = 12
-        self.mod_layer = RelPosEncoderLayer(d_model=d_mod, nhead=heads_m, num_special_tokens=1)
+        self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, num_layers=2)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, d_mod))
 
         # Global features encoder
@@ -141,8 +141,8 @@ class MinkUNetConvNeXtV2(nn.Module):
         # Event-level transformer (across modules)
         heads_e = 12
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
-        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=2)
-        self.event_pos = nn.Embedding(self.num_modules, d_mod)  # positional embedding for modules
+        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=5)
+        self.pos_encoder = PositionalEncoding(d_model=d_mod, max_len=self.num_modules)
 
         # Decoder configuration (reversing the encoder dimensions)
         decoder_depths = [2] * len(encoder_depths)
@@ -226,7 +226,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)          # [M, L+1]
         zero_coord = torch.zeros((len(grouped_feats), 1, 3), device=padded_coords.device)
         seq_coords = torch.cat([zero_coord, padded_coords], dim=1)    # [M, L+1, 3]
-        mod_out = self.mod_layer(seq_mod, seq_coords, key_mask_mod)
+        mod_out = self.mod_transformer(seq_mod, seq_coords, key_mask_mod)
         mod_emb = mod_out[:, 0, :]                                    # [M, d]     
 
         # Event-level Transformer
@@ -235,7 +235,7 @@ class MinkUNetConvNeXtV2(nn.Module):
         pos_lists = [module_pos[module_to_event == e] for e in range(B)]
         pad_evt = pad_sequence(evt_lists, batch_first=True)             # [B, M_max, d]
         pad_pos = pad_sequence(pos_lists, batch_first=True)             # [B, M_max]
-        pos_emb = self.event_pos(pad_pos)                               # [B, M_max, d]
+        pos_emb = self.pos_encoder.pe[0, pad_pos]
         seq_evt = pad_evt + pos_emb
         lengths_evt = torch.tensor([g.size(0) for g in evt_lists], device=seq_evt.device)
         M_max = seq_evt.size(1)
@@ -256,7 +256,7 @@ class MinkUNetConvNeXtV2(nn.Module):
             num_mods = mod_idxs.size(0)
             emb_slice = evt_out[e, 1:1+num_mods]
             updated_mod_emb[mod_idxs] = emb_slice
-        voxel_mod_idx = x.C[:, 0]
+        voxel_mod_idx = x.C[:, 0].long()
         module_ctx = updated_mod_emb[voxel_mod_idx]  # [N, d_mod]
         x = ME.SparseTensor(
             features=x.F + module_ctx,

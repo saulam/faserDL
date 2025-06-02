@@ -77,7 +77,6 @@ class MinkEncConvNeXtV2(nn.Module):
             in_channels (int): Number of input channels.
             out_channels (int): Number of output channels.
             D (int): Spatial dimension.
-            num_tasks: Number of tasks.
             args: Arguments namespace with at least a `dataset_path` attribute.
         """
         super().__init__()
@@ -142,11 +141,11 @@ class MinkEncConvNeXtV2(nn.Module):
         # Event-level transformer (across modules)
         heads_e = 12
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
-        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=2)
+        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=5)
         self.event_pos = nn.Embedding(self.num_modules, d_mod)  # positional embedding for modules
 
-        # Task-level transformer (across modules)
-        branch_names = [
+        # Task branches (across modules)
+        self.branch_names = [
             "flavour",
             "e_vis",
             "pt_miss",
@@ -164,16 +163,15 @@ class MinkEncConvNeXtV2(nn.Module):
             "jet_momentum_mag": 1,
             "jet_momentum_dir": 3,
         }
-        heads_e = 12
-        task_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
-        self.task_transformer = nn.TransformerEncoder(task_layer, num_layers=3)
-        self.num_tasks = len(branch_names)
+        self.num_tasks = len(self.branch_names)
         self.cls_task = nn.Parameter(torch.zeros(1, self.num_tasks, d_mod))
         self.branches = nn.ModuleDict()
-        for name in branch_names:
-            branch = nn.Linear(d_mod, branch_out_channels[name])
-            self.branches[name] = branch
-
+        for name in self.branch_names:
+            if name == "flavour":
+                self.branches[name] = nn.Linear(d_mod, branch_out_channels[name])
+            else:
+                self.branches[name] = nn.Linear(d_mod + 4, branch_out_channels[name])
+                
         # Initialise weights
         self.apply(_init_weights)
     
@@ -190,11 +188,9 @@ class MinkEncConvNeXtV2(nn.Module):
         """
         # Encoder
         x = self.stem(x)
-        x_enc = []
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
             if i < self.nb_elayers - 1:
-                x_enc.append(x)
                 x = self.downsample_layers[i](x)
 
         # Module-level Transformer
@@ -229,23 +225,26 @@ class MinkEncConvNeXtV2(nn.Module):
         M_max = seq_evt.size(1)
         evt_mask = torch.arange(M_max, device=lengths_evt.device).unsqueeze(0) >= lengths_evt.unsqueeze(1)
         glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)   # [B, 1, d]
-        seq2 = torch.cat([glob_emb, seq_evt], dim=1)    # [B,K+1+M_max,d]
-        spec_mask = torch.zeros((B, 1), dtype=torch.bool, device=evt_mask.device)
+        cls_tokens = self.cls_task.expand(B, self.num_tasks, -1)  # [B,K,d]
+        seq2 = torch.cat([cls_tokens, glob_emb, seq_evt], dim=1)    # [B,K+1+M_max,d]
+        spec_mask = torch.zeros((B, self.num_tasks+1), dtype=torch.bool, device=evt_mask.device)
         key_mask = torch.cat([spec_mask, evt_mask], dim=1)          # [B,K+1+M_max]
         evt_out = self.event_transformer(seq2, src_key_padding_mask=key_mask)
-
-        # Task-level Transformer
-        cls_tokens = self.cls_task.expand(B, self.num_tasks, -1)  # [B,K,d]
-        seq3 = torch.cat([cls_tokens, evt_out], dim=1)    # [B,K+1+M_max,d]
-        spec_mask = torch.zeros((B, self.num_tasks), dtype=torch.bool, device=evt_mask.device)
-        key_mask2 = torch.cat([spec_mask, key_mask], dim=1)          # [B,K+1+M_max]
-        evt_out = self.task_transformer(seq3, src_key_padding_mask=key_mask2)
         evt_emb = evt_out[:, :self.num_tasks, :]
         
         # Branch-specific processing
         outputs = {}
+        flavour_index = self.branch_names.index("flavour")
+        flav_logits = self.branches["flavour"](evt_emb[:, flavour_index]) 
+        outputs["out_flavour"] = flav_logits 
         for i, (name, branch) in enumerate(self.branches.items()):
-            outputs[f"out_{name}"] = branch(evt_emb[:, i])
+            if name == "flavour":
+                continue  # already handled
+            reg_input = torch.cat([evt_emb[:, i], flav_logits], dim=1)  # [B,d+4]
+            if "_dir" in name:
+                outputs[f"out_{name}"] = F.normalize(branch(reg_input), dim=-1)
+            else:
+                outputs[f"out_{name}"] = F.softplus(branch(reg_input))
         return outputs
 
     def replace_depthwise_with_channelwise(self):

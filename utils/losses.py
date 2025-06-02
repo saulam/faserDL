@@ -25,14 +25,14 @@ class MAPE(torch.nn.Module):
     Args:
         epsilon (float): Small value to prevent division by zero. Default is 1e-8.
         reduction (str): Specifies the reduction method ('mean' or 'sum'). Default is 'mean'.
-        from_log_space (bool): If True, applies exp(x) - 1 to pred and target before computing MAPE.
+        preprocessing (str): Type of preprocessing applied ('sqrt', 'log', or None).
     """
 
-    def __init__(self, eps=1e-8, reduction='mean', from_log_scale=False):
+    def __init__(self, eps=1e-8, reduction='mean', preprocessing=None):
         super(MAPE, self).__init__()
         self.eps = eps
         self.reduction = reduction
-        self.from_log_space = from_log_scale
+        self.preprocessing = preprocessing
 
     def forward(self, pred, target):
         """
@@ -45,25 +45,24 @@ class MAPE(torch.nn.Module):
         Returns:
             torch.Tensor: Computed MAPE loss, considering only target values > 0.
         """
-        if self.from_log_space:
-            pred = torch.exp(pred) - 1.0
-            target = torch.exp(target) - 1.0
-
-        # Create a mask to only compute the loss where target > 0
-        mask = target > 0
-
+        if self.preprocessing == "sqrt":
+            pred = pred ** 2
+            target = target ** 2
+        elif self.preprocessing == "log":
+            pred = torch.expm1(pred)
+            target = torch.expm1(target)
+            
         # Calculate percentage error where the target is greater than 0
+        mask = target > 0
         percentage_error = torch.abs((pred - target) / (target + self.eps))
         percentage_error = torch.nan_to_num(percentage_error, nan=0.0) * mask
 
-        # Apply reduction method
         if self.reduction == 'mean':
-            # Compute the mean loss only for valid values (where target > 0)
             return percentage_error.sum() / (mask.sum() + self.eps)
-        elif self.reduction == 'sum':
+        if self.reduction == 'sum':
             return percentage_error.sum()
-        else:
-            return percentage_error  # No reduction
+        
+        return percentage_error
 
 
 class CosineLoss(torch.nn.Module):
@@ -85,34 +84,16 @@ class CosineLoss(torch.nn.Module):
         self.eps = eps
 
     def forward(self, pred, target):
-        """
-        Computes the cosine loss given predicted and target 3D vectors.
+        # mask out any zero-target rows
+        mask = torch.any(target != 0, dim=1).float()
 
-        Args:
-            pred (torch.Tensor): Predicted 3D vectors (batch_size, 3).
-            target (torch.Tensor): True 3D vectors (batch_size, 3).
-
-        Returns:
-            torch.Tensor: The computed loss.
-        """
-        mask = torch.any(target != 0, dim=1)
-        
-        pred_norm = F.normalize(pred, dim=-1, eps=self.eps)
-        target_norm = F.normalize(target, dim=-1, eps=self.eps)
-        
-        # Compute cosine similarity and convert to loss
-        cosine_similarity = F.cosine_similarity(pred_norm, target_norm, dim=-1)
-        cosine_loss = 1.0 - cosine_similarity
-        
-        cosine_loss = cosine_loss * mask.float()
+        cos_sim = F.cosine_similarity(pred, target, dim=-1)
+        loss = (1.0 - cos_sim) * mask
         
         if self.reduction == 'mean':
-            valid_loss_count = mask.sum()
-            cosine_loss = cosine_loss.sum() / (valid_loss_count + self.eps)
-        elif self.reduction == 'sum':
-            cosine_loss = cosine_loss.sum()
-            
-        return cosine_loss
+            return loss.sum() / (mask.sum() + self.eps)
+        else:  # 'sum'
+            return loss.sum()
 
 
 class SphericalAngularLoss(torch.nn.Module):

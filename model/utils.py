@@ -9,6 +9,7 @@
 
 import numpy.random as random
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,8 +27,32 @@ import torch
 import torch.nn as nn
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=200):
+        super().__init__()
+
+        # Precompute [max_len × d_model] sinusoidal table once
+        pe = torch.zeros(max_len, d_model).float()
+        pe.requires_grad = False
+
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (
+            torch.arange(0, d_model, 2).float() *
+            -(math.log(10000.0) / d_model)
+        ).exp()
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        pe = pe.unsqueeze(0)   # shape = [1, max_len, d_model]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return self.pe[:, : x.size(1)]
+        
+
 class RelPosSelfAttention(nn.Module):
-    def __init__(self, d_model, nhead, num_special_tokens=1):
+    def __init__(self, d_model, nhead, num_special_tokens=1, coord_scales=(12.0, 12.0, 5.0)):
         super().__init__()
         self.nhead = nhead
         self.scale = (d_model // nhead) ** -0.5
@@ -35,22 +60,27 @@ class RelPosSelfAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model)
         self.bias_alpha = nn.Parameter(torch.zeros(1))
         self.bias_mlp = nn.Sequential(
-            nn.Linear(3, nhead * 4),
+            nn.Linear(4, nhead * 4),
             nn.GELU(),
             nn.Linear(nhead * 4, nhead)
         )
         self.num_special_tokens = num_special_tokens
+        #self.register_buffer('coord_scales', torch.tensor(coord_scales))  # [3]
+        self.coord_scales = nn.Parameter(torch.tensor(coord_scales))
 
     def forward(self, x, coords, key_padding_mask=None):
         B, N, _ = x.size()
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
+        c = coords / self.coord_scales
 
         # relative positional bias
-        ci = coords.unsqueeze(2)  # [B,N,1,3]
-        cj = coords.unsqueeze(1)  # [B,1,N,3]
-        dpos = ci - cj            # [B,N,N,3]
-        bias = self.bias_mlp(dpos).permute(0, 3, 1, 2)  # [B,heads,N,N]
+        ci = c.unsqueeze(2)  # [B,N,1,3]
+        cj = c.unsqueeze(1)  # [B,1,N,3]
+        dpos = ci - cj       # [B,N,N,3]
+        dist = torch.norm(dpos, dim=-1, keepdim=True)   # [B, N, N, 1]
+        dpos_with_norm = torch.cat([dpos, dist], dim=-1)  # [B, N, N, 4]
+        bias = self.bias_mlp(dpos_with_norm).permute(0, 3, 1, 2)  # [B,heads,N,N]
         
         # zero out bias for special tokens
         ns = self.num_special_tokens
@@ -88,6 +118,35 @@ class RelPosEncoderLayer(nn.Module):
         ffn = self.linear2(self.dropout(self.act(self.linear1(src))))
         src = src + self.dropout(ffn)
         return self.norm2(src)
+
+
+class RelPosTransformer(nn.Module):
+    """
+    A stack of K RelPosEncoderLayer modules, each performing
+    relative‐positional self‐attention + MLP. 
+
+    Args:
+      d_model (int): hidden dimension of each layer
+      nhead (int): number of attention heads 
+      num_special_tokens (int): how many “CLS‐like” tokens to zero out in bias
+      depth (int): number of layers (K)
+      dropout (float): dropout rate inside each RelPosEncoderLayer
+    """
+    def __init__(self, d_model: int, nhead: int, num_special_tokens: int = 1, num_layers: int = 6, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            RelPosEncoderLayer(d_model=d_model, 
+                               nhead=nhead, 
+                               num_special_tokens=num_special_tokens, 
+                               dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        self.num_layers = num_layers
+
+    def forward(self, x: torch.Tensor, coords: torch.Tensor, key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, coords, key_padding_mask)
+        return x
 
         
 class GlobalFeatureEncoder(nn.Module):

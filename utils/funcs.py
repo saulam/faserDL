@@ -121,7 +121,7 @@ def collate_test(batch):
     for key in optional_keys:
         if key in batch[0]:
             ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'flavour_label']
-                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss']
+                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
                         else [d[key] for d in batch])
     
     return ret
@@ -156,8 +156,8 @@ def collate_sparse_minkowski(batch):
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'flavour_label', 'e_vis', 'pt_miss']
-                        else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_mag', 'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir']
+            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'flavour_label', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
+                        else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_dir', 'jet_momentum_dir']
                         else [d[key] for d in batch])
     
     return ret

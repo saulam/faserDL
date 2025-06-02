@@ -110,7 +110,8 @@ class SparseFASERCALDataset(Dataset):
         dict: Data sample with filename, coordinates, features, and labels.
         """
         data = np.load(self.data_files[idx], allow_pickle=True)
-        
+
+        is_cc = data['is_cc'].item()
         reco_hits_true = data['reco_hits_true']
         true_hits = data['true_hits']
         reco_hits = data['reco_hits']
@@ -125,6 +126,8 @@ class SparseFASERCALDataset(Dataset):
         out_lepton_momentum = data['out_lepton_momentum']
         out_lepton_energy = data['out_lepton_energy'].item()
         jet_momentum = data['jet_momentum']
+        if not is_cc:
+            out_lepton_momentum.fill(0)
 
         if len(reco_hits) == 0:
             os.remove(self.data_files[idx])
@@ -180,7 +183,7 @@ class SparseFASERCALDataset(Dataset):
                 "jet_momentum": jet_momentum
                }
 
-dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v5.1")
+dataset = SparseFASERCALDataset("/scratch2/salonso/faser/events_v5.1b")
 
 def collate(batch):
     pdg = np.unique(np.concatenate([x['pdg'] for x in batch]))
@@ -361,7 +364,7 @@ metadata.update({'x': x, 'y': y, 'z': z,
 
 # save metadata
 import pickle as pk
-with open("/scratch2/salonso/faser/events_v5.1/metadata2.pkl", "wb") as fd:
+with open("/scratch2/salonso/faser/events_v5.1b/metadata.pkl", "wb") as fd:
     pk.dump(metadata, fd)
 
 print("Metadata with log1p and sqrt statistics saved.")

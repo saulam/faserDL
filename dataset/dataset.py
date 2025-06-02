@@ -42,7 +42,10 @@ class SparseFASERCALDataset(Dataset):
             self.metadata['z'] = np.array(self.metadata['z'])
         self.module_size = int((self.metadata['z'][:,1]==0).sum())
         self.gap_size = 4
-        self.preprocessing = args.preprocessing
+        self.standardize_input = args.standardize_input
+        self.standardize_output = args.standardize_output
+        self.preprocessing_input = args.preprocessing_input
+        self.preprocessing_output = args.preprocessing_output
 
             
     @property
@@ -260,35 +263,71 @@ class SparseFASERCALDataset(Dataset):
     
         return momentum[0] if magnitude.shape[0] == 1 else momentum
 
-    
-    def standardize(self, x, param_name, preprocess=None):
-        if preprocess == "sqrt":
+
+    def preprocess(self, x, param_name, preprocessing=None, standardize=False):
+        if np.ndim(x) == 0:
+            x = np.atleast_1d(x)
+
+        internal_name = param_name
+        if preprocessing == "sqrt":
             if np.any(x < 0):
-                raise ValueError(f"{param_name}: negative values for sqrt")
+                raise ValueError(f"{param_name}: negative values cannot take sqrt")
             x = np.sqrt(x)
-            param_name += '_sqrt'
-        elif preprocess == "log":
+            internal_name = param_name + "_sqrt"
+        elif preprocessing == "log":
             if np.any(x <= -1):
-                raise ValueError(f"{param_name}: <= -1 for log1p")
+                raise ValueError(f"{param_name}: values <= -1 cannot take log1p")
             x = np.log1p(x)
-            param_name += '_log1p'
-        stats = self.metadata[param_name]            
-        if stats["std"] == 0:
-            raise ValueError(f"{param_name}: std is zero")
-        return (x - stats["mean"]) / stats["std"]
+            internal_name = param_name + "_log1p"
+
+        if standardize:
+            stats = self.metadata[internal_name]
+            if stats["std"] == 0:
+                raise ValueError(f"{internal_name}: std is zero in metadata")
+            x = (x - stats["mean"]) / stats["std"]
+
+        if x.shape == (1,) and preprocessing is None and not standardize:
+            return x.item()
+        else:
+            return x
+
+
+    def unpreprocess(self, x, param_name, preprocessing=None, standardize=False):
+        was_scalar = False
+        if np.ndim(x) == 0 or (isinstance(x, np.ndarray) and x.shape == ()):
+            x = np.atleast_1d(x)
+            was_scalar = True
+
+        internal_name = param_name
+        if preprocessing == "sqrt":
+            internal_name = param_name + "_sqrt"
+        elif preprocessing == "log":
+            internal_name = param_name + "_log1p"
+
+        if standardize:
+            stats = self.metadata[internal_name]
+            if stats["std"] == 0:
+                raise ValueError(f"{internal_name}: std is zero in metadata")
+            x = x * stats["std"] + stats["mean"]
+
+        if preprocessing == "sqrt":
+            x = x ** 2
+        elif preprocessing == "log":
+            x = np.expm1(x)
+
+        if was_scalar and x.shape == (1,):
+            return x.item()
+        else:
+            return x
         
 
-    def get_param(self, data, param_name, preprocess=None, standardize=False):
+    def get_param(self, data, param_name, preprocessing=None, standardize=False):
         if param_name not in data:
             return None
 
         param = data[param_name]
-        if param.ndim == 0:
-            param = np.atleast_1d(param) if preprocess else param.item()
+        param = self.preprocess(param, param_name, preprocessing, standardize)
 
-        if standardize:
-            param = self.standardize(param, param_name, preprocess=preprocess)
-        
         return param
 
     
@@ -316,30 +355,34 @@ class SparseFASERCALDataset(Dataset):
         vis_sp_momentum = self.get_param(data, 'vis_sp_momentum')
         jet_momentum = self.get_param(data, 'jet_momentum')
         is_cc = self.get_param(data, 'is_cc')
-        e_vis = self.get_param(data, 'e_vis', preprocess=self.preprocessing, standardize=True)
-        pt_miss = self.get_param(data, 'pt_miss', preprocess=self.preprocessing, standardize=True)
-        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocess=self.preprocessing, standardize=True)
-        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocess=self.preprocessing, standardize=True)
-        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocess=self.preprocessing, standardize=True)
-        faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocess=self.preprocessing, standardize=True)
-        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocess=self.preprocessing, standardize=True)
-        faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocess=self.preprocessing, standardize=True)
+        e_vis = self.get_param(data, 'e_vis', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
+        pt_miss = self.get_param(data, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
+        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         primary_vertex = data['primary_vertex']
 
         if not self.is_v5 and not is_cc:
             # Fix jet momentum and no outgoing lepton momentum for NC events
             jet_momentum = jet_momentum + out_lepton_momentum
+
+        if not is_cc:
             out_lepton_momentum.fill(0)
-        
+
         # momentum -> direction + magnitude
         out_lepton_momentum_mag, out_lepton_momentum_dir = self.decompose_momentum(out_lepton_momentum)
-        out_lepton_momentum_mag = self.standardize(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude', preprocess=self.preprocessing)
+        out_lepton_momentum_mag = self.preprocess(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude', 
+                                                  preprocessing=self.preprocessing_output, standardize=self.standardize_output)
         jet_momentum_mag, jet_momentum_dir = self.decompose_momentum(jet_momentum)
-        jet_momentum_mag = self.standardize(jet_momentum_mag, 'jet_momentum_magnitude', preprocess=self.preprocessing)
-        
+        jet_momentum_mag = self.preprocess(jet_momentum_mag, 'jet_momentum_magnitude', 
+                                           preprocessing=self.preprocessing_output, standardize=self.standardize_output)
+
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
-        q = self.standardize(reco_hits[:, 4].reshape(-1, 1), 'q', preprocess=self.preprocessing)
+        q = self.preprocess(reco_hits[:, 4].reshape(-1, 1), 'q', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
 
         # look-up hit modules
         module_idx = np.searchsorted(self.metadata['z'][:, 0], coords[:, 2])
@@ -385,7 +428,7 @@ class SparseFASERCALDataset(Dataset):
         coords[:, 2] = coords[:, 2] % self.module_size
 
         augmented, feats = False, q
-        if self.augmentations_enabled:     
+        if self.augmentations_enabled: 
             # augmented event
             (
                 coords, modules, feats, (primlepton_labels, seg_labels),
@@ -410,7 +453,7 @@ class SparseFASERCALDataset(Dataset):
         
         # ptmiss
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
-        pt_miss = self.standardize(pt_miss, 'pt_miss', preprocess=self.preprocessing)
+        pt_miss = self.preprocess(pt_miss, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
 
         # output
         output = {}
