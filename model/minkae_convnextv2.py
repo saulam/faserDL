@@ -148,7 +148,7 @@ class MinkAEConvNeXtV2(nn.Module):
         # Event-level transformer (across modules)
         heads_e = 12
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
-        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=5)
+        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.pos_embed = nn.Embedding(self.num_modules, d_mod)
         
         # Decoder configuration (reversing the encoder dimensions)
@@ -231,14 +231,14 @@ class MinkAEConvNeXtV2(nn.Module):
         lengths = torch.tensor([g.size(0) for g in grouped_feats], device=padded_feats.device)
         L = padded_feats.size(1)
         pad_mask = torch.arange(L, device=lengths.device).unsqueeze(0) >= lengths.unsqueeze(1)
-        cls_mod = self.cls_mod.expand(len(grouped_feats), -1, -1)      # [M, 1, d]
-        seq_mod = torch.cat([cls_mod, padded_feats], dim=1)            # [M, L+1, d]
+        cls_mod = self.cls_mod.expand(len(grouped_feats), -1, -1)          # [M, 1, d]
+        seq_mod = self.dropout(torch.cat([cls_mod, padded_feats], dim=1))  # [M, L+1, d]
         cls_pad = torch.zeros((len(grouped_feats), 1), dtype=torch.bool, device=pad_mask.device)
-        key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)           # [M, L+1]
+        key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)               # [M, L+1]
         zero_coord = torch.zeros((len(grouped_feats), 1, 3), device=padded_coords.device)
-        seq_coords = torch.cat([zero_coord, padded_coords], dim=1)     # [M, L+1, 3]
+        seq_coords = torch.cat([zero_coord, padded_coords], dim=1)         # [M, L+1, 3]
         mod_out = self.mod_transformer(seq_mod, seq_coords, key_mask_mod)
-        mod_emb = mod_out[:, 0, :]                                     # [M, d]
+        mod_emb = mod_out[:, 0, :]                                         # [M, d]
 
         # Event-level Transformer
         B = module_to_event.max().item() + 1
@@ -248,13 +248,13 @@ class MinkAEConvNeXtV2(nn.Module):
         event_idx = module_to_event.long()    # [M]
         module_idx = module_pos.long()        # [M]
         pad_evt[event_idx, module_idx, :] = mod_emb
-        pos_indices = torch.arange(self.num_modules, device=device)  # [num_modules]
-        pos_emb = self.pos_embed(pos_indices).unsqueeze(0)           # [1, num_modules, d]
-        seq_evt = pad_evt + pos_emb                                  # [B, num_modules, d]
-        glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)    # [B, 1, d]
-        seq_evt = torch.cat([glob_emb, seq_evt], dim=1)              # [B, 1+num_modules, d]
-        evt_out = self.event_transformer(seq_evt)                    # [B, 1+num_modules, d]
-        updated_mod_emb = evt_out[event_idx, 1 + module_idx, :]      # [M, d]
+        pos_indices = torch.arange(self.num_modules, device=device)   # [num_modules]
+        pos_emb = self.pos_embed(pos_indices).unsqueeze(0)            # [1, num_modules, d]
+        seq_evt = pad_evt + pos_emb                                   # [B, num_modules, d]
+        glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)     # [B, 1, d]
+        seq_evt = self.dropout(torch.cat([glob_emb, seq_evt], dim=1)) # [B, 1+num_modules, d]
+        evt_out = self.event_transformer(seq_evt)                     # [B, 1+num_modules, d]
+        updated_mod_emb = evt_out[event_idx, 1 + module_idx, :]       # [M, d]
 
         # Broadcast back to voxels
         voxel_mod_feat = torch.zeros_like(feats_all)    # [N, d_mod]
@@ -269,7 +269,7 @@ class MinkAEConvNeXtV2(nn.Module):
             coordinate_map_key = x.coordinate_map_key
         )
 
-        # Decoder with skip connections
+        # Decoder
         for i in range(self.nb_dlayers):
             x = self.upsample_layers[i](x)
             x = self.decoder_layers[i](x)

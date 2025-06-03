@@ -52,7 +52,7 @@ class PositionalEncoding(nn.Module):
         
 
 class RelPosSelfAttention(nn.Module):
-    def __init__(self, d_model, nhead, num_special_tokens=1, coord_scales=(12.0, 12.0, 5.0)):
+    def __init__(self, d_model, nhead, num_special_tokens=1):
         super().__init__()
         self.nhead = nhead
         self.scale = (d_model // nhead) ** -0.5
@@ -65,14 +65,12 @@ class RelPosSelfAttention(nn.Module):
             nn.Linear(nhead * 4, nhead)
         )
         self.num_special_tokens = num_special_tokens
-        #self.register_buffer('coord_scales', torch.tensor(coord_scales))  # [3]
-        self.coord_scales = nn.Parameter(torch.tensor(coord_scales))
 
     def forward(self, x, coords, key_padding_mask=None):
         B, N, _ = x.size()
         qkv = self.qkv(x).chunk(3, dim=-1)
         q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
-        c = coords / self.coord_scales
+        c = coords
 
         # relative positional bias
         ci = c.unsqueeze(2)  # [B,N,1,3]
@@ -149,62 +147,6 @@ class RelPosTransformer(nn.Module):
         return x
 
 
-'''
-class GlobalFeatureEncoder(nn.Module):
-    """
-    Encodes a set of global features consisting of four scalar energies and two small sequences.
-
-    Inputs:
-      - x: Tensor of shape (batch_size, 23) or (batch_size, 28)
-        Order:
-          [0]    rear_cal_energy
-          [1]    rear_hcal_energy
-          [2]    rear_mucal_energy
-          [3]    faser_cal_energy
-          [4:13] 9-module energy sequence (rear_hcal_modules)
-          [13:]  10-or-15-module energy sequence (faser_cal_modules)
-
-    Args:
-      encoder_dim: int, dimensionality of the final embedding
-      hidden_dim: int, hidden size for intermediate heads (defaults to encoder_dim)
-    """
-    def __init__(self, encoder_dim, hidden_dim=None):
-        super().__init__()
-        hidden_dim = hidden_dim or encoder_dim
-
-        self.scalar_mlp = nn.Sequential(
-            nn.Linear(4, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, encoder_dim),
-        )
-        self.seqA_proj = nn.Linear(hidden_dim, encoder_dim)
-        self.seqB_proj = nn.Linear(hidden_dim, encoder_dim)
-        self.seqA_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
-        self.seqB_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
-        self.norm = nn.LayerNorm(encoder_dim)
-
-    def forward(self, x):
-        scalars = x[:, :4]
-        seqA = x[:, 4:13].unsqueeze(-1)
-        seqB = x[:, 13:].unsqueeze(-1)
-
-        # Scalar path
-        emb_s = self.scalar_mlp(scalars)              # (batch, encoder_dim)
-
-        # Seq A
-        _, (hA, _) = self.seqA_lstm(seqA)
-        hA = hA.sum(0)                                # (batch, hidden_dim)
-        emb_A = self.seqA_proj(hA)                    # (batch, encoder_dim)
-
-        # Seq B
-        _, (hB, _) = self.seqB_lstm(seqB)
-        hB = hB.sum(0)                                # (batch, hidden_dim)
-        emb_B = self.seqB_proj(hB)                    # (batch, encoder_dim)
-
-        # Fuse into a single “token” and normalise
-        global_token = emb_s + emb_A + emb_B
-        return self.norm(global_token)
-'''
 class GlobalFeatureEncoder(nn.Module):
     """
     Encodes a set of global features consisting of four scalar energies and two small sequences.
