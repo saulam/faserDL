@@ -267,7 +267,7 @@ def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']
     return rotated_coords, rotated_dirs, rotated_vertex
 
 
-def translate(coords, modules, primary_vertex, metadata, shift=4, selected_axes=['x', 'y', 'z']):
+def translate(coords, modules, primary_vertex, metadata, shift=8, selected_axes=['x', 'y', 'z'], shift_modules=False):
     """
     coords[:,2] is assumed to be the *in-module* z (0..module_size-1).
     modules[:] is the integer module index (0..n_mod-1).
@@ -278,12 +278,12 @@ def translate(coords, modules, primary_vertex, metadata, shift=4, selected_axes=
     """
 
     if 'x' in selected_axes:
-        shift_x = np.random.randint(-shift, shift+1)
+        shift_x = np.random.randint(0, shift+1)
         coords[:, 0]       += shift_x
         primary_vertex[0]  += shift_x
 
     if 'y' in selected_axes:
-        shift_y = np.random.randint(-shift, shift+1)
+        shift_y = np.random.randint(0, shift+1)
         coords[:, 1]       += shift_y
         primary_vertex[1]  += shift_y
 
@@ -293,14 +293,15 @@ def translate(coords, modules, primary_vertex, metadata, shift=4, selected_axes=
 
         # pick shifts (in module units) so that all (modules + s) stay in [0, n_mod-1]
         cur_min, cur_max = int(modules.min()), int(modules.max())
-        valid_shifts = [
-            s for s in range(-cur_min, n_mod - cur_max)
-        ]
-        if valid_shifts:
-            s = np.random.choice(valid_shifts)
-            modules += s         # shift every hit’s module
+        if shift_modules:
+            valid_shifts = [
+                s for s in range(-cur_min, n_mod - cur_max)
+            ]
+            if valid_shifts:
+                s = np.random.choice(valid_shifts)
+                modules += s         # shift every hit’s module
 
-        shift_z = np.random.randint(-shift, shift+1)
+        shift_z = np.random.randint(0, shift+1)
         coords[:, 2]       += shift_z
         primary_vertex[2]  += shift_z
 

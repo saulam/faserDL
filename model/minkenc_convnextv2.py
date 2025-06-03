@@ -24,7 +24,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import RelPosEncoderLayer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
+from .utils import PositionalEncoding, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
 def _init_weights(m):
@@ -52,6 +52,8 @@ def _init_weights(m):
     elif isinstance(m, nn.LayerNorm):
         nn.init.constant_(m.bias, 0)
         nn.init.constant_(m.weight, 1.0)
+    elif isinstance(m, nn.Embedding):
+        nn.init.trunc_normal_(m.weight, std=0.02)
     elif isinstance(m, nn.LSTM):
         # For each parameter tensor in the LSTM:
         for name, param in m.named_parameters():
@@ -68,6 +70,8 @@ def _init_weights(m):
                 hidden_size = m.hidden_size
                 # forget-gate slice is the 2nd quarter
                 param.data[hidden_size:2*hidden_size].fill_(1)
+    elif hasattr(m, 'empty_mod_emb'):
+        trunc_normal_(m.empty_mod_emb, std=0.02)
 
 
 class MinkEncConvNeXtV2(nn.Module):
@@ -132,7 +136,7 @@ class MinkEncConvNeXtV2(nn.Module):
         # Module-level real-pos transformer
         d_mod = encoder_dims[-1]
         heads_m = 12
-        self.mod_layer = RelPosEncoderLayer(d_model=d_mod, nhead=heads_m, num_special_tokens=1)
+        self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, num_layers=2)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, d_mod))
 
         # Global features encoder
@@ -142,7 +146,8 @@ class MinkEncConvNeXtV2(nn.Module):
         heads_e = 12
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=5)
-        self.event_pos = nn.Embedding(self.num_modules, d_mod)  # positional embedding for modules
+        #self.event_pos = nn.Embedding(self.num_modules, d_mod)  # positional embedding for modules
+        self.pos_encoder = PositionalEncoding(d_model=d_mod, max_len=self.num_modules)
 
         # Task branches (across modules)
         self.branch_names = [
@@ -163,14 +168,15 @@ class MinkEncConvNeXtV2(nn.Module):
             "jet_momentum_mag": 1,
             "jet_momentum_dir": 3,
         }
-        self.num_tasks = len(self.branch_names)
+        self.num_tasks = 1 #len(self.branch_names)
         self.cls_task = nn.Parameter(torch.zeros(1, self.num_tasks, d_mod))
         self.branches = nn.ModuleDict()
         for name in self.branch_names:
             if name == "flavour":
                 self.branches[name] = nn.Linear(d_mod, branch_out_channels[name])
             else:
-                self.branches[name] = nn.Linear(d_mod + 4, branch_out_channels[name])
+                #self.branches[name] = nn.Linear(d_mod + 4, branch_out_channels[name])
+                self.branches[name] = nn.Linear(d_mod, branch_out_channels[name])
                 
         # Initialise weights
         self.apply(_init_weights)
@@ -210,7 +216,7 @@ class MinkEncConvNeXtV2(nn.Module):
         key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)          # [M, L+1]
         zero_coord = torch.zeros((len(grouped_feats), 1, 3), device=padded_coords.device)
         seq_coords = torch.cat([zero_coord, padded_coords], dim=1)    # [M, L+1, 3]
-        mod_out = self.mod_layer(seq_mod, seq_coords, key_mask_mod)
+        mod_out = self.mod_transformer(seq_mod, seq_coords, key_mask_mod)
         mod_emb = mod_out[:, 0, :]                                    # [M, d]     
 
         # Event-level Transformer
@@ -219,7 +225,7 @@ class MinkEncConvNeXtV2(nn.Module):
         pos_lists = [module_pos[module_to_event == e] for e in range(B)]
         pad_evt = pad_sequence(evt_lists, batch_first=True)             # [B, M_max, d]
         pad_pos = pad_sequence(pos_lists, batch_first=True)             # [B, M_max]
-        pos_emb = self.event_pos(pad_pos)                               # [B, M_max, d]
+        pos_emb = self.pos_encoder.pe[0, pad_pos]
         seq_evt = pad_evt + pos_emb
         lengths_evt = torch.tensor([g.size(0) for g in evt_lists], device=seq_evt.device)
         M_max = seq_evt.size(1)
@@ -234,10 +240,18 @@ class MinkEncConvNeXtV2(nn.Module):
         
         # Branch-specific processing
         outputs = {}
-        flavour_index = self.branch_names.index("flavour")
-        flav_logits = self.branches["flavour"](evt_emb[:, flavour_index]) 
-        outputs["out_flavour"] = flav_logits 
+        #flavour_index = self.branch_names.index("flavour")
+        #flav_logits = self.branches["flavour"](evt_emb[:, flavour_index]) 
+        #outputs["out_flavour"] = flav_logits 
         for i, (name, branch) in enumerate(self.branches.items()):
+            
+            if name == "flavour":
+                outputs[f"out_{name}"] = branch(evt_emb[:, 0])
+            if "_dir" in name:
+                outputs[f"out_{name}"] = F.normalize(branch(evt_emb[:, 0]), dim=-1)
+            else:
+                outputs[f"out_{name}"] = F.softplus(branch(evt_emb[:, 0]))
+            '''
             if name == "flavour":
                 continue  # already handled
             reg_input = torch.cat([evt_emb[:, i], flav_logits], dim=1)  # [B,d+4]
@@ -245,6 +259,7 @@ class MinkEncConvNeXtV2(nn.Module):
                 outputs[f"out_{name}"] = F.normalize(branch(reg_input), dim=-1)
             else:
                 outputs[f"out_{name}"] = F.softplus(branch(reg_input))
+            '''
         return outputs
 
     def replace_depthwise_with_channelwise(self):

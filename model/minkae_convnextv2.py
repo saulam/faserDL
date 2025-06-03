@@ -74,7 +74,7 @@ def _init_weights(m):
         trunc_normal_(m.empty_mod_emb, std=0.02)
 
 
-class MinkUNetConvNeXtV2(nn.Module):
+class MinkAEConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
         """
         Args:
@@ -190,6 +190,11 @@ class MinkUNetConvNeXtV2(nn.Module):
             Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
             MinkowskiConvolution(decoder_dims[-1], 3, kernel_size=1, stride=1, dimension=D),
         )
+        self.charge_layer = nn.Sequential(
+            MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
+            Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
+            MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
+        )
 
         # Initialise weights
         self.apply(_init_weights)
@@ -209,11 +214,9 @@ class MinkUNetConvNeXtV2(nn.Module):
         """        
         # Encoder
         x = self.stem(x)
-        x_enc = []
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
             if i < self.nb_elayers - 1:
-                x_enc.append(x)
                 x = self.downsample_layers[i](x)
 
         # Module-level Transformer
@@ -267,17 +270,17 @@ class MinkUNetConvNeXtV2(nn.Module):
         )
 
         # Decoder with skip connections
-        x_enc = x_enc[::-1]
         for i in range(self.nb_dlayers):
             x = self.upsample_layers[i](x)
-            x = x + x_enc[i]
             x = self.decoder_layers[i](x)
 
         out_primlepton = self.primlepton_layer(x)
         out_seg = self.seg_layer(x)
+        out_charge = self.charge_layer(x)
         return {
             "out_primlepton": out_primlepton,
-            "out_seg": out_seg
+            "out_seg": out_seg,
+            "out_charge": out_charge,
         }
 
     def replace_depthwise_with_channelwise(self):

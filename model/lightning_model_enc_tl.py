@@ -19,7 +19,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def __init__(self, model, args):
         super(SparseEncTlLightningModel, self).__init__()
         self.model = model
-        self.preprocessing = args.preprocessing
         
         # Loss functions
         self.loss_flavour = nn.CrossEntropyLoss()
@@ -278,8 +277,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
                     base += 1  # one ID reserved for downsample_layers[x]
             return base
 
-        # 2) ENCODER LAYERS (each Block) & DOWNSAMPLE LAYERS interleaved
-        #    encoder_layers[i][j] → ID = 1 + (all blocks+dowmsamples before it) + j
+        # 2) ENCODER LAYERS & DOWNSAMPLE LAYERS interleaved
         m = re.match(r"model\.encoder_layers\.(\d+)\.(\d+)\.", name)
         if m:
             i = int(m.group(1))
@@ -302,47 +300,44 @@ class SparseEncTlLightningModel(pl.LightningModule):
             used += counts[i]
             return used
 
-        # 3) MODULE‐LEVEL TRANSFORMER (mod_layer & its cls_mod) → next single ID
-        if name.startswith("model.mod_layer") or name.startswith("model.cls_mod"):
-            return compute_base()
+        # 3) MODULE‐LEVEL TRANSFORMER (mod_transformer layers & cls_mod)
+        base = compute_base()
+        num_mod = len(self.model.mod_transformer.layers)  # number of mod_transformer layers
 
-        # 4) EVENT‐LEVEL TRANSFORMER (each of its 5 TransformerEncoderLayer’s)
+        m = re.match(r"model\.mod_transformer\.layers\.(\d+)\.", name)
+        if m:
+            k = int(m.group(1))
+            return base + k
+    
+        if name.startswith("model.cls_mod"):
+            return base  # same ID as mod_transformer.layers.0        
+
+        # 4) EVENT‐LEVEL TRANSFORMER & related heads
+        num_evt = len(self.model.event_transformer.layers)  # e.g. 5
         m = re.match(r"model\.event_transformer\.layers\.(\d+)\.", name)
         if m:
-            k = int(m.group(1))  # 0..4
-            base = compute_base()
-            return base + 1 + k  # IDs = base+1, base+2, …, base+5
-
-        # 5) global_feats_encoder, event_pos, cls_task → ALL share ID = (base + 1 + num_evt_layers)
+            k = int(m.group(1))
+            return base + num_mod + k
+    
         if (name.startswith("model.global_feats_encoder")
-            or name.startswith("model.event_pos")
+            or name.startswith("model.pos_embed")
             or name.startswith("model.cls_task")):
-            base = compute_base()
-            num_evt_layers = len(self.model.event_transformer.layers)  # =5
-            return base + 1 + num_evt_layers
+            return base + num_mod  # same ID as first event layer
 
-        # 6) All branches (“model.branches.<any>.*”) → share ID = (base + 1 + num_evt_layers + 1)
+        # 5) All branches (“model.branches.*” or “log_sigma”) follow all event‐level IDs
         if name.startswith("model.branches") or name.startswith("log_sigma"):
-            base = compute_base()
-            num_evt_layers = len(self.model.event_transformer.layers)
-            return base + 1 + num_evt_layers + 1
+            return base + num_mod + num_evt
 
         raise Exception("Parameter name undefined: {}".format(name))
 
 
     def _get_layerwise_param_groups(self):
-        nb_elayers = self.model.nb_elayers
-        counts = self.encoder_block_counts 
-        base = 1  # IDs start from 1 immediately after stem
-        for k in range(nb_elayers):
-            base += counts[k]
-            if k < nb_elayers - 1:
-                base += 1  # one ID for downsample_layers[k]
-    
-        # max layers
-        num_event_layers = len(self.model.event_transformer.layers)
-        branch_id = base + 1 + num_event_layers + 1
-        max_layer_id = branch_id
+        layer_ids = [
+            self._get_layer_id(name)
+            for name, param in self.named_parameters()
+            if param.requires_grad
+        ]
+        max_layer_id = max(layer_ids) if layer_ids else 0
     
         groups = {}
         for name, param in self.named_parameters():

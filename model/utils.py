@@ -78,8 +78,8 @@ class RelPosSelfAttention(nn.Module):
         ci = c.unsqueeze(2)  # [B,N,1,3]
         cj = c.unsqueeze(1)  # [B,1,N,3]
         dpos = ci - cj       # [B,N,N,3]
-        dist = torch.norm(dpos, dim=-1, keepdim=True)   # [B, N, N, 1]
-        dpos_with_norm = torch.cat([dpos, dist], dim=-1)  # [B, N, N, 4]
+        dist = torch.norm(dpos, dim=-1, keepdim=True)             # [B, N, N, 1]
+        dpos_with_norm = torch.cat([dpos, dist], dim=-1)          # [B, N, N, 4]
         bias = self.bias_mlp(dpos_with_norm).permute(0, 3, 1, 2)  # [B,heads,N,N]
         
         # zero out bias for special tokens
@@ -148,7 +148,8 @@ class RelPosTransformer(nn.Module):
             x = layer(x, coords, key_padding_mask)
         return x
 
-        
+
+'''
 class GlobalFeatureEncoder(nn.Module):
     """
     Encodes a set of global features consisting of four scalar energies and two small sequences.
@@ -188,21 +189,65 @@ class GlobalFeatureEncoder(nn.Module):
         seqB = x[:, 13:].unsqueeze(-1)
 
         # Scalar path
-        emb_s = self.scalar_mlp(scalars)              # → (batch, encoder_dim)
+        emb_s = self.scalar_mlp(scalars)              # (batch, encoder_dim)
 
         # Seq A
         _, (hA, _) = self.seqA_lstm(seqA)
         hA = hA.sum(0)                                # (batch, hidden_dim)
-        emb_A = self.seqA_proj(hA)                    # → (batch, encoder_dim)
+        emb_A = self.seqA_proj(hA)                    # (batch, encoder_dim)
 
         # Seq B
         _, (hB, _) = self.seqB_lstm(seqB)
         hB = hB.sum(0)                                # (batch, hidden_dim)
-        emb_B = self.seqB_proj(hB)                    # → (batch, encoder_dim)
+        emb_B = self.seqB_proj(hB)                    # (batch, encoder_dim)
 
         # Fuse into a single “token” and normalise
-        global_token = emb_s + emb_A + emb_B          # element-wise sum
-        return self.norm(global_token)                # matches transformer scale
+        global_token = emb_s + emb_A + emb_B
+        return self.norm(global_token)
+'''
+class GlobalFeatureEncoder(nn.Module):
+    """
+    Encodes a set of global features consisting of four scalar energies and two small sequences.
+
+    Inputs:
+      - x: Tensor of shape (batch_size, 23) or (batch_size, 28)
+        Order:
+          [0]    rear_cal_energy
+          [1]    rear_hcal_energy
+          [2]    rear_mucal_energy
+          [3]    faser_cal_energy
+          [4:13] 9-module energy sequence (rear_hcal_modules)
+          [13:]  10-or-15-module energy sequence (faser_cal_modules)
+
+    Args:
+      hidden_dim: int, hidden size for intermediate heads
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.scalar_mlp = nn.Linear(4, hidden_dim)
+        self.seqA_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
+        self.seqB_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        scalars = x[:, :4]
+        seqA = x[:, 4:13].unsqueeze(-1)
+        seqB = x[:, 13:].unsqueeze(-1)
+
+        # Scalar path
+        emb_s = self.scalar_mlp(scalars)   # (batch, hidden_dim)
+
+        # Seq A
+        _, (hA, _) = self.seqA_lstm(seqA)
+        emb_A = hA.sum(0)                  # (batch, hidden_dim)
+
+        # Seq B
+        _, (hB, _) = self.seqB_lstm(seqB)
+        emb_B = hB.sum(0)                  # (batch, hidden_dim)
+
+        # Fuse into a single “token” and normalise
+        global_token = emb_s + emb_A + emb_B
+        return self.norm(global_token)
 
 
 class MinkowskiSE(nn.Module):

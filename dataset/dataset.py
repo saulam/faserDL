@@ -87,11 +87,7 @@ class SparseFASERCALDataset(Dataset):
         dirs = [x.copy() for x in dirs_ori]
 
         # mirror
-        if self.stage1:
-            selected_axes = ['x', 'y', 'z']
-        else:
-            selected_axes = ['x', 'y']
-        coords, modules, dirs, primary_vertex = mirror(coords, modules, dirs, primary_vertex, self.metadata, selected_axes=selected_axes)
+        coords, modules, dirs, primary_vertex = mirror(coords, modules, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # rotate
         coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
         # translate

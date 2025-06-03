@@ -17,16 +17,16 @@ beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
 save_dir="logs_final"
-name="seg_v5.1b_att_sqrt_remove"
+name="ae_v5.1b_remove"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="seg_v5.1b_att_sqrt_remove"
+checkpoint_name="ae_v5.1b_remove"
 early_stop_patience=10
 load_checkpoint="checkpoints_final/seg_v5.1_att_std/loss_val_total/last.ckpt"
 gpus=(1)
 
-python -m train.train_seg \
+python -m train.train_ae \
     --train \
     --stage1 \
     --augmentations_enabled \
