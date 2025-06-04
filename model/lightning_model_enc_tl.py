@@ -320,6 +320,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
             return base + num_mod + k
     
         if (name.startswith("model.global_feats_encoder")
+            or name.startswith("model.empty_mod_emb")
             or name.startswith("model.pos_embed")
             or name.startswith("model.cls_task")):
             return base + num_mod  # same ID as first event layer

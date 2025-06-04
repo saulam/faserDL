@@ -13,6 +13,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
+from timm.models.layers import trunc_normal_
 from MinkowskiEngine import (
     SparseTensor,
     MinkowskiConvolution,
@@ -25,6 +27,47 @@ from MinkowskiEngine import (
 
 import torch
 import torch.nn as nn
+
+
+def _init_weights(m):
+    """Custom weight initialization for various layers."""
+    if isinstance(m, MinkowskiConvolution):
+        trunc_normal_(m.kernel, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, MinkowskiDepthwiseConvolution):
+        trunc_normal_(m.kernel, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, MinkowskiLinear):
+        trunc_normal_(m.linear.weight, std=0.02)
+        if m.linear.bias is not None:
+            nn.init.constant_(m.linear.bias, 0)
+    elif isinstance(m, nn.Linear):
+        trunc_normal_(m.weight, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Embedding):
+        nn.init.trunc_normal_(m.weight, std=0.02)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.constant_(m.bias, 0)
+        nn.init.constant_(m.weight, 1.0)
+    elif isinstance(m, nn.LSTM):
+        for name, param in m.named_parameters():
+            if 'weight_ih' in name:
+                init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                init.orthogonal_(param.data)
+            elif 'bias' in name:
+                param.data.fill_(0)
+                hidden_size = m.hidden_size
+                param.data[hidden_size:2*hidden_size].fill_(1)
+    elif hasattr(m, 'empty_mod_emb'):
+        trunc_normal_(m.empty_mod_emb, std=0.02)
+    elif hasattr(m, 'cls_mod'):
+        trunc_normal_(m.cls_mod, std=0.02)
+    elif hasattr(m, 'cls_task'):
+        trunc_normal_(m.cls_task, std=0.02)
 
 
 class PositionalEncoding(nn.Module):

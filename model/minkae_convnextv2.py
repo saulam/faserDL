@@ -3,14 +3,12 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 04.25
 
-Description: PyTorch model - stage 1: semantic segmentation.
+Description: PyTorch model - stage 1: semantic segmentation using an autoencoder + transformer.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
-from timm.models.layers import trunc_normal_
 from torch.nn.utils.rnn import pad_sequence
 
 import MinkowskiEngine as ME
@@ -24,54 +22,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import PositionalEncoding, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
-
-
-def _init_weights(m):
-    """Custom weight initialization for various layers."""
-    if isinstance(m, MinkowskiConvolution):
-        trunc_normal_(m.kernel, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, MinkowskiConvolutionTranspose):
-        trunc_normal_(m.kernel, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, ME.MinkowskiDepthwiseConvolution):
-        trunc_normal_(m.kernel, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, MinkowskiLinear):
-        trunc_normal_(m.linear.weight, std=0.02)
-        if m.linear.bias is not None:
-            nn.init.constant_(m.linear.bias, 0)
-    elif isinstance(m, nn.Linear):
-        trunc_normal_(m.weight, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Embedding):
-        nn.init.trunc_normal_(m.weight, std=0.02)
-    elif isinstance(m, nn.LayerNorm):
-        nn.init.constant_(m.bias, 0)
-        nn.init.constant_(m.weight, 1.0)
-    elif isinstance(m, nn.LSTM):
-        # For each parameter tensor in the LSTM:
-        for name, param in m.named_parameters():
-            if 'weight_ih' in name:
-                # input-to-hidden weights: Xavier uniform
-                init.xavier_uniform_(param.data)
-            elif 'weight_hh' in name:
-                # hidden-to-hidden (recurrent) weights: orthogonal
-                init.orthogonal_(param.data)
-            elif 'bias' in name:
-                # biases: zero, except forget-gate bias = 1
-                param.data.fill_(0)
-                # each bias is [b_ii | b_if | b_ig | b_io], so
-                hidden_size = m.hidden_size
-                # forget-gate slice is the 2nd quarter
-                param.data[hidden_size:2*hidden_size].fill_(1)
-    elif hasattr(m, 'empty_mod_emb'):
-        trunc_normal_(m.empty_mod_emb, std=0.02)
+from .utils import _init_weights, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
 class MinkAEConvNeXtV2(nn.Module):
@@ -223,7 +174,6 @@ class MinkAEConvNeXtV2(nn.Module):
         coords_all = x.C[:, 1:].float()            # [N, 3]
         feats_all = x.F                            # [N, d]
         batch_ids = x.C[:, 0].long()               # [N]
-        
         grouped_feats = [feats_all[batch_ids == m] for m in range(len(module_to_event))]
         grouped_coords = [coords_all[batch_ids == m] for m in range(len(module_to_event))]
         padded_feats = pad_sequence(grouped_feats, batch_first=True)   # [M, L, d]

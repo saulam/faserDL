@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 from functools import partial
 from utils import transfer_weights, CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
 from dataset import SparseFASERCALDataset
-from model import MinkUNetConvNeXtV2, MinkEncConvNeXtV2, SparseEncTlLightningModel
+from model import MinkAEConvNeXtV2, MinkEncConvNeXtV2, SparseEncTlLightningModel
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
@@ -70,7 +70,7 @@ def main():
     accum = args.accum_grad_batches
 
     # Model and LightningModule
-    pretrained_model = MinkUNetConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
+    pretrained_model = MinkAEConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
     base_model = MinkEncConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
     
     # Transfer weights from pretrained model to new model
