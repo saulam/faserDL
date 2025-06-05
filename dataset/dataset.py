@@ -282,17 +282,12 @@ class SparseFASERCALDataset(Dataset):
                 raise ValueError(f"{internal_name}: std is zero in metadata")
             x = (x - stats["mean"]) / stats["std"]
 
-        if x.shape == (1,) and preprocessing is None and not standardize:
-            return x.item()
-        else:
-            return x
+        return x
 
 
     def unpreprocess(self, x, param_name, preprocessing=None, standardize=False):
-        was_scalar = False
         if np.ndim(x) == 0 or (isinstance(x, np.ndarray) and x.shape == ()):
             x = np.atleast_1d(x)
-            was_scalar = True
 
         internal_name = param_name
         if preprocessing == "sqrt":
@@ -311,10 +306,7 @@ class SparseFASERCALDataset(Dataset):
         elif preprocessing == "log":
             x = np.expm1(x)
 
-        if was_scalar and x.shape == (1,):
-            return x.item()
-        else:
-            return x
+        return x
         
 
     def get_param(self, data, param_name, preprocessing=None, standardize=False):
@@ -457,7 +449,6 @@ class SparseFASERCALDataset(Dataset):
             output['run_number'] = run_number
             output['event_id'] = event_id
             output['primary_vertex'] = primary_vertex
-            output['is_cc'] = is_cc
             output['in_neutrino_pdg'] = in_neutrino_pdg
             output['in_neutrino_energy'] = in_neutrino_energy
             output['vis_sp_momentum'] = vis_sp_momentum
@@ -478,6 +469,7 @@ class SparseFASERCALDataset(Dataset):
         output['modules'] = torch.from_numpy(modules).long()
         output['feats'] = torch.from_numpy(feats).float()
         output['feats_global'] = torch.from_numpy(feats_global).float()
+        output['is_cc'] = torch.from_numpy(is_cc).float()
 
         return output
 

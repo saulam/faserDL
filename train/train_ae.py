@@ -68,13 +68,12 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
     callbacks = []
     monitored_losses = [
-            #"loss/val_flavour", 
-            "loss/val_primlepton", 
-            #'loss/val_ghost',
-            #'loss/val_elect',
-            #'loss/val_hadro',
+            'loss/val_primlepton',
             'loss/val_seg',
-            "loss/val_total"]
+            'loss/val_charge',
+            'loss/val_iscc',
+            'loss/val_total',
+    ]
     for loss_name in monitored_losses:
         checkpoint = ModelCheckpoint(
             dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss_name.replace('/', '_')}",

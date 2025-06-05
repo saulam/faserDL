@@ -62,12 +62,16 @@ def _init_weights(m):
                 param.data.fill_(0)
                 hidden_size = m.hidden_size
                 param.data[hidden_size:2*hidden_size].fill_(1)
+    elif hasattr(m, 'mask_voxel_emb'):
+        trunc_normal_(m.mask_voxel_emb, std=0.02)
     elif hasattr(m, 'empty_mod_emb'):
         trunc_normal_(m.empty_mod_emb, std=0.02)
     elif hasattr(m, 'cls_mod'):
         trunc_normal_(m.cls_mod, std=0.02)
     elif hasattr(m, 'cls_task'):
         trunc_normal_(m.cls_task, std=0.02)
+    elif hasattr(m, 'iscc_token'):
+        trunc_normal_(m.cls_task, std=0.02)        
 
 
 class PositionalEncoding(nn.Module):

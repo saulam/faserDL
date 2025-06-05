@@ -55,11 +55,10 @@ class MinkAEConvNeXtV2(nn.Module):
         dp_cur = 0
 
         # Stem
-        self.stem = nn.Sequential(
-             MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D),
-             MinkowskiLayerNorm(encoder_dims[0], eps=1e-6),
-        )
-
+        self.stem_conv = MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D)
+        self.stem_norm = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
+        self.mask_voxel_emb = nn.Parameter(torch.zeros(encoder_dims[0]))  # embedding for masked voxels
+        
         # Build encoder
         self.encoder_layers = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
@@ -84,8 +83,6 @@ class MinkAEConvNeXtV2(nn.Module):
                 )
                 self.downsample_layers.append(downsample_layer)
 
-        self.dropout = nn.Dropout(0.1)
-
         # Module-level real-pos transformer
         d_mod = encoder_dims[-1]
         heads_m = 12
@@ -101,6 +98,9 @@ class MinkAEConvNeXtV2(nn.Module):
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.pos_embed = nn.Embedding(self.num_modules, d_mod)
+        self.iscc_token = nn.Parameter(torch.zeros(1, 1, d_mod))
+        self.iscc_norm = nn.LayerNorm(d_mod)
+        self.dropout = nn.Dropout(0.1)
         
         # Decoder configuration (reversing the encoder dimensions)
         decoder_depths = [2] * len(encoder_depths)
@@ -130,7 +130,7 @@ class MinkAEConvNeXtV2(nn.Module):
             self.decoder_layers.append(decoder_layer)
             dp_cur_dec += decoder_depths[i]
 
-        # Semantic segmentation prediction layers.
+        # Prediction layers
         self.primlepton_layer = nn.Sequential(
             MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
             Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
@@ -146,11 +146,12 @@ class MinkAEConvNeXtV2(nn.Module):
             Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
             MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
         )
+        self.iscc_layer = nn.Linear(d_mod, 1)
 
         # Initialise weights
         self.apply(_init_weights)
 
-    def forward(self, x, x_glob, module_to_event, module_pos):
+    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool=None):
         """
         Forward pass through the encoder-decoder network.
 
@@ -159,12 +160,24 @@ class MinkAEConvNeXtV2(nn.Module):
             x_glob: Global feature tensor.
             module_to_event: mapping module index to event index tensor
             module_pos: mapping module index to module position tensor
+            mask_bool: mask for voxels (masked autoencoder).
 
         Returns:
             A dictionary with voxel predictions.
         """        
         # Encoder
-        x = self.stem(x)
+        x = self.stem_conv(x)
+        if mask_bool is not None:
+            num_masked = mask_bool.sum().item()
+            masked_feats = x.F.clone()
+            replacement = self.mask_voxel_emb.unsqueeze(0).expand(num_masked, -1).to(masked_feats.dtype)
+            masked_feats[mask_bool] = replacement
+            x = ME.SparseTensor(
+                features=masked_feats,
+                coordinate_map_key=x.coordinate_map_key,
+                coordinate_manager=x.coordinate_manager,
+            )
+        x = self.stem_norm(x)
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
             if i < self.nb_elayers - 1:
@@ -202,9 +215,11 @@ class MinkAEConvNeXtV2(nn.Module):
         pos_emb = self.pos_embed(pos_indices).unsqueeze(0)            # [1, num_modules, d]
         seq_evt = pad_evt + pos_emb                                   # [B, num_modules, d]
         glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)     # [B, 1, d]
-        seq_evt = self.dropout(torch.cat([glob_emb, seq_evt], dim=1)) # [B, 1+num_modules, d]
+        iscc_token = self.iscc_token.expand(B, 1, -1)                 # [B, K, d]
+        seq_evt = self.dropout(torch.cat([iscc_token, glob_emb, seq_evt], dim=1)) # [B, 1+num_modules, d]
         evt_out = self.event_transformer(seq_evt)                     # [B, 1+num_modules, d]
-        updated_mod_emb = evt_out[event_idx, 1 + module_idx, :]       # [M, d]
+        evt_emb = self.dropout(self.iscc_norm(evt_out[:, 0, :]))
+        updated_mod_emb = evt_out[event_idx, 2 + module_idx, :]       # [M, d]
 
         # Broadcast back to voxels
         voxel_mod_feat = torch.zeros_like(feats_all)    # [N, d_mod]
@@ -227,10 +242,12 @@ class MinkAEConvNeXtV2(nn.Module):
         out_primlepton = self.primlepton_layer(x)
         out_seg = self.seg_layer(x)
         out_charge = self.charge_layer(x)
+        out_iscc = self.iscc_layer(evt_emb)
         return {
             "out_primlepton": out_primlepton,
             "out_seg": out_seg,
             "out_charge": out_charge,
+            "out_iscc": out_iscc,
         }
 
     def replace_depthwise_with_channelwise(self):

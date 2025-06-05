@@ -28,9 +28,10 @@ class SparseAELightningModel(pl.LightningModule):
         super(SparseAELightningModel, self).__init__()
 
         self.model = model
-        self.loss_sigmoid = nn.BCEWithLogitsLoss()
-        self.loss_softmax = nn.CrossEntropyLoss()
+        self.loss_primlepton = nn.BCEWithLogitsLoss()
+        self.loss_seg = nn.CrossEntropyLoss()
         self.loss_charge = nn.MSELoss()
+        self.loss_iscc = nn.BCEWithLogitsLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -59,8 +60,8 @@ class SparseAELightningModel(pl.LightningModule):
     '''
 
     
-    def forward(self, x, x_glob, module_to_event, module_pos):
-        return self.model(x, x_glob, module_to_event, module_pos)
+    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool):
+        return self.model(x, x_glob, module_to_event, module_pos, mask_bool)
 
 
     def _arrange_batch(self, batch):
@@ -70,25 +71,29 @@ class SparseAELightningModel(pl.LightningModule):
         return batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target
 
 
-    def compute_losses(self, batch_output, target, target_charge):
+    def compute_losses(self, batch_output, target, target_charge, mask_bool):
         # pred
         out_primlepton = batch_output['out_primlepton'].F
         out_seg = batch_output['out_seg'].F
-        out_charge = batch_output['out_charge'].F
+        out_charge = batch_output['out_charge'].F[mask_bool]
+        out_iscc = batch_output['out_iscc'].squeeze(-1)
 
         # true
         targ_primlepton = target['primlepton_labels']
         targ_seg = target['seg_labels']
-        targ_charge = target_charge
+        targ_charge = target_charge[mask_bool]
+        targ_iscc = target['is_cc']
 
         # losses
-        loss_primlepton = self.loss_sigmoid(out_primlepton, targ_primlepton)
-        loss_seg = self.loss_softmax(out_seg, targ_seg)
+        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
+        loss_seg = self.loss_seg(out_seg, targ_seg)
         loss_charge = self.loss_charge(out_charge, targ_charge)
+        loss_iscc = self.loss_iscc(out_iscc, targ_iscc)
 
         part_losses = {'primlepton': loss_primlepton,
                        'seg': loss_seg,
                        'charge': loss_charge,
+                       'iscc': loss_iscc,
                        }
         total_loss = sum(part_losses.values())
 
@@ -99,9 +104,24 @@ class SparseAELightningModel(pl.LightningModule):
         batch_size = len(batch["c"])
         batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
 
+        # Build mask_bool: 10% of the N_active voxels
+        orig_charge = batch_input.F.clone()  # [N_active, 1] or [N_active]
+        N_active = batch_input.F.size(0)
+        mask_bool = torch.zeros(N_active, dtype=torch.bool, device=batch_input.F.device)
+        if self.training:
+            # Random every time
+            prob = torch.rand(N_active, device=batch_input.F.device)
+            mask_bool = prob < 0.10
+        else:
+            # Deterministic mask for validation: fixed seed
+            gen = torch.Generator(device=batch_input.F.device)
+            gen.manual_seed(0)
+            prob = torch.rand(N_active, generator=gen, device=batch_input.F.device)
+            mask_bool = prob < 0.10
+
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
-        loss, part_losses = self.compute_losses(batch_output, target, batch_input.F)
+        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask_bool)
+        loss, part_losses = self.compute_losses(batch_output, target, orig_charge, mask_bool)
   
         # Retrieve current learning rate
         lr = self.optimizers().param_groups[0]['lr']
