@@ -97,7 +97,7 @@ class MinkAEConvNeXtV2(nn.Module):
         heads_e = 12
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
-        self.pos_embed = nn.Embedding(1 + 1 + self.num_modules, d_mod)
+        self.pos_embed = nn.Embedding(1 + self.num_modules, d_mod)
         self.iscc_token = nn.Parameter(torch.zeros(1, 1, d_mod))
         self.iscc_norm = nn.LayerNorm(d_mod)
         self.dropout = nn.Dropout(0.1)
@@ -214,9 +214,9 @@ class MinkAEConvNeXtV2(nn.Module):
         iscc_token = self.iscc_token.expand(B, 1, -1)                     # [B, 1, d]
         glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)         # [B, 1, d]
         seq_evt = torch.cat([iscc_token, glob_emb, pad_evt], dim=1)       # [B, 1 + 1+ num_modules, d]
-        pos_indices = torch.arange(2 + self.num_modules, device=device)   # [1 + 1 + num_modules]
-        pos_emb = self.pos_embed(pos_indices).unsqueeze(0)                # [1, 1 + 1 + num_modules, d]
-        seq_evt = seq_evt + pos_emb                                       # [B, 1 + 1 + num_modules, d]
+        pos_indices = torch.arange(1 + self.num_modules, device=device)   # [1 + num_modules]
+        pos_emb = self.pos_embed(pos_indices).unsqueeze(0)                # [1, 1 + num_modules, d]
+        seq_evt[:, 1:] = seq_evt[:, 1:] + pos_emb                         # [B, 1 + num_modules, d]
         evt_out = self.event_transformer(seq_evt)                         # [B, 1 + 1 + num_modules, d]
         evt_emb = self.dropout(self.iscc_norm(evt_out[:, 0, :]))          # [B, d]
         updated_mod_emb = evt_out[event_idx, 2 + module_idx, :]           # [M, d]
