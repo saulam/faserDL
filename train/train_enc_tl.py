@@ -121,8 +121,8 @@ def main():
     _, w1, c1, s1 = compute_scheduler_args(
         nb_batches, accum, nb_gpus,
         phase_epochs=args.phase1_epochs,
-        phase_warmup=args.phase1_epochs,
-        phase_cosine=0,
+        phase_warmup=args.phase1_epochs//2,
+        phase_cosine=args.phase1_epochs//2,
     )
     lightning_model.warmup_steps = w1
     lightning_model.cosine_annealing_steps = c1
@@ -134,7 +134,7 @@ def main():
     callbacks1= make_callbacks("phase1")
     
     trainer1 = pl.Trainer(
-        max_epochs=args.phase1_epochs,  # e.g. 5
+        max_epochs=args.phase1_epochs,
         callbacks=callbacks1,
         accelerator="gpu",
         devices=nb_gpus,
@@ -151,13 +151,11 @@ def main():
     )
     
     # 5) Phase 2: unfreeze rest of the model
-    #args.batch_size =  args.batch_size // 2
-    #train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
     _, w2, c2, s2 = compute_scheduler_args(
         nb_batches, accum, nb_gpus,
         phase_epochs=args.phase2_epochs,
-        phase_warmup=0,
-        phase_cosine=args.phase2_epochs,
+        phase_warmup=3,
+        phase_cosine=args.phase2_epochs-3,
     )
     lightning_model.warmup_steps = w2
     lightning_model.cosine_annealing_steps = c2

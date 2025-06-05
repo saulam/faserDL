@@ -33,14 +33,18 @@ class SparseEncTlLightningModel(pl.LightningModule):
         self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
         self.log_sigma_e_vis = nn.Parameter(torch.zeros(()))
         self.log_sigma_pt_miss = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lepton_momentum = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_momentum = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lepton_momentum_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_momentum_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_momentum_dir = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = [
             self.log_sigma_flavour,
             self.log_sigma_e_vis,
             self.log_sigma_pt_miss,
-            self.log_sigma_lepton_momentum,
-            self.log_sigma_jet_momentum,
+            self.log_sigma_lepton_momentum_mag,
+            self.log_sigma_lepton_momentum_dir,
+            self.log_sigma_jet_momentum_mag,
+            self.log_sigma_jet_momentum_dir,
         ]
         self.log_sigma_params = set(self._uncertainty_params)
         
@@ -127,8 +131,10 @@ class SparseEncTlLightningModel(pl.LightningModule):
         total_loss = ( weighted_classification(loss_flavour, self.log_sigma_flavour)
                      + weighted_regression(loss_e_vis, self.log_sigma_e_vis)
                      + weighted_regression(loss_pt_miss, self.log_sigma_pt_miss)
-                     + weighted_regression(loss_lepton_momentum_mag + loss_lepton_momentum_dir, self.log_sigma_lepton_momentum)
-                     + weighted_regression(loss_jet_momentum_mag + loss_jet_momentum_dir, self.log_sigma_jet_momentum)
+                     + weighted_regression(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag)
+                     + weighted_regression(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir)
+                     + weighted_regression(loss_jet_momentum_mag, self.log_sigma_jet_momentum_mag)
+                     + weighted_regression(loss_jet_momentum_dir, self.log_sigma_jet_momentum_dir)
                    )
 
         return total_loss, part_losses
@@ -326,7 +332,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
             return base + num_mod  # same ID as first event layer
 
         # 5) All branches (“model.branches.*” or “log_sigma”) follow all event‐level IDs
-        if name.startswith("model.branches") or name.startswith("log_sigma"):
+        if name.startswith("model.branches") or name.startswith("model.branch_norm") or name.startswith("log_sigma"):
             return base + num_mod + num_evt
 
         raise Exception("Parameter name undefined: {}".format(name))
