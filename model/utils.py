@@ -25,10 +25,6 @@ from MinkowskiEngine import (
 )
 
 
-import torch
-import torch.nn as nn
-
-
 def _init_weights(m):
     """Custom weight initialization for various layers."""
     if isinstance(m, MinkowskiConvolution):
@@ -71,7 +67,7 @@ def _init_weights(m):
     elif hasattr(m, 'cls_task'):
         trunc_normal_(m.cls_task, std=0.02)
     elif hasattr(m, 'iscc_token'):
-        trunc_normal_(m.cls_task, std=0.02)        
+        trunc_normal_(m.iscc_token, std=0.02)        
 
 
 class PositionalEncoding(nn.Module):

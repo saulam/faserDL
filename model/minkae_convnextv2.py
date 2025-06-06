@@ -22,7 +22,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import _init_weights, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
+from .utils import _init_weights, RelPosTransformer, Block, MinkowskiLayerNorm
 
 
 class MinkAEConvNeXtV2(nn.Module):
@@ -99,7 +99,6 @@ class MinkAEConvNeXtV2(nn.Module):
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.pos_embed = nn.Embedding(1 + self.num_modules, d_mod)
         self.iscc_token = nn.Parameter(torch.zeros(1, 1, d_mod))
-        self.iscc_norm = nn.LayerNorm(d_mod)
         self.dropout = nn.Dropout(0.1)
         
         # Decoder configuration (reversing the encoder dimensions)
@@ -195,11 +194,12 @@ class MinkAEConvNeXtV2(nn.Module):
         L = padded_feats.size(1)
         pad_mask = torch.arange(L, device=lengths.device).unsqueeze(0) >= lengths.unsqueeze(1)
         cls_mod = self.cls_mod.expand(len(grouped_feats), -1, -1)          # [M, 1, d]
-        seq_mod = self.dropout(torch.cat([cls_mod, padded_feats], dim=1))  # [M, L+1, d]
+        seq_mod = torch.cat([cls_mod, padded_feats], dim=1)                # [M, 1 + L, d]
+        seq_mod = self.dropout(seq_mod)                                    # [M, 1 + L, d]
         cls_pad = torch.zeros((len(grouped_feats), 1), dtype=torch.bool, device=pad_mask.device)
-        key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)               # [M, L+1]
+        key_mask_mod = torch.cat([cls_pad, pad_mask], dim=1)               # [M, 1 + L]
         zero_coord = torch.zeros((len(grouped_feats), 1, 3), device=padded_coords.device)
-        seq_coords = torch.cat([zero_coord, padded_coords], dim=1)         # [M, L+1, 3]
+        seq_coords = torch.cat([zero_coord, padded_coords], dim=1)         # [M, 1 + L, 3]
         mod_out = self.mod_transformer(seq_mod, seq_coords, key_mask_mod)
         mod_emb = mod_out[:, 0, :]                                         # [M, d]
 
@@ -208,17 +208,19 @@ class MinkAEConvNeXtV2(nn.Module):
         d = mod_emb.size(1)
         device = mod_emb.device
         pad_evt = self.empty_mod_emb.unsqueeze(0).unsqueeze(0).expand(B, self.num_modules, d).clone()  # [B, num_modules, d]
-        event_idx = module_to_event.long()    # [M]
-        module_idx = module_pos.long()        # [M]
+        event_idx = module_to_event.long()                                # [M]
+        module_idx = module_pos.long()                                    # [M]
         pad_evt[event_idx, module_idx, :] = mod_emb
         iscc_token = self.iscc_token.expand(B, 1, -1)                     # [B, 1, d]
         glob_emb = self.global_feats_encoder(x_glob).unsqueeze(1)         # [B, 1, d]
         seq_evt = torch.cat([iscc_token, glob_emb, pad_evt], dim=1)       # [B, 1 + 1+ num_modules, d]
         pos_indices = torch.arange(1 + self.num_modules, device=device)   # [1 + num_modules]
         pos_emb = self.pos_embed(pos_indices).unsqueeze(0)                # [1, 1 + num_modules, d]
-        seq_evt[:, 1:] = seq_evt[:, 1:] + pos_emb                         # [B, 1 + num_modules, d]
+        seq_evt[:, 1:] = seq_evt[:, 1:] + pos_emb                         
+        seq_evt = self.dropout(seq_evt)                                   # [B, 1 + 1 + num_modules, d]
         evt_out = self.event_transformer(seq_evt)                         # [B, 1 + 1 + num_modules, d]
-        evt_emb = self.dropout(self.iscc_norm(evt_out[:, 0, :]))          # [B, d]
+        evt_emb = evt_out[:, 0, :]                                        # [B, d]
+        evt_emb = self.dropout(evt_emb)                                   # [B, d]
         updated_mod_emb = evt_out[event_idx, 2 + module_idx, :]           # [M, d]
         
         # Broadcast back to voxels
