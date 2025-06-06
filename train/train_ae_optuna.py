@@ -12,6 +12,7 @@ from model import MinkAEConvNeXtV2, SparseAELightningModel
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
 
+torch.set_float32_matmul_precision("medium")
 pl_major = int(pl.__version__.split(".")[0])
 
 class CustomProgressBar(TQDMProgressBar):
