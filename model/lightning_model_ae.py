@@ -20,9 +20,6 @@ from functools import partial
 from packaging import version
 
 
-pl_version = pl.__version__
-
-
 class SparseAELightningModel(pl.LightningModule):
     def __init__(self, model, args):
         super(SparseAELightningModel, self).__init__()
@@ -181,7 +178,7 @@ class SparseAELightningModel(pl.LightningModule):
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer=optimizer,
                 T_max=self.cosine_annealing_steps,
-                eta_min=self.lr/1000.,
+                eta_min=0.,
             )
 
         # Combine both schedulers
