@@ -16,6 +16,10 @@ from model import MinkAEConvNeXtV2, MinkEncConvNeXtV2, SparseEncTlLightningModel
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
+
+torch.set_float32_matmul_precision("medium")
+pl_major = int(pl.__version__.split(".")[0])
+
 class CustomProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):
         bar = super().init_train_tqdm()
@@ -138,6 +142,7 @@ def main():
         callbacks=callbacks1,
         accelerator="gpu",
         devices=nb_gpus,
+        precision="bf16-mixed" if pl_major >= 2 else 32,
         strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger1, tb_logger1],
         log_every_n_steps=args.log_every_n_steps,
@@ -171,6 +176,7 @@ def main():
         callbacks=callbacks2,
         accelerator="gpu",
         devices=nb_gpus,
+        precision="bf16-mixed" if pl_major >= 2 else 32,
         strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger2, tb_logger2],
         log_every_n_steps=args.log_every_n_steps,

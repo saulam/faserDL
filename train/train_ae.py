@@ -19,6 +19,9 @@ from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
 
 
+torch.set_float32_matmul_precision("medium")
+pl_major = int(pl.__version__.split(".")[0])
+
 class CustomProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):
         bar = super().init_train_tqdm()
@@ -53,9 +56,15 @@ def main():
 
     # Calculate arguments for scheduler
     nb_batches = len(train_loader)
-    args.scheduler_steps = nb_batches * args.cosine_annealing_steps // (args.accum_grad_batches * nb_gpus)
-    args.warmup_steps = nb_batches * args.warmup_steps // (args.accum_grad_batches * nb_gpus)
-    args.start_cosine_step = (nb_batches * args.epochs // (args.accum_grad_batches * nb_gpus)) - args.scheduler_steps
+    denom = args.accum_grad_batches * nb_gpus
+    args.lr = args.lr * (args.batch_size * denom) / 256.
+    args.scheduler_steps = nb_batches * args.cosine_annealing_steps // denom
+    args.warmup_steps = nb_batches * args.warmup_steps // denom
+    args.start_cosine_step = (nb_batches * args.epochs // denom) - args.scheduler_steps
+    print(f"lr               = {args.lr}")
+    print(f"scheduler_steps  = {args.scheduler_steps}")
+    print(f"warmup_steps     = {args.warmup_steps}")
+    print(f"start_cosine_step= {args.start_cosine_step}")
 
     # Initialize the model
     model = MinkAEConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
@@ -111,7 +120,7 @@ def main():
         callbacks=callbacks,
         accelerator="gpu",
         devices=nb_gpus,
-        precision="bf16-mixed",
+        precision="bf16-mixed" if pl_major >= 2 else 32,
         strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
