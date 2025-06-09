@@ -48,7 +48,7 @@ def mirror(coords, modules, dirs, primary_vertex, metadata, selected_axes=['x', 
             if axis<2:
                 coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
             else:
-                module_size = int((metadata['z'][:,1]==0).sum()) - 4
+                module_size = int((metadata['z'][:,1]==0).sum())
                 n_mod       = metadata['z'][:,1].max() + 1
                 coords[:, axis] = module_size - coords[:, axis] - 1
                 modules = n_mod - modules - 1

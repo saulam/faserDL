@@ -57,15 +57,20 @@ class SparseAELightningModel(pl.LightningModule):
     '''
 
     
-    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool):
+    def forward(self, 
+                x, 
+                x_glob,
+                module_to_event, 
+                module_pos, 
+                mask_bool):
         return self.model(x, x_glob, module_to_event, module_pos, mask_bool)
 
 
     def _arrange_batch(self, batch):
-        batch_input, batch_input_global = arrange_sparse_minkowski(batch, self.device)
+        batch_input, *global_params = arrange_sparse_minkowski(batch, self.device)
         batch_module_to_event, batch_module_pos = batch['module_to_event'], batch['module_pos']
         target = arrange_truth(batch)
-        return batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target
+        return batch_input, *global_params, batch_module_to_event, batch_module_pos, target
 
 
     def compute_losses(self, batch_output, target, target_charge, mask_bool):
@@ -99,7 +104,7 @@ class SparseAELightningModel(pl.LightningModule):
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
+        batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
 
         # Build mask_bool: 10% of the N_active voxels
         orig_charge = batch_input.F.clone()  # [N_active, 1] or [N_active]

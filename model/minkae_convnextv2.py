@@ -22,7 +22,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import _init_weights, RelPosTransformer, Block, MinkowskiLayerNorm
+from .utils import _init_weights, GlobalFeatureEncoder, RelPosTransformer, Block, MinkowskiLayerNorm
 
 
 class MinkAEConvNeXtV2(nn.Module):
@@ -86,20 +86,21 @@ class MinkAEConvNeXtV2(nn.Module):
         # Module-level real-pos transformer
         d_mod = encoder_dims[-1]
         heads_m = 12
-        self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, num_layers=2)
+        self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, 
+                                                 num_layers=2, dropout=args.dropout)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, d_mod))
 
         # Global features encoder and empty module embedding
-        self.global_feats_encoder = nn.Linear(1 + 1 + 1 + 1 + 9 + self.num_modules, d_mod)
+        self.global_feats_encoder = GlobalFeatureEncoder(d_model=d_mod, dropout=args.dropout)
         self.empty_mod_emb = nn.Parameter(torch.zeros(d_mod))
 
         # Event-level transformer (across modules)
         heads_e = 12
-        evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
+        evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True, dropout=args.dropout)
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.pos_embed = nn.Embedding(1 + self.num_modules, d_mod)
         self.iscc_token = nn.Parameter(torch.zeros(1, 1, d_mod))
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(args.dropout)
         
         # Decoder configuration (reversing the encoder dimensions)
         decoder_depths = [2] * len(encoder_depths)
@@ -156,7 +157,7 @@ class MinkAEConvNeXtV2(nn.Module):
 
         Args:
             x: Input sparse tensor.
-            x_glob: Global feature tensor.
+            x_glob: Global feature tensors.
             module_to_event: mapping module index to event index tensor
             module_pos: mapping module index to module position tensor
             mask_bool: mask for voxels (masked autoencoder).
@@ -218,7 +219,10 @@ class MinkAEConvNeXtV2(nn.Module):
         pos_emb = self.pos_embed(pos_indices).unsqueeze(0)                # [1, 1 + num_modules, d]
         seq_evt[:, 1:] = seq_evt[:, 1:] + pos_emb                         
         seq_evt = self.dropout(seq_evt)                                   # [B, 1 + 1 + num_modules, d]
-        evt_out = self.event_transformer(seq_evt)                         # [B, 1 + 1 + num_modules, d]
+        S = 1 + 1 + self.num_modules
+        mask = torch.zeros(S, S, device=device)
+        mask[:, 1] = float('-inf')
+        evt_out = self.event_transformer(seq_evt, mask=mask)              # [B, 1 + 1 + num_modules, d]
         evt_emb = evt_out[:, 0, :]                                        # [B, d]
         evt_emb = self.dropout(evt_emb)                                   # [B, d]
         updated_mod_emb = evt_out[event_idx, 2 + module_idx, :]           # [M, d]

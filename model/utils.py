@@ -192,47 +192,95 @@ class RelPosTransformer(nn.Module):
 
 class GlobalFeatureEncoder(nn.Module):
     """
-    Encodes a set of global features consisting of four scalar energies and two small sequences.
-
-    Inputs:
-      - x: Tensor of shape (batch_size, 23) or (batch_size, 28)
-        Order:
-          [0]    rear_cal_energy
-          [1]    rear_hcal_energy
-          [2]    rear_mucal_energy
-          [3]    faser_cal_energy
-          [4:13] 9-module energy sequence (rear_hcal_modules)
-          [13:]  10-or-15-module energy sequence (faser_cal_modules)
+    Encodes global detector information (Rear ECal, Rear HCal, scalars)
+    into a single embedding for use as a [GLOBAL] token.
 
     Args:
-      hidden_dim: int, hidden size for intermediate heads
+        ecal_hidden_dim (int): Channels for the ECal Conv2D.
+        hcal_hidden_dim (int): Hidden size per direction for HCal BiLSTM.
+        scalar_hidden_dim (int): Hidden size for MuTag projection.
+        d_model (int): Final embedding dimension (transformer hidden size).
     """
-    def __init__(self, hidden_dim):
+    def __init__(self,
+                 scalar_hidden_dim: int = 64,
+                 fasercal_hidden_dim: int = 64,
+                 ecal_hidden_dim: int = 64,                 
+                 hcal_hidden_dim: int = 64,
+                 d_model: int = 768,
+                 dropout: float = 0.1,
+                ):
         super().__init__()
-        self.scalar_mlp = nn.Linear(4, hidden_dim)
-        self.seqA_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
-        self.seqB_lstm = nn.LSTM(1, hidden_dim, batch_first=True, bidirectional=True)
-        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x):
-        scalars = x[:, :4]
-        seqA = x[:, 4:13].unsqueeze(-1)
-        seqB = x[:, 13:].unsqueeze(-1)
+        # Scalars: single scalar → project → mu_hidden_dim
+        self.scalars_proj = nn.Linear(4, scalar_hidden_dim)
 
-        # Scalar path
-        emb_s = self.scalar_mlp(scalars)   # (batch, hidden_dim)
+        # FASERCal lstm encoder
+        self.fasercal_lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=fasercal_hidden_dim//2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
 
-        # Seq A
-        _, (hA, _) = self.seqA_lstm(seqA)
-        emb_A = hA.sum(0)                  # (batch, hidden_dim)
+        # ECal conv encoder
+        self.ecal_encoder = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=ecal_hidden_dim, kernel_size=3),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),  # (batch, ecal_hidden_dim, 1, 1)
+            nn.Flatten()              # (batch, ecal_hidden_dim)
+        )
+        
+        # HCal lstm encoder
+        self.hcal_lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=hcal_hidden_dim//2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        # Fuse all three → project to d_model
+        fused_dim = scalar_hidden_dim + fasercal_hidden_dim + ecal_hidden_dim + hcal_hidden_dim
+        self.fusion_proj = nn.Linear(fused_dim, d_model)
+        self.dropout = nn.Dropout(0.1)
 
-        # Seq B
-        _, (hB, _) = self.seqB_lstm(seqB)
-        emb_B = hB.sum(0)                  # (batch, hidden_dim)
+    def forward(self,
+                x_glob) -> torch.Tensor:
+        """
+        Args (list):
+            [scalars: Tensor of shape (batch, 4)
+             fasercal: Tensor of shape (batch, 10)
+             ecal: Tensor of shape (batch, 5, 5)
+             hcal: Tensor of shape (batch, 9)
+            }
 
-        # Fuse into a single “token” and normalise
-        global_token = emb_s + emb_A + emb_B
-        return self.norm(global_token)
+        Returns:
+            Tensor of shape (batch, d_model): the [GLOBAL] embedding
+        """
+        scalars_in, fasercal, ecal, hcal = x_glob
+
+        # Scalars path
+        scalars_feat = self.scalars_proj(scalars_in)
+
+        # FASERCal path
+        x_fasercal = hcal.unsqueeze(-1)
+        outputs, (h_n, _) = self.fasercal_lstm(x_fasercal)
+        fasercal_feat = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        
+        # ECal path
+        x_ecal = ecal.unsqueeze(1)
+        ecal_feat = self.ecal_encoder(x_ecal)
+        
+        # HCal path
+        x_hcal = hcal.unsqueeze(-1)
+        outputs, (h_n, _) = self.hcal_lstm(x_hcal)
+        hcal_feat = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        
+        # Fuse and project
+        combined = torch.cat([scalars_feat, fasercal_feat, ecal_feat, hcal_feat], dim=1)
+        global_embed = self.fusion_proj(combined)
+        return self.dropout(global_embed)
 
 
 class MinkowskiSE(nn.Module):

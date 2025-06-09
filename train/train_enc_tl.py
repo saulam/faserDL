@@ -58,6 +58,7 @@ def main():
     print("\n- Arguments:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
+    base_lr = args.lr
 
     # GPU setup
     nb_gpus = len(args.gpus)
@@ -89,16 +90,26 @@ def main():
     del pretrained_model
     print("Weights transferred succesfully")
 
+    iscc_token = state_dict['iscc_token']                   # shape (1, 1, d_mod)
+    num_tasks = base_model.num_tasks
+    d_mod     = iscc_token.size(-1)
+    cls_task_weights = iscc_token.repeat(1, num_tasks, 1)   # (1, num_tasks, d_mod)
+    with torch.no_grad():
+        base_model.cls_task.data.copy_(cls_task_weights)
+    print("Cls tokens transferred too")  
+
     # 1) define the list of losses you want to monitor (same for all phases)
     monitor_losses = [
         "loss/val_total",
         "loss/val_flavour",
-        "loss/val_e_vis",
+        "loss/val_charm",
+        "loss/val_e_vis_cc",
+        "loss/val_e_vis_nc",
+        "loss/val_pt_miss"
         "loss/val_jet_momentum_dir",
         "loss/val_jet_momentum_mag",
         "loss/val_lepton_momentum_dir",
         "loss/val_lepton_momentum_mag",
-        "loss/val_pt_miss"
     ]
     
     # 2) helper to build a fresh checkpoint callback list for each phase
@@ -119,6 +130,7 @@ def main():
         return cbs
     
     # 3) Instantiate your LightningModule
+    args.lr = base_lr * 10
     lightning_model = SparseEncTlLightningModel(model=base_model, args=args)
 
     # 4) Phase 1: train only the new heads + task‐transformer
@@ -162,6 +174,7 @@ def main():
         phase_warmup=3,
         phase_cosine=args.phase2_epochs-3,
     )
+    lightning_model.lr = base_lr
     lightning_model.warmup_steps = w2
     lightning_model.cosine_annealing_steps = c2
     lightning_model.start_cosine_step = s2

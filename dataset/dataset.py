@@ -41,7 +41,6 @@ class SparseFASERCALDataset(Dataset):
             self.metadata['y'] = np.array(self.metadata['y'])
             self.metadata['z'] = np.array(self.metadata['z'])
         self.module_size = int((self.metadata['z'][:,1]==0).sum())
-        self.gap_size = 4
         self.standardize_input = args.standardize_input
         self.standardize_output = args.standardize_output
         self.preprocessing_input = args.preprocessing_input
@@ -95,7 +94,7 @@ class SparseFASERCALDataset(Dataset):
         # drop voxels
         coords, modules, feats, labels = drop(coords, modules, feats, labels, std_dev=0.1)
         # shift feature values
-        feats = shift_q_gaussian(feats, std_dev=0.01)
+        feats = shift_q_gaussian(feats, std_dev=0.05)
         # keep within limits
         #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         if coords.shape[0] < 2:
@@ -309,12 +308,12 @@ class SparseFASERCALDataset(Dataset):
         return x
         
 
-    def get_param(self, data, param_name, preprocessing=None, standardize=False):
+    def get_param(self, data, param_name, preprocessing=None, standardize=False, suffix=""):
         if param_name not in data:
             return None
 
         param = data[param_name]
-        param = self.preprocess(param, param_name, preprocessing, standardize)
+        param = self.preprocess(param, param_name + suffix, preprocessing, standardize)
 
         return param
 
@@ -343,23 +342,22 @@ class SparseFASERCALDataset(Dataset):
         vis_sp_momentum = self.get_param(data, 'vis_sp_momentum')
         jet_momentum = self.get_param(data, 'jet_momentum')
         is_cc = self.get_param(data, 'is_cc')
-        e_vis = self.get_param(data, 'e_vis', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
+        charm = self.get_param(data, 'charm')
+        e_vis = self.get_param(data, 'e_vis', preprocessing=self.preprocessing_output, standardize=self.standardize_output, 
+                               suffix='_cc' if is_cc else '_nc')
         pt_miss = self.get_param(data, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
-        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_cal_modules = self.get_param(data, 'rear_cal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        
         primary_vertex = data['primary_vertex']
-
-        if not self.is_v5 and not is_cc:
-            # Fix jet momentum and no outgoing lepton momentum for NC events
-            jet_momentum = jet_momentum + out_lepton_momentum
-
         if not is_cc:
             out_lepton_momentum.fill(0)
-
+        
         # momentum -> direction + magnitude
         out_lepton_momentum_mag, out_lepton_momentum_dir = self.decompose_momentum(out_lepton_momentum)
         out_lepton_momentum_mag = self.preprocess(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude', 
@@ -383,20 +381,11 @@ class SparseFASERCALDataset(Dataset):
         # voxelise coordinates and prepare global features and labels
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
-        feats_global = np.concatenate([rear_cal_energy, rear_hcal_energy, rear_mucal_energy, 
-                                       faser_cal_energy, rear_hcal_modules, faser_cal_modules])   
+        
+        feats_global = np.concatenate([faser_cal_energy, rear_cal_energy, rear_hcal_energy, rear_mucal_energy])   
         flavour_label = self.pdg2label(in_neutrino_pdg, is_cc)
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)
-
-        if self.is_v5:
-            # mask out voxels between modules
-            mask = ~((coords[:, 2] % self.module_size) >= (self.module_size - self.gap_size))
-            coords = coords[mask]
-            modules = modules[mask]
-            q = q[mask]
-            primlepton_labels = primlepton_labels[mask]
-            seg_labels = seg_labels[mask]
 
         if self.load_seg:
             # load labels from pretrained model predictions
@@ -434,10 +423,10 @@ class SparseFASERCALDataset(Dataset):
             # merge duplicated coordinates and finalise with augmentations
             #coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
             seg_labels = self.normalise_seg_labels(seg_labels)
-            if not self.stage1:
-                primlepton_labels = add_gaussian_noise(primlepton_labels, shuffle_prob=0.)
-                seg_labels = add_gaussian_noise(seg_labels, shuffle_prob=0.)
-            feats_global = add_noise_global_params(feats_global)
+            feats_global = shift_q_gaussian(feats_global, std_dev=0.05)
+            faser_cal_modules = shift_q_gaussian(faser_cal_modules, std_dev=0.05)
+            rear_cal_modules = shift_q_gaussian(rear_cal_modules, std_dev=0.05)
+            rear_hcal_modules = shift_q_gaussian(rear_hcal_modules, std_dev=0.05)
         
         # ptmiss
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
@@ -453,6 +442,7 @@ class SparseFASERCALDataset(Dataset):
             output['in_neutrino_energy'] = in_neutrino_energy
             output['vis_sp_momentum'] = vis_sp_momentum
         if not self.train or not self.stage1:
+            output['charm'] = torch.tensor(charm).float()
             output['e_vis'] = torch.from_numpy(e_vis).float()
             output['pt_miss'] = torch.from_numpy(pt_miss).float()
             output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag).float()
@@ -469,6 +459,9 @@ class SparseFASERCALDataset(Dataset):
         output['modules'] = torch.from_numpy(modules).long()
         output['feats'] = torch.from_numpy(feats).float()
         output['feats_global'] = torch.from_numpy(feats_global).float()
+        output['faser_cal_modules'] = torch.from_numpy(faser_cal_modules).float()
+        output['rear_cal_modules'] = torch.from_numpy(rear_cal_modules).float()
+        output['rear_hcal_modules'] = torch.from_numpy(rear_hcal_modules).float()
         output['is_cc'] = torch.from_numpy(is_cc).float()
 
         return output

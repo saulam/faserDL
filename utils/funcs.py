@@ -106,6 +106,9 @@ def collate_test(batch):
     ret = {
         'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
+        'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
+        'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
         'c': coords_list,
         'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
         'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
@@ -114,13 +117,13 @@ def collate_test(batch):
     optional_keys = [
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
+        'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
         'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
     ]
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label']
+            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm']
                         else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
                         else [d[key] for d in batch])
     
@@ -143,20 +146,23 @@ def collate_sparse_minkowski(batch):
     ret = {
         'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
+        'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
+        'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
         'c': coords_list,
         'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
         'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = {
-        'primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label',
+        'primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm',
         'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
         'jet_momentum_mag', 'jet_momentum_dir',
     }
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
+            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
                         else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_dir', 'jet_momentum_dir']
                         else [d[key] for d in batch])
     
@@ -170,8 +176,11 @@ def arrange_sparse_minkowski(data, device):
         device=device
     )
     tensor_global = data['f_glob']
+    faser_cal = data['faser_cal_modules']
+    rear_cal = data['rear_cal_modules']
+    rear_hcal = data['rear_hcal_modules']
 
-    return tensor, tensor_global
+    return tensor, tensor_global, faser_cal, rear_cal, rear_hcal
 
 def arrange_truth(data):
     output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}
@@ -179,7 +188,7 @@ def arrange_truth(data):
     optional_keys = [
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
+        'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
         'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
     ]
     

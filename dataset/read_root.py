@@ -1,7 +1,7 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 05.25
 
 Description: script to generate numpy files.
 """
@@ -13,6 +13,7 @@ import glob
 import numpy as np
 import tqdm
 import argparse
+import json
 
 
 version = "5.1"
@@ -23,6 +24,9 @@ reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(v
 output_dir = '/scratch2/salonso/faser/events_v{}'.format(version_reco)
 
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
+
+with open(path + "charm_events.json", 'r') as file:
+    charm_events = json.load(file)
 
 # Placeholder for class objects
 tcal_event = ROOT.TcalEvent()
@@ -231,7 +235,10 @@ def generate_events(number, chunks, disable):
 
             # Extract global event information
             po_event = tporeco_event.GetPOEvent()
+            geom_detector = tporeco_event.geom_detector
+            
             run_number, event_id = po_event.run_number, po_event.event_id
+            charm = event_id in charm_events
             primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             is_cc = bool(po_event.isCC)
             e_vis = po_event.Evis
@@ -267,12 +274,16 @@ def generate_events(number, chunks, disable):
             rear_cal_energy = tporeco_event.rearCals.rearCalDeposit
             rear_hcal_energy = tporeco_event.rearCals.rearHCalDeposit
             rear_mucal_energy = tporeco_event.rearCals.rearMuCalDeposit
-            rear_hcal_modules = np.zeros(9)
-            faser_cal_modules = np.zeros(10) 
+            rear_cal_modules = np.zeros(geom_detector.rearCalNxy**2)
+            rear_hcal_modules = np.zeros(geom_detector.rearHCalNxy)
+            faser_cal_modules = np.zeros(10)
+            for module in tporeco_event.rearCals.rearCalModule:
+                rear_cal_modules[module.moduleID] = module.energyDeposit
             for module in tporeco_event.rearCals.rearHCalModule:
                 rear_hcal_modules[module.moduleID] = module.energyDeposit
             for module in tporeco_event.faserCals:
                 faser_cal_modules[module.ModuleID] = module.EDeposit
+            rear_cal_modules = rear_cal_modules.reshape(geom_detector.rearCalNxy, geom_detector.rearCalNxy)
             faser_cal_energy = faser_cal_modules.sum()
 
             # Retrieve corresponding true event
@@ -283,6 +294,10 @@ def generate_events(number, chunks, disable):
             true_hits = get_true_hits(tcal_event)
             reco_hits, reco_hits_true = get_reco_hits(tporeco_event, tcal_event, true_hits)
 
+            if reco_hits.shape[0] < 5:
+                print("Skipping event {} with {} hits".format(event_id, reco_hits.shape[0]))
+                continue
+
             primlepton_labels, seg_labels = process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc)
             
             # Save event data
@@ -291,6 +306,7 @@ def generate_events(number, chunks, disable):
                 run_number=run_number,
                 event_id=event_id,
                 is_cc=is_cc,
+                charm=charm,
                 e_vis=e_vis,
                 sp_momentum=sp_momentum,
                 vis_sp_momentum=vis_sp_momentum,
@@ -312,11 +328,12 @@ def generate_events(number, chunks, disable):
                 out_lepton_momentum=out_lepton_momentum,
                 out_lepton_energy=out_lepton_energy,
                 rear_cal_energy=rear_cal_energy,
-                rear_hcal_modules=rear_hcal_modules,
+                rear_cal_modules=rear_cal_modules,
                 rear_hcal_energy=rear_hcal_energy,
-                rear_mucal_energy=rear_mucal_energy,
-                faser_cal_modules=faser_cal_modules,
+                rear_hcal_modules=rear_hcal_modules,
                 faser_cal_energy=faser_cal_energy,
+                faser_cal_modules=faser_cal_modules,
+                rear_mucal_energy=rear_mucal_energy,
                 primlepton_labels=primlepton_labels,
                 seg_labels=seg_labels,
             )

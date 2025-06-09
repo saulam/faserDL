@@ -22,7 +22,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import _init_weights, RelPosTransformer, Block, MinkowskiLayerNorm
+from .utils import _init_weights, GlobalFeatureEncoder, RelPosTransformer, Block, MinkowskiLayerNorm
 
 
 class MinkEncConvNeXtV2(nn.Module):
@@ -85,33 +85,38 @@ class MinkEncConvNeXtV2(nn.Module):
         # Module-level real-pos transformer
         d_mod = encoder_dims[-1]
         heads_m = 12
-        self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, num_layers=2)
+        self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, 
+                                                 num_layers=2, dropout=args.dropout)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, d_mod))
 
         # Global features encoder and empty module embedding
-        self.global_feats_encoder = nn.Linear(1 + 1 + 1 + 1 + 9 + self.num_modules, d_mod)
+        self.global_feats_encoder = GlobalFeatureEncoder(d_model=d_mod, dropout=args.dropout)
         self.empty_mod_emb = nn.Parameter(torch.zeros(d_mod))
 
         # Event-level transformer (across modules)
         heads_e = 12
-        evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True)
+        evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True, dropout=args.dropout)
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.pos_embed = nn.Embedding(1 + self.num_modules, d_mod)
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(args.dropout)
 
         # Task branches and corresponding token
         self.branch_tokens = {
             "flavour": 0,
-            "e_vis": 1,
-            "pt_miss": 0,
-            "lepton_momentum_mag": 0,
-            "lepton_momentum_dir": 0,
-            "jet_momentum_mag": 1,
-            "jet_momentum_dir": 1,
+            "charm": 1,
+            "e_vis_cc": 2,
+            "e_vis_nc": 3,
+            "pt_miss": 4,
+            "lepton_momentum_mag": 5,
+            "lepton_momentum_dir": 5,
+            "jet_momentum_mag": 6,
+            "jet_momentum_dir": 6,
         }
         branch_out_channels = {
             "flavour": 4,
-            "e_vis": 1,
+            "charm": 1,
+            "e_vis_cc": 1,
+            "e_vis_nc": 1,
             "pt_miss": 1,
             "lepton_momentum_mag": 1,
             "lepton_momentum_dir": 3,
@@ -182,7 +187,10 @@ class MinkEncConvNeXtV2(nn.Module):
         pos_emb = self.pos_embed(pos_indices).unsqueeze(0)                   # [1, 1 + num_modules, d]
         seq_evt[:, self.num_tasks:] = seq_evt[:, self.num_tasks:] + pos_emb  
         seq_evt = self.dropout(seq_evt)                                      # [B, K + 1 + num_modules, d]
-        evt_out = self.event_transformer(seq_evt)                            # [B, K + 1 + num_modules, d]
+        S = self.num_tasks + 1 + self.num_modules
+        mask = torch.zeros(S, S, device=device)
+        mask[:, self.num_tasks] = float('-inf')
+        evt_out = self.event_transformer(seq_evt, mask=mask)                 # [B, K + 1 + num_modules, d]
         evt_emb = evt_out[:, :self.num_tasks, :]                             # [B, K, d]
         evt_emb = self.dropout(evt_emb)                                      # [B, K, d]
         
@@ -190,7 +198,7 @@ class MinkEncConvNeXtV2(nn.Module):
         outputs = {}
         for i, (name, branch) in enumerate(self.branches.items()):
             output = branch(evt_emb[:, self.branch_tokens[name]])
-            if name == "flavour":
+            if name == "flavour" or name == "charm":
                 outputs[f"out_{name}"] = output
             if "_dir" in name:
                 outputs[f"out_{name}"] = F.normalize(output, dim=-1)

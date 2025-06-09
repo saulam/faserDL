@@ -113,22 +113,19 @@ class SphericalAngularLoss(torch.nn.Module):
 
     def forward(self, pred, target):
         """
-        Computes the combined loss given predicted and target 3D momentum vectors.
+        Computes the combined loss given predicted and target 3D direction vectors.
 
         Args:
-            pred (torch.Tensor): Predicted 3D momentum vectors (batch_size, 3).
-            target (torch.Tensor): True 3D momentum vectors (batch_size, 3).
+            pred (torch.Tensor): Predicted 3D direction vectors (batch_size, 3).
+            target (torch.Tensor): True 3D direction vectors (batch_size, 3).
 
         Returns:
             torch.Tensor: The computed loss.
         """
         mask = torch.any(target != 0, dim=1)
-
-        pred_norm = torch.nn.functional.normalize(pred, dim=-1, eps=self.eps)
-        target_norm = torch.nn.functional.normalize(target, dim=-1, eps=self.eps)
  
         # Compute the dot product (cosine of the angle)
-        dot_product = torch.sum(pred_norm * target_norm, dim=1).clamp(-0.9999, 0.9999)
+        dot_product = torch.sum(pred * target, dim=1).clamp(-0.9999, 0.9999)
 
         # Compute the angular distance (geodesic distance on the unit sphere)
         angular_loss = torch.acos(dot_product)  # Returns angles in radians
