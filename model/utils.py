@@ -67,7 +67,9 @@ def _init_weights(m):
     elif hasattr(m, 'cls_task'):
         trunc_normal_(m.cls_task, std=0.02)
     elif hasattr(m, 'iscc_token'):
-        trunc_normal_(m.iscc_token, std=0.02)        
+        trunc_normal_(m.iscc_token, std=0.02)   
+    elif hasattr(m, 'special_token_embeddings'):
+        trunc_normal_(m.special_token_embeddings, std=0.02)   
 
 
 class PositionalEncoding(nn.Module):
@@ -92,21 +94,55 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x):
         return self.pe[:, : x.size(1)]
+
+
+class PositionalEncoding3D(nn.Module):
+    """
+    3D sinusoidal positional encoding.
+
+    Args:
+        L (int): Number of frequency bands per axis. Produces 2*L features per axis, total out_dim = 6 * L.
+    """
+    def __init__(self, L: int):
+        super(PositionalEncoding3D, self).__init__()
+        self.L = L
+        freqs = 2. ** torch.arange(L).float() * torch.pi
+        self.register_buffer('freqs', freqs)
+
+    @property
+    def out_dim(self) -> int:
+        """Total output dimension of the encoding (6 * L)."""
+        return 6 * self.L
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        x, y, z = coords.unbind(-1)
+        xp = x.unsqueeze(-1) * self.freqs
+        yp = y.unsqueeze(-1) * self.freqs
+        zp = z.unsqueeze(-1) * self.freqs
+
+        # Compute sin/cos for each
+        sin_x, cos_x = torch.sin(xp), torch.cos(xp)
+        sin_y, cos_y = torch.sin(yp), torch.cos(yp)
+        sin_z, cos_z = torch.sin(zp), torch.cos(zp)
+
+        # Concatenate along feature dimension
+        pos_enc = torch.cat([sin_x, cos_x, sin_y, cos_y, sin_z, cos_z], dim=-1)
+        return pos_enc
         
 
 class RelPosSelfAttention(nn.Module):
-    def __init__(self, d_model, nhead, num_special_tokens=1):
+    def __init__(self, d_model, nhead, num_dims, num_special_tokens=1):
         super().__init__()
+        self.bias_alpha = nn.Parameter(torch.zeros(1))
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(num_dims + 1 if num_dims > 1 else num_dims, nhead * 4),
+            nn.GELU(),
+            nn.Linear(nhead * 4, nhead)
+        )
         self.nhead = nhead
         self.scale = (d_model // nhead) ** -0.5
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.out = nn.Linear(d_model, d_model)
-        self.bias_alpha = nn.Parameter(torch.zeros(1))
-        self.bias_mlp = nn.Sequential(
-            nn.Linear(4, nhead * 4),
-            nn.GELU(),
-            nn.Linear(nhead * 4, nhead)
-        )
         self.num_special_tokens = num_special_tokens
 
     def forward(self, x, coords, key_padding_mask=None):
@@ -116,12 +152,13 @@ class RelPosSelfAttention(nn.Module):
         c = coords
 
         # relative positional bias
-        ci = c.unsqueeze(2)  # [B,N,1,3]
-        cj = c.unsqueeze(1)  # [B,1,N,3]
-        dpos = ci - cj       # [B,N,N,3]
-        dist = torch.norm(dpos, dim=-1, keepdim=True)             # [B, N, N, 1]
-        dpos_with_norm = torch.cat([dpos, dist], dim=-1)          # [B, N, N, 4]
-        bias = self.bias_mlp(dpos_with_norm).permute(0, 3, 1, 2)  # [B,heads,N,N]
+        ci = c.unsqueeze(2)  # [B,N,1,C]
+        cj = c.unsqueeze(1)  # [B,1,N,C]
+        dpos = ci - cj       # [B,N,N,C]
+        if dpos.size(-1) > 1:
+            dist = torch.norm(dpos, dim=-1, keepdim=True)  # [B,N,N,1]
+            dpos = torch.cat([dpos, dist], dim=-1)         # [B,N,N,C+1]
+        bias = self.bias_mlp(dpos).permute(0, 3, 1, 2)     # [B,heads,N,N]
         
         # zero out bias for special tokens
         ns = self.num_special_tokens
@@ -138,13 +175,13 @@ class RelPosSelfAttention(nn.Module):
         attn = torch.softmax(logits, dim=-1)
         out = torch.einsum('bhij,bhjd->bhid', attn, v)
         out = out.transpose(1, 2).reshape(B, N, -1)
-        return self.out(out)
+        return self.out(out), attn
 
 
 class RelPosEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, num_special_tokens=1, dropout=0.1):
+    def __init__(self, d_model, nhead, num_special_tokens=1, num_dims=1, dropout=0.1):
         super().__init__()
-        self.self_attn = RelPosSelfAttention(d_model, nhead, num_special_tokens)
+        self.self_attn = RelPosSelfAttention(d_model, nhead, num_dims, num_special_tokens)
         self.linear1 = nn.Linear(d_model, d_model * 4)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_model * 4, d_model)
@@ -153,7 +190,7 @@ class RelPosEncoderLayer(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, src, coords, key_padding_mask=None):
-        attn_out = self.self_attn(src, coords, key_padding_mask)
+        attn_out, _ = self.self_attn(src, coords, key_padding_mask)
         src = src + self.dropout(attn_out)
         src = self.norm1(src)
         ffn = self.linear2(self.dropout(self.act(self.linear1(src))))
@@ -173,18 +210,27 @@ class RelPosTransformer(nn.Module):
       depth (int): number of layers (K)
       dropout (float): dropout rate inside each RelPosEncoderLayer
     """
-    def __init__(self, d_model: int, nhead: int, num_special_tokens: int = 1, num_layers: int = 6, dropout: float = 0.1):
+    def __init__(self, d_model: int, nhead: int, num_special_tokens: int = 1, num_layers: int = 6, 
+                 num_dims: int = 3, dropout: float = 0.1):
         super().__init__()
+        assert d_model % nhead==0, "d_model not divisible by number of heads"
         self.layers = nn.ModuleList([
             RelPosEncoderLayer(d_model=d_model, 
                                nhead=nhead, 
-                               num_special_tokens=num_special_tokens, 
+                               num_special_tokens=num_special_tokens,
+                               num_dims=num_dims,
                                dropout=dropout)
             for _ in range(num_layers)
         ])
+        self.num_special_tokens = num_special_tokens
+        self.special_token_embeddings = nn.Parameter(torch.zeros(num_special_tokens, d_model))
         self.num_layers = num_layers
 
     def forward(self, x: torch.Tensor, coords: torch.Tensor, key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        B, N_total, d = x.size()
+        N_regular = N_total - self.num_special_tokens
+        special_tokens_emb = self.special_token_embeddings.unsqueeze(0).expand(B, -1, -1)
+        x[:, :self.num_special_tokens, :] = x[:, :self.num_special_tokens, :] + special_tokens_emb
         for layer in self.layers:
             x = layer(x, coords, key_padding_mask)
         return x
@@ -202,30 +248,14 @@ class GlobalFeatureEncoder(nn.Module):
         d_model (int): Final embedding dimension (transformer hidden size).
     """
     def __init__(self,
-                 scalar_hidden_dim: int = 64,
-                 fasercal_hidden_dim: int = 64,
-                 ecal_hidden_dim: int = 64,                 
-                 hcal_hidden_dim: int = 64,
-                 d_model: int = 768,
+                 d_model: int = 512,
                  dropout: float = 0.1,
                 ):
         super().__init__()
 
-        # Scalars: single scalar → project → mu_hidden_dim
-        self.scalars_proj = nn.Linear(4, scalar_hidden_dim)
-
-        # FASERCal lstm encoder
-        self.fasercal_lstm = nn.LSTM(
-            input_size=1,
-            hidden_size=fasercal_hidden_dim//2,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-
         # ECal conv encoder
         self.ecal_encoder = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=ecal_hidden_dim, kernel_size=3),
+            nn.Conv2d(in_channels=1, out_channels=d_model, kernel_size=3),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),  # (batch, ecal_hidden_dim, 1, 1)
             nn.Flatten()              # (batch, ecal_hidden_dim)
@@ -234,39 +264,32 @@ class GlobalFeatureEncoder(nn.Module):
         # HCal lstm encoder
         self.hcal_lstm = nn.LSTM(
             input_size=1,
-            hidden_size=hcal_hidden_dim//2,
+            hidden_size=d_model,
             num_layers=1,
             batch_first=True,
             bidirectional=True
         )
+
+        # Scalars: single scalar → project → mu_hidden_dim
+        self.scalars_proj = nn.Linear(5, d_model)
         
         # Fuse all three → project to d_model
-        fused_dim = scalar_hidden_dim + fasercal_hidden_dim + ecal_hidden_dim + hcal_hidden_dim
-        self.fusion_proj = nn.Linear(fused_dim, d_model)
         self.dropout = nn.Dropout(0.1)
 
     def forward(self,
                 x_glob) -> torch.Tensor:
         """
         Args (list):
-            [scalars: Tensor of shape (batch, 4)
-             fasercal: Tensor of shape (batch, 10)
-             ecal: Tensor of shape (batch, 5, 5)
-             hcal: Tensor of shape (batch, 9)
-            }
+            [
+             ecal: Tensor of shape (batch, 5, 5),
+             hcal: Tensor of shape (batch, 9),
+             scalars: Tensor of shape (batch, 5),
+            ]
 
         Returns:
             Tensor of shape (batch, d_model): the [GLOBAL] embedding
         """
-        scalars_in, fasercal, ecal, hcal = x_glob
-
-        # Scalars path
-        scalars_feat = self.scalars_proj(scalars_in)
-
-        # FASERCal path
-        x_fasercal = hcal.unsqueeze(-1)
-        outputs, (h_n, _) = self.fasercal_lstm(x_fasercal)
-        fasercal_feat = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        ecal, hcal, scalars_in = x_glob
         
         # ECal path
         x_ecal = ecal.unsqueeze(1)
@@ -275,11 +298,13 @@ class GlobalFeatureEncoder(nn.Module):
         # HCal path
         x_hcal = hcal.unsqueeze(-1)
         outputs, (h_n, _) = self.hcal_lstm(x_hcal)
-        hcal_feat = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        hcal_feat = h_n[-2] + h_n[-1]
+
+        # Scalars path
+        scalars_feat = self.scalars_proj(scalars_in)
         
         # Fuse and project
-        combined = torch.cat([scalars_feat, fasercal_feat, ecal_feat, hcal_feat], dim=1)
-        global_embed = self.fusion_proj(combined)
+        global_embed = ecal_feat + hcal_feat + scalars_feat
         return self.dropout(global_embed)
 
 

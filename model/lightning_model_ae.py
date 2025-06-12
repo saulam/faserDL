@@ -18,6 +18,7 @@ from utils import (
 )
 from functools import partial
 from packaging import version
+from typing import Optional
 
 
 class SparseAELightningModel(pl.LightningModule):
@@ -101,25 +102,63 @@ class SparseAELightningModel(pl.LightningModule):
 
         return total_loss, part_losses
 
+
+    def create_mask(
+        self,
+        batch_input,
+        batch_module_to_event,
+        p_mask: float = 0.3,
+        p_module_mask: float = 0.5,
+        generator: Optional[torch.Generator] = None,
+    ):
+        """
+        Create a mask over voxels, mixing per-event random voxel masking
+        (up to p_mask fraction) with at most one full-module masking
+        per event (with probability p_module_mask), only when an event
+        has two or more non-empty modules.
+        """
+        N = batch_input.F.shape[0]
+        device = batch_input.F.device
+        voxel_mod = batch_input.C[:, 0].long()
+        voxel_evt = batch_module_to_event[voxel_mod]
+        mask = torch.zeros(N, dtype=torch.bool, device=device)
+    
+        evt_to_mods = {}
+        for m, e in enumerate(batch_module_to_event.tolist()):
+            evt_to_mods.setdefault(e, []).append(m)
+    
+        for e, mods in evt_to_mods.items():
+            if len(mods) < 2:
+                continue
+            if torch.rand(1, generator=generator, device=device) < p_module_mask:
+                m_choice = mods[torch.randint(len(mods), (1,), generator=generator, device=device).item()]
+                mask[voxel_mod == m_choice] = True
+    
+        for e in voxel_evt.unique():
+            evt_idx = (voxel_evt == e).nonzero(as_tuple=True)[0]
+            if mask[evt_idx].any():
+                # only skip if that event is already masked
+                continue
+            frac = torch.rand(1, generator=generator, device=device).item() * p_mask
+            perm = torch.rand(evt_idx.numel(), generator=generator, device=device)
+            mask[evt_idx[perm < frac]] = True
+    
+        return mask
+        
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
         batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
-
-        # Build mask_bool: 10% of the N_active voxels
-        orig_charge = batch_input.F.clone()  # [N_active, 1] or [N_active]
-        N_active = batch_input.F.size(0)
-        mask_bool = torch.zeros(N_active, dtype=torch.bool, device=batch_input.F.device)
+        orig_charge = batch_input.F.clone()
+    
+        # create the mask
         if self.training:
-            # Random every time
-            prob = torch.rand(N_active, device=batch_input.F.device)
-            mask_bool = prob < 0.10
+            mask_bool = self.create_mask(batch_input, batch_module_to_event)
         else:
-            # Deterministic mask for validation: fixed seed
+            # deterministic for validation
             gen = torch.Generator(device=batch_input.F.device)
             gen.manual_seed(0)
-            prob = torch.rand(N_active, generator=gen, device=batch_input.F.device)
-            mask_bool = prob < 0.10
+            mask_bool = self.create_mask(batch_input, batch_module_to_event, generator=gen)
 
         # Forward pass
         batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask_bool)

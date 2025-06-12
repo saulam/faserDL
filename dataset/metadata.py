@@ -150,6 +150,9 @@ class SparseFASERCALDataset(Dataset):
             out_lepton_momentum = np.array([]).reshape(0, 3)
         jet_momentum = jet_momentum.reshape(1, 3)
 
+        module_hits = np.bincount(reco_hits[:, 3].astype(int))
+        module_hits = module_hits[module_hits>0]
+        event_hits = np.array([reco_hits.shape[0]])
         rear_cal_energy = np.array([rear_cal_energy])
         rear_hcal_energy = np.array([rear_hcal_energy])
         rear_mucal_energy = np.array([rear_mucal_energy])
@@ -175,6 +178,8 @@ class SparseFASERCALDataset(Dataset):
                 "rear_mucal_energy": rear_mucal_energy,
                 "in_neutrino_energy": in_neutrino_energy,
                 "out_lepton_energy": out_lepton_energy,
+                "module_hits": module_hits,
+                "event_hits": event_hits,
                }
 
 dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v5.1b")
@@ -200,6 +205,8 @@ def collate(batch):
     rear_mucal_energy = np.concatenate([x['rear_mucal_energy'] for x in batch])
     in_neutrino_energy = np.concatenate([x['in_neutrino_energy'] for x in batch])
     out_lepton_energy = np.concatenate([x['out_lepton_energy'] for x in batch])
+    module_hits = np.concatenate([x['module_hits'] for x in batch])
+    event_hits = np.concatenate([x['event_hits'] for x in batch])
     
     
     return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
@@ -216,6 +223,8 @@ def collate(batch):
             "rear_mucal_energy": rear_mucal_energy,
             "in_neutrino_energy": in_neutrino_energy,
             "out_lepton_energy": out_lepton_energy,
+            "module_hits": module_hits,
+            "event_hits": event_hits,
            }
     
 loader = DataLoader(dataset, collate_fn=collate, batch_size=10, num_workers=10, drop_last=False, shuffle=False)
@@ -240,6 +249,8 @@ rear_hcal_modules = []
 rear_mucal_energy = []
 in_neutrino_energy = []
 out_lepton_energy = []
+module_hits = []
+event_hits = []
 
 t = tqdm(enumerate(loader), total=len(loader), disable=False)
 for i, batch in t:
@@ -263,6 +274,8 @@ for i, batch in t:
     rear_mucal_energy.append(batch["rear_mucal_energy"])
     in_neutrino_energy.append(batch["in_neutrino_energy"])
     out_lepton_energy.append(batch["out_lepton_energy"])
+    module_hits.append(batch["module_hits"])
+    event_hits.append(batch["event_hits"])
     
 print("Done with loader")
 
@@ -287,6 +300,8 @@ rear_hcal_modules = np.concatenate(rear_hcal_modules)
 rear_mucal_energy = np.concatenate(rear_mucal_energy)
 in_neutrino_energy = np.concatenate(in_neutrino_energy)
 out_lepton_energy = np.concatenate(out_lepton_energy)
+module_hits = np.concatenate(module_hits)
+event_hits = np.concatenate(event_hits)
 
 print("Done with concat")
 
@@ -304,7 +319,7 @@ base_keys = ['e_vis', 'e_vis_cc', 'e_vis_nc', 'pt_miss',
              'faser_cal_energy', 'faser_cal_modules',
              'rear_cal_energy', 'rear_cal_modules',
              'rear_hcal_energy', 'rear_hcal_modules',
-             'rear_mucal_energy',
+             'rear_mucal_energy', 'module_hits', 'event_hits',
             ]
 
 metadata = {}

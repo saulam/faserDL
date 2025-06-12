@@ -278,12 +278,12 @@ def translate(coords, modules, primary_vertex, metadata, shift=8, selected_axes=
     """
 
     if 'x' in selected_axes:
-        shift_x = np.random.randint(0, shift+1)
+        shift_x = np.random.randint(0, shift)
         coords[:, 0]       += shift_x
         primary_vertex[0]  += shift_x
 
     if 'y' in selected_axes:
-        shift_y = np.random.randint(0, shift+1)
+        shift_y = np.random.randint(0, shift)
         coords[:, 1]       += shift_y
         primary_vertex[1]  += shift_y
 
@@ -301,7 +301,7 @@ def translate(coords, modules, primary_vertex, metadata, shift=8, selected_axes=
                 s = np.random.choice(valid_shifts)
                 modules += s         # shift every hit’s module
 
-        shift_z = np.random.randint(0, shift+1)
+        shift_z = np.random.randint(0, shift//2)
         coords[:, 2]       += shift_z
         primary_vertex[2]  += shift_z
 

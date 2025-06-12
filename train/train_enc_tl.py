@@ -105,7 +105,7 @@ def main():
         "loss/val_charm",
         "loss/val_e_vis_cc",
         "loss/val_e_vis_nc",
-        "loss/val_pt_miss"
+        "loss/val_pt_miss",
         "loss/val_jet_momentum_dir",
         "loss/val_jet_momentum_mag",
         "loss/val_lepton_momentum_dir",

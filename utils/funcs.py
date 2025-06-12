@@ -106,6 +106,7 @@ def collate_test(batch):
     ret = {
         'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        'module_hits': torch.stack([d['module_hits'] for d in batch]),
         'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
         'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
         'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
@@ -146,6 +147,7 @@ def collate_sparse_minkowski(batch):
     ret = {
         'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
+        'module_hits': torch.stack([d['module_hits'] for d in batch]),
         'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
         'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
         'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
@@ -175,12 +177,13 @@ def arrange_sparse_minkowski(data, device):
         coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
         device=device
     )
-    tensor_global = data['f_glob']
+    module_hits = data['module_hits']
     faser_cal = data['faser_cal_modules']
     rear_cal = data['rear_cal_modules']
     rear_hcal = data['rear_hcal_modules']
+    tensor_global = data['f_glob']
 
-    return tensor, tensor_global, faser_cal, rear_cal, rear_hcal
+    return tensor, module_hits, faser_cal, rear_cal, rear_hcal, tensor_global
 
 def arrange_truth(data):
     output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}

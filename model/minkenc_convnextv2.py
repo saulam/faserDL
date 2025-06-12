@@ -42,7 +42,8 @@ class MinkEncConvNeXtV2(nn.Module):
         
         # Encoder configuration
         encoder_depths = [3, 3, 9, 3]
-        encoder_dims = [96, 192, 384, 768]
+        #encoder_dims = [96, 192, 384, 768]
+        encoder_dims = [32, 64, 128, 256]
         kernel_size_ds = (2, 2, 2)
         block_kernel = (3, 3, 3)
         
@@ -84,7 +85,7 @@ class MinkEncConvNeXtV2(nn.Module):
 
         # Module-level real-pos transformer
         d_mod = encoder_dims[-1]
-        heads_m = 12
+        heads_m = 8
         self.mod_transformer = RelPosTransformer(d_model=d_mod, nhead=heads_m, num_special_tokens=1, 
                                                  num_layers=2, dropout=args.dropout)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, d_mod))
@@ -94,7 +95,7 @@ class MinkEncConvNeXtV2(nn.Module):
         self.empty_mod_emb = nn.Parameter(torch.zeros(d_mod))
 
         # Event-level transformer (across modules)
-        heads_e = 12
+        heads_e = 8
         evt_layer = nn.TransformerEncoderLayer(d_model=d_mod, nhead=heads_e, batch_first=True, dropout=args.dropout)
         self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.pos_embed = nn.Embedding(1 + self.num_modules, d_mod)
@@ -132,7 +133,7 @@ class MinkEncConvNeXtV2(nn.Module):
         # Initialise weights
         self.apply(_init_weights)
     
-    def forward(self, x, x_glob, module_to_event, module_pos):
+    def forward(self, x, x_glob, module_to_event, module_pos, mask=None):
         """
         Forward pass through the shared backbone and branch-specific modules.
         
@@ -187,12 +188,9 @@ class MinkEncConvNeXtV2(nn.Module):
         pos_emb = self.pos_embed(pos_indices).unsqueeze(0)                   # [1, 1 + num_modules, d]
         seq_evt[:, self.num_tasks:] = seq_evt[:, self.num_tasks:] + pos_emb  
         seq_evt = self.dropout(seq_evt)                                      # [B, K + 1 + num_modules, d]
-        S = self.num_tasks + 1 + self.num_modules
-        mask = torch.zeros(S, S, device=device)
-        mask[:, self.num_tasks] = float('-inf')
         evt_out = self.event_transformer(seq_evt, mask=mask)                 # [B, K + 1 + num_modules, d]
         evt_emb = evt_out[:, :self.num_tasks, :]                             # [B, K, d]
-        evt_emb = self.dropout(evt_emb)                                      # [B, K, d]
+        #evt_emb = self.dropout(evt_emb)                                      # [B, K, d]
         
         # Branch-specific processing
         outputs = {}

@@ -72,13 +72,36 @@ class SparseEncTlLightningModel(pl.LightningModule):
             for i in range(self.model.nb_elayers)
         ]
 
+        # Mask for global token
+        S = model.num_tasks + 1 + model.num_modules
+        start_value = getattr(args, 'mask_start_value', -1e9)
+        base = torch.zeros(S, S)
+        base[:, model.num_tasks] = start_value
+        self.register_buffer('base_mask', base)
+
+
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
         
     
-    def forward(self, x, x_glob, module_to_event, module_pos):
-        return self.model(x, x_glob, module_to_event, module_pos)
+    def forward(self, x, x_glob, module_to_event, module_pos, mask):
+        return self.model(x, x_glob, module_to_event, module_pos, mask)
+
+
+    def _get_evt_mask(self):
+        # Phase 1: always fully block
+        if self.current_phase == 1:
+            return self.base_mask
+        # Phase 2: anneal from base_mask → 0 over warmup steps
+        step = float(self.global_step)
+        warm = float(self.warmup_steps)
+        if step >= warm:
+            return torch.zeros_like(self.base_mask)
+        progress = step / warm
+        power = 10
+        alpha = (1.0 - progress)**power
+        return self.base_mask * alpha
 
 
     def _arrange_batch(self, batch):
@@ -173,21 +196,21 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def common_step(self, batch):
         batch_size = len(batch["c"])
         batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
+        mask = self._get_evt_mask()
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
+        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask)
         loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
         lr = self.optimizers().param_groups[0]['lr']
 
-        return loss, part_losses, batch_size, lr
+        return loss, part_losses, batch_size, lr, mask[0, -11]
 
 
     def training_step(self, batch, batch_idx):
         torch.cuda.empty_cache()
-
-        loss, part_losses, batch_size, lr = self.common_step(batch)
+        loss, part_losses, batch_size, lr, mask_value = self.common_step(batch)
 
         if torch.isnan(loss):
             return None
@@ -196,6 +219,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
+        self.log(f"mask_value", mask_value, batch_size=batch_size, prog_bar=False, sync_dist=True)
         
         # log the actual sigmas (exp(log_sigma))
         for name, param in self.named_parameters():
@@ -208,7 +232,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         torch.cuda.empty_cache()
 
-        loss, part_losses, batch_size, lr = self.common_step(batch)
+        loss, part_losses, batch_size, lr, _ = self.common_step(batch)
 
         self.log(f"loss/val_total", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():

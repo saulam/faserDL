@@ -45,6 +45,7 @@ class SparseFASERCALDataset(Dataset):
         self.standardize_output = args.standardize_output
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
+        self.num_modules = int(self.metadata['z'][:, 1].max() + 1)
 
             
     @property
@@ -353,6 +354,11 @@ class SparseFASERCALDataset(Dataset):
         rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+
+        module_hits = np.bincount(reco_hits[:, 3].astype(int), minlength=self.num_modules)
+        module_hits = self.preprocess(module_hits, "module_hits", preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        event_hits = len(reco_hits)
+        event_hits = self.preprocess(event_hits, "event_hits", preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         
         primary_vertex = data['primary_vertex']
         if not is_cc:
@@ -382,7 +388,7 @@ class SparseFASERCALDataset(Dataset):
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
         
-        feats_global = np.concatenate([faser_cal_energy, rear_cal_energy, rear_hcal_energy, rear_mucal_energy])   
+        feats_global = np.concatenate([event_hits, faser_cal_energy, rear_cal_energy, rear_hcal_energy, rear_mucal_energy])   
         flavour_label = self.pdg2label(in_neutrino_pdg, is_cc)
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)
@@ -459,6 +465,7 @@ class SparseFASERCALDataset(Dataset):
         output['modules'] = torch.from_numpy(modules).long()
         output['feats'] = torch.from_numpy(feats).float()
         output['feats_global'] = torch.from_numpy(feats_global).float()
+        output['module_hits'] = torch.from_numpy(module_hits).float()
         output['faser_cal_modules'] = torch.from_numpy(faser_cal_modules).float()
         output['rear_cal_modules'] = torch.from_numpy(rear_cal_modules).float()
         output['rear_hcal_modules'] = torch.from_numpy(rear_hcal_modules).float()
