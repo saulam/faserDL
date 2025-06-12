@@ -85,7 +85,7 @@ class MinkAEConvNeXtV2(nn.Module):
 
         # Module-level real-pos transformer
         self.d_mod = encoder_dims[-1]
-        heads_m = 8
+        heads_m = 12
         mod_layer = nn.TransformerEncoderLayer(d_model=self.d_mod, nhead=heads_m, batch_first=True, dropout=args.dropout)
         self.mod_transformer = nn.TransformerEncoder(mod_layer, num_layers=2)
         self.pos_emb_mod = PositionalEncoding3D(L=8)
