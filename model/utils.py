@@ -128,6 +128,20 @@ class PositionalEncoding3D(nn.Module):
         # Concatenate along feature dimension
         pos_enc = torch.cat([sin_x, cos_x, sin_y, cos_y, sin_z, cos_z], dim=-1)
         return pos_enc
+
+
+class ScaledFourierPosEmb3D(nn.Module):
+    def __init__(self, num_features, d_model, init_scale=5):
+        super().__init__()
+        self.B = nn.Parameter(torch.randn(num_features, 3) * init_scale)
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        self.proj = nn.Linear(2 * num_features, d_model)
+
+    def forward(self, coords):
+        proj_feats = coords @ self.B.t()
+        pe = torch.cat([proj_feats.sin(), proj_feats.cos()], dim=-1)
+        pe = self.alpha * pe
+        return self.proj(pe)
         
 
 class RelPosSelfAttention(nn.Module):
@@ -222,15 +236,10 @@ class RelPosTransformer(nn.Module):
                                dropout=dropout)
             for _ in range(num_layers)
         ])
-        self.num_special_tokens = num_special_tokens
-        self.special_token_embeddings = nn.Parameter(torch.zeros(num_special_tokens, d_model))
         self.num_layers = num_layers
 
     def forward(self, x: torch.Tensor, coords: torch.Tensor, key_padding_mask: torch.Tensor = None) -> torch.Tensor:
         B, N_total, d = x.size()
-        N_regular = N_total - self.num_special_tokens
-        special_tokens_emb = self.special_token_embeddings.unsqueeze(0).expand(B, -1, -1)
-        x[:, :self.num_special_tokens, :] = x[:, :self.num_special_tokens, :] + special_tokens_emb
         for layer in self.layers:
             x = layer(x, coords, key_padding_mask)
         return x

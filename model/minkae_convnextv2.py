@@ -22,7 +22,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import _init_weights, PositionalEncoding3D, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
+from .utils import _init_weights, ScaledFourierPosEmb3D, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
 class MinkAEConvNeXtV2(nn.Module):
@@ -86,10 +86,9 @@ class MinkAEConvNeXtV2(nn.Module):
         # Module-level real-pos transformer
         self.d_mod = encoder_dims[-1]
         heads_m = 12
-        mod_layer = nn.TransformerEncoderLayer(d_model=self.d_mod, nhead=heads_m, batch_first=True, dropout=args.dropout)
-        self.mod_transformer = nn.TransformerEncoder(mod_layer, num_layers=2)
-        self.pos_emb_mod = PositionalEncoding3D(L=8)
-        self.pos_emb_mod_proj = nn.Linear(self.pos_emb_mod.out_dim, self.d_mod)
+        self.mod_transformer = RelPosTransformer(
+            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=3, num_dims=3, dropout=args.dropout)
+        self.pos_emb_mod = ScaledFourierPosEmb3D(num_features=32, d_model=self.d_mod)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, self.d_mod))
         self.cls_mod_extra_emb = nn.Linear(2, self.d_mod)
 
@@ -104,8 +103,10 @@ class MinkAEConvNeXtV2(nn.Module):
         # Event-level transformer (across modules)
         heads_e = 8
         self.global_feats_encoder = GlobalFeatureEncoder(d_model=self.d_evt, dropout=args.dropout)
-        evt_layer = nn.TransformerEncoderLayer(d_model=self.d_evt, nhead=heads_e, batch_first=True, dropout=args.dropout)
-        self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
+        #evt_layer = nn.TransformerEncoderLayer(d_model=self.d_evt, nhead=heads_e, batch_first=True, dropout=args.dropout)
+        #self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
+        self.event_transformer = RelPosTransformer(
+            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=3, num_dims=1, dropout=args.dropout)
         self.pos_emb = nn.Embedding(self.num_modules, self.d_evt)
         self.cls_evt = nn.Parameter(torch.zeros(1, 1, self.d_evt))
         self.dropout = nn.Dropout(args.dropout)
@@ -123,7 +124,7 @@ class MinkAEConvNeXtV2(nn.Module):
         kernel_size_us = kernel_size_ds
         self.nb_dlayers = len(decoder_dims) - 1
         total_depth_dec = sum(decoder_depths)
-        dp_rates_dec = [x.item() for x in torch.linspace(dp_rates_enc[-encoder_depths[-1]], 0, total_depth_dec)]
+        dp_rates_dec = [x.item() for x in torch.linspace(drop_path_rate, 0, total_depth_dec)]
         dp_cur_dec = 0
 
         # Build decoder
@@ -200,16 +201,16 @@ class MinkAEConvNeXtV2(nn.Module):
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
             if i < self.nb_elayers - 1:
-                x = self.downsample_layers[i](x)        
+                x = self.downsample_layers[i](x)   
 
         # ----------------- Module-level Transformer -----------------
         # N_vox = total number of voxels in the batch
         # M = number of modules in the batch
         # L_vox = max number of voxels in a module
         # D_mod = model dimension
-        initial_voxel_feats = x.F                                               # [N_vox, D_mod]
-        voxel_coords = x.C[:, 1:].float()                                       # [N_vox, 3]
-        voxel_to_module_map = x.C[:, 0].long()                                  # [N_vox]
+        initial_voxel_feats = x.F                                                         # [N_vox, D_mod]
+        voxel_coords = x.C[:, 1:].float()                                                 # [N_vox, 3]
+        voxel_to_module_map = x.C[:, 0].long()                                            # [N_vox]
         M = int(voxel_to_module_map.max().item()) + 1
         assert M == module_to_event.size(0)       
         grouped_feats = [initial_voxel_feats[voxel_to_module_map == m] for m in range(M)]
@@ -221,87 +222,91 @@ class MinkAEConvNeXtV2(nn.Module):
         module_lengths = torch.tensor([g.size(0) for g in grouped_feats], device=device)  # [M]
         L_vox = int(module_lengths.max().item()) if len(module_lengths) > 0 else 0
         padded_feats  = pad_sequence(grouped_feats,  batch_first=True)                    # [M, L_vox, D_mod]
-        padded_coords = pad_sequence(grouped_coords, batch_first=True)                    # [M, L_vox, 3]
+        padded_coords = pad_sequence(grouped_coords, batch_first=True) / 48.              # [M, L_vox, 3]
         padded_idxs   = pad_sequence(grouped_idxs,   batch_first=True, padding_value=-1)  # [M, L_vox]
         hits_per_module = module_hits[module_to_event.long(), module_pos.long()]          # [M]
         ergy_per_module = faser_cal_modules[module_to_event.long(), module_pos.long()]    # [M]
         ergy_and_hits = torch.stack([ergy_per_module, hits_per_module], dim=1)            # [M, 2]
         ergy_and_hits_emb = self.cls_mod_extra_emb(ergy_and_hits).unsqueeze(1)            # [M, 1, D_mod]
-        padded_coords_norm = self.norm_coords(padded_coords, 48 + 1.)                     # [M, L_vox, 3]
-        pos_emb_mod = self.pos_emb_mod(padded_coords_norm)                                # [M, L_vox, 2*num_bands*3]
-        pos_emb_mod_proj = self.pos_emb_mod_proj(pos_emb_mod)                             # [M, L_vox, D_mod]
+        pos_emb_mod = self.pos_emb_mod(padded_coords)                                     # [M, L_vox, D_mod]
         cls_tokens_mod = self.cls_mod.expand(M, -1, -1)                                   # [M, 1, D_mod]
         cls_tokens_mod = cls_tokens_mod + ergy_and_hits_emb                               # [M, 1, D_mod]
-        mod_in = torch.cat([cls_tokens_mod, padded_feats + pos_emb_mod_proj], dim=1)      # [M, 1+L_vox, D_mod]
+        mod_in = torch.cat([cls_tokens_mod, padded_feats + pos_emb_mod], dim=1)           # [M, 1+L_vox, D_mod]
         mod_in = self.dropout(mod_in)                                                     # [M, 1+L_vox, D_mod]
         module_key_padding_mask = torch.ones((M, 1 + L_vox),
                                              dtype=torch.bool, device=device)             # [M, 1+L_vox]
+        cls_coords = torch.zeros((M, 1, padded_coords.size(-1)), device=device)           # [M, 1, 3]
+        mod_coords = torch.cat([cls_coords, padded_coords], dim=1)                        # [M, 1+L_vox, 3]
         module_key_padding_mask[:, 0] = False
         module_key_padding_mask[:, 1:] = (
             torch.arange(L_vox, device=device).unsqueeze(0)
             >= module_lengths.unsqueeze(1)
         )
         module_seq_out = self.mod_transformer(
-            mod_in, src_key_padding_mask=module_key_padding_mask)                        # [M, 1+L_vox, D_mod]
+            mod_in, coords=mod_coords, key_padding_mask=module_key_padding_mask)          # [M, 1+L_vox, D_mod]
 
         # ----------------- Scatter back to voxels -----------------
-        vox_out = module_seq_out[:, 1:, :].reshape(-1, self.d_mod)                       # [M*L_vox, D_mod]
-        idxs_flat = padded_idxs.reshape(-1)                                              # [M*L_vox]
+        vox_out = module_seq_out[:, 1:, :].reshape(-1, self.d_mod)                        # [M*L_vox, D_mod]
+        idxs_flat = padded_idxs.reshape(-1)                                               # [M*L_vox]
         valid = idxs_flat >= 0
-        intra_module_ctx = torch.zeros_like(initial_voxel_feats)                         # [N_vox, D_mod]
+        intra_module_ctx = torch.zeros_like(initial_voxel_feats)                          # [N_vox, D_mod]
         intra_module_ctx[idxs_flat[valid]] = vox_out[valid]
 
-        # ----------------- Subtoken Expansion -----------------
-        module_cls = module_seq_out[:, 0, :]                                             # [M, D_mod]
-        subtoks = self.subtoken_proj(module_cls).view(M, self.K, self.d_evt)             # [M, K, D_evt]
-        mod_pos_exp = module_pos.unsqueeze(1).expand(-1, self.K)                         # [M, K]
-        pe_mod2 = self.pos_emb(mod_pos_exp)                                              # [M, K, D_evt]
-        sub_ids = torch.arange(self.K, device=device).unsqueeze(0).expand(M, -1)         # [M, K]
-        pe_sub = self.pos_emb_sub(sub_ids)                                               # [M, K, D_evt]
-        subtoks = subtoks + pe_mod2 + pe_sub                                             # [M, K, D_evt]
-        flat_subtoks = subtoks.view(-1, self.d_evt)                                      # [M*K, D_evt]
-        flat_mod2evt = module_to_event.repeat_interleave(self.K)                         # [M*K]
+        # ----------------- Subtoken expansion -----------------
+        module_cls = module_seq_out[:, 0, :]                                              # [M, D_mod]
+        subtoks = self.subtoken_proj(module_cls).view(M, self.K, self.d_evt)              # [M, K, D_evt]
+        mod_pos_exp = module_pos.unsqueeze(1).expand(-1, self.K)                          # [M, K]
+        pe_mod2 = self.pos_emb(mod_pos_exp)                                               # [M, K, D_evt]
+        sub_ids = torch.arange(self.K, device=device).unsqueeze(0).expand(M, -1)          # [M, K]
+        pe_sub = self.pos_emb_sub(sub_ids)                                                # [M, K, D_evt]
+        subtoks = subtoks + pe_mod2 + pe_sub                                              # [M, K, D_evt]
+        flat_subtoks = subtoks.view(-1, self.d_evt)                                       # [M*K, D_evt]
+        flat_mod2evt = module_to_event.repeat_interleave(self.K)                          # [M*K]
 
         # ----------------- Event-level Transformer -----------------
         # B = number of events in the batch
         # L_sub = max number of modules in an event * K
         B = int(module_to_event.max().item()) + 1
-        glob_emb = self.global_feats_encoder(params_glob).unsqueeze(1)                   # [B, 1, D_evt]
-        cls_tokens_evt = self.cls_evt.expand(B, 1, self.d_evt)                           # [B, 1, D_evt]
+        glob_emb = self.global_feats_encoder(params_glob).unsqueeze(1)                    # [B, 1, D_evt]
+        cls_tokens_evt = self.cls_evt.expand(B, 1, self.d_evt)                            # [B, 1, D_evt]
         #cls_tokens_evt = cls_tokens_evt + glob_emb                                       # [B, 1, D_evt]
         grouped_subs = [flat_subtoks[flat_mod2evt == b] for b in range(B)]
-        grouped_sub_idxs = [(flat_mod2evt == b).nonzero(as_tuple=False).squeeze(1) for b in range(B)]
-        sub_lengths = torch.tensor([g.size(0) for g in grouped_subs], device=device)
-        L_sub = int(sub_lengths.max().item()) if len(sub_lengths) > 0 else 0
-        padded_subs = pad_sequence(grouped_subs, batch_first=True)                       # [B, L_sub, D_evt]
-        padded_sub_idxs = pad_sequence(
-            grouped_sub_idxs, batch_first=True, padding_value=-1)                        # [B, L_sub]
-        evt_in = torch.cat([cls_tokens_evt, padded_subs], dim=1)                         # [B, 1+L_sub, D_evt]
-        evt_in = self.dropout(evt_in)                                                    # [B, 1+L_sub, D_evt]
+
+        padded_subs = pad_sequence(grouped_subs, batch_first=True)                        # [B, L_sub, D_evt]
+        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_subs], dim=1))            # [B, 1+L_sub, D_evt]
+        flat_mod_pos = mod_pos_exp.reshape(-1, 1)                                         # [M*K,1]
+        grouped_pos = [flat_mod_pos[flat_mod2evt == b] for b in range(B)]
+        padded_pos = pad_sequence(grouped_pos, batch_first=True)                          # [B, L_sub, 1]
+        cls_pos = torch.zeros((B, 1, 1), device=device)                                   # [B, 1, 1]
+        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, 1+L_sub,1]
         event_key_padding_mask = torch.ones(
-            (B, 1 + L_sub), dtype=torch.bool, device=device)                             # [B, 1+L_sub]
+            (B, 1 + padded_subs.size(1)), dtype=torch.bool, device=device)                # [B, 1+L_sub]
         event_key_padding_mask[:, 0] = False
         event_key_padding_mask[:, 1:] = (
-            torch.arange(L_sub, device=device).unsqueeze(0)
-            >= sub_lengths.unsqueeze(1)
+            torch.arange(padded_subs.size(1), device=device).unsqueeze(0)
+            >= torch.tensor([g.size(0) for g in grouped_subs], device=device).unsqueeze(1)
         )
         event_seq_out = self.event_transformer(
-            evt_in, src_key_padding_mask=event_key_padding_mask)                         # [B, 1+L_sub, D_evt]
-        event_cls = event_seq_out[:, 0, :]                                               # [B, D_evt]
-        event_cls = self.dropout(event_cls)                                              # [B, D_evt]
-        
+            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, 1+L_sub, D_evt]
+        event_cls = event_seq_out[:, 0, :]                                                # [B, D_evt]
+        event_cls = self.dropout(event_cls)                                               # [B, D_evt]
+
         # ----------------- Collapse and fusion -----------------
-        mod_out = event_seq_out[:, 1:, :].reshape(-1, self.d_evt)                        # [B*L_sub, D_evt]
-        idxs_evt_flat = padded_sub_idxs.reshape(-1)                                      # [B*L_sub]
+        mod_out = event_seq_out[:, 1:, :].reshape(-1, self.d_evt)                         # [B*L_sub, D_evt]
+        idxs_evt_flat = pad_sequence(
+            [(flat_mod2evt == b).nonzero(as_tuple=False).squeeze(1) for b in range(B)],
+            batch_first=True,
+            padding_value=-1
+        ).reshape(-1)                                                                     # [B*L_sub]
         valid2 = idxs_evt_flat >= 0
-        flat_ctx = torch.zeros_like(flat_subtoks)                                        # [M*K, D_evt]
-        flat_ctx[idxs_evt_flat[valid2]] = mod_out[valid2]                                # [M*K, D_evt]      
-        subtok_out = flat_ctx.view(M, self.K, self.d_evt)                                # [M, K, D_evt]
-        module_ctx = self.subtokens_to_module(subtok_out.reshape(M, -1))                 # [M, D_mod]
-        inter_module_ctx = module_ctx[voxel_to_module_map]                               # [N_vox, D_mod]
-        combined_context = torch.cat([intra_module_ctx, inter_module_ctx], dim=1)        # [N_vox, D_mod*2]
-        gate = torch.sigmoid(self.fusion_gate(combined_context))                         # [N_vox, D_mod]
-        final_voxel_feat = gate * intra_module_ctx + (1 - gate) * inter_module_ctx       # [N_vox, D_mod]        
+        flat_ctx = torch.zeros_like(flat_subtoks)                                         # [M*K, D_evt]
+        flat_ctx[idxs_evt_flat[valid2]] = mod_out[valid2]                                 # [M*K, D_evt]      
+        subtok_out = flat_ctx.view(M, self.K, self.d_evt)                                 # [M, K, D_evt]
+        module_ctx = self.subtokens_to_module(subtok_out.reshape(M, -1))                  # [M, D_mod]
+        inter_module_ctx = module_ctx[voxel_to_module_map]                                # [N_vox, D_mod]
+        combined_context = torch.cat([intra_module_ctx, inter_module_ctx], dim=1)         # [N_vox, D_mod*2]
+        gate = torch.sigmoid(self.fusion_gate(combined_context))                          # [N_vox, D_mod]
+        final_voxel_feat = gate * intra_module_ctx + (1 - gate) * inter_module_ctx        # [N_vox, D_mod]        
         x = ME.SparseTensor(
             features=final_voxel_feat,
             coordinate_manager=x.coordinate_manager,
@@ -323,11 +328,7 @@ class MinkAEConvNeXtV2(nn.Module):
             "out_charge": out_charge,
             "out_iscc": out_iscc,
         }
-
-    def norm_coords(self, coords, max_value=10.):
-        norm = coords / (max_value - 1)
-        return norm * 2 - 1
-
+        
     def replace_depthwise_with_channelwise(self):
         """
         Replace all MinkowskiDepthwiseConvolution modules with
