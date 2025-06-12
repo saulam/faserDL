@@ -103,8 +103,6 @@ class MinkAEConvNeXtV2(nn.Module):
         # Event-level transformer (across modules)
         heads_e = 8
         self.global_feats_encoder = GlobalFeatureEncoder(d_model=self.d_evt, dropout=args.dropout)
-        #evt_layer = nn.TransformerEncoderLayer(d_model=self.d_evt, nhead=heads_e, batch_first=True, dropout=args.dropout)
-        #self.event_transformer = nn.TransformerEncoder(evt_layer, num_layers=3)
         self.event_transformer = RelPosTransformer(
             d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=3, num_dims=1, dropout=args.dropout)
         self.pos_emb = nn.Embedding(self.num_modules, self.d_evt)
