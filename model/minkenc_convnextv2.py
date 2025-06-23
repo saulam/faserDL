@@ -86,7 +86,7 @@ class MinkEncConvNeXtV2(nn.Module):
         self.d_mod = encoder_dims[-1]
         heads_m = 12
         self.mod_transformer = RelPosTransformer(
-            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=3, num_dims=3, dropout=args.dropout)
+            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=5, num_dims=3, dropout=args.dropout)
         self.pos_emb_mod = ScaledFourierPosEmb3D(num_features=32, d_model=self.d_mod)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, self.d_mod))
         self.cls_mod_extra_emb = nn.Linear(2, self.d_mod)
