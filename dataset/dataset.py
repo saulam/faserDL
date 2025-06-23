@@ -385,6 +385,7 @@ class SparseFASERCALDataset(Dataset):
         seg_labels = self.get_param(data, 'seg_labels')
         
         # voxelise coordinates and prepare global features and labels
+        orig_coords = coords.copy()
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
         
@@ -461,6 +462,7 @@ class SparseFASERCALDataset(Dataset):
         elif self.load_seg:
             feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
         output['flavour_label'] = torch.tensor([flavour_label]).long()
+        output['orig_coords'] = orig_coords
         output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
         output['modules'] = torch.from_numpy(modules).long()
         output['feats'] = torch.from_numpy(feats).float()

@@ -33,8 +33,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
         self.log_sigma_charm = nn.Parameter(torch.zeros(()))
-        self.log_sigma_e_vis_cc = nn.Parameter(torch.zeros(()))
-        self.log_sigma_e_vis_nc = nn.Parameter(torch.zeros(()))
+        self.log_sigma_e_vis = nn.Parameter(torch.zeros(()))
         self.log_sigma_pt_miss = nn.Parameter(torch.zeros(()))
         self.log_sigma_lepton_momentum_mag = nn.Parameter(torch.zeros(()))
         self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
@@ -43,8 +42,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         self._uncertainty_params = [
             self.log_sigma_flavour,
             self.log_sigma_charm,
-            self.log_sigma_e_vis_cc,
-            self.log_sigma_e_vis_nc,
+            self.log_sigma_e_vis,
             self.log_sigma_pt_miss,
             self.log_sigma_lepton_momentum_mag,
             self.log_sigma_lepton_momentum_dir,
@@ -72,13 +70,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
             for i in range(self.model.nb_elayers)
         ]
 
-        # Mask for global token
-        S = model.num_tasks + 1 + model.num_modules
-        start_value = getattr(args, 'mask_start_value', -1e9)
-        base = torch.zeros(S, S)
-        base[:, model.num_tasks] = start_value
-        self.register_buffer('base_mask', base)
-
 
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
@@ -87,21 +78,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
     
     def forward(self, x, x_glob, module_to_event, module_pos, mask):
         return self.model(x, x_glob, module_to_event, module_pos, mask)
-
-
-    def _get_evt_mask(self):
-        # Phase 1: always fully block
-        if self.current_phase == 1:
-            return self.base_mask
-        # Phase 2: anneal from base_mask → 0 over warmup steps
-        step = float(self.global_step)
-        warm = float(self.warmup_steps)
-        if step >= warm:
-            return torch.zeros_like(self.base_mask)
-        progress = step / warm
-        power = 10
-        alpha = (1.0 - progress)**power
-        return self.base_mask * alpha
 
 
     def _arrange_batch(self, batch):
@@ -115,8 +91,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # pred
         out_flavour = batch_output['out_flavour']
         out_charm = batch_output['out_charm'].squeeze()
-        out_e_vis_cc = batch_output['out_e_vis_cc'].squeeze()
-        out_e_vis_nc = batch_output['out_e_vis_nc'].squeeze()
+        out_e_vis = batch_output['out_e_vis'].squeeze()
         out_pt_miss = batch_output['out_pt_miss'].squeeze()
         out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag'].squeeze()
         out_lepton_momentum_dir = batch_output['out_lepton_momentum_dir']
@@ -135,8 +110,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         # CC
         mask_cc = targ_flavour < 3
-        out_e_vis_cc = out_e_vis_cc[mask_cc]
-        targ_e_vis_cc = targ_e_vis[mask_cc]
         out_lepton_momentum_mag = out_lepton_momentum_mag[mask_cc]
         out_lepton_momentum_dir = out_lepton_momentum_dir[mask_cc]
         targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask_cc]
@@ -144,8 +117,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
         
         # NC
         mask_nc = ~mask_cc
-        out_e_vis_nc = out_e_vis_nc[mask_nc]
-        targ_e_vis_nc = targ_e_vis[mask_nc]
         out_pt_miss = out_pt_miss[mask_nc]
         targ_pt_miss = targ_pt_miss[mask_nc]
         
@@ -161,8 +132,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm = self.loss_charm(out_charm, targ_charm)
-        loss_e_vis_cc = self.loss_evis(out_e_vis_cc, targ_e_vis_cc)
-        loss_e_vis_nc = self.loss_evis(out_e_vis_nc, targ_e_vis_nc)
+        loss_e_vis = self.loss_evis(out_e_vis, targ_e_vis)
         loss_pt_miss = self.loss_ptmiss(out_pt_miss, targ_pt_miss)
         loss_lepton_momentum_mag = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
         loss_lepton_momentum_dir = self.loss_lepton_momentum_dir(out_lepton_momentum_dir, targ_lepton_momentum_dir)
@@ -171,8 +141,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         
         part_losses = {'flavour': loss_flavour,
                        'charm': loss_charm,
-                       'e_vis_cc': loss_e_vis_cc,
-                       'e_vis_nc': loss_e_vis_nc,
+                       'e_vis': loss_e_vis,
                        'pt_miss': loss_pt_miss,
                        'lepton_momentum_mag': loss_lepton_momentum_mag,
                        'lepton_momentum_dir': loss_lepton_momentum_dir,
@@ -181,8 +150,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
                        }
         total_loss = ( weighted_classification(loss_flavour, self.log_sigma_flavour)
                      + weighted_classification(loss_charm, self.log_sigma_charm)
-                     + weighted_regression(loss_e_vis_cc, self.log_sigma_e_vis_cc)
-                     + weighted_regression(loss_e_vis_nc, self.log_sigma_e_vis_nc)
+                     + weighted_regression(loss_e_vis, self.log_sigma_e_vis)
                      + weighted_regression(loss_pt_miss, self.log_sigma_pt_miss)
                      + weighted_regression(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag)
                      + weighted_regression(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir)
@@ -196,7 +164,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def common_step(self, batch):
         batch_size = len(batch["c"])
         batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
-        mask = self._get_evt_mask()
+        mask = torch.tensor([1.], device=self.device)
 
         # Forward pass
         batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask)
@@ -205,7 +173,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # Retrieve current learning rate
         lr = self.optimizers().param_groups[0]['lr']
 
-        return loss, part_losses, batch_size, lr, mask[0, -11]
+        return loss, part_losses, batch_size, lr, mask
 
 
     def training_step(self, batch, batch_idx):
@@ -374,7 +342,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
             k = int(m.group(1))
             return base + k
     
-        if name.startswith("model.cls_mod"):
+        if name.startswith("model.cls_mod") or name.startswith("model.pos_emb_mod"):
             return base  # same ID as mod_transformer.layers.0        
 
         # 4) EVENT‐LEVEL TRANSFORMER & related heads
@@ -385,9 +353,12 @@ class SparseEncTlLightningModel(pl.LightningModule):
             return base + num_mod + k
     
         if (name.startswith("model.global_feats_encoder")
-            or name.startswith("model.empty_mod_emb")
-            or name.startswith("model.pos_embed")
-            or name.startswith("model.cls_task")):
+            or name.startswith("model.pos_emb")
+            or name.startswith("model.cls_evt")
+            or name.startswith("model.subtoken_proj")
+            or name.startswith("model.pos_emb_sub")
+            or name.startswith("model.subtokens_to_module")
+           ):
             return base + num_mod  # same ID as first event layer
 
         # 5) All branches (“model.branches.*”) follow all event‐level IDs

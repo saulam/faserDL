@@ -90,21 +90,12 @@ def main():
     del pretrained_model
     print("Weights transferred succesfully")
 
-    iscc_token = state_dict['iscc_token']                   # shape (1, 1, d_mod)
-    num_tasks = base_model.num_tasks
-    d_mod     = iscc_token.size(-1)
-    cls_task_weights = iscc_token.repeat(1, num_tasks, 1)   # (1, num_tasks, d_mod)
-    with torch.no_grad():
-        base_model.cls_task.data.copy_(cls_task_weights)
-    print("Cls tokens transferred too")  
-
     # 1) define the list of losses you want to monitor (same for all phases)
     monitor_losses = [
         "loss/val_total",
         "loss/val_flavour",
         "loss/val_charm",
-        "loss/val_e_vis_cc",
-        "loss/val_e_vis_nc",
+        "loss/val_e_vis",
         "loss/val_pt_miss",
         "loss/val_jet_momentum_dir",
         "loss/val_jet_momentum_mag",

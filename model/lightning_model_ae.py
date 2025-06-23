@@ -37,6 +37,7 @@ class SparseAELightningModel(pl.LightningModule):
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
+        self.global_alpha = None
 
 
     def on_train_start(self):
@@ -44,18 +45,11 @@ class SparseAELightningModel(pl.LightningModule):
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
 
 
-    '''
     def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
-        # Calculate progress p: global step / max_steps
-        # Make sure self.trainer is set (it usually is after a few batches)
-        if self.trainer.max_steps:
-            total_steps = (self.trainer.max_epochs // 2) * self.trainer.num_training_batches  # div by 2 added
-            p = float(self.global_step) / total_steps
-            # Here, gamma = 10 is a typical choice, modify as needed
-            new_value = 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
-            with torch.no_grad():
-                self.model.global_weight.fill_(new_value)
-    '''
+        total = float(self.trainer.max_epochs * self.trainer.num_training_batches)
+        p = float(self.trainer.global_step) / total
+        raw = (p - 0.1) / 0.1
+        self.global_alpha = torch.tensor(raw, device=self.device).clamp(0,1)
 
     
     def forward(self, 
@@ -63,8 +57,10 @@ class SparseAELightningModel(pl.LightningModule):
                 x_glob,
                 module_to_event, 
                 module_pos, 
-                mask_bool):
-        return self.model(x, x_glob, module_to_event, module_pos, mask_bool)
+                mask_bool,
+                global_alpha=None,
+               ):
+        return self.model(x, x_glob, module_to_event, module_pos, mask_bool, global_alpha)
 
 
     def _arrange_batch(self, batch):
@@ -96,7 +92,7 @@ class SparseAELightningModel(pl.LightningModule):
         part_losses = {'primlepton': loss_primlepton,
                        'seg': loss_seg,
                        'charge': loss_charge,
-                       'iscc': loss_iscc,
+                       'iscc': 0.0001*loss_iscc,
                        }
         total_loss = sum(part_losses.values())
 
@@ -108,14 +104,16 @@ class SparseAELightningModel(pl.LightningModule):
         batch_input,
         batch_module_to_event,
         p_mask: float = 0.3,
-        p_module_mask: float = 0.5,
+        p_module_mask: float = 0.8,
+        mask_frac: float = 0.75,
         generator: Optional[torch.Generator] = None,
     ):
         """
-        Create a mask over voxels, mixing per-event random voxel masking
-        (up to p_mask fraction) with at most one full-module masking
-        per event (with probability p_module_mask), only when an event
-        has two or more non-empty modules.
+        Create a mixed mask over voxels:
+        - With probability p_module_mask per event (only if the event
+          has ≥2 non-empty modules), mask between 1 and up to
+          mask_frac of its modules (never all of them).
+        - Otherwise, randomly mask up to p_mask fraction of that event’s voxels.
         """
         N = batch_input.F.shape[0]
         device = batch_input.F.device
@@ -130,9 +128,12 @@ class SparseAELightningModel(pl.LightningModule):
         for e, mods in evt_to_mods.items():
             if len(mods) < 2:
                 continue
-            if torch.rand(1, generator=generator, device=device) < p_module_mask:
-                m_choice = mods[torch.randint(len(mods), (1,), generator=generator, device=device).item()]
-                mask[voxel_mod == m_choice] = True
+            if torch.rand(1, generator=generator, device=device).item() < p_module_mask:
+                k_max = min(int(len(mods) * mask_frac), len(mods) - 1)
+                num_to_mask = torch.randint(1, k_max + 1, (1,), generator=generator, device=device).item()
+                perm = torch.randperm(len(mods), generator=generator, device=device)
+                for i in perm[:num_to_mask]:
+                    mask[voxel_mod == mods[i]] = True
     
         for e in voxel_evt.unique():
             evt_idx = (voxel_evt == e).nonzero(as_tuple=True)[0]
@@ -150,7 +151,7 @@ class SparseAELightningModel(pl.LightningModule):
         batch_size = len(batch["c"])
         batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
         orig_charge = batch_input.F.clone()
-    
+        
         # create the mask
         if self.training:
             mask_bool = self.create_mask(batch_input, batch_module_to_event)
@@ -161,7 +162,8 @@ class SparseAELightningModel(pl.LightningModule):
             mask_bool = self.create_mask(batch_input, batch_module_to_event, generator=gen)
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask_bool)
+        batch_output = self.forward(
+            batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask_bool, self.global_alpha)
         loss, part_losses = self.compute_losses(batch_output, target, orig_charge, mask_bool)
   
         # Retrieve current learning rate
@@ -179,6 +181,7 @@ class SparseAELightningModel(pl.LightningModule):
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
+        self.log(f"global_alpha", self.global_alpha, batch_size=batch_size, prog_bar=False, sync_dist=True)
 
         return loss
 

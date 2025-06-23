@@ -97,14 +97,15 @@ class MinkAEConvNeXtV2(nn.Module):
         assert self.d_mod % self.K == 0, "d_mod must be divisible by K subtokens"
         self.d_evt = self.d_mod // self.K
         self.subtoken_proj = nn.Linear(self.d_mod, self.K * self.d_evt)
-        self.pos_emb_sub = nn.Embedding(self.K, self.d_evt)
         self.subtokens_to_module = nn.Linear(self.K * self.d_evt, self.d_mod)
+        if self.K > 1:
+            self.pos_emb_sub = nn.Embedding(self.K, self.d_evt)
 
         # Event-level transformer (across modules)
         heads_e = 8
         self.global_feats_encoder = GlobalFeatureEncoder(d_model=self.d_evt, dropout=args.dropout)
         self.event_transformer = RelPosTransformer(
-            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=3, num_dims=1, dropout=args.dropout)
+            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=5, num_dims=1, dropout=args.dropout)
         self.pos_emb = nn.Embedding(self.num_modules, self.d_evt)
         self.cls_evt = nn.Parameter(torch.zeros(1, 1, self.d_evt))
         self.dropout = nn.Dropout(args.dropout)
@@ -165,7 +166,7 @@ class MinkAEConvNeXtV2(nn.Module):
         # Initialise weights
         self.apply(_init_weights)
 
-    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool=None):
+    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool=None, global_alpha=None):
         """
         Forward pass through the encoder-decoder network.
 
@@ -174,7 +175,8 @@ class MinkAEConvNeXtV2(nn.Module):
             x_glob: Global feature tensors.
             module_to_event: mapping module index to event index tensor
             module_pos: mapping module index to module position tensor
-            mask_bool: mask for voxels (masked autoencoder).
+            mask_bool: mask for voxels (masked autoencoder)
+            global_alpha: percentage of global information to use
 
         Returns:
             A dictionary with voxel predictions.
@@ -255,9 +257,11 @@ class MinkAEConvNeXtV2(nn.Module):
         subtoks = self.subtoken_proj(module_cls).view(M, self.K, self.d_evt)              # [M, K, D_evt]
         mod_pos_exp = module_pos.unsqueeze(1).expand(-1, self.K)                          # [M, K]
         pe_mod2 = self.pos_emb(mod_pos_exp)                                               # [M, K, D_evt]
-        sub_ids = torch.arange(self.K, device=device).unsqueeze(0).expand(M, -1)          # [M, K]
-        pe_sub = self.pos_emb_sub(sub_ids)                                                # [M, K, D_evt]
-        subtoks = subtoks + pe_mod2 + pe_sub                                              # [M, K, D_evt]
+        subtoks = subtoks + pe_mod2                                                       # [M, K, D_evt]
+        if self.K > 1:
+            sub_ids = torch.arange(self.K, device=device).unsqueeze(0).expand(M, -1)      # [M, K]
+            pe_sub = self.pos_emb_sub(sub_ids)                                            # [M, K, D_evt]    
+            subtoks = subtoks + pe_sub                                                    # [M, K, D_evt]
         flat_subtoks = subtoks.view(-1, self.d_evt)                                       # [M*K, D_evt]
         flat_mod2evt = module_to_event.repeat_interleave(self.K)                          # [M*K]
 
@@ -267,12 +271,12 @@ class MinkAEConvNeXtV2(nn.Module):
         B = int(module_to_event.max().item()) + 1
         glob_emb = self.global_feats_encoder(params_glob).unsqueeze(1)                    # [B, 1, D_evt]
         cls_tokens_evt = self.cls_evt.expand(B, 1, self.d_evt)                            # [B, 1, D_evt]
-        #cls_tokens_evt = cls_tokens_evt + glob_emb                                       # [B, 1, D_evt]
+        if global_alpha is not None:
+            cls_tokens_evt = cls_tokens_evt + global_alpha*glob_emb                       # [B, 1, D_evt]
         grouped_subs = [flat_subtoks[flat_mod2evt == b] for b in range(B)]
-
         padded_subs = pad_sequence(grouped_subs, batch_first=True)                        # [B, L_sub, D_evt]
         evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_subs], dim=1))            # [B, 1+L_sub, D_evt]
-        flat_mod_pos = mod_pos_exp.reshape(-1, 1)                                         # [M*K,1]
+        flat_mod_pos = mod_pos_exp.reshape(-1, 1)                                         # [M*K, 1]
         grouped_pos = [flat_mod_pos[flat_mod2evt == b] for b in range(B)]
         padded_pos = pad_sequence(grouped_pos, batch_first=True)                          # [B, L_sub, 1]
         cls_pos = torch.zeros((B, 1, 1), device=device)                                   # [B, 1, 1]
