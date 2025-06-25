@@ -9,6 +9,16 @@ Description:
 
 import argparse
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in ('yes', 'true', 't', 'y', '1'):
+        return True
+    if v in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise argparse.ArgumentTypeError(f'Boolean value expected (got {v!r}).')
+
 '''
 Parameters
 '''
@@ -20,8 +30,8 @@ def ini_argparse():
     parser.add_argument("--stage2", action="store_false", dest="stage1", help="set if stage 2 (flavour/regression)")
     parser.add_argument("--preprocessing_input", type=str, default="log", help="input data preprocessing (log or sqrt)")
     parser.add_argument("--preprocessing_output", type=str, default="log", help="output data preprocessing (log or sqrt)")
-    parser.add_argument("--standardize_input", action="store_true", default=False, help="input data standardisation (log or sqrt)")
-    parser.add_argument("--standardize_output", action="store_true", default=False, help="output data standardisation (log or sqrt)")
+    parser.add_argument("--standardize_input", type=str, default=None, help="standarisation type to input (z-score / uni-var / norm)")
+    parser.add_argument("--standardize_output", type=str, default=None, help="standarisation type to output (z-score / uni-var / norm)")
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")

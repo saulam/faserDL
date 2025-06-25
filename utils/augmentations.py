@@ -41,10 +41,11 @@ def is_escaping(coords, metadata):
     return np.any(on_boundary, axis=1)
 
 
-def mirror(coords, modules, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def mirror(coords, modules, dirs, rear_cal_modules, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     axes = ['x', 'y', 'z']
     for axis in range(3):
         if axes[axis] in selected_axes and np.random.choice([True, False]):
+            # flip coords
             if axis<2:
                 coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
             else:
@@ -52,14 +53,25 @@ def mirror(coords, modules, dirs, primary_vertex, metadata, selected_axes=['x', 
                 n_mod       = metadata['z'][:,1].max() + 1
                 coords[:, axis] = module_size - coords[:, axis] - 1
                 modules = n_mod - modules - 1
+
+            # flip primary vertex
             primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis] - 1
+
+            # flip direction vectors
             for x in dirs:
                 x[axis] *= -1
 
-    return coords, modules, dirs, primary_vertex
+            # flip the rearCal modules
+            if axis < 2:
+                # axis==0 (x): flip columns  => axis=1 of the 2D array
+                # axis==1 (y): flip rows     => axis=0 of the 2D array
+                flip_axis = 1 - axis
+                rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis)
+
+    return coords, modules, dirs, rear_cal_modules, primary_vertex
 
 
-def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+def rotate_90(coords, dirs, rear_cal_modules, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
     # Rotation matrices for 90, 180, and 270 degrees on each axis
     rotations = {
         'x': {0: np.eye(3),
@@ -88,6 +100,10 @@ def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', '
             angle = np.random.choice([0, 90, 180, 270])
             final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
 
+            if axis == 'z' and angle != 0:
+                k = angle // 90  # number of 90° CCW turns
+                rear_cal_modules = np.rot90(rear_cal_modules, k)
+
     translated_points = coords - reference_point
     translated_vertex = primary_vertex - reference_point
     rotated_points = translated_points @ final_rotation_matrix
@@ -96,7 +112,7 @@ def rotate_90(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', '
     final_vertex = rotated_vertex + reference_point
     rotated_dirs = [x @ final_rotation_matrix for x in dirs]
 
-    return final_points, rotated_dirs, final_vertex
+    return final_points, rotated_dirs, rear_cal_modules, final_vertex
 
 
 def shear_rotation_2d(points_2d, theta):

@@ -14,7 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-from timm.models.layers import trunc_normal_
+from torch.cuda.amp import autocast
+from timm.models.layers import trunc_normal_, DropPath
 from MinkowskiEngine import (
     SparseTensor,
     MinkowskiConvolution,
@@ -32,11 +33,11 @@ def _init_weights(m):
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
     elif isinstance(m, MinkowskiDepthwiseConvolution):
-        trunc_normal_(m.kernel, std=0.02)
+        trunc_normal_(m.kernel)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
     elif isinstance(m, MinkowskiLinear):
-        trunc_normal_(m.linear.weight, std=0.02)
+        trunc_normal_(m.linear.weight)
         if m.linear.bias is not None:
             nn.init.constant_(m.linear.bias, 0)
     elif isinstance(m, nn.Linear):
@@ -48,6 +49,19 @@ def _init_weights(m):
     elif isinstance(m, nn.LayerNorm):
         nn.init.constant_(m.bias, 0)
         nn.init.constant_(m.weight, 1.0)
+    elif isinstance(m, nn.Conv2d):
+        w = m.weight.data
+        trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
+        nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.Conv3d):
+        w = m.weight.data
+        trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
+        nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.ConvTranspose3d):
+        w = m.weight.data
+        trunc_normal_(w.view(w.shape[0], -1))
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
     elif isinstance(m, nn.LSTM):
         for name, param in m.named_parameters():
             if 'weight_ih' in name:
@@ -58,18 +72,11 @@ def _init_weights(m):
                 param.data.fill_(0)
                 hidden_size = m.hidden_size
                 param.data[hidden_size:2*hidden_size].fill_(1)
-    elif hasattr(m, 'mask_voxel_emb'):
-        trunc_normal_(m.mask_voxel_emb, std=0.02)
-    elif hasattr(m, 'empty_mod_emb'):
-        trunc_normal_(m.empty_mod_emb, std=0.02)
-    elif hasattr(m, 'cls_mod'):
-        trunc_normal_(m.cls_mod, std=0.02)
-    elif hasattr(m, 'cls_task'):
-        trunc_normal_(m.cls_task, std=0.02)
-    elif hasattr(m, 'iscc_token'):
-        trunc_normal_(m.iscc_token, std=0.02)   
-    elif hasattr(m, 'special_token_embeddings'):
-        trunc_normal_(m.special_token_embeddings, std=0.02)   
+    else:
+        for attr in ('mask_voxel_emb', 'mask_mod_emb', 'empty_mod_emb',
+                     'cls_mod', 'cls_evt'):
+            if hasattr(m, attr):
+                init.normal_(getattr(m, attr), std=0.02)
 
 
 class PositionalEncoding(nn.Module):
@@ -129,6 +136,80 @@ class PositionalEncoding3D(nn.Module):
         pos_enc = torch.cat([sin_x, cos_x, sin_y, cos_y, sin_z, cos_z], dim=-1)
         return pos_enc
 
+
+class TransposeUpsampleDecoder(nn.Module):
+    def __init__(self, input_dim, hidden_channels=16):
+        super().__init__()
+        
+        self.init_dims = (6, 6, 5)
+        self.hidden = hidden_channels
+        self.fc = nn.Linear(input_dim,
+                            hidden_channels * self.init_dims[0] * self.init_dims[1] * self.init_dims[2])
+        self.deconv1 = nn.ConvTranspose3d(hidden_channels,
+                                          hidden_channels,
+                                          kernel_size=(4, 4, 2),
+                                          stride=(4, 4, 2))
+        self.deconv2 = nn.ConvTranspose3d(hidden_channels,
+                                          hidden_channels,
+                                          kernel_size=(2, 2, 2),
+                                          stride=(2, 2, 2))
+        self.conv_out = nn.Conv3d(hidden_channels, 1, kernel_size=3, padding=1)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        B = x.size(0)
+        x = self.fc(x)                                 # [B, hidden*6*6*5]
+        x = x.view(B, self.hidden, *self.init_dims)    # [B, hidden, 6, 6, 5}
+        x = self.act(self.deconv1(x))                  # [B, hidden, 24, 24, 10]
+        x = self.act(self.deconv2(x))                  # [B, hidden, 48, 48, 20]
+        x = self.conv_out(x)                           # [B, 1, 48, 48, 20]
+        return x
+
+
+class Upsample3DDecoder(nn.Module):
+    def __init__(self,
+                 latent_dim: int,
+                 decoder_dim: int = 64,
+                 depth: int = 1,
+                 init_size=(6,6,5),
+                 patch_size=(8,8,4)
+                ):
+        super().__init__()
+        H0, W0, D0 = init_size
+        ph, pw, pd = patch_size
+        pv = ph * pw * pd
+
+        self.proj = nn.Linear(latent_dim, decoder_dim * H0 * W0 * D0)
+        self.blocks = nn.Sequential(*[
+            BlockDense(decoder_dim)
+            for _ in range(depth)
+        ])
+        self.pred = nn.Conv3d(decoder_dim, pv, kernel_size=1)
+        self.init_size = init_size
+        self.patch_size = patch_size
+
+    def forward(self, z):
+        """
+        z: [M_masked, latent_dim]
+        returns: [M_masked, 1, 48, 48, 20]
+        """
+        M = z.size(0)
+        H0, W0, D0 = self.init_size
+        ph, pw, pd = self.patch_size
+
+        x = self.proj(z)                                # [B, dec*H0*W0*D0]
+        x = x.view(M, -1, H0, W0, D0)                   # [B, dec, 6, 6, 5]
+        x = self.blocks(x)                              # [B, dec, 6, 6, 5]
+        x = self.pred(x)                                # [B, ph*pw*pd, 6, 6, 5]
+        x = x.permute(0, 2, 3, 4, 1)                    # [B, 6, 6, 5, pv]
+        x = x.view(M, H0, W0, D0, ph, pw, pd)
+        x = x.permute(0, 4, 1, 5, 2, 6, 3)              # [B, ph, 6, pw, 6, pd, 5]
+        x = x.contiguous().view(M, 1,
+                                ph*H0,
+                                pw*W0,
+                                pd*D0)                  # [B, 1, 48, 48, 20]
+        return x
+        
 
 class ScaledFourierPosEmb3D(nn.Module):
     def __init__(self, num_features, d_model, init_scale=5):
@@ -265,7 +346,7 @@ class GlobalFeatureEncoder(nn.Module):
         # ECal conv encoder
         self.ecal_encoder = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=d_model, kernel_size=3),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.AdaptiveAvgPool2d(1),  # (batch, ecal_hidden_dim, 1, 1)
             nn.Flatten()              # (batch, ecal_hidden_dim)
         )
@@ -364,6 +445,43 @@ class MinkowskiSE(nn.Module):
             coordinate_map_key=voxel_feature.coordinate_map_key,
         )
 
+        
+class BlockDense(nn.Module):
+    """ Dense ConvNeXtV2 Block.
+    
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.0
+    """
+    def __init__(self, dim, drop_path=0.):
+        super().__init__()
+        self.dwconv = nn.Conv3d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.grn = GRN(4 * dim)
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        input = x
+
+        # small workaround (conv_depthwise3d not implemented for bf16)
+        with autocast(enabled=False):
+            x_fp32 = self.dwconv(x.float())
+        x = x_fp32.to(input.dtype)
+        
+        x = x.permute(0, 2, 3, 4, 1) # (N, C, H, W, D) -> (N, H, W, D, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.grn(x)
+        x = self.pwconv2(x)
+        x = x.permute(0, 4, 1, 2, 3) # (N, H, W, D, C) -> (N, C, H, W, D)
+
+        x = input + self.drop_path(x)
+        return x
+        
 
 class Block(nn.Module):
     """ Sparse ConvNeXtV2 Block. 

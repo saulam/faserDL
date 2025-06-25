@@ -80,18 +80,19 @@ class SparseFASERCALDataset(Dataset):
         return len(self.data_files)
 
     
-    def _augment(self, coords_ori, modules_ori, feats_ori, labels_ori, dirs_ori, primary_vertex_ori):
+    def _augment(self, coords_ori, modules_ori, feats_ori, labels_ori, dirs_ori, rear_cal_modules_ori, primary_vertex_ori):
         coords, modules, feats = coords_ori.copy(), modules_ori.copy(), feats_ori.copy()
         primary_vertex = primary_vertex_ori.copy()
+        rear_cal_modules = rear_cal_modules_ori.copy()
         labels = [x.copy() for x in labels_ori]
         dirs = [x.copy() for x in dirs_ori]
 
         # mirror
-        coords, modules, dirs, primary_vertex = mirror(coords, modules, dirs, primary_vertex, self.metadata, selected_axes=['x', 'y'])
+        coords, modules, dirs, rear_cal_modules, primary_vertex = mirror(coords, modules, dirs, rear_cal_modules, primary_vertex, self.metadata, selected_axes=['x', 'y'])
         # rotate
-        coords, dirs, primary_vertex = rotate_90(coords, dirs, primary_vertex, self.metadata, selected_axes=['z'])
+        coords, dirs, rear_cal_modules, primary_vertex = rotate_90(coords, dirs, rear_cal_modules, primary_vertex, self.metadata, selected_axes=['z'])
         # translate
-        coords, modules, primary_vertex = translate(coords, modules, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
+        #coords, modules, primary_vertex = translate(coords, modules, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
         # drop voxels
         coords, modules, feats, labels = drop(coords, modules, feats, labels, std_dev=0.1)
         # shift feature values
@@ -99,9 +100,9 @@ class SparseFASERCALDataset(Dataset):
         # keep within limits
         #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
         if coords.shape[0] < 2:
-            return coords_ori, modules_ori, feats_ori, labels_ori, dirs_ori, primary_vertex_ori
+            return coords_ori, modules_ori, feats_ori, labels_ori, dirs_ori, rear_cal_modules_ori, primary_vertex_ori
 
-        return coords, modules, feats, labels, dirs, primary_vertex
+        return coords, modules, feats, labels, dirs, rear_cal_modules, primary_vertex
     
     
     def within_limits(self, coords, feats=None, labels=None, voxelised=False, mask_axes=(0, 1, 2)):
@@ -260,7 +261,7 @@ class SparseFASERCALDataset(Dataset):
         return momentum[0] if magnitude.shape[0] == 1 else momentum
 
 
-    def preprocess(self, x, param_name, preprocessing=None, standardize=False):
+    def preprocess(self, x, param_name, preprocessing=None, standardize=None):
         if np.ndim(x) == 0:
             x = np.atleast_1d(x)
 
@@ -276,16 +277,29 @@ class SparseFASERCALDataset(Dataset):
             x = np.log1p(x)
             internal_name = param_name + "_log1p"
 
-        if standardize:
+        if standardize is not None:
             stats = self.metadata[internal_name]
-            if stats["std"] == 0:
-                raise ValueError(f"{internal_name}: std is zero in metadata")
-            x = (x - stats["mean"]) / stats["std"]
+            if standardize == "z-score":
+                # mean=0, std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = (x - stats["mean"]) / stats["std"]
+            elif standardize == "unit-var":
+                # std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x / stats["std"]
+            else:
+                # [0, 1] normalisation
+                rng = stats["max"] - stats["min"]
+                if rng == 0:
+                    raise ValueError(f"{param_name}: max and min are equal in metadata")
+                x = (x - stats["min"]) / rng
 
         return x
 
 
-    def unpreprocess(self, x, param_name, preprocessing=None, standardize=False):
+    def unpreprocess(self, x, param_name, preprocessing=None, standardize=None):
         if np.ndim(x) == 0 or (isinstance(x, np.ndarray) and x.shape == ()):
             x = np.atleast_1d(x)
 
@@ -295,11 +309,24 @@ class SparseFASERCALDataset(Dataset):
         elif preprocessing == "log":
             internal_name = param_name + "_log1p"
 
-        if standardize:
+        if standardize is not None:
             stats = self.metadata[internal_name]
-            if stats["std"] == 0:
-                raise ValueError(f"{internal_name}: std is zero in metadata")
-            x = x * stats["std"] + stats["mean"]
+            if standardize == "z-score":
+                # mean=0, std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x * stats["std"] + stats["mean"]
+            elif standardize == "unit-var":
+                # std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x * stats["std"]
+            else:
+                # [0, 1] normalisation
+                rng = stats["max"] - stats["min"]
+                if rng == 0:
+                    raise ValueError(f"{param_name}: max and min are equal in metadata")
+                x = x * rng + stats["min"]
 
         if preprocessing == "sqrt":
             x = x ** 2
@@ -309,7 +336,7 @@ class SparseFASERCALDataset(Dataset):
         return x
         
 
-    def get_param(self, data, param_name, preprocessing=None, standardize=False, suffix=""):
+    def get_param(self, data, param_name, preprocessing=None, standardize=None, suffix=""):
         if param_name not in data:
             return None
 
@@ -416,11 +443,11 @@ class SparseFASERCALDataset(Dataset):
             # augmented event
             (
                 coords, modules, feats, (primlepton_labels, seg_labels),
-                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum), primary_vertex
+                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum), rear_cal_modules, primary_vertex
             ) = self._augment(
                 coords, modules, feats, (primlepton_labels, seg_labels),
                 (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum),
-                primary_vertex
+                rear_cal_modules, primary_vertex
             )
             augmented = True
         else:
