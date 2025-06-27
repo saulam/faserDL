@@ -11,7 +11,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
+from utils import CustomFinetuningReversed, ini_argparse, split_dataset
 from dataset import SparseFASERCALDataset
 from model import MinkMAEConvNeXtV2, SparseMAELightningModel
 from pytorch_lightning.loggers import CSVLogger
@@ -77,7 +77,10 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
     callbacks = []
     monitored_losses = [
+            'loss/val_occupancy',
             'loss/val_charge',
+            'loss/val_primlepton',
+            'loss/val_seg',
             'loss/val_iscc',
             'loss/val_total',
     ]

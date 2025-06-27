@@ -11,9 +11,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from utils import (
-    focal_loss, dice_loss, arrange_sparse_minkowski, argsort_sparse_tensor, 
+    SigmoidFocalLossWithLogits, arrange_sparse_minkowski, argsort_sparse_tensor, 
     arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 )
 from functools import partial
@@ -28,6 +29,9 @@ class SparseMAELightningModel(pl.LightningModule):
         super(SparseMAELightningModel, self).__init__()
 
         self.model = model
+        self.loss_primlepton = nn.BCEWithLogitsLoss()
+        self.loss_seg = nn.CrossEntropyLoss()
+        self.loss_charge = nn.MSELoss()
         self.loss_iscc = nn.BCEWithLogitsLoss()
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
@@ -62,54 +66,74 @@ class SparseMAELightningModel(pl.LightningModule):
         target = arrange_truth(batch)
         return batch_input, *global_params, batch_module_to_event, batch_module_pos, target
 
-
+    
     def compute_losses(self, batch_input, batch_output, target, mask_bool):
         # true
         coords = batch_input.C
-        feats = batch_input.F.squeeze(-1)
+        targ_charge = batch_input.F
+        targ_primlepton = target['primlepton_labels']
+        targ_seg = target['seg_labels']
         targ_iscc = target['is_cc']
 
-        # keep voxels from masked modules
+        # keep voxels from masked modules only
         orig_mod_ids = coords[:, 0].long()
         masked_mod_ids = mask_bool.nonzero(as_tuple=True)[0]
         keep = torch.isin(orig_mod_ids, masked_mod_ids) 
         coords = coords[keep]
-        feats = feats[keep]
+        targ_charge = targ_charge[keep]
+        targ_primlepton = targ_primlepton[keep]
+        targ_seg = targ_seg[keep]
 
         # pred
+        out_occupancy = batch_output['out_occupancy']
         out_charge = batch_output['out_charge']
+        out_primlepton = batch_output['out_primlepton']
+        out_seg = batch_output['out_seg']
         out_iscc = batch_output['out_iscc'].squeeze(-1)
-
-        # compute c = standardized(0) = (0 - mu) / sigma
-        if self.standardize_input == "z-score":
-            q_meta = "q"
-            if self.preprocessing_input == "sqrt":
-                q_meta += "_sqrt"
-            elif self.preprocessing_input == "log":
-                q_meta += "_log"
-            mu, sigma = self.metadata[q_meta]["mean"], self.metadata[q_meta]["std"]
-            c = (- mu) / sigma
-        else:
-            c = 0
-        c = torch.as_tensor(c, device=out_charge.device, dtype=out_charge.dtype)
-        
-        # sum‐of‐squares over every voxel (all zero+nonzero)
-        total_ss = (out_charge - c).pow(2).sum()
 
         # gather predictions at nonzero locations
         local_b_idx = torch.searchsorted(masked_mod_ids, coords[:, 0].long())
         x,y,z = coords[:,1], coords[:,2], coords[:,3]
-        pred_feats = out_charge[local_b_idx, x, y, z]
+        out_charge = out_charge[local_b_idx, :, x, y, z]
+        out_primlepton = out_primlepton[local_b_idx, :, x, y, z]
+        out_seg = out_seg[local_b_idx, :, x, y, z]
+        targ_occupancy = torch.zeros_like(out_occupancy)
+        targ_occupancy[local_b_idx, :, x, y, z] = 1.
 
-        # swap out pred^2 for (pred−true)^2 at those nonzero locations
-        nonzero_ss_pred2 = (pred_feats - c).pow(2).sum()
-        nonzero_ss_true  = (pred_feats - feats).pow(2).sum()
+        # weight for occupancy loss (using log of original charge)
+        q_meta = "q"
+        targ_charge_copy = targ_charge.clone()
+        if self.preprocessing_input == "sqrt":
+            q_meta += "_sqrt"
+        elif self.preprocessing_input == "log":
+            q_meta += "_log1p"
+        if self.standardize_input is not None:
+            stats = self.metadata[q_meta]
+            if self.standardize_input == "z-score":
+                targ_charge_copy = targ_charge_copy * stats["std"] + stats["mean"]
+            elif self.standardize_input == "unit-var":
+                targ_charge_copy = targ_charge_copy * stats["std"]
+            else:
+                rng = stats["max"] - stats["min"]
+                targ_charge_copy = targ_charge_copy * rng + stats["min"]
+        if self.preprocessing_input == "sqrt":
+            targ_charge_copy = targ_charge_copy ** 2
+        targ_charge_copy = torch.log1p(targ_charge_copy)
+        weight_occupancy = torch.zeros_like(targ_occupancy, dtype=targ_charge_copy.dtype)
+        weight_occupancy[local_b_idx, :, x, y, z] = targ_charge_copy
+        weight_occupancy = weight_occupancy + 1.  # empty voxels -> weight of 1
 
         # losses
-        loss_charge = (total_ss - nonzero_ss_pred2 + nonzero_ss_true) / out_charge.numel()
+        loss_occupancy = F.binary_cross_entropy_with_logits(out_occupancy, targ_occupancy, weight=weight_occupancy)
+        loss_charge = self.loss_charge(out_charge, targ_charge)
+        loss_primlepton = self.loss_primlepton(out_primlepton, targ_primlepton)
+        loss_seg = self.loss_seg(out_seg, targ_seg)
         loss_iscc = self.loss_iscc(out_iscc, targ_iscc)
 
-        part_losses = {'charge': loss_charge,
+        part_losses = {'occupancy': loss_occupancy,
+                       'charge': loss_charge,
+                       'primlepton': loss_primlepton,
+                       'seg': loss_seg,
                        'iscc': 0.0001*loss_iscc,
                        }
         total_loss = sum(part_losses.values())

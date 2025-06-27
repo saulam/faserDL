@@ -22,7 +22,7 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import _init_weights, Upsample3DDecoder, ScaledFourierPosEmb3D, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
+from .utils import _init_weights, MultiTaskUpsample3DDecoder, ScaledFourierPosEmb3D, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
 class MinkMAEConvNeXtV2(nn.Module):
@@ -101,7 +101,7 @@ class MinkMAEConvNeXtV2(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
 
         # Dense decoder
-        self.decoder = Upsample3DDecoder(latent_dim=self.d_evt, decoder_dim=32)
+        self.decoder = MultiTaskUpsample3DDecoder(latent_dim=self.d_evt, decoder_dim=32)
         
         # Output layer
         self.iscc_layer = nn.Linear(self.d_evt, 1)
@@ -223,11 +223,20 @@ class MinkMAEConvNeXtV2(nn.Module):
         valid = idxs_flat >= 0
         mask_flat = valid & mask_bool[idxs_flat]
         dec_in = flat_evt[mask_flat]
-        out_charge = self.decoder(dec_in).squeeze(1)                                      # (M_masked, 48, 48, 20)
-        out_iscc = self.iscc_layer(event_cls)
+        dec_out = self.decoder(dec_in)
+
+        # --------------- Predictions ----------------
+        out_occupancy = dec_out["occupancy_logits"]                                       # [M_masked, 1, 48, 48, 20]
+        out_charge = dec_out["pred_charge"]                                               # [M_masked, 1, 48, 48, 20]
+        out_primlepton = dec_out["primlepton_logits"]                                     # [M_masked, 1, 48, 48, 20]
+        out_seg = dec_out["seg_logits"]                                                   # [M_masked, 3, 48, 48, 20]
+        out_iscc = self.iscc_layer(event_cls)                                             # [B, 1]
         
         return {
+            "out_occupancy": out_occupancy,
             "out_charge": out_charge,
+            "out_primlepton": out_primlepton,
+            "out_seg": out_seg,
             "out_iscc": out_iscc,
         }
         

@@ -209,6 +209,85 @@ class Upsample3DDecoder(nn.Module):
                                 pw*W0,
                                 pd*D0)                  # [B, 1, 48, 48, 20]
         return x
+
+
+class MultiTaskUpsample3DDecoder(nn.Module):
+    def __init__(self,
+                 latent_dim: int,
+                 decoder_dim: int = 64,
+                 depth: int = 1,
+                 init_size=(6,6,5),
+                 patch_size=(8,8,4),
+                ):
+        super().__init__()
+        H0, W0, D0 = init_size
+        ph, pw, pd = patch_size
+        pv = ph * pw * pd  # Channels needed for voxel shuffling
+        self.num_seg_classes = 3
+
+        # --- Shared Backbone ---
+        self.proj = nn.Linear(latent_dim, decoder_dim * H0 * W0 * D0)
+        self.blocks = nn.Sequential(*[
+            BlockDense(decoder_dim)
+            for _ in range(depth)
+        ])
+        
+        # --- Four Separate Prediction Heads ---
+        # Head 1: Voxel occupancy (binary classification)
+        self.pred_occupancy = nn.Conv3d(decoder_dim, pv, kernel_size=1)
+        
+        # Head 2: Voxel charge (regression)
+        self.pred_charge = nn.Conv3d(decoder_dim, pv, kernel_size=1)
+
+        # Head 3: Primary lepton (binary classification)
+        self.pred_lepton = nn.Conv3d(decoder_dim, pv, kernel_size=1)
+
+        # Head 4: Electromagnetic/hadronic/ghost (multi-class classification)
+        self.pred_particle_type = nn.Conv3d(decoder_dim, self.num_seg_classes * pv, kernel_size=1)
+
+        self.init_size = init_size
+        self.patch_size = patch_size
+
+    def forward(self, z):
+        """
+        z: [M_masked, latent_dim]
+        returns: dict with four tensors
+        """
+        M = z.size(0)
+        H0, W0, D0 = self.init_size
+        ph, pw, pd = self.patch_size
+
+        # Shared backbone
+        x_shared = self.proj(z)                                            # [M, C_in*H0*W0*D0]
+        x_shared = x_shared.view(M, -1, H0, W0, D0)                        # [M, C_in, H0, W0, D0]
+        x_shared = self.blocks(x_shared)                                   # [M, C_in, H0, W0, D0]
+
+        # Process all heads in parallel
+        x_occ = self.pred_occupancy(x_shared)                              # [M, C_out, H0, W0, D0]
+        x_chg = self.pred_charge(x_shared)                                 # [M, C_out, H0, W0, D0]
+        x_lep = self.pred_lepton(x_shared)                                 # [M, C_out, H0, W0, D0]
+        x_part = self.pred_particle_type(x_shared)                         # [M, C_out, H0, W0, D0]
+
+        # Utility function for unpatching
+        def unpatch(tensor, channels_per_voxel=1):
+            out = tensor.permute(0, 2, 3, 4, 1)                            # [M, H0, W0, D0, C_out]
+            out = out.view(M, H0, W0, D0, ph, pw, pd, channels_per_voxel)  # [M, H0, W0, D0, ph, pw, pd, C_voxel]
+            out = out.permute(0, 7, 4, 1, 5, 2, 6, 3)                      # [M, C_voxel, ph, H0, pw, W0, pd, D0]
+            final_shape = (M, channels_per_voxel, ph*H0, pw*W0, pd*D0)     # [M, C_voxel, ph*H0, pw*W0, pd*D0]
+            return out.contiguous().view(final_shape)                      # [M, C_voxel, 48, 48, 20]
+
+        # Head's output
+        occ_logits = unpatch(x_occ, channels_per_voxel=1)
+        pred_charge = unpatch(x_chg, channels_per_voxel=1)
+        lepton_logits = unpatch(x_lep, channels_per_voxel=1)
+        particle_type_logits = unpatch(x_part, channels_per_voxel=self.num_seg_classes)
+
+        return {
+            "occupancy_logits": occ_logits,         # Shape: [M, 1, 48, 48, 20]
+            "pred_charge": pred_charge,             # Shape: [M, 1, 48, 48, 20]
+            "primlepton_logits": lepton_logits,     # Shape: [M, 1, 48, 48, 20]
+            "seg_logits": particle_type_logits      # Shape: [M, 3, 48, 48, 20]
+        }
         
 
 class ScaledFourierPosEmb3D(nn.Module):

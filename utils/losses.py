@@ -9,6 +9,7 @@ Description:
 
 
 import torch
+import torch.nn as nn
 from torch.nn import functional as F
 
 
@@ -289,6 +290,64 @@ def softmax_focal_loss(
 
     return loss
 
+
+class SigmoidFocalLossWithLogits(nn.Module):
+    """
+    Focal Loss for binary classification with logits input, matching
+    the interface of torch.nn.BCEWithLogitsLoss.
+
+    LOSS = alpha * (1 - p_t)^gamma * BCEWithLogits
+
+    Args:
+        alpha (float, optional): weight for the positive class in [0,1].
+            Defaults to 0.25.
+        gamma (float, optional): focusing parameter >= 0. Defaults to 2.0.
+        reduction (str, optional): 'none' | 'mean' | 'sum'. Default: 'mean'
+    """
+    def __init__(
+        self,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        reduction: str = "mean"
+    ):
+        super().__init__()
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be in [0,1]")
+        if gamma < 0:
+            raise ValueError("gamma must be non-negative")
+        if reduction not in ("none", "mean", "sum"):
+            raise ValueError(f"reduction must be one of 'none','mean','sum', got {reduction}")
+
+        self.register_buffer("alpha", torch.tensor(alpha))
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction="none"
+        )
+
+        # p_t = exp(-bce_loss): stable way to get sigmoid/logits relation
+        pt = torch.exp(-bce_loss)
+
+        # alpha_t = alpha if target==1 else (1-alpha)
+        alpha_factor = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        # compute focal factor (1 - p_t)^gamma ---
+        focal_factor = (1 - pt).pow(self.gamma)
+
+        # combine into focal loss per element ---
+        loss = alpha_factor * focal_factor * bce_loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:  # 'none'
+            return loss
+            
 
 def sigmoid_focal_loss(
     inputs: torch.Tensor,
