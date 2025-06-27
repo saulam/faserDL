@@ -93,7 +93,7 @@ class SparseMAELightningModel(pl.LightningModule):
 
         # gather predictions at nonzero locations
         local_b_idx = torch.searchsorted(masked_mod_ids, coords[:, 0].long())
-        x,y,z = coords[:,1], coords[:,2], coords[:,3]
+        x, y, z = coords[:, 1].long(), coords[:, 2].long(), coords[:, 3].long()
         out_charge = out_charge[local_b_idx, :, x, y, z]
         out_primlepton = out_primlepton[local_b_idx, :, x, y, z]
         out_seg = out_seg[local_b_idx, :, x, y, z]
