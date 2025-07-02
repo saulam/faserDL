@@ -6,10 +6,13 @@ Date: 04.25
 Description: PyTorch model - stage 2: event-level classification and regression tasks.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
 from torch.nn.utils.rnn import pad_sequence
+from timm.models.layers import trunc_normal_
 
 import MinkowskiEngine as ME
 from MinkowskiEngine import (
@@ -45,9 +48,7 @@ class MinkEncConvNeXtV2(nn.Module):
         encoder_dims = [96, 192, 384, 768]
         kernel_size_ds = (2, 2, 2)
         block_kernel = (3, 3, 3)
-        
         drop_path_rate = 0.2
-        
         assert len(encoder_depths) == len(encoder_dims)
         self.nb_elayers = len(encoder_dims)
         total_depth = sum(encoder_depths)
@@ -86,25 +87,19 @@ class MinkEncConvNeXtV2(nn.Module):
         self.d_mod = encoder_dims[-1]
         heads_m = 12
         self.mod_transformer = RelPosTransformer(
-            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=5, num_dims=3, dropout=args.dropout)
+            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=2, num_dims=3, dropout=args.dropout)
         self.pos_emb_mod = ScaledFourierPosEmb3D(num_features=32, d_model=self.d_mod)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, self.d_mod))
         self.cls_mod_extra_emb = nn.Linear(2, self.d_mod)
 
-        # Sub-tokens
-        self.K = 2
-        assert self.d_mod % self.K == 0, "d_mod must be divisible by K subtokens"
-        self.d_evt = self.d_mod // self.K
-        self.subtoken_proj = nn.Linear(self.d_mod, self.K * self.d_evt)
-        self.pos_emb_sub = nn.Embedding(self.K, self.d_evt)
-        self.subtokens_to_module = nn.Linear(self.K * self.d_evt, self.d_mod)
-
         # Event-level transformer (across modules)
-        heads_e = 8
+        heads_e = 12
+        self.d_evt = self.d_mod
         self.global_feats_encoder = GlobalFeatureEncoder(d_model=self.d_evt, dropout=args.dropout)
-        self.event_transformer = RelPosTransformer(
-            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=5, num_dims=1, dropout=args.dropout)
-        self.pos_emb = nn.Embedding(self.num_modules, self.d_evt)
+        self.evt_transformer = RelPosTransformer(
+            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=6, num_dims=1, dropout=args.dropout)
+        self.pos_emb_evt = nn.Embedding(self.num_modules, self.d_evt)
+        self.cls_evt = nn.Parameter(torch.zeros(1, 1, self.d_evt))
         self.dropout = nn.Dropout(args.dropout)
 
         # Task branches and corresponding token
@@ -132,12 +127,29 @@ class MinkEncConvNeXtV2(nn.Module):
         self.cls_evt = nn.Parameter(torch.zeros(1, self.num_cls, self.d_evt))
         self.branches = nn.ModuleDict()
         for name in self.branch_tokens.keys():
-            self.branches[name] = nn.Linear(self.d_evt, branch_out_channels[name])
+            self.branches[name] = nn.Sequential(
+                nn.LayerNorm(self.d_evt),
+                nn.Dropout(args.dropout),
+                nn.Linear(self.d_evt, branch_out_channels[name])
+            )
                 
         # Initialise weights
         self.apply(_init_weights)
+
+        # Initialise heads
+        for name in self.branch_tokens.keys():
+            lin = self.branches[name][2]
+            trunc_normal_(lin.weight, std=args.head_init)
+            if lin.bias is not None:
+                #if name == "charm":
+                #    p_charm = 0.08
+                #    initial_bias = np.log(p_charm / (1 - p_charm))
+                #    init.constant_(lin.bias, initial_bias)
+                #else:
+                init.constant_(lin.bias, 0)
+        
     
-    def forward(self, x, x_glob, module_to_event, module_pos, global_alpha=None):
+    def forward(self, x, x_glob, module_to_event, module_pos):
         """
         Forward pass through the encoder-decoder network.
 
@@ -146,7 +158,6 @@ class MinkEncConvNeXtV2(nn.Module):
             x_glob: Global feature tensors.
             module_to_event: mapping module index to event index tensor
             module_pos: mapping module index to module position tensor
-            global_alpha: percentage of global information to use 
 
         Returns:
             A dictionary with voxel predictions.
@@ -155,13 +166,13 @@ class MinkEncConvNeXtV2(nn.Module):
         module_hits, faser_cal_modules = x_glob[:2]
         params_glob = x_glob[2:]
         
-        # Encoder
+        # ----------------- Encoder -----------------
         x = self.stem_conv(x)
         x = self.stem_norm(x)
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
             if i < self.nb_elayers - 1:
-                x = self.downsample_layers[i](x)
+                x = self.downsample_layers[i](x)   
 
         # ----------------- Module-level Transformer -----------------
         # N_vox = total number of voxels in the batch
@@ -204,53 +215,42 @@ class MinkEncConvNeXtV2(nn.Module):
         )
         module_seq_out = self.mod_transformer(
             mod_in, coords=mod_coords, key_padding_mask=module_key_padding_mask)          # [M, 1+L_vox, D_mod]
-
-        # ----------------- Subtoken expansion -----------------
         module_cls = module_seq_out[:, 0, :]                                              # [M, D_mod]
-        subtoks = self.subtoken_proj(module_cls).view(M, self.K, self.d_evt)              # [M, K, D_evt]
-        mod_pos_exp = module_pos.unsqueeze(1).expand(-1, self.K)                          # [M, K]
-        pe_mod2 = self.pos_emb(mod_pos_exp)                                               # [M, K, D_evt]
-        sub_ids = torch.arange(self.K, device=device).unsqueeze(0).expand(M, -1)          # [M, K]
-        pe_sub = self.pos_emb_sub(sub_ids)                                                # [M, K, D_evt]
-        subtoks = subtoks + pe_mod2 + pe_sub                                              # [M, K, D_evt]
-        flat_subtoks = subtoks.view(-1, self.d_evt)                                       # [M*K, D_evt]
-        flat_mod2evt = module_to_event.repeat_interleave(self.K)                          # [M*K]
 
         # ----------------- Event-level Transformer -----------------
         # B = number of events in the batch
-        # L_sub = max number of modules in an event * K
+        # L_mod = max number of modules in an event
         B = int(module_to_event.max().item()) + 1
+        pos_emb_evt = self.pos_emb_evt(module_pos)                                        # [M, D_evt]
+        module_cls = module_cls + pos_emb_evt
         glob_emb = self.global_feats_encoder(params_glob).unsqueeze(1)                    # [B, 1, D_evt]
-        cls_tokens_evt = self.cls_evt.expand(B, self.num_cls, self.d_evt)                 # [B, num_cls, D_evt]
-        if global_alpha is not None:
-            cls_tokens_evt = cls_tokens_evt + global_alpha*glob_emb                       # [B, num_cls, D_evt]
-        grouped_subs = [flat_subtoks[flat_mod2evt == b] for b in range(B)]
-        padded_subs = pad_sequence(grouped_subs, batch_first=True)                        # [B, L_sub, D_evt]
-        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_subs], dim=1))            # [B, num_cls+L_sub, D_evt]
-        flat_mod_pos = mod_pos_exp.reshape(-1, 1)                                         # [M*K, 1]
-        grouped_pos = [flat_mod_pos[flat_mod2evt == b] for b in range(B)]
-        padded_pos = pad_sequence(grouped_pos, batch_first=True)                          # [B, L_sub, 1]
-        cls_pos = torch.zeros((B, self.num_cls, 1), device=device)                        # [B, num_cls, 1]
-        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, num_cls+L_sub,1]
+        cls_tokens_evt = self.cls_evt.expand(B, 1, self.d_evt)                            # [B, 1, D_evt]
+        cls_tokens_evt = cls_tokens_evt + glob_emb                                        # [B, 1, D_evt]
+        grouped_mods = [module_cls[module_to_event == b] for b in range(B)]
+        padded_mods = pad_sequence(grouped_mods, batch_first=True)                        # [B, L_mod, D_evt]
+        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_mods], dim=1))            # [B, 1+L_mod, D_evt]
+        grouped_pos = [module_pos[module_to_event == b] for b in range(B)]
+        padded_pos = pad_sequence(grouped_pos, batch_first=True).unsqueeze(-1)            # [B, L_mod, 1]
+        cls_pos = torch.zeros((B, 1, 1), device=device)                                   # [B, 1, 1]
+        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, 1+L_mod,1]
         event_key_padding_mask = torch.ones(
-            (B, self.num_cls + padded_subs.size(1)), dtype=torch.bool, device=device)     # [B, 1+L_sub]
-        event_key_padding_mask[:, :self.num_cls] = False
-        event_key_padding_mask[:, self.num_cls:] = (
-            torch.arange(padded_subs.size(1), device=device).unsqueeze(0)
-            >= torch.tensor([g.size(0) for g in grouped_subs], device=device).unsqueeze(1)
+            (B, 1 + padded_mods.size(1)), dtype=torch.bool, device=device)                # [B, 1+L_mod]
+        event_key_padding_mask[:, 0] = False
+        event_key_padding_mask[:, 1:] = (
+            torch.arange(padded_mods.size(1), device=device).unsqueeze(0)
+            >= torch.tensor([g.size(0) for g in grouped_pos], device=device).unsqueeze(1)
         )
-        event_seq_out = self.event_transformer(
-            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, num_cls+L_sub, D_evt]
-        event_cls = event_seq_out[:, :self.num_cls, :]                                    # [B, num_cls, D_evt]
-        event_cls = self.dropout(event_cls)                                               # [B, num_cls, D_evt]
+        event_seq_out = self.evt_transformer(
+            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, 1+L_mod, D_evt]
+        event_cls = event_seq_out[:, 0, :]                                                # [B, D_evt]
         
         # Branch-specific processing
         outputs = {}
         for i, (name, branch) in enumerate(self.branches.items()):
-            output = branch(event_cls[:, self.branch_tokens[name]])
+            output = branch(event_cls)
             if name == "flavour" or name == "charm":
                 outputs[f"out_{name}"] = output
-            if "_dir" in name:
+            elif "_dir" in name:
                 outputs[f"out_{name}"] = F.normalize(output, dim=-1)
             else:
                 outputs[f"out_{name}"] = F.softplus(output)

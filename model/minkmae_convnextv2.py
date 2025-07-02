@@ -6,6 +6,7 @@ Date: 06.25
 Description: PyTorch model - stage 1: pretraining.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,13 +102,23 @@ class MinkMAEConvNeXtV2(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
 
         # Dense decoder
-        self.decoder = MultiTaskUpsample3DDecoder(latent_dim=self.d_evt, decoder_dim=32)
+        self.decoder = MultiTaskUpsample3DDecoder(
+            latent_dim= 768, decoder_dim= 512, depth= 1, init_size=(3,3,2), patch_size=(16,16,10))
         
         # Output layer
         self.iscc_layer = nn.Linear(self.d_evt, 1)
 
         # Initialise weights
         self.apply(_init_weights)
+
+        # If occupacy/primlepton loss is BCE only
+        p_signal = 0.019
+        initial_bias = np.log(p_signal / (1 - p_signal))
+        self.decoder.pred_occupancy.bias.data.fill_(initial_bias)
+        p_primlepton = 0.013
+        initial_bias = np.log(p_primlepton / (1 - p_primlepton))
+        self.decoder.pred_lepton.bias.data.fill_(initial_bias)
+
 
     def forward(self, x, x_glob, module_to_event, module_pos, mask_bool=None):
         """
@@ -142,7 +153,6 @@ class MinkMAEConvNeXtV2(nn.Module):
         # D_mod = model dimension
         initial_voxel_feats = x.F                                                         # [N_vox, D_mod]
         voxel_coords = x.C[:, 1:].float()                                                 # [N_vox, 3]
-        
         voxel_to_module_map = x.C[:, 0].long()                                            # [N_vox]
         M = int(voxel_to_module_map.max().item()) + 1
         assert M == module_to_event.size(0)       

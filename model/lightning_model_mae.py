@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from utils import (
     SigmoidFocalLossWithLogits, arrange_sparse_minkowski, argsort_sparse_tensor, 
-    arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
+    arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler, dice_loss
 )
 from functools import partial
 from packaging import version
@@ -118,11 +118,10 @@ class SparseMAELightningModel(pl.LightningModule):
                 targ_charge_copy = targ_charge_copy * rng + stats["min"]
         if self.preprocessing_input == "sqrt":
             targ_charge_copy = targ_charge_copy ** 2
-        targ_charge_copy = torch.log1p(targ_charge_copy)
-        weight_occupancy = torch.zeros_like(targ_occupancy, dtype=targ_charge_copy.dtype)
+        targ_charge_copy = (torch.log1p(targ_charge_copy) + 1)
+        weight_occupancy = torch.ones_like(targ_occupancy, dtype=targ_charge_copy.dtype)
         weight_occupancy[local_b_idx, :, x, y, z] = targ_charge_copy
-        weight_occupancy = weight_occupancy + 1.  # empty voxels -> weight of 1
-
+        
         # losses
         loss_occupancy = F.binary_cross_entropy_with_logits(out_occupancy, targ_occupancy, weight=weight_occupancy)
         loss_charge = self.loss_charge(out_charge, targ_charge)
@@ -247,13 +246,31 @@ class SparseMAELightningModel(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure and initialize the optimizer and learning rate scheduler."""
-        # Optimiser
+        decay, no_decay = [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if (
+                p.ndim <= 1
+                or name.endswith(".bias")
+                or "emb" in name
+                or "cls_mod" in name
+                or "cls_evt" in name
+                or "mask_mod_emb" in name
+                or name.endswith((".gamma", ".beta"))
+            ):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+                
         optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
+            [
+                {"params": decay,    "weight_decay": self.weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
             lr=self.lr,
             betas=self.betas,
             eps=self.eps,
-            weight_decay=self.weight_decay
         )
 
         if self.warmup_steps==0 and self.cosine_annealing_steps==0:

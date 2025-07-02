@@ -247,6 +247,7 @@ class MultiTaskUpsample3DDecoder(nn.Module):
 
         self.init_size = init_size
         self.patch_size = patch_size
+        self.decoder_dim = decoder_dim
 
     def forward(self, z):
         """
@@ -259,7 +260,7 @@ class MultiTaskUpsample3DDecoder(nn.Module):
 
         # Shared backbone
         x_shared = self.proj(z)                                            # [M, C_in*H0*W0*D0]
-        x_shared = x_shared.view(M, -1, H0, W0, D0)                        # [M, C_in, H0, W0, D0]
+        x_shared = x_shared.view(M, self.decoder_dim, H0, W0, D0)          # [M, C_in, H0, W0, D0]
         x_shared = self.blocks(x_shared)                                   # [M, C_in, H0, W0, D0]
 
         # Process all heads in parallel

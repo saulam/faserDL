@@ -61,10 +61,11 @@ def main():
     args.scheduler_steps = nb_batches * args.cosine_annealing_steps // denom
     args.warmup_steps = nb_batches * args.warmup_steps // denom
     args.start_cosine_step = (nb_batches * args.epochs // denom) - args.scheduler_steps
-    print(f"lr               = {args.lr}")
-    print(f"scheduler_steps  = {args.scheduler_steps}")
-    print(f"warmup_steps     = {args.warmup_steps}")
-    print(f"start_cosine_step= {args.start_cosine_step}")
+    print(f"lr                = {args.lr}")
+    print(f"scheduler_steps   = {args.scheduler_steps}")
+    print(f"warmup_steps      = {args.warmup_steps}")
+    print(f"start_cosine_step = {args.start_cosine_step}")
+    print(f"eff. batch size   = {args.batch_size * denom}")
 
     # Initialize the model
     model = MinkMAEConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)

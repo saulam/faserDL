@@ -336,12 +336,12 @@ class SparseFASERCALDataset(Dataset):
         return x
         
 
-    def get_param(self, data, param_name, preprocessing=None, standardize=None, suffix=""):
+    def get_param(self, data, param_name, preprocessing=None, standardize=None):
         if param_name not in data:
             return None
 
         param = data[param_name]
-        param = self.preprocess(param, param_name + suffix, preprocessing, standardize)
+        param = self.preprocess(param, param_name, preprocessing, standardize)
 
         return param
 
@@ -371,8 +371,7 @@ class SparseFASERCALDataset(Dataset):
         jet_momentum = self.get_param(data, 'jet_momentum')
         is_cc = self.get_param(data, 'is_cc')
         charm = self.get_param(data, 'charm')
-        e_vis = self.get_param(data, 'e_vis', preprocessing=self.preprocessing_output, standardize=self.standardize_output, 
-                               suffix='_cc' if is_cc else '_nc')
+        e_vis = self.get_param(data, 'e_vis', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
         pt_miss = self.get_param(data, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
         faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
         faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
@@ -421,20 +420,6 @@ class SparseFASERCALDataset(Dataset):
         primlepton_labels = primlepton_labels.reshape(-1, 1)
         seg_labels = seg_labels.reshape(-1, 3)
 
-        if self.load_seg:
-            # load labels from pretrained model predictions
-            version = "v5.1" if self.is_v5 else "v3.5"
-            file_name = self.data_files[idx].replace(f"events_{version}", f"events_{version}_seg_results")
-            predictions = np.load(file_name)
-            primlepton_labels_pred, seg_labels_pred = predictions['out_primlepton'], predictions['out_seg']
-            
-            # convert electromagnetic and hadronic probabilities to energy desposits (using truth info)
-            seg_labels_pred[:, 1:] *= (seg_labels[:, 1:].sum(axis=1, keepdims=True) + 1e-8)            
-            
-            # predictions become labels
-            primlepton_labels = primlepton_labels_pred
-            seg_labels = seg_labels_pred
-
         # relative coords to each module
         coords[:, 2] = coords[:, 2] % self.module_size
 
@@ -476,7 +461,7 @@ class SparseFASERCALDataset(Dataset):
             output['in_neutrino_energy'] = in_neutrino_energy
             output['vis_sp_momentum'] = vis_sp_momentum
         if not self.train or not self.stage1:
-            output['charm'] = torch.tensor(charm).float()
+            output['charm'] = torch.from_numpy(charm).float()
             output['e_vis'] = torch.from_numpy(e_vis).float()
             output['pt_miss'] = torch.from_numpy(pt_miss).float()
             output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag).float()

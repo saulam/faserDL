@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
+from torch_ema import ExponentialMovingAverage
 from utils import MAPE, CosineLoss, SphericalAngularLoss, StableLogCoshLoss, arrange_sparse_minkowski, argsort_sparse_tensor, arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler
 
 
@@ -51,18 +52,18 @@ class SparseEncTlLightningModel(pl.LightningModule):
         ]
         self.log_sigma_params = set(self._uncertainty_params)
         
-        # Fine-tuning phases
-        self.current_phase = 1
+        self.warmup_steps = args.warmup_steps
+        self.start_cosine_step = args.start_cosine_step
+        self.cosine_annealing_steps = args.scheduler_steps
         self.lr = args.lr
         self.layer_decay = args.layer_decay
+        self.ema_decay = args.ema_decay
+        self.ema = None
 
         # Optimiser params
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
-
-        # Placeholders for param lists
-        self.phase1_params = []
 
         # For layer-wise lr decay
         self.encoder_block_counts = [
@@ -74,10 +75,25 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+        if not self.trainer.is_global_zero:
+            # only keep EMA on rank 0 (for DDP)
+            return
+        if self.ema is None:
+            self.ema = ExponentialMovingAverage(
+                self.model.parameters(),
+                decay=self.ema_decay,
+            )
+            
+    
+    def on_before_zero_grad(self, optimizer):
+        # called after optimizer.step() but before optimizer.zero_grad()
+        # so this is the perfect spot to capture the freshly updated weights
+        if self.ema is not None:
+            self.ema.update()
         
     
-    def forward(self, x, x_glob, module_to_event, module_pos, mask):
-        return self.model(x, x_glob, module_to_event, module_pos, mask)
+    def forward(self, x, x_glob, module_to_event, module_pos):
+        return self.model(x, x_glob, module_to_event, module_pos)
 
 
     def _arrange_batch(self, batch):
@@ -160,25 +176,37 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
         return total_loss, part_losses
 
+    def get_lr_for_module(self, module: torch.nn.Module) -> float:
+        """
+        Scan through all optimizer param_groups and return the lr for the one
+        that holds any parameter of `module`.
+        """
+        opt = self.optimizers()
+        param_ids = {id(p) for p in module.parameters()}
+        for pg in opt.param_groups:
+            if any(id(p) in param_ids for p in pg['params']):
+                return pg['lr']
+        raise ValueError(f"No param_group found for module {module}")
+
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
         batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
-        mask = torch.tensor([1.], device=self.device)
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos, mask)
+        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
         loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
-        lr = self.optimizers().param_groups[0]['lr']
+        lr = self.get_lr_for_module(self.model.branches["flavour"])
+        #lf = self.optimizers().param_groups[0]['lr']
 
-        return loss, part_losses, batch_size, lr, mask
+        return loss, part_losses, batch_size, lr
 
 
     def training_step(self, batch, batch_idx):
         torch.cuda.empty_cache()
-        loss, part_losses, batch_size, lr, mask_value = self.common_step(batch)
+        loss, part_losses, batch_size, lr = self.common_step(batch)
 
         if torch.isnan(loss):
             return None
@@ -187,7 +215,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
-        self.log(f"mask_value", mask_value, batch_size=batch_size, prog_bar=False, sync_dist=True)
         
         # log the actual sigmas (exp(log_sigma))
         for name, param in self.named_parameters():
@@ -200,7 +227,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         torch.cuda.empty_cache()
 
-        loss, part_losses, batch_size, lr, _ = self.common_step(batch)
+        loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(f"loss/val_total", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
@@ -210,18 +237,8 @@ class SparseEncTlLightningModel(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        """Configure optimizer with phase-aware LR groups, plus warmup & cosine schedulers."""
-        # ─── Print current phase & count trainable params ────────────────────────────
-        num_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"[Phase {self.current_phase}] Trainable parameters: {num_trainable:,}")
-
-        if self.current_phase == 1:
-            # Phase1: heads + cls tokens only
-            decay_params = [p for p in self.phase1_params if p not in self.log_sigma_params]
-            param_groups = [{'params': decay_params, 'lr': self.lr, 'weight_decay': self.weight_decay}]
-        else:
-            # Phase2: full unfreeze with layer-wise lr decay
-            param_groups = self._get_layerwise_param_groups()
+        """Configure optimiser with LR groups, plus warmup & cosine schedulers."""
+        param_groups = self._get_layerwise_param_groups()
 
         # group uncertainty params
         param_groups.append({
@@ -264,27 +281,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
-
-    
-    def freeze_phase1(self):
-        self.current_phase = 1
-        for p in self.parameters():
-            p.requires_grad = False
-        # Unfreeze heads, task-transformer, cls_task, log_sigma
-        for head in self.model.branches.values():
-            for p in head.parameters():
-                p.requires_grad = True
-        #self.model.cls_task.requires_grad_(True)
-        for p in self._uncertainty_params:
-            p.requires_grad = True
-        self.phase1_params = [p for p in self.parameters() if p.requires_grad]
-
-    
-    def unfreeze_phase2(self):
-        # unfreeze all remaining layers
-        self.current_phase = 2
-        for p in self.parameters():
-            p.requires_grad = True
 
         
     def _get_layer_id(self, name: str) -> int:
@@ -346,8 +342,8 @@ class SparseEncTlLightningModel(pl.LightningModule):
             return base  # same ID as mod_transformer.layers.0        
 
         # 4) EVENT‐LEVEL TRANSFORMER & related heads
-        num_evt = len(self.model.event_transformer.layers)  # e.g. 5
-        m = re.match(r"model\.event_transformer\.layers\.(\d+)\.", name)
+        num_evt = len(self.model.evt_transformer.layers)  # e.g. 5
+        m = re.match(r"model\.evt_transformer\.layers\.(\d+)\.", name)
         if m:
             k = int(m.group(1))
             return base + num_mod + k
@@ -355,9 +351,6 @@ class SparseEncTlLightningModel(pl.LightningModule):
         if (name.startswith("model.global_feats_encoder")
             or name.startswith("model.pos_emb")
             or name.startswith("model.cls_evt")
-            or name.startswith("model.subtoken_proj")
-            or name.startswith("model.pos_emb_sub")
-            or name.startswith("model.subtokens_to_module")
            ):
             return base + num_mod  # same ID as first event layer
 
@@ -384,7 +377,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
             if layer_id == -1:
                 continue
                 
-            scale   = self.layer_decay ** (max_layer_id - layer_id)
+            scale = self.layer_decay ** (max_layer_id - layer_id)
             if (name.endswith(".bias")
                 or "norm" in name.lower()         # any norm layer
                 or param in self.log_sigma_params # uncertainty tensors

@@ -40,8 +40,6 @@ def ini_argparse():
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch size")
     parser.add_argument("-e", "--epochs", type=int, default=50, help="number of epochs")
-    parser.add_argument("--phase1_epochs", type=int, default=5, help="number of phase 1 epochs (transfer learning)")
-    parser.add_argument("--phase2_epochs", type=int, default=10, help="number of phase 2 epochs (transfer learning)")
     parser.add_argument("--layer_decay", type=float, default=0.9, help="layer-wise lr decay during finetuning")
     parser.add_argument("-w", "--num_workers", type=int, default=16, help="number of loader workers")
     parser.add_argument("--lr", type=float, default=1e-4, help="learning rate of the optimiser")
@@ -51,6 +49,8 @@ def ini_argparse():
     parser.add_argument("-wd", "--weight_decay", type=float, default=0.05, help="weight_decay of the optimiser")
     parser.add_argument("-b1", "--beta1", type=float, default=0.9, help="AdamW first beta value")
     parser.add_argument("-b2", "--beta2", type=float, default=0.999, help="AdamW second beta value")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay")
+    parser.add_argument("--head_init", type=float, default=0.001, help="Fine-tuning head(s) initialisation value")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout value")
     parser.add_argument('--losses', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
                         default=["focal", "dice"],  # Default list

@@ -448,7 +448,7 @@ def dice_score(inputs: torch.Tensor,
         smooth: A smoothing constant to smooth gradients. 
     Returns:
         dice_score: Dice loss value.
-    """    
+    """
     reduce_axes: list[int] = torch.arange(1, len(inputs.shape)).tolist()
     intersection = torch.sum(targets * inputs, dim=reduce_axes)
     union = torch.sum(targets, dim=reduce_axes) + torch.sum(inputs, dim=reduce_axes)

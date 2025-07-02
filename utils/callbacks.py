@@ -8,10 +8,12 @@ Description:
 """
 
 
+import copy
+import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BaseFinetuning
 
-
+        
 class CustomFinetuningReversed(pl.callbacks.BaseFinetuning):
     def __init__(self, unfreeze_at_epoch=5, gradual_unfreeze_steps=5, lr_factor=0.1, unfreeze_all=False):
         """
