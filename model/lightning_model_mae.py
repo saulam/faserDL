@@ -251,13 +251,10 @@ class SparseMAELightningModel(pl.LightningModule):
             if not p.requires_grad:
                 continue
             if (
-                p.ndim <= 1
-                or name.endswith(".bias")
-                or "emb" in name
-                or "cls_mod" in name
-                or "cls_evt" in name
-                or "mask_mod_emb" in name
-                or name.endswith((".gamma", ".beta"))
+                (p.ndim == 1 and "mask_mod_emb" not in name)
+                or name.endswith((".bias", ".gamma", ".beta"))
+                #or any(k in name for k in ("cls_mod", "cls_evt", "mask_mod_emb", "pos_emb_evt"))
+                #or (name.startswith("pos_emb_mod.") and not name.endswith("proj.weight"))
             ):
                 no_decay.append(p)
             else:

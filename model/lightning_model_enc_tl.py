@@ -243,7 +243,7 @@ class SparseEncTlLightningModel(pl.LightningModule):
         # group uncertainty params
         param_groups.append({
             'params': list(self.log_sigma_params),
-            'lr': self.lr * 0.1,
+            'lr': 1e-5,
             'weight_decay': 0.0,
         })
         
@@ -378,9 +378,9 @@ class SparseEncTlLightningModel(pl.LightningModule):
                 continue
                 
             scale = self.layer_decay ** (max_layer_id - layer_id)
-            if (name.endswith(".bias")
-                or "norm" in name.lower()         # any norm layer
-                or param in self.log_sigma_params # uncertainty tensors
+            if (
+                (param.ndim == 1 and "mask_mod_emb" not in name)
+                or name.endswith((".bias", ".gamma", ".beta"))
             ):
                 decay = 0.0
             else:
