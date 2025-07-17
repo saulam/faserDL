@@ -16,6 +16,7 @@ import MinkowskiEngine as ME
 from sklearn.model_selection import KFold
 from torch.utils.data import random_split, Subset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
+from torch.nn.utils.rnn import pad_sequence
 
 
 def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
@@ -69,7 +70,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
         test_set.data_files = extract_files(test_split.indices)
     
     train_set.augmentations_enabled = args.augmentations_enabled
-    collate_fn = collate_test if test else collate_sparse_minkowski
+    collate_fn = collate_test if test else collate_train
     persistent = args.num_workers > 0
 
     def create_loader(ds, shuffle):
@@ -91,81 +92,75 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
 
 
 def collate_test(batch):
-    coords_list, feats_list = [], []
-    module_to_event, module_pos = [], []
-
-    for ev_idx, sample in enumerate(batch):
-        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        for m in torch.unique(mods):
-            mask = (mods == m)
-            coords_list.append(coords[mask])
-            feats_list.append(feats[mask])
-            module_to_event.append(ev_idx)
-            module_pos.append(int(m))
-
+    patches_charge = [sample['patches_charge'] for sample in batch]
+    patch_ids = [sample['patch_ids'] for sample in batch]
+    batch_size = len(patches_charge)
+    lengths = torch.tensor([patch.size(0) for patch in patches_charge], dtype=torch.long)
+    patches_charge_padded = pad_sequence(patches_charge, batch_first=True, padding_value=0.0)
+    patch_ids_padded = pad_sequence(patch_ids, batch_first=True, padding_value=0.0)
+    max_len = patches_charge_padded.size(1)
+    idxs = torch.arange(max_len, device=patches_charge_padded.device).unsqueeze(0).expand(batch_size, -1)
+    attn_mask = (idxs < lengths.unsqueeze(1)).long()
+    
     ret = {
-        'f': torch.cat(feats_list, dim=0),
+        'patches_charge': patches_charge_padded,
+        'patch_ids': patch_ids_padded,
+        'attn_mask': attn_mask,
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'module_hits': torch.stack([d['module_hits'] for d in batch]),
         'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
         'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
         'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
-        'c': coords_list,
-        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
-        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = [
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
-        'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
+        'in_neutrino_energy', 'flavour_label', 'patches_lepton', 'patches_seg',
         'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
         'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
     ]
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm']
+            ret[key] = ([d[key].numpy() for d in batch] if key in ['is_cc', 'flavour_label', 'charm']
                         else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
+                        else pad_sequence([sample[key] for sample in batch], batch_first=True, padding_value=0.0) if key in ['patches_lepton', 'patches_seg']
                         else [d[key] for d in batch])
     
     return ret
 
 
-def collate_sparse_minkowski(batch):
-    coords_list, feats_list = [], []
-    module_to_event, module_pos = [], []
-
-    for ev_idx, sample in enumerate(batch):
-        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        for m in torch.unique(mods):
-            mask = (mods == m)
-            coords_list.append(coords[mask])
-            feats_list.append(feats[mask])
-            module_to_event.append(ev_idx)
-            module_pos.append(int(m))
-
+def collate_train(batch):
+    patches_charge = [sample['patches_charge'] for sample in batch]
+    patch_ids = [sample['patch_ids'] for sample in batch]
+    batch_size = len(patches_charge)
+    lengths = torch.tensor([patch.size(0) for patch in patches_charge], dtype=torch.long)
+    patches_charge_padded = pad_sequence(patches_charge, batch_first=True, padding_value=0.0)
+    patch_ids_padded = pad_sequence(patch_ids, batch_first=True, padding_value=0.0)
+    max_len = patches_charge_padded.size(1)
+    idxs = torch.arange(max_len, device=patches_charge_padded.device).unsqueeze(0).expand(batch_size, -1)
+    attn_mask = (idxs < lengths.unsqueeze(1)).long()
+    
     ret = {
-        'f': torch.cat(feats_list, dim=0),
+        'patches_charge': patches_charge_padded,
+        'patch_ids': patch_ids_padded,
+        'attn_mask': attn_mask,
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'module_hits': torch.stack([d['module_hits'] for d in batch]),
         'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
         'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
         'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
-        'c': coords_list,
-        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
-        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = {
-        'primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm',
+        'is_cc', 'flavour_label', 'charm', 'patches_lepton', 'patches_seg',
         'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
         'jet_momentum_mag', 'jet_momentum_dir',
     }
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
+            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
                         else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_dir', 'jet_momentum_dir']
+                        else pad_sequence([sample[key] for sample in batch], batch_first=True, padding_value=0.0) if key in ['patches_lepton', 'patches_seg']
                         else [d[key] for d in batch])
     
     return ret
