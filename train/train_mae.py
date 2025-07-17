@@ -13,7 +13,7 @@ import pytorch_lightning as pl
 from functools import partial
 from utils import CustomFinetuningReversed, ini_argparse, split_dataset
 from dataset import SparseFASERCALDataset
-from model import MinkMAEConvNeXtV2, SparseMAELightningModel
+from model import MaskedAutoencoderViT3DSparse, SparseMAELightningModel
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
@@ -68,7 +68,7 @@ def main():
     print(f"eff. batch size   = {args.batch_size * denom}")
 
     # Initialize the model
-    model = MinkMAEConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
+    model = MaskedAutoencoderViT3DSparse()
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
@@ -78,11 +78,6 @@ def main():
     tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
     callbacks = []
     monitored_losses = [
-            'loss/val_occupancy',
-            'loss/val_charge',
-            'loss/val_primlepton',
-            'loss/val_seg',
-            'loss/val_iscc',
             'loss/val_total',
     ]
     for loss_name in monitored_losses:
@@ -109,7 +104,6 @@ def main():
     # Lightning model
     lightning_model = SparseMAELightningModel(
         model=model,
-        metadata=dataset.metadata,
         args=args)
 
     # Log the hyperparameters

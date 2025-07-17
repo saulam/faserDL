@@ -9,3 +9,6 @@ from .lightning_model_enc import SparseEncLightningModel
 from .lightning_model_enc_tl import SparseEncTlLightningModel
 from .utils import *
 
+from .mae_utils import *
+from .mae import MaskedAutoencoderViT3D
+from .mae_sparse import MaskedAutoencoderViT3DSparse

@@ -15,6 +15,8 @@ from glob import glob
 from torch.utils.data import Dataset
 from utils import ini_argparse
 from utils.augmentations import *
+from .patcher import SparseVolumePatcher
+
 import MinkowskiEngine as ME
 
 
@@ -46,6 +48,7 @@ class SparseFASERCALDataset(Dataset):
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
         self.num_modules = int(self.metadata['z'][:, 1].max() + 1)
+        self.patcher = SparseVolumePatcher(patch_size=(16, 16, 10), volume_shape=(48, 48, 200))
 
             
     @property
@@ -160,33 +163,6 @@ class SparseFASERCALDataset(Dataset):
             mapped[..., 2] = np.searchsorted(self.metadata['z'][:, 0], coords[..., 2])
 
         return mapped#.round()  # round needed only for augmentations
-        
-        
-    def aggregate_duplicate_coords(self, coords, feats, primlepton_labels, seg_labels):
-        """
-        Aggregate duplicate coordinates by:
-        - Keeping unique 3D coordinates.
-        - Prioritising primary leptons when handling collisions, as primlepton_labels indicate primary lepton presence.
-        - Handling seg_labels as follows:
-            - The first column corresponds to ghost identification, meaning ghosts disappear if they collide with non-ghosts.
-            - The second and third columns represent total energy deposits from electromagnetic and hadronic particles, respectively,
-            which should be summed in case of collisions.
-        """
-        coords_tuple = [tuple(row) for row in coords]
-        unique_coords, indices = np.unique(coords_tuple, axis=0, return_inverse=True)
-
-        unique_feats = np.zeros((len(unique_coords), 1))
-        unique_primlepton_labels = np.zeros((len(unique_coords), 1))
-        unique_seg_labels = np.zeros((len(unique_coords), 3))
-
-        for i, idx in enumerate(indices):
-            unique_feats[idx, 0] += feats[i, 0]
-            unique_primlepton_labels[idx] = max(unique_primlepton_labels[idx], primlepton_labels[i])
-            unique_seg_labels[idx, 0] = min(unique_seg_labels[idx, 0], seg_labels[i, 0]) if unique_seg_labels[idx, 0] != 0 else seg_labels[i, 0]
-            unique_seg_labels[idx, 1] += seg_labels[i, 1]
-            unique_seg_labels[idx, 2] += seg_labels[i, 2]
-
-        return unique_coords, unique_feats, unique_primlepton_labels, unique_seg_labels
     
     
     def normalise_seg_labels(self, seg_labels, eps=1e-8):
@@ -400,7 +376,7 @@ class SparseFASERCALDataset(Dataset):
 
         # retrieve coordiantes and features (energy deposited)
         coords = reco_hits[:, :3]
-        q = self.preprocess(reco_hits[:, 4].reshape(-1, 1), 'q', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
+        q = self.preprocess(reco_hits[:, 4], 'q', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
 
         # look-up hit modules
         module_idx = np.searchsorted(self.metadata['z'][:, 0], coords[:, 2])
@@ -417,7 +393,7 @@ class SparseFASERCALDataset(Dataset):
         
         feats_global = np.concatenate([event_hits, faser_cal_energy, rear_cal_energy, rear_hcal_energy, rear_mucal_energy])   
         flavour_label = self.pdg2label(in_neutrino_pdg, is_cc)
-        primlepton_labels = primlepton_labels.reshape(-1, 1)
+        primlepton_labels = primlepton_labels.reshape(-1)
         seg_labels = seg_labels.reshape(-1, 3)
 
         # relative coords to each module
@@ -440,7 +416,6 @@ class SparseFASERCALDataset(Dataset):
           
         if augmented:
             # merge duplicated coordinates and finalise with augmentations
-            #coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
             seg_labels = self.normalise_seg_labels(seg_labels)
             feats_global = shift_q_gaussian(feats_global, std_dev=0.05)
             faser_cal_modules = shift_q_gaussian(faser_cal_modules, std_dev=0.05)
@@ -451,6 +426,20 @@ class SparseFASERCALDataset(Dataset):
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
         pt_miss = self.preprocess(pt_miss, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
 
+        # create volume
+        coords[:, 2] += (modules * self.module_size)
+        coords = torch.from_numpy(coords).long()
+        charge = torch.from_numpy(feats).float()
+
+        if self.stage1:
+            primlepton_labels = torch.from_numpy(primlepton_labels).float()
+            seg_labels = torch.from_numpy(seg_labels).float()
+            patches, patch_ids = self.patcher.patchify(coords, [charge, primlepton_labels, seg_labels])
+            patches_charge, patches_lepton, patches_seg = patches
+        else:
+            patches, patch_ids = self.patcher.patchify(coords, [charge])
+            patches_charge = patches[0]
+        
         # output
         output = {}
         if not self.train:
@@ -469,17 +458,14 @@ class SparseFASERCALDataset(Dataset):
             output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag).float()
             output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir).float()
         if self.stage1:
-            output['primlepton_labels'] = torch.from_numpy(primlepton_labels).float()
-            output['seg_labels'] = torch.from_numpy(seg_labels).float()
+            output['patches_lepton'] = patches_lepton
+            output['patches_seg'] = patches_seg
         elif self.load_seg:
             feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
         output['flavour_label'] = torch.tensor([flavour_label]).long()
-        output['orig_coords'] = orig_coords
-        output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
-        output['modules'] = torch.from_numpy(modules).long()
-        output['feats'] = torch.from_numpy(feats).float()
+        output['patches_charge'] = patches_charge
+        output['patch_ids'] = patch_ids
         output['feats_global'] = torch.from_numpy(feats_global).float()
-        output['module_hits'] = torch.from_numpy(module_hits).float()
         output['faser_cal_modules'] = torch.from_numpy(faser_cal_modules).float()
         output['rear_cal_modules'] = torch.from_numpy(rear_cal_modules).float()
         output['rear_hcal_modules'] = torch.from_numpy(rear_hcal_modules).float()

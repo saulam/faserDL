@@ -6,7 +6,7 @@ sets_path="/scratch/salonso/sparse-nns/faser/events_v5.1/sets.pkl"
 eps=1e-12
 batch_size=64
 preprocessing_input="sqrt"
-standardize_input="z-score"
+standardize_input="unit-var"
 epochs=200
 num_workers=16
 lr=1.5e-4
@@ -18,14 +18,14 @@ beta1=0.9
 beta2=0.95
 losses=("focal" "dice")
 save_dir="logs_final"
-name="mae_v5.1b_noglob_v22"
+name="mae_vit_v1"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="mae_v5.1b_noglob_v22"
+checkpoint_name="mae_vit_v1"
 early_stop_patience=30
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
-gpus=(1)
+gpus=(0)
 
 python -m train.train_mae \
     --train \
