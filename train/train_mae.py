@@ -19,8 +19,10 @@ from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
 
 
+torch.use_deterministic_algorithms(True, warn_only=True)
 torch.set_float32_matmul_precision("medium")
 pl_major = int(pl.__version__.split(".")[0])
+
 
 class CustomProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):

@@ -73,7 +73,7 @@ class SparseVolumePatcher:
         lstride_t = torch.tensor(self._local_stride, device=device)
 
         # Compute flat patch IDs per coordinate
-        patch_coords = coords // psize_t
+        patch_coords = torch.div(coords, psize_t, rounding_mode='trunc')
         flat_patch_idx = (patch_coords * pstride_t).sum(dim=1)
         unique_ids, inv = torch.unique(flat_patch_idx, sorted=True, return_inverse=True)
         M = unique_ids.numel()
