@@ -99,19 +99,18 @@ class MinkEncConvNeXtV2(nn.Module):
         self.evt_transformer = RelPosTransformer(
             d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=6, num_dims=1, dropout=args.dropout)
         self.pos_emb_evt = nn.Embedding(self.num_modules, self.d_evt)
-        self.cls_evt = nn.Parameter(torch.zeros(1, 1, self.d_evt))
         self.dropout = nn.Dropout(args.dropout)
 
         # Task branches and corresponding token
         self.branch_tokens = {
             "flavour": 0,
-            "charm": 0,#1,
-            "e_vis": 0,#2,
-            "pt_miss": 0,#4,
-            "lepton_momentum_mag": 0,#5,
-            "lepton_momentum_dir": 0,#5,
-            "jet_momentum_mag": 0,#6,
-            "jet_momentum_dir": 0,#6,
+            "charm": 1,
+            "e_vis": 2,
+            "pt_miss": 3,
+            "lepton_momentum_mag": 4,
+            "lepton_momentum_dir": 4,
+            "jet_momentum_mag": 5,
+            "jet_momentum_dir": 5,
         }
         branch_out_channels = {
             "flavour": 4,
@@ -224,30 +223,30 @@ class MinkEncConvNeXtV2(nn.Module):
         pos_emb_evt = self.pos_emb_evt(module_pos)                                        # [M, D_evt]
         module_cls = module_cls + pos_emb_evt
         glob_emb = self.global_feats_encoder(params_glob).unsqueeze(1)                    # [B, 1, D_evt]
-        cls_tokens_evt = self.cls_evt.expand(B, 1, self.d_evt)                            # [B, 1, D_evt]
-        cls_tokens_evt = cls_tokens_evt + glob_emb                                        # [B, 1, D_evt]
+        cls_tokens_evt = self.cls_evt.expand(B, self.num_cls, self.d_evt)                 # [B, num_cls, D_evt]
+        cls_tokens_evt = cls_tokens_evt + glob_emb                                        # [B, num_cls, D_evt]
         grouped_mods = [module_cls[module_to_event == b] for b in range(B)]
         padded_mods = pad_sequence(grouped_mods, batch_first=True)                        # [B, L_mod, D_evt]
-        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_mods], dim=1))            # [B, 1+L_mod, D_evt]
+        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_mods], dim=1))            # [B, num_cls+L_mod, D_evt]
         grouped_pos = [module_pos[module_to_event == b] for b in range(B)]
         padded_pos = pad_sequence(grouped_pos, batch_first=True).unsqueeze(-1)            # [B, L_mod, 1]
-        cls_pos = torch.zeros((B, 1, 1), device=device)                                   # [B, 1, 1]
-        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, 1+L_mod,1]
+        cls_pos = torch.zeros((B, self.num_cls, 1), device=device)                        # [B, num_cls, 1]
+        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, num_cls+L_mod, 1]
         event_key_padding_mask = torch.ones(
-            (B, 1 + padded_mods.size(1)), dtype=torch.bool, device=device)                # [B, 1+L_mod]
-        event_key_padding_mask[:, 0] = False
-        event_key_padding_mask[:, 1:] = (
+            (B, self.num_cls + padded_mods.size(1)), dtype=torch.bool, device=device)     # [B, num_cls+L_mod]
+        event_key_padding_mask[:, :self.num_cls] = False
+        event_key_padding_mask[:, self.num_cls:] = (
             torch.arange(padded_mods.size(1), device=device).unsqueeze(0)
             >= torch.tensor([g.size(0) for g in grouped_pos], device=device).unsqueeze(1)
         )
         event_seq_out = self.evt_transformer(
-            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, 1+L_mod, D_evt]
-        event_cls = event_seq_out[:, 0, :]                                                # [B, D_evt]
+            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, num_cls+L_mod, D_evt]
+        event_cls = event_seq_out[:, :self.num_cls, :]                                    # [B, num_cls, D_evt]
         
         # Branch-specific processing
         outputs = {}
         for i, (name, branch) in enumerate(self.branches.items()):
-            output = branch(event_cls)
+            output = branch(event_cls[:, self.branch_tokens[name]])
             if name == "flavour" or name == "charm":
                 outputs[f"out_{name}"] = output
             elif "_dir" in name:

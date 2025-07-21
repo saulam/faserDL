@@ -23,14 +23,14 @@ ema_decay=0.9999
 head_init=0.001
 losses=("focal" "dice")
 save_dir="logs_final"
-name="enc_v5.1b_mae_nersc_v19"
+name="enc_v5.1b_mae_nersc_v21"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="enc_v5.1b_mae_nersc_v19"
+checkpoint_name="enc_v5.1b_mae_nersc_v21"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/mae_v5.1b_nersc_v1/loss_val_total/last.ckpt"
-gpus=(1)
+load_checkpoint="checkpoints_final/mae_v5.1b_nersc_v2/loss_val_total/last.ckpt"
+gpus=(0)
 
 python -m train.train_enc_tl \
     --train \

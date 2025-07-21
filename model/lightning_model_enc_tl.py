@@ -71,6 +71,20 @@ class SparseEncTlLightningModel(pl.LightningModule):
             for i in range(self.model.nb_elayers)
         ]
 
+    
+    def on_save_checkpoint(self, checkpoint):
+        if self.ema is not None:
+            checkpoint["ema_state_dict"] = self.ema.state_dict()
+
+    
+    def on_load_checkpoint(self, checkpoint):
+        if self.ema is None:
+            self.ema = ExponentialMovingAverage(
+                self.model.parameters(),
+                decay=self.ema_decay,
+            )
+        self.ema.load_state_dict(checkpoint["ema_state_dict"])
+        
 
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"

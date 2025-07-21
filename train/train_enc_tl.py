@@ -74,6 +74,10 @@ def main():
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
     pretrained_model.load_state_dict(state_dict, strict=True)
     filtered = {k: v for k, v in pretrained_model.state_dict().items() if k in base_model.state_dict()}
+    if "cls_evt" in filtered:
+        target_shape = base_model.state_dict()["cls_evt"].shape  # (1, num_cls, emb_dim)
+        _, num_cls, _ = target_shape
+        filtered["cls_evt"] = filtered["cls_evt"].repeat(1, num_cls, 1).contiguous()
     mismatched = base_model.load_state_dict(filtered, strict=False)
     print("missing keys:", mismatched.missing_keys)
     print("unexpected keys:", mismatched.unexpected_keys)
@@ -83,14 +87,14 @@ def main():
     # 1) define the list of losses you want to monitor
     monitor_losses = [
         "loss/val_total",
-        "loss/val_flavour",
-        "loss/val_charm",
-        "loss/val_e_vis",
-        "loss/val_pt_miss",
-        "loss/val_jet_momentum_dir",
-        "loss/val_jet_momentum_mag",
-        "loss/val_lepton_momentum_dir",
-        "loss/val_lepton_momentum_mag",
+        #"loss/val_flavour",
+        #"loss/val_charm",
+        #"loss/val_e_vis",
+        #"loss/val_pt_miss",
+        #"loss/val_jet_momentum_dir",
+        #"loss/val_jet_momentum_mag",
+        #"loss/val_lepton_momentum_dir",
+        #"loss/val_lepton_momentum_mag",
     ]
     
     # helper to build a fresh checkpoint callback list
