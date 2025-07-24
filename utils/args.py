@@ -1,7 +1,7 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 07.25
 
 Description:
     Arguments.
@@ -9,15 +9,6 @@ Description:
 
 import argparse
 
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    v = v.lower()
-    if v in ('yes', 'true', 't', 'y', '1'):
-        return True
-    if v in ('no', 'false', 'f', 'n', '0'):
-        return False
-    raise argparse.ArgumentTypeError(f'Boolean value expected (got {v!r}).')
 
 '''
 Parameters
@@ -35,8 +26,7 @@ def ini_argparse():
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
-    parser.add_argument("--sets_path", type=str, default=None, help="path of pickle file with training/val/test splits")
-    parser.add_argument("--load_seg", action="store_true", default=False, help="whether to load results from segmentation network.")
+    parser.add_argument("--mask_ratio", type=float, default=0.75, help="Percentage of masked patches during pre-training")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch size")
     parser.add_argument("-e", "--epochs", type=int, default=50, help="number of epochs")
@@ -52,10 +42,6 @@ def ini_argparse():
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay")
     parser.add_argument("--head_init", type=float, default=0.001, help="Fine-tuning head(s) initialisation value")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout value")
-    parser.add_argument('--losses', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
-                        default=["focal", "dice"],  # Default list
-                        help='kist of losses to use (options: "focal", "dice")'
-                        )
     parser.add_argument("--save_dir", type=str, default="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL", help="log save directory")
     parser.add_argument("--name", type=str, default="v1", help="model name")
     parser.add_argument("--log_every_n_steps", type=int, default=50, help="steps between logs")

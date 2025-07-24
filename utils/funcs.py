@@ -24,7 +24,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
 
     Parameters:
         dataset (torch.utils.data.Dataset): The dataset to split.
-        args (Namespace): Arguments containing batch_size, num_workers, and optionally sets_path and dataset_path.
+        args (Namespace): Arguments containing batch_size, num_workers.
         splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
         seed (int): Seed for reproducibility. Default is 7.
         test (bool): Whether to use collate_test or collate_sparse_minkowski. Default is False.
@@ -32,41 +32,27 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     Returns:
         tuple: DataLoader objects for training, validation, and test sets.
     """
+    assert sum(splits) == 1, "The splits should sum up to 1."
 
-    if args.sets_path is not None:
-        with open(args.sets_path, "rb") as fd:
-            sets = pkl.load(fd)
-        
-        def update_path(files):
-            return np.char.replace(files, "path", args.dataset_path, count=1)
+    fulllen = len(dataset)
+    train_len = int(fulllen * splits[0])
+    val_len = int(fulllen * splits[1])
+    test_len = fulllen - train_len - val_len  # Remaining length for the test set
 
-        train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
-        train_set.data_files = update_path(sets["train_files"])
-        val_set.data_files = update_path(sets["valid_files"])
-        test_set.data_files = update_path(sets["test_files"])
-        print("Loaded saved splits!")
-    else:
-        assert sum(splits) == 1, "The splits should sum up to 1."
+    # Split the dataset
+    train_split, val_split, test_split = random_split(
+        dataset, 
+        [train_len, val_len, test_len], 
+        generator=torch.Generator().manual_seed(seed)
+    )
 
-        fulllen = len(dataset)
-        train_len = int(fulllen * splits[0])
-        val_len = int(fulllen * splits[1])
-        test_len = fulllen - train_len - val_len  # Remaining length for the test set
+    def extract_files(indices):
+        return [dataset.data_files[i] for i in indices]
 
-        # Split the dataset
-        train_split, val_split, test_split = random_split(
-            dataset, 
-            [train_len, val_len, test_len], 
-            generator=torch.Generator().manual_seed(seed)
-        )
-
-        def extract_files(indices):
-            return [dataset.data_files[i] for i in indices]
-
-        train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
-        train_set.data_files = extract_files(train_split.indices)
-        val_set.data_files = extract_files(val_split.indices)
-        test_set.data_files = extract_files(test_split.indices)
+    train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
+    train_set.data_files = extract_files(train_split.indices)
+    val_set.data_files = extract_files(val_split.indices)
+    test_set.data_files = extract_files(test_split.indices)
     
     train_set.augmentations_enabled = args.augmentations_enabled
     collate_fn = collate_test if test else collate_sparse_minkowski
@@ -96,12 +82,18 @@ def collate_test(batch):
 
     for ev_idx, sample in enumerate(batch):
         coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
+        '''
         for m in torch.unique(mods):
             mask = (mods == m)
             coords_list.append(coords[mask])
             feats_list.append(feats[mask])
             module_to_event.append(ev_idx)
             module_pos.append(int(m))
+        '''
+        coords_list.append(coords)
+        feats_list.append(feats)
+        module_to_event.append(ev_idx)
+        module_pos.append(0)
 
     ret = {
         'f': torch.cat(feats_list, dim=0),
@@ -137,12 +129,18 @@ def collate_sparse_minkowski(batch):
 
     for ev_idx, sample in enumerate(batch):
         coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
+        '''
         for m in torch.unique(mods):
             mask = (mods == m)
             coords_list.append(coords[mask])
             feats_list.append(feats[mask])
             module_to_event.append(ev_idx)
             module_pos.append(int(m))
+        '''
+        coords_list.append(coords)
+        feats_list.append(feats)
+        module_to_event.append(ev_idx)
+        module_pos.append(0)
 
     ret = {
         'f': torch.cat(feats_list, dim=0),
@@ -183,7 +181,7 @@ def arrange_sparse_minkowski(data, device):
     rear_hcal = data['rear_hcal_modules']
     tensor_global = data['f_glob']
 
-    return tensor, module_hits, faser_cal, rear_cal, rear_hcal, tensor_global
+    return tensor, faser_cal, rear_cal, rear_hcal, tensor_global
 
 def arrange_truth(data):
     output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}

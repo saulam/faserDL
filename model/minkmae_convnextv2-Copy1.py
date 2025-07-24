@@ -6,6 +6,7 @@ Date: 06.25
 Description: PyTorch model - stage 1: pretraining.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,10 +23,10 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
-from .utils import _init_weights, ScaledFourierPosEmb3D, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
+from .utils import _init_weights, MultiTaskUpsample3DDecoder, ScaledFourierPosEmb3D, RelPosTransformer, GlobalFeatureEncoder, Block, MinkowskiLayerNorm
 
 
-class MinkAEConvNeXtV2(nn.Module):
+class MinkMAEConvNeXtV2(nn.Module):
     def __init__(self, in_channels, out_channels, D=3, args=None):
         """
         Args:
@@ -45,9 +46,7 @@ class MinkAEConvNeXtV2(nn.Module):
         encoder_dims = [96, 192, 384, 768]
         kernel_size_ds = (2, 2, 2)
         block_kernel = (3, 3, 3)
-        
         drop_path_rate = 0.0
-        
         assert len(encoder_depths) == len(encoder_dims)
         self.nb_elayers = len(encoder_dims)
         total_depth = sum(encoder_depths)
@@ -57,7 +56,6 @@ class MinkAEConvNeXtV2(nn.Module):
         # Stem
         self.stem_conv = MinkowskiConvolution(in_channels, encoder_dims[0], kernel_size=1, stride=1, dimension=D)
         self.stem_norm = MinkowskiLayerNorm(encoder_dims[0], eps=1e-6)
-        self.mask_voxel_emb = nn.Parameter(torch.zeros(encoder_dims[0]))  # embedding for masked voxels
         
         # Build encoder
         self.encoder_layers = nn.ModuleList()
@@ -87,86 +85,42 @@ class MinkAEConvNeXtV2(nn.Module):
         self.d_mod = encoder_dims[-1]
         heads_m = 12
         self.mod_transformer = RelPosTransformer(
-            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=5, num_dims=3, dropout=args.dropout)
+            d_model=self.d_mod, nhead=heads_m, num_special_tokens=1, num_layers=2, num_dims=3, dropout=args.dropout)
         self.pos_emb_mod = ScaledFourierPosEmb3D(num_features=32, d_model=self.d_mod)
         self.cls_mod = nn.Parameter(torch.zeros(1, 1, self.d_mod))
         self.cls_mod_extra_emb = nn.Linear(2, self.d_mod)
 
-        # Sub-tokens
-        self.K = 2
-        assert self.d_mod % self.K == 0, "d_mod must be divisible by K subtokens"
-        self.d_evt = self.d_mod // self.K
-        self.subtoken_proj = nn.Linear(self.d_mod, self.K * self.d_evt)
-        self.subtokens_to_module = nn.Linear(self.K * self.d_evt, self.d_mod)
-        if self.K > 1:
-            self.pos_emb_sub = nn.Embedding(self.K, self.d_evt)
-
         # Event-level transformer (across modules)
-        heads_e = 8
+        heads_e = 12
+        self.d_evt = self.d_mod
+        self.mask_mod_emb = nn.Parameter(torch.zeros(self.d_evt))
         self.global_feats_encoder = GlobalFeatureEncoder(d_model=self.d_evt, dropout=args.dropout)
-        self.event_transformer = RelPosTransformer(
-            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=5, num_dims=1, dropout=args.dropout)
-        self.pos_emb = nn.Embedding(self.num_modules, self.d_evt)
+        self.evt_transformer = RelPosTransformer(
+            d_model=self.d_evt, nhead=heads_e, num_special_tokens=1, num_layers=6, num_dims=1, dropout=args.dropout)
+        self.pos_emb_evt = nn.Embedding(self.num_modules, self.d_evt)
         self.cls_evt = nn.Parameter(torch.zeros(1, 1, self.d_evt))
         self.dropout = nn.Dropout(args.dropout)
 
-        # Context fusion
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(self.d_mod * 2, self.d_mod),
-            nn.GELU(),
-            nn.Linear(self.d_mod, self.d_mod),
-        )
+        # Dense decoder
+        self.decoder = MultiTaskUpsample3DDecoder(
+            latent_dim= 768, decoder_dim= 512, depth= 1, init_size=(3,3,2), patch_size=(16,16,10))
         
-        # Decoder configuration (reversing the encoder dimensions)
-        decoder_depths = [2] * len(encoder_depths)
-        decoder_dims = list(reversed(encoder_dims))
-        kernel_size_us = kernel_size_ds
-        self.nb_dlayers = len(decoder_dims) - 1
-        total_depth_dec = sum(decoder_depths)
-        dp_rates_dec = [x.item() for x in torch.linspace(drop_path_rate, 0, total_depth_dec)]
-        dp_cur_dec = 0
-
-        # Build decoder
-        self.decoder_layers = nn.ModuleList()
-        self.upsample_layers = nn.ModuleList()
-        for i in range(self.nb_dlayers):
-            upsample_layer = nn.Sequential(
-                MinkowskiLayerNorm(decoder_dims[i], eps=1e-6),
-                MinkowskiConvolutionTranspose(decoder_dims[i], decoder_dims[i + 1],
-                                              kernel_size=kernel_size_us, stride=kernel_size_us,
-                                              bias=True, dimension=D),
-            )
-            self.upsample_layers.append(upsample_layer)
-
-            decoder_layer = nn.Sequential(
-                *[Block(dim=decoder_dims[i + 1], kernel_size=block_kernel, drop_path=dp_rates_dec[dp_cur_dec + j], D=D)
-                  for j in range(decoder_depths[i])]
-            )
-            self.decoder_layers.append(decoder_layer)
-            dp_cur_dec += decoder_depths[i]
-
-        # Prediction layers
-        self.primlepton_layer = nn.Sequential(
-            MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
-        )
-        self.seg_layer = nn.Sequential(
-            MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 3, kernel_size=1, stride=1, dimension=D),
-        )
-        self.charge_layer = nn.Sequential(
-            MinkowskiLayerNorm(decoder_dims[-1], eps=1e-6),
-            Block(dim=decoder_dims[-1], kernel_size=block_kernel, drop_path=0.0, D=D),
-            MinkowskiConvolution(decoder_dims[-1], 1, kernel_size=1, stride=1, dimension=D),
-        )
+        # Output layer
         self.iscc_layer = nn.Linear(self.d_evt, 1)
 
         # Initialise weights
         self.apply(_init_weights)
 
-    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool=None, global_alpha=None):
+        # If occupacy/primlepton loss is BCE only
+        p_signal = 0.019
+        initial_bias = np.log(p_signal / (1 - p_signal))
+        self.decoder.pred_occupancy.bias.data.fill_(initial_bias)
+        p_primlepton = 0.013
+        initial_bias = np.log(p_primlepton / (1 - p_primlepton))
+        self.decoder.pred_lepton.bias.data.fill_(initial_bias)
+
+
+    def forward(self, x, x_glob, module_to_event, module_pos, mask_bool=None):
         """
         Forward pass through the encoder-decoder network.
 
@@ -176,7 +130,6 @@ class MinkAEConvNeXtV2(nn.Module):
             module_to_event: mapping module index to event index tensor
             module_pos: mapping module index to module position tensor
             mask_bool: mask for voxels (masked autoencoder)
-            global_alpha: percentage of global information to use
 
         Returns:
             A dictionary with voxel predictions.
@@ -187,16 +140,6 @@ class MinkAEConvNeXtV2(nn.Module):
 
         # ----------------- Encoder -----------------
         x = self.stem_conv(x)
-        if mask_bool is not None:
-            num_masked = mask_bool.sum().item()
-            masked_feats = x.F.clone()
-            replacement = self.mask_voxel_emb.unsqueeze(0).expand(num_masked, -1).to(masked_feats.dtype)
-            masked_feats[mask_bool] = replacement
-            x = ME.SparseTensor(
-                features=masked_feats,
-                coordinate_map_key=x.coordinate_map_key,
-                coordinate_manager=x.coordinate_manager,
-            )
         x = self.stem_norm(x)
         for i in range(self.nb_elayers):
             x = self.encoder_layers[i](x)
@@ -245,89 +188,65 @@ class MinkAEConvNeXtV2(nn.Module):
         module_seq_out = self.mod_transformer(
             mod_in, coords=mod_coords, key_padding_mask=module_key_padding_mask)          # [M, 1+L_vox, D_mod]
 
-        # ----------------- Scatter back to voxels -----------------
-        vox_out = module_seq_out[:, 1:, :].reshape(-1, self.d_mod)                        # [M*L_vox, D_mod]
-        idxs_flat = padded_idxs.reshape(-1)                                               # [M*L_vox]
-        valid = idxs_flat >= 0
-        intra_module_ctx = torch.zeros_like(initial_voxel_feats)                          # [N_vox, D_mod]
-        intra_module_ctx[idxs_flat[valid]] = vox_out[valid]
-
-        # ----------------- Subtoken expansion -----------------
+        # extract CLS per module and mask
         module_cls = module_seq_out[:, 0, :]                                              # [M, D_mod]
-        subtoks = self.subtoken_proj(module_cls).view(M, self.K, self.d_evt)              # [M, K, D_evt]
-        mod_pos_exp = module_pos.unsqueeze(1).expand(-1, self.K)                          # [M, K]
-        pe_mod2 = self.pos_emb(mod_pos_exp)                                               # [M, K, D_evt]
-        subtoks = subtoks + pe_mod2                                                       # [M, K, D_evt]
-        if self.K > 1:
-            sub_ids = torch.arange(self.K, device=device).unsqueeze(0).expand(M, -1)      # [M, K]
-            pe_sub = self.pos_emb_sub(sub_ids)                                            # [M, K, D_evt]    
-            subtoks = subtoks + pe_sub                                                    # [M, K, D_evt]
-        flat_subtoks = subtoks.view(-1, self.d_evt)                                       # [M*K, D_evt]
-        flat_mod2evt = module_to_event.repeat_interleave(self.K)                          # [M*K]
+        if mask_bool is not None:
+            module_cls = torch.where(
+                mask_bool.unsqueeze(-1),
+                self.mask_mod_emb.unsqueeze(0),
+                module_cls
+            )
 
         # ----------------- Event-level Transformer -----------------
         # B = number of events in the batch
-        # L_sub = max number of modules in an event * K
+        # L_mod = max number of modules in an event
         B = int(module_to_event.max().item()) + 1
+        pos_emb_evt = self.pos_emb_evt(module_pos)                                        # [M, D_evt]
+        module_cls = module_cls + pos_emb_evt
         glob_emb = self.global_feats_encoder(params_glob).unsqueeze(1)                    # [B, 1, D_evt]
         cls_tokens_evt = self.cls_evt.expand(B, 1, self.d_evt)                            # [B, 1, D_evt]
-        if global_alpha is not None:
-            cls_tokens_evt = cls_tokens_evt + global_alpha*glob_emb                       # [B, 1, D_evt]
-        grouped_subs = [flat_subtoks[flat_mod2evt == b] for b in range(B)]
-        padded_subs = pad_sequence(grouped_subs, batch_first=True)                        # [B, L_sub, D_evt]
-        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_subs], dim=1))            # [B, 1+L_sub, D_evt]
-        flat_mod_pos = mod_pos_exp.reshape(-1, 1)                                         # [M*K, 1]
-        grouped_pos = [flat_mod_pos[flat_mod2evt == b] for b in range(B)]
-        padded_pos = pad_sequence(grouped_pos, batch_first=True)                          # [B, L_sub, 1]
+        cls_tokens_evt = cls_tokens_evt + glob_emb                                        # [B, 1, D_evt]
+        grouped_mods = [module_cls[module_to_event == b] for b in range(B)]
+        padded_mods = pad_sequence(grouped_mods, batch_first=True)                        # [B, L_mod, D_evt]
+        evt_in = self.dropout(torch.cat([cls_tokens_evt, padded_mods], dim=1))            # [B, 1+L_mod, D_evt]
+        grouped_pos = [module_pos[module_to_event == b] for b in range(B)]
+        padded_pos = pad_sequence(grouped_pos, batch_first=True).unsqueeze(-1)            # [B, L_mod, 1]
         cls_pos = torch.zeros((B, 1, 1), device=device)                                   # [B, 1, 1]
-        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, 1+L_sub,1]
+        evt_coords = torch.cat([cls_pos, padded_pos], dim=1)                              # [B, 1+L_mod,1]
         event_key_padding_mask = torch.ones(
-            (B, 1 + padded_subs.size(1)), dtype=torch.bool, device=device)                # [B, 1+L_sub]
+            (B, 1 + padded_mods.size(1)), dtype=torch.bool, device=device)                # [B, 1+L_mod]
         event_key_padding_mask[:, 0] = False
         event_key_padding_mask[:, 1:] = (
-            torch.arange(padded_subs.size(1), device=device).unsqueeze(0)
-            >= torch.tensor([g.size(0) for g in grouped_subs], device=device).unsqueeze(1)
+            torch.arange(padded_mods.size(1), device=device).unsqueeze(0)
+            >= torch.tensor([g.size(0) for g in grouped_pos], device=device).unsqueeze(1)
         )
-        event_seq_out = self.event_transformer(
-            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, 1+L_sub, D_evt]
+        event_seq_out = self.evt_transformer(
+            evt_in, coords=evt_coords, key_padding_mask=event_key_padding_mask)           # [B, 1+L_mod, D_evt]
         event_cls = event_seq_out[:, 0, :]                                                # [B, D_evt]
         event_cls = self.dropout(event_cls)                                               # [B, D_evt]
 
-        # ----------------- Collapse and fusion -----------------
-        mod_out = event_seq_out[:, 1:, :].reshape(-1, self.d_evt)                         # [B*L_sub, D_evt]
-        idxs_evt_flat = pad_sequence(
-            [(flat_mod2evt == b).nonzero(as_tuple=False).squeeze(1) for b in range(B)],
-            batch_first=True,
-            padding_value=-1
-        ).reshape(-1)                                                                     # [B*L_sub]
-        valid2 = idxs_evt_flat >= 0
-        flat_ctx = torch.zeros_like(flat_subtoks)                                         # [M*K, D_evt]
-        flat_ctx[idxs_evt_flat[valid2]] = mod_out[valid2]                                 # [M*K, D_evt]      
-        subtok_out = flat_ctx.view(M, self.K, self.d_evt)                                 # [M, K, D_evt]
-        module_ctx = self.subtokens_to_module(subtok_out.reshape(M, -1))                  # [M, D_mod]
-        inter_module_ctx = module_ctx[voxel_to_module_map]                                # [N_vox, D_mod]
-        combined_context = torch.cat([intra_module_ctx, inter_module_ctx], dim=1)         # [N_vox, D_mod*2]
-        gate = torch.sigmoid(self.fusion_gate(combined_context))                          # [N_vox, D_mod]
-        final_voxel_feat = gate * intra_module_ctx + (1 - gate) * inter_module_ctx        # [N_vox, D_mod]        
-        x = ME.SparseTensor(
-            features=final_voxel_feat,
-            coordinate_manager=x.coordinate_manager,
-            coordinate_map_key=x.coordinate_map_key
-        )
-
         # ----------------- Decoder -----------------
-        for i in range(self.nb_dlayers):
-            x = self.upsample_layers[i](x)
-            x = self.decoder_layers[i](x)
+        flat_evt = event_seq_out[:, 1:, :].reshape(-1, self.d_mod)                        # [B*L_mod, D_evt]
+        mod_idxs = [torch.where(module_to_event==b)[0] for b in range(B)]
+        padded_idxs = pad_sequence(mod_idxs, batch_first=True, padding_value=-1)          # [B, L_mod]
+        idxs_flat = padded_idxs.reshape(-1)                                               # [B*L_mod]
+        valid = idxs_flat >= 0
+        mask_flat = valid & mask_bool[idxs_flat]
+        dec_in = flat_evt[mask_flat]
+        dec_out = self.decoder(dec_in)
 
-        out_primlepton = self.primlepton_layer(x)
-        out_seg = self.seg_layer(x)
-        out_charge = self.charge_layer(x)
-        out_iscc = self.iscc_layer(event_cls)
+        # --------------- Predictions ----------------
+        out_occupancy = dec_out["occupancy_logits"]                                       # [M_masked, 1, 48, 48, 20]
+        out_charge = dec_out["pred_charge"]                                               # [M_masked, 1, 48, 48, 20]
+        out_primlepton = dec_out["primlepton_logits"]                                     # [M_masked, 1, 48, 48, 20]
+        out_seg = dec_out["seg_logits"]                                                   # [M_masked, 3, 48, 48, 20]
+        out_iscc = self.iscc_layer(event_cls)                                             # [B, 1]
+        
         return {
+            "out_occupancy": out_occupancy,
+            "out_charge": out_charge,
             "out_primlepton": out_primlepton,
             "out_seg": out_seg,
-            "out_charge": out_charge,
             "out_iscc": out_iscc,
         }
         

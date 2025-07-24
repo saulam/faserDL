@@ -29,7 +29,6 @@ class SparseFASERCALDataset(Dataset):
         """
         self.root = args.dataset_path
         self.data_files = self.processed_file_names
-        self.load_seg = args.load_seg
         self.stage1 = args.stage1
         self.train = args.train
         self.augmentations_enabled = False
@@ -189,18 +188,37 @@ class SparseFASERCALDataset(Dataset):
         return unique_coords, unique_feats, unique_primlepton_labels, unique_seg_labels
     
     
-    def normalise_seg_labels(self, seg_labels, eps=1e-8):
+    def normalise_seg_labels(self, seg_labels, primlepton_labels, smoothing=0.0, eps=1e-8):
         """
         Normalise seg_labels by:
         - Keeping the first column unchanged as it represents ghost identification.
-        - Normalizing the second and third columns (energy depositions from electromagnetic and hadronic components) so that their sum equals (1 - first column value) per row.
-        """
-        
-        sum_values = np.sum(seg_labels[:, 1:], axis=1, keepdims=True)
-        mask = sum_values.squeeze() > 0
-        seg_labels[mask, 1:] = (1 - seg_labels[mask, 0:1]) * (seg_labels[mask, 1:] / sum_values[mask, :])
+        - Normalising the second and third columns (energy depositions from electromagnetic and hadronic components) so that their sum equals (1 - first column value) per row.
+        - Appending a new column for primlepton_labels and zeroing out the original components when primlepton_labels == 1.
     
-        return seg_labels
+        Args:
+            seg_labels (np.ndarray): Array of shape (N, 3) with columns [ghost, em, had].
+            primlepton_labels (np.ndarray): Binary array of shape (N, 1) indicating primary lepton rows.
+            smoothing (float): Epsilon for label smoothing.
+            eps (float): Small epsilon to avoid division by zero.
+    
+        Returns:
+            np.ndarray: Array of shape (N, 4) with normalized [ghost, em, had, primlepton].
+        """
+        labels = seg_labels.copy().astype(np.float32)
+    
+        sum_vals = np.sum(labels[:, 1:], axis=1, keepdims=True)
+        mask = sum_vals.squeeze() > eps
+        labels[mask, 1:] = (1 - labels[mask, :1]) * (labels[mask, 1:] / sum_vals[mask])
+        prim = primlepton_labels.reshape(-1, 1).astype(labels.dtype)
+        result = np.concatenate([labels, prim], axis=1)
+        prim_mask = prim.squeeze() == 1
+        result[prim_mask, :3] = 0.0
+
+        if smoothing > 0:
+            N, C = result.shape
+            return result * (1.0 - smoothing) + smoothing / C
+    
+        return result
 
         
     def pdg2label(self, pdg, iscc, name=False):
@@ -436,12 +454,11 @@ class SparseFASERCALDataset(Dataset):
             )
             augmented = True
         else:
-            seg_labels = self.normalise_seg_labels(seg_labels)
+            seg_labels = self.normalise_seg_labels(seg_labels, primlepton_labels, smoothing=0.0)
           
         if augmented:
             # merge duplicated coordinates and finalise with augmentations
-            #coords, feats, primlepton_labels, seg_labels = self.aggregate_duplicate_coords(coords, feats, primlepton_labels, seg_labels)
-            seg_labels = self.normalise_seg_labels(seg_labels)
+            seg_labels = self.normalise_seg_labels(seg_labels, primlepton_labels, smoothing=0.1)
             feats_global = shift_q_gaussian(feats_global, std_dev=0.05)
             faser_cal_modules = shift_q_gaussian(faser_cal_modules, std_dev=0.05)
             rear_cal_modules = shift_q_gaussian(rear_cal_modules, std_dev=0.05)
@@ -450,6 +467,7 @@ class SparseFASERCALDataset(Dataset):
         # ptmiss
         pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
         pt_miss = self.preprocess(pt_miss, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
+        coords[:, 2] += (modules * self.module_size)
 
         # output
         output = {}
@@ -469,10 +487,7 @@ class SparseFASERCALDataset(Dataset):
             output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag).float()
             output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir).float()
         if self.stage1:
-            output['primlepton_labels'] = torch.from_numpy(primlepton_labels).float()
             output['seg_labels'] = torch.from_numpy(seg_labels).float()
-        elif self.load_seg:
-            feats = np.concatenate((feats, primlepton_labels, seg_labels), axis=1)
         output['flavour_label'] = torch.tensor([flavour_label]).long()
         output['orig_coords'] = orig_coords
         output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
