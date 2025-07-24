@@ -187,7 +187,7 @@ class MinkMAEViT(nn.Module):
             for _ in range(decoder_depth)
         ])
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.final_embed = nn.Linear(decoder_embed_dim, embed_dim)
+        self.final_embed = nn.Linear(decoder_embed_dim, embed_dim) 
     
         # upsample blocks
         def _up_blk(in_c, out_c, ks):
@@ -199,20 +199,21 @@ class MinkMAEViT(nn.Module):
                 MinkowskiLayerNorm(out_c, eps=1e-6),
                 MinkowskiGELU(),
             )
-    
+
+        up_out_dim = encoder_dims[0]//2
         self.upsample_layers = nn.Sequential(
             _up_blk(encoder_dims[2], encoder_dims[1], kernel_size[2]),
             _up_blk(encoder_dims[1], encoder_dims[0], kernel_size[1]),
-            _up_blk(encoder_dims[0], encoder_dims[0], kernel_size[0]),
+            _up_blk(encoder_dims[0], up_out_dim, kernel_size[0]),
         )
     
         # heads
         self.reg_head = MinkowskiConvolution(
-            encoder_dims[0], in_channels, kernel_size=1,
+            up_out_dim, in_channels, kernel_size=1,
             stride=1, bias=True, dimension=D
         )
         self.cls_head = MinkowskiConvolution(
-            encoder_dims[0], out_channels, kernel_size=1,
+            up_out_dim, out_channels, kernel_size=1,
             stride=1, bias=True, dimension=D
         )
     
@@ -536,3 +537,38 @@ class MinkMAEViT(nn.Module):
             parent = getattr(parent, comp)
         return parent, components[-1]
 
+
+def mae_vit_base(**kwargs):
+    model = MinkMAEViT(
+        in_channels=1, out_channels=4, D=3, img_size=(48, 48, 200),
+        encoder_dims=[192, 384, 768],
+        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        depth=12, num_heads=12,
+        decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        loss_weights={'reg': 1.0, 'cls': 1.0}, **kwargs)
+    return model
+    
+
+def mae_vit_large(**kwargs):
+    model = MinkMAEViT(
+        in_channels=1, out_channels=4, D=3, img_size=(48, 48, 200),
+        encoder_dims=[252, 504, 1008],
+        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        depth=24, num_heads=16,
+        decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        loss_weights={'reg': 1.0, 'cls': 1.0}, **kwargs)
+    return model
+
+
+def mae_vit_huge(**kwargs):
+    model = MinkMAEViT(
+        in_channels=1, out_channels=4, D=3, img_size=(48, 48, 200),
+        encoder_dims=[324, 648, 1296],
+        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        depth=32, num_heads=16,
+        decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        loss_weights={'reg': 1.0, 'cls': 1.0}, **kwargs)
+    return model

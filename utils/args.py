@@ -8,12 +8,21 @@ Description:
 """
 
 import argparse
+from typing import Callable, Dict
 
 
-'''
-Parameters
-'''
-def ini_argparse():
+def ini_argparse(
+    model_factories: Dict[str, Callable[[], object]]
+) -> argparse.ArgumentParser:
+    """
+    Creates an ArgumentParser.
+    """
+    def model_type(name: str) -> Callable[[], object]:
+        if name not in model_factories:
+            valid = ', '.join(model_factories)
+            raise argparse.ArgumentTypeError(f"Invalid model '{name}'. Choose from: {valid}")
+        return model_factories[name]
+            
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", default=True, help="set if training")
     parser.add_argument("--test", action="store_false", dest="train", help="set if testing")
@@ -26,13 +35,15 @@ def ini_argparse():
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
+    parser.add_argument('--model', type=model_type, default='base', help='Which MAE-ViT size to use')
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Percentage of masked patches during pre-training")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch size")
     parser.add_argument("-e", "--epochs", type=int, default=50, help="number of epochs")
     parser.add_argument("--layer_decay", type=float, default=0.9, help="layer-wise lr decay during finetuning")
     parser.add_argument("-w", "--num_workers", type=int, default=16, help="number of loader workers")
-    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate of the optimiser")
+    parser.add_argument("--lr", type=float, default=None, help="learning rate of the optimiser")
+    parser.add_argument("--blr", type=float, default=None, help="base learning rate of the optimiser")
     parser.add_argument("-ag", "--accum_grad_batches", type=int, default=1, help="batches for gradient accumulation")
     parser.add_argument('-ws', '--warmup_steps', type=int, default=0, help='number of warmup steps')
     parser.add_argument('--cosine_annealing_steps', type=int, default=0, help='number of cosine annealing steps')

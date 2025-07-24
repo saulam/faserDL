@@ -4,6 +4,8 @@ log*/
 tb_logs/
 lightning_logs/
 core
+out*
 notebooks/
 checkpoint*/
 *db
+INSTALL

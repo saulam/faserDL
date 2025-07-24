@@ -11,9 +11,9 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import CustomFinetuningReversed, ini_argparse, split_dataset
+from utils import ini_argparse, split_dataset
 from dataset import SparseFASERCALDataset
-from model import MinkMAEViT, SparseMAELightningModel
+from model import *
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
@@ -21,6 +21,12 @@ from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyS
 
 torch.set_float32_matmul_precision("medium")
 pl_major = int(pl.__version__.split(".")[0])
+MODEL_FACTORIES = {
+    'base':  mae_vit_base,
+    'large': mae_vit_large,
+    'huge':  mae_vit_huge,
+}
+
 
 class CustomProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):
@@ -36,7 +42,7 @@ class CustomProgressBar(TQDMProgressBar):
 
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
-    parser = ini_argparse()
+    parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
 
     print("\n- Arguments:")
@@ -57,7 +63,9 @@ def main():
     # Calculate arguments for scheduler
     nb_batches = len(train_loader)
     denom = args.accum_grad_batches * nb_gpus
-    args.lr = args.lr * (args.batch_size * denom) / 256.
+    if args.blr is not None:
+        # overwrite lr by linearly-scaled blr if args.blr is defined
+        args.lr = args.blr * (args.batch_size * denom) / 256.
     args.scheduler_steps = nb_batches * args.cosine_annealing_steps // denom
     args.warmup_steps = nb_batches * args.warmup_steps // denom
     args.start_cosine_step = (nb_batches * args.epochs // denom) - args.scheduler_steps
@@ -68,7 +76,7 @@ def main():
     print(f"eff. batch size   = {args.batch_size * denom}")
 
     # Initialise the model
-    model = MinkMAEViT(in_channels=1, out_channels=4, D=3, args=args)
+    model = args.model()
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))

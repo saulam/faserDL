@@ -2,6 +2,7 @@
 
 # Default arguments
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
+model="base"
 eps=1e-12
 batch_size=64
 preprocessing_input="sqrt"
@@ -9,7 +10,7 @@ standardize_input="unit-var"
 mask_ratio=0.5
 epochs=200
 num_workers=16
-lr=1.5e-4
+blr=1.5e-4
 accum_grad_batches=1
 warmup_steps=10
 cosine_annealing_steps=190
@@ -31,6 +32,7 @@ python -m train.train_mae \
     --stage1 \
     --augmentations_enabled \
     --dataset_path $dataset_path \
+    --model $model \
     --eps $eps \
     --batch_size $batch_size \
     --preprocessing_input $preprocessing_input \
@@ -38,7 +40,7 @@ python -m train.train_mae \
     --mask_ratio $mask_ratio \
     --epochs $epochs \
     --num_workers $num_workers \
-    --lr $lr \
+    --blr $blr \
     --accum_grad_batches $accum_grad_batches \
     --warmup_steps $warmup_steps \
     --cosine_annealing_steps $cosine_annealing_steps \

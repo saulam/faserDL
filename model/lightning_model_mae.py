@@ -14,8 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from utils import (
-    SigmoidFocalLossWithLogits, arrange_sparse_minkowski, argsort_sparse_tensor, 
-    arrange_truth, argsort_coords, CustomLambdaLR, CombinedScheduler, dice_loss
+    arrange_sparse_minkowski, arrange_truth, CustomLambdaLR, CombinedScheduler
 )
 from functools import partial
 from packaging import version
