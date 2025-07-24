@@ -10,22 +10,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import MinkowskiEngine as ME
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence
 from timm.models.vision_transformer import Attention, Block
-
-import MinkowskiEngine as ME
 from MinkowskiEngine import (
     MinkowskiConvolution,
-    MinkowskiGELU,
     MinkowskiConvolutionTranspose,
-    MinkowskiLinear,
-    MinkowskiGlobalAvgPooling,
-    MinkowskiGlobalMaxPooling,
-    MinkowskiReLU,
     MinkowskiGELU,
 )
-
 from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoder, MinkowskiLayerNorm
 
 
@@ -206,15 +199,19 @@ class MinkMAEViT(nn.Module):
             _up_blk(encoder_dims[1], encoder_dims[0], kernel_size[1]),
             _up_blk(encoder_dims[0], up_out_dim, kernel_size[0]),
         )
-    
-        # heads
-        self.reg_head = MinkowskiConvolution(
-            up_out_dim, in_channels, kernel_size=1,
-            stride=1, bias=True, dimension=D
+
+        # regression head
+        self.reg_head = nn.Sequential(
+            MinkowskiConvolution(up_out_dim, up_out_dim, kernel_size=1, stride=1, bias=True, dimension=D),
+            MinkowskiGELU(),
+            MinkowskiConvolution(up_out_dim, in_channels, kernel_size=1, stride=1, bias=True, dimension=D)
         )
-        self.cls_head = MinkowskiConvolution(
-            up_out_dim, out_channels, kernel_size=1,
-            stride=1, bias=True, dimension=D
+        
+        # classification head
+        self.cls_head = nn.Sequential(
+            MinkowskiConvolution(up_out_dim, up_out_dim, kernel_size=1, stride=1, bias=True, dimension=D),
+            MinkowskiGELU(),
+            MinkowskiConvolution(up_out_dim, out_channels, kernel_size=1, stride=1, bias=True, dimension=D)
         )
     
         self.initialize_weights()
@@ -433,9 +430,9 @@ class MinkMAEViT(nn.Module):
         )
 
         # upsample and get predictions
-        x_sparse = self.upsample_layers(x_sparse)
-        pred_reg = self.reg_head(x_sparse)
-        pred_cls = self.cls_head(x_sparse)
+        x_sparse_up = self.upsample_layers(x_sparse)
+        pred_reg = self.reg_head(x_sparse_up)
+        pred_cls = self.cls_head(x_sparse_up)
         preds_C  = pred_reg.C
 
         # build a mask in the upsampled lattice
@@ -482,6 +479,7 @@ class MinkMAEViT(nn.Module):
         """        
         latent, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
         preds_reg, preds_cls, mask_up = self.forward_decoder(latent, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore)
+        #assert (x.C==preds_reg.C).all() and (x.C==preds_cls.C).all()  # always true!
         total_loss, individual_losses = self.forward_loss(x.F, cls_labels, preds_reg.F, preds_cls.F, mask_up)
         
         return total_loss, individual_losses, preds_reg, preds_cls, mask_up

@@ -110,8 +110,7 @@ class GlobalFeatureEncoder(nn.Module):
         # Scalars: single scalar → project → mu_hidden_dim
         self.scalars_proj = nn.Linear(5, embed_dim)
         
-        # Fuse all three → project to embed_dim
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self,
                 x_glob) -> torch.Tensor:
@@ -146,7 +145,7 @@ class GlobalFeatureEncoder(nn.Module):
         # Scalars path
         scalars_feat = self.scalars_proj(scalars_in)
         
-        # Fuse and project
+        # Combine
         global_embed = fcal_feat + ecal_feat + hcal_feat + scalars_feat
         return self.dropout(global_embed)
 

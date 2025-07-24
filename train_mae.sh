@@ -4,16 +4,16 @@
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
 model="base"
 eps=1e-12
-batch_size=64
+batch_size=256
 preprocessing_input="sqrt"
 standardize_input="unit-var"
-mask_ratio=0.5
-epochs=200
-num_workers=16
+mask_ratio=0.75
+epochs=800
+num_workers=8
 blr=1.5e-4
 accum_grad_batches=1
-warmup_steps=10
-cosine_annealing_steps=190
+warmup_steps=40
+cosine_annealing_steps=760
 weight_decay=0.05
 beta1=0.9
 beta2=0.95
@@ -25,7 +25,7 @@ checkpoint_path="checkpoints_final"
 checkpoint_name="maevit_v5.1b_v1"
 early_stop_patience=30
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
-gpus=(0)
+gpus=(0 1)
 
 python -m train.train_mae \
     --train \

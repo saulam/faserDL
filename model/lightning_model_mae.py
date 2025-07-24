@@ -28,6 +28,7 @@ class SparseMAELightningModel(pl.LightningModule):
         super(SparseMAELightningModel, self).__init__()
 
         self.model = model
+        self.mask_ratio = args.mask_ratio
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
         self.cosine_annealing_steps = args.scheduler_steps
@@ -66,7 +67,7 @@ class SparseMAELightningModel(pl.LightningModule):
 
         # Forward pass
         loss, part_losses, _, _, _ = self.forward(
-            batch_input, batch_input_global, cls_labels, mask_ratio=0.5)
+            batch_input, batch_input_global, cls_labels, mask_ratio=self.mask_ratio)
   
         # Retrieve current learning rate
         lr = self.optimizers().param_groups[0]['lr']
