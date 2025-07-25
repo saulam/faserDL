@@ -110,7 +110,7 @@ def main():
         callbacks.append(early_stop_callback)
 
     # Lightning model
-    lightning_model = SparseMAELightningModel(
+    lightning_model = MAEPreTrainer(
         model=model,
         metadata=dataset.metadata,
         args=args)

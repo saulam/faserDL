@@ -5,7 +5,7 @@ tb_logs/
 lightning_logs/
 core
 out*
-notebooks/
+notebook*
 checkpoint*/
 *db
 INSTALL
