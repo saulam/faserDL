@@ -3,7 +3,7 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 07.25
 
-Description: PyTorch model - stage 1: pretraining.
+Description: PyTorch MAE-ViT model with MinkowskiEngine patching.
 """
 
 import numpy as np
@@ -13,87 +13,19 @@ import torch.nn.functional as F
 import MinkowskiEngine as ME
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence
-from timm.models.vision_transformer import Attention, Block
 from MinkowskiEngine import (
     MinkowskiConvolution,
     MinkowskiConvolutionTranspose,
     MinkowskiGELU,
 )
-from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoder, MinkowskiLayerNorm
-
-
-# NOTE: patch works for timm version 0.6.13
-class MaskableAttention(Attention):
-    def forward(self, x, attn_mask=None):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
-        if attn_mask is not None:
-            # if key padding mask (B, N) → expand to (B, 1, 1, N)
-            if attn_mask.ndim == 2:
-                mask = attn_mask[:, None, None, :].to(torch.bool)
-            # if full mask (B, N, N) → expand to (B, 1, N, N)
-            else:
-                mask = attn_mask[:, None, :, :].to(torch.bool)
-            attn = attn.masked_fill(~mask, float("-1e9"))
-        
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class BlockWithMask(Block):
-    def __init__(
-            self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            drop=0.,
-            attn_drop=0.,
-            init_values=None,
-            drop_path=0.,
-            act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm
-    ):
-        super().__init__(
-            dim,
-            num_heads,
-            mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias,
-            drop=drop,
-            attn_drop=attn_drop,
-            init_values=init_values,
-            drop_path=drop_path,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-        )
-        self.attn = MaskableAttention(
-            dim=dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
-
-    def forward(self, x, attn_mask=None):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x
+from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoder, MinkowskiLayerNorm
         
 
 class MinkMAEViT(nn.Module):
     def __init__(
         self,
-        in_channels=1, 
-        out_channels=4, 
+        in_chans=1, 
+        out_chans=4, 
         D=3,
         img_size=(48, 48, 200),
         encoder_dims=[192, 256, 384],
@@ -104,14 +36,13 @@ class MinkMAEViT(nn.Module):
         decoder_depth=8,
         decoder_num_heads=16,
         mlp_ratio=4.0,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        norm_layer=nn.LayerNorm,
         loss_weights={'reg': 1.0, 'cls': 1.0},
-        args=None
     ):
         """
         Args:
-            in_channels (int): Number of input channels.
-            out_channels (int): Number of output channels.
+            in_chans (int): Number of input channels.
+            out_chans (int): Number of output channels.
             D (int): Spatial dimension for Minkowski layers.
             img_size (tuple): Input image size (H, W, D).
             args: Namespace with at least a `dataset_path` attribute.
@@ -148,7 +79,7 @@ class MinkMAEViT(nn.Module):
             )
     
         self.downsample_layers = nn.Sequential(
-            _down_blk(in_channels, encoder_dims[0], kernel_size[0]),
+            _down_blk(in_chans, encoder_dims[0], kernel_size[0]),
             _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
             _down_blk(encoder_dims[1], encoder_dims[2], kernel_size[2]),
         )
@@ -204,14 +135,14 @@ class MinkMAEViT(nn.Module):
         self.reg_head = nn.Sequential(
             MinkowskiConvolution(up_out_dim, up_out_dim, kernel_size=1, stride=1, bias=True, dimension=D),
             MinkowskiGELU(),
-            MinkowskiConvolution(up_out_dim, in_channels, kernel_size=1, stride=1, bias=True, dimension=D)
+            MinkowskiConvolution(up_out_dim, in_chans, kernel_size=1, stride=1, bias=True, dimension=D)
         )
         
         # classification head
         self.cls_head = nn.Sequential(
             MinkowskiConvolution(up_out_dim, up_out_dim, kernel_size=1, stride=1, bias=True, dimension=D),
             MinkowskiGELU(),
-            MinkowskiConvolution(up_out_dim, out_channels, kernel_size=1, stride=1, bias=True, dimension=D)
+            MinkowskiConvolution(up_out_dim, out_chans, kernel_size=1, stride=1, bias=True, dimension=D)
         )
     
         self.initialize_weights()
@@ -518,6 +449,7 @@ class MinkMAEViT(nn.Module):
                 setattr(parent_module, attr_name, new_conv)
         
         return
+
     
     def _get_parent_module(self, layer_name):
         """
@@ -538,7 +470,7 @@ class MinkMAEViT(nn.Module):
 
 def mae_vit_base(**kwargs):
     model = MinkMAEViT(
-        in_channels=1, out_channels=4, D=3, img_size=(48, 48, 200),
+        in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         encoder_dims=[192, 384, 768],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         depth=12, num_heads=12,
@@ -550,7 +482,7 @@ def mae_vit_base(**kwargs):
 
 def mae_vit_large(**kwargs):
     model = MinkMAEViT(
-        in_channels=1, out_channels=4, D=3, img_size=(48, 48, 200),
+        in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         encoder_dims=[252, 504, 1008],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         depth=24, num_heads=16,
@@ -562,7 +494,7 @@ def mae_vit_large(**kwargs):
 
 def mae_vit_huge(**kwargs):
     model = MinkMAEViT(
-        in_channels=1, out_channels=4, D=3, img_size=(48, 48, 200),
+        in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         encoder_dims=[324, 648, 1296],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         depth=32, num_heads=16,

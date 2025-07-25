@@ -2,7 +2,75 @@ import numpy as np
 import torch
 import torch.nn as nn
 from MinkowskiEngine import SparseTensor
+from timm.models.vision_transformer import Attention, Block
 
+
+# NOTE: patch works for timm version 0.6.13
+class MaskableAttention(Attention):
+    def forward(self, x, attn_mask=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        if attn_mask is not None:
+            # if key padding mask (B, N) → expand to (B, 1, 1, N)
+            if attn_mask.ndim == 2:
+                mask = attn_mask[:, None, None, :].to(torch.bool)
+            # if full mask (B, N, N) → expand to (B, 1, N, N)
+            else:
+                mask = attn_mask[:, None, :, :].to(torch.bool)
+            attn = attn.masked_fill(~mask, float("-1e9"))
+        
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class BlockWithMask(Block):
+    def __init__(
+            self,
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            drop=0.,
+            attn_drop=0.,
+            init_values=None,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm
+    ):
+        super().__init__(
+            dim,
+            num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            drop=drop,
+            attn_drop=attn_drop,
+            init_values=init_values,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+        )
+        self.attn = MaskableAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+
+    def forward(self, x, attn_mask=None):
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        return x
+        
 
 def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     """

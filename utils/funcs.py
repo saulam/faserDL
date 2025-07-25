@@ -199,35 +199,6 @@ def arrange_truth(data):
     
     return output
 
-def argsort_coords(coordinates):
-    # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
-    # Multiply coordinates by powers of a large number to encode them uniquely into one tensor
-    max_val = coordinates.max() + 1
-    multipliers = torch.tensor([max_val**i for i in reversed(range(coordinates.shape[1]))], device=coordinates.device)
-
-    # Create a single sortable tensor
-    encoded_coords = (coordinates * multipliers).sum(dim=1)
-
-    # Sort based on the encoded coordinates
-    sorted_indices = torch.argsort(encoded_coords)
-
-    return sorted_indices
-
-def argsort_sparse_tensor(tensor):
-    # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
-    # Multiply coordinates by powers of a large number to encode them uniquely into one tensor
-    max_val = tensor.coordinates.max() + 1
-    multipliers = torch.tensor([max_val**i for i in reversed(range(tensor.coordinates.shape[1]))], device=tensor.coordinates.device)
-    
-    # Create a single sortable tensor
-    #encoded_coords = torch.matmul(tensor.coordinates.float(), multipliers.float())
-    encoded_coords = (tensor.coordinates * multipliers).sum(dim=1)
-
-    # Sort based on the encoded coordinates
-    sorted_indices = torch.argsort(encoded_coords)
-    
-    return sorted_indices
-
 
 class CustomLambdaLR(LambdaLR):
     def __init__(self, optimizer, warmup_steps):
@@ -313,25 +284,4 @@ class CombinedScheduler(_LRScheduler):
             self.scheduler1.load_state_dict(state_dict['scheduler1'])
         if self.scheduler2:
             self.scheduler2.load_state_dict(state_dict['scheduler2'])
-
-
-def transfer_weights(model_seg, model_enc):
-    """
-    Load weights from segmentation model to encoder model
-    """
-    model_enc.stem.load_state_dict(model_seg.stem.state_dict())
-    model_enc.global_feats_encoder.load_state_dict(model_seg.global_feats_encoder.state_dict())
-    N_bb = len(model_enc.shared_encoders)
-    for i in range(N_bb):
-        model_enc.shared_encoders[i].load_state_dict(model_seg.encoder_layers[i].state_dict())
-        model_enc.shared_se_layers[i].load_state_dict(model_seg.se_layers[i].state_dict())
-        if i < N_bb - 1:
-            model_enc.shared_downsamples[i].load_state_dict(model_seg.downsample_layers[i].state_dict())
-
-    last = N_bb  # index in model_seg: encoder_layers[last], se_layers[last], downsample_layers[last]
-    for name, branch in model_enc.branches.items():
-        # branch is an nn.ModuleDict, so indexing by string
-        branch["downsample"].load_state_dict(model_seg.downsample_layers[last - 1].state_dict())
-        branch["encoder"].load_state_dict(model_seg.encoder_layers[last].state_dict())
-        branch["se"].load_state_dict(model_seg.se_layers[last].state_dict())
 
