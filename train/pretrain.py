@@ -6,7 +6,6 @@ Date: 01.25
 Description: Training script - stage 1: semantic segmentation.
 """
 
-
 import os
 import torch
 import pytorch_lightning as pl
@@ -44,14 +43,13 @@ def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
-
     print("\n- Arguments:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
+
+    # GPU setup
     nb_gpus = len(args.gpus)
     gpus = ', '.join(args.gpus) if nb_gpus > 1 else str(args.gpus[0])
-
-    # Manually specify the GPUs to use
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
@@ -98,6 +96,7 @@ def main():
         )
         callbacks.append(checkpoint)    
 
+    # Rest of callbacks
     progress_bar = CustomProgressBar()
     callbacks.append(progress_bar)
     if args.early_stop_patience > 0:
@@ -108,18 +107,16 @@ def main():
             mode='min' 
         )
         callbacks.append(early_stop_callback)
+    logger.log_hyperparams(vars(args))
+    tb_logger.log_hyperparams(vars(args))
 
     # Lightning model
     lightning_model = MAEPreTrainer(
         model=model,
         metadata=dataset.metadata,
         args=args)
-
-    # Log the hyperparameters
-    logger.log_hyperparams(vars(args))
-    tb_logger.log_hyperparams(vars(args))
  
-    # Initialize PyTorch Lightning trainer
+    # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(
         #num_sanity_val_steps=0,
         max_epochs=args.epochs,

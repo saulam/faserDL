@@ -12,13 +12,18 @@ import pytorch_lightning as pl
 from functools import partial
 from utils import transfer_weights, CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
 from dataset import SparseFASERCALDataset
-from model import MinkMAEConvNeXtV2, MinkEncConvNeXtV2, SparseEncTlLightningModel
+from model import *
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
 
 torch.set_float32_matmul_precision("medium")
 pl_major = int(pl.__version__.split(".")[0])
+MODEL_FACTORIES = {
+    'base':  vit_base,
+    'large': vit_large,
+    'huge':  vit_huge,
+}
 
 
 class CustomProgressBar(TQDMProgressBar):
@@ -35,7 +40,7 @@ class CustomProgressBar(TQDMProgressBar):
 
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
-    parser = ini_argparse()
+    parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
     print("\n- Arguments:")
     for arg, value in vars(args).items():
@@ -49,52 +54,43 @@ def main():
 
     # Dataset and splits
     dataset = SparseFASERCALDataset(args)
+    print("- Dataset size: {} events".format(len(dataset)))
     train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
 
     # Calculate arguments for scheduler
     nb_batches = len(train_loader)
     denom = args.accum_grad_batches * nb_gpus
-    #args.lr = args.lr * (args.batch_size * denom) / 256.
+    if args.blr is not None:
+        # overwrite lr by linearly-scaled blr if args.blr is defined
+        args.lr = args.blr * (args.batch_size * denom) / 256.
     args.scheduler_steps = nb_batches * args.cosine_annealing_steps // denom
     args.warmup_steps = nb_batches * args.warmup_steps // denom
     args.start_cosine_step = (nb_batches * args.epochs // denom) - args.scheduler_steps
-    print(f"lr               = {args.lr}")
-    print(f"scheduler_steps  = {args.scheduler_steps}")
-    print(f"warmup_steps     = {args.warmup_steps}")
-    print(f"start_cosine_step= {args.start_cosine_step}")
-    print(f"eff. batch size  = {args.batch_size * denom}")
+    print(f"lr                = {args.lr}")
+    print(f"scheduler_steps   = {args.scheduler_steps}")
+    print(f"warmup_steps      = {args.warmup_steps}")
+    print(f"start_cosine_step = {args.start_cosine_step}")
+    print(f"eff. batch size   = {args.batch_size * denom}")
 
-    # Model and LightningModule
-    pretrained_model = MinkMAEConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
-    base_model = MinkEncConvNeXtV2(in_channels=1, out_channels=3, D=3, args=args)
-    
-    # Transfer weights from pretrained model to new model
+    # Transfer weights from pre-trained model
+    base_model = args.model()
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
-    pretrained_model.load_state_dict(state_dict, strict=True)
-    filtered = {k: v for k, v in pretrained_model.state_dict().items() if k in base_model.state_dict()}
-    if "cls_evt" in filtered:
-        target_shape = base_model.state_dict()["cls_evt"].shape  # (1, num_cls, emb_dim)
+    filtered = {k: v for k, v in state_dict().items() if k in base_model.state_dict()}
+    if "cls_token" in filtered:
+        # Handle cls_token expansion if needed
+        target_shape = base_model.state_dict()["cls_tokens"].shape  # (1, num_cls, emb_dim)
         _, num_cls, _ = target_shape
-        filtered["cls_evt"] = filtered["cls_evt"].repeat(1, num_cls, 1).contiguous()
+        filtered["cls_tokens"] = filtered["cls_token"].repeat(1, num_cls, 1).contiguous()
     mismatched = base_model.load_state_dict(filtered, strict=False)
     print("missing keys:", mismatched.missing_keys)
     print("unexpected keys:", mismatched.unexpected_keys)
-    del pretrained_model
     print("Weights transferred succesfully")
 
-    # 1) define the list of losses you want to monitor
+    # define the list of losses to monitor
     monitor_losses = [
         "loss/val_total",
-        #"loss/val_flavour",
-        #"loss/val_charm",
-        #"loss/val_e_vis",
-        #"loss/val_pt_miss",
-        #"loss/val_jet_momentum_dir",
-        #"loss/val_jet_momentum_mag",
-        #"loss/val_lepton_momentum_dir",
-        #"loss/val_lepton_momentum_mag",
     ]
     
     # helper to build a fresh checkpoint callback list
@@ -113,13 +109,18 @@ def main():
         progress_bar = CustomProgressBar()
         cbs.append(progress_bar)
         return cbs
-    
-    lightning_model = SparseEncTlLightningModel(model=base_model, args=args)
-    
+
+    # Rest of callbacks
     logger    = CSVLogger(save_dir=f"{args.save_dir}/logs", name=f"{args.name}")
     tb_logger = TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=f"{args.name}")
     callbacks = make_callbacks()
-    
+    logger.log_hyperparams(vars(args))
+    tb_logger.log_hyperparams(vars(args))
+
+    # Lightning model
+    lightning_model = ViTFineTuner(model=base_model, args=args)
+
+    # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         callbacks=callbacks,
@@ -132,6 +133,8 @@ def main():
         deterministic=True,
         accumulate_grad_batches=args.accum_grad_batches,
     )
+
+    # Train and validate the model
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,

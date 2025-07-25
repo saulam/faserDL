@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
 from torch_ema import ExponentialMovingAverage
-from utils import MAPE, SphericalAngularLoss, arrange_sparse_minkowski, CustomLambdaLR, CombinedScheduler
+from utils import param_groups_lrd, MAPE, SphericalAngularLoss, arrange_sparse_minkowski, CustomLambdaLR, CombinedScheduler
 
 
 class ViTFineTuner(pl.LightningModule):
@@ -65,11 +65,13 @@ class ViTFineTuner(pl.LightningModule):
         self.weight_decay = args.weight_decay
         self.eps = args.eps
 
+        '''
         # For layer-wise lr decay
         self.encoder_block_counts = [
             len(self.model.encoder_layers[i]) 
             for i in range(self.model.nb_elayers)
         ]
+        '''
 
     
     def on_save_checkpoint(self, checkpoint):
@@ -190,6 +192,7 @@ class ViTFineTuner(pl.LightningModule):
 
         return total_loss, part_losses
 
+    
     def get_lr_for_module(self, module: torch.nn.Module) -> float:
         """
         Scan through all optimizer param_groups and return the lr for the one
@@ -213,7 +216,6 @@ class ViTFineTuner(pl.LightningModule):
   
         # Retrieve current learning rate
         lr = self.get_lr_for_module(self.model.branches["flavour"])
-        #lf = self.optimizers().param_groups[0]['lr']
 
         return loss, part_losses, batch_size, lr
 
@@ -252,7 +254,14 @@ class ViTFineTuner(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimiser with LR groups, plus warmup & cosine schedulers."""
-        param_groups = self._get_layerwise_param_groups()
+        param_groups = param_groups_lrd(
+            self.model, 
+            weight_decay=self.weight_decay, 
+            layer_decay=self.layer_decay)
+
+        for param_group in param_groups:
+            lr_scale = param_group.pop("lr_scale", 1.0)
+            param_group["lr"] = self.lr * lr_scale
 
         # group uncertainty params
         param_groups.append({
@@ -295,120 +304,6 @@ class ViTFineTuner(pl.LightningModule):
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
-
-        
-    def _get_layer_id(self, name: str) -> int:
-        """
-        Assign a unique integer ID according to the exact forward‐pass order
-        """        
-        if name.startswith("log_sigma"):
-            return -1
-        
-        # 1) STEM (one ID = 0)
-        if name.startswith("model.stem"):
-            return 0
-
-        nb_elayers = self.model.nb_elayers
-        counts = self.encoder_block_counts  # e.g. [3, 3, 9, 3]
-
-        # Helper: compute “base” = ID of mod_layer
-        def compute_base():
-            base = 1  # IDs start at 1 immediately after stem
-            for x in range(nb_elayers):
-                base += counts[x]
-                if x < nb_elayers - 1:
-                    base += 1  # one ID reserved for downsample_layers[x]
-            return base
-
-        # 2) ENCODER LAYERS & DOWNSAMPLE LAYERS interleaved
-        m = re.match(r"model\.encoder_layers\.(\d+)\.(\d+)\.", name)
-        if m:
-            i = int(m.group(1))
-            j = int(m.group(2))
-            used = 1  # the first available ID after stem = 1
-            for k in range(i):
-                used += counts[k]
-                if k < nb_elayers - 1:
-                    used += 1  # that downsample_layers[k]
-            return used + j
-
-        m = re.match(r"model\.downsample_layers\.(\d+)\.", name)
-        if m:
-            i = int(m.group(1))
-            used = 1
-            for k in range(i):
-                used += counts[k]
-                if k < nb_elayers - 1:
-                    used += 1
-            used += counts[i]
-            return used
-
-        # 3) MODULE‐LEVEL TRANSFORMER (mod_transformer layers & cls_mod)
-        base = compute_base()
-        num_mod = len(self.model.mod_transformer.layers)  # number of mod_transformer layers
-
-        m = re.match(r"model\.mod_transformer\.layers\.(\d+)\.", name)
-        if m:
-            k = int(m.group(1))
-            return base + k
-    
-        if name.startswith("model.cls_mod") or name.startswith("model.pos_emb_mod"):
-            return base  # same ID as mod_transformer.layers.0        
-
-        # 4) EVENT‐LEVEL TRANSFORMER & related heads
-        num_evt = len(self.model.evt_transformer.layers)  # e.g. 5
-        m = re.match(r"model\.evt_transformer\.layers\.(\d+)\.", name)
-        if m:
-            k = int(m.group(1))
-            return base + num_mod + k
-    
-        if (name.startswith("model.global_feats_encoder")
-            or name.startswith("model.pos_emb")
-            or name.startswith("model.cls_evt")
-           ):
-            return base + num_mod  # same ID as first event layer
-
-        # 5) All branches (“model.branches.*”) follow all event‐level IDs
-        if name.startswith("model.branches"):
-            return base + num_mod + num_evt
-
-        raise Exception("Parameter name undefined: {}".format(name))
-
-
-    def _get_layerwise_param_groups(self):
-        layer_ids = [
-            self._get_layer_id(name)
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        ]
-        max_layer_id = max(layer_ids) if layer_ids else 0
-    
-        groups = {}
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            layer_id = self._get_layer_id(name)
-            if layer_id == -1:
-                continue
-                
-            scale = self.layer_decay ** (max_layer_id - layer_id)
-            if (
-                (param.ndim == 1 and "mask_mod_emb" not in name)
-                or name.endswith((".bias", ".gamma", ".beta"))
-            ):
-                decay = 0.0
-            else:
-                decay = self.weight_decay
-            key = (layer_id, decay)
-            if key not in groups:
-                groups[key] = {
-                    'params': [],
-                    'lr': self.lr * scale,
-                    'weight_decay': decay
-                }
-            groups[key]['params'].append(param)
-    
-        return list(groups.values())
 
 
     def lr_scheduler_step(self, scheduler, *args):

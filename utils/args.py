@@ -35,7 +35,7 @@ def ini_argparse(
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
-    parser.add_argument('--model', type=model_type, default='base', help='Which MAE-ViT size to use')
+    parser.add_argument('--model', type=model_type, default='base', help='Which model size to use (base / large / huge')
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Percentage of masked patches during pre-training")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch size")

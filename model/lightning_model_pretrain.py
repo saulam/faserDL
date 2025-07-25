@@ -47,12 +47,7 @@ class MAEPreTrainer(pl.LightningModule):
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
 
     
-    def forward(self, 
-                x, 
-                x_glob,
-                cls_labels,
-                mask_ratio,
-               ):
+    def forward(self, x, x_glob, cls_labels, mask_ratio):
         return self.model(x, x_glob, cls_labels, mask_ratio)
 
 
@@ -102,7 +97,7 @@ class MAEPreTrainer(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure and initialize the optimizer and learning rate scheduler."""
-        param_groups = optim_factory.add_weight_decay(self.model, args.weight_decay)
+        param_groups = optim_factory.param_groups_weight_decay(self.model, self.weight_decay)
         optimizer = torch.optim.AdamW(
             param_groups,
             lr=self.lr,

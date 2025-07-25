@@ -34,10 +34,13 @@ class MinkViT(vit.VisionTransformer):
         encoder_dims=[192, 256, 384],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         global_pool=False,
-        head_dropout=0.1,
         **kwargs
     ):
         super(MinkViT, self).__init__(**kwargs)
+        
+        norm_layer = kwargs['norm_layer']
+        in_chans = kwargs['in_chans']
+        drop_rate = kwargs['drop_rate']
 
         # patch & grid setup
         patch_size = np.prod(np.array(kernel_size), axis=0).tolist()
@@ -67,8 +70,6 @@ class MinkViT(vit.VisionTransformer):
                 MinkowskiGELU(),
             )
 
-        norm_layer = kwargs['norm_layer']
-        in_chans = kwargs['in_chans']
         self.downsample_layers = nn.Sequential(
             _down_blk(in_chans, encoder_dims[0], kernel_size[0]),
             _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
@@ -76,7 +77,7 @@ class MinkViT(vit.VisionTransformer):
         )
 
         embed_dim = encoder_dims[-1]
-        del self.pos_embed
+        del self.pos_embed, self.patch_embed, self.head
         self.global_feats_encoder = GlobalFeatureEncoder(embed_dim)
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
 
@@ -113,7 +114,7 @@ class MinkViT(vit.VisionTransformer):
         for name in self.branch_tokens.keys():
             self.heads[name] = nn.Sequential(
                 norm_layer(embed_dim),
-                nn.Dropout(head_dropout),
+                nn.Dropout(drop_rate),
                 nn.Linear(embed_dim, branch_out_channels[name])
             )
             
@@ -327,8 +328,9 @@ def vit_base(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         encoder_dims=[192, 384, 768],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=768, depth=12, num_heads=12, head_dropout=0.1,
-        mlp_ratio=4.0, qkv_bias=True, block_fn=BlockWithMask,
+        embed_dim=768, depth=12, num_heads=12, drop_rate=0.,
+        mlp_ratio=4.0, qkv_bias=True, 
+        block_fn=BlockWithMask, drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
     
@@ -338,8 +340,9 @@ def vit_large(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         encoder_dims=[252, 504, 1008],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=1008, depth=24, num_heads=16, head_dropout=0.1,
-        mlp_ratio=4.0, qkv_bias=True, block_fn=BlockWithMask,
+        embed_dim=1008, depth=24, num_heads=16, drop_rate=0.,
+        mlp_ratio=4.0, qkv_bias=True, 
+        block_fn=BlockWithMask, drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -349,7 +352,8 @@ def vit_huge(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         encoder_dims=[324, 648, 1296],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=1296, depth=32, num_heads=16, head_dropout=0.1,
-        mlp_ratio=4.0, qkv_bias=True, block_fn=BlockWithMask,
+        embed_dim=1296, depth=32, num_heads=16, drop_rate=0.,
+        mlp_ratio=4.0, qkv_bias=True,
+        block_fn=BlockWithMask, drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
