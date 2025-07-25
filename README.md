@@ -74,13 +74,6 @@ You can override any settings via command-line arguments (see below).
 | **Hardware**             | `--gpus`                                                                                                                                                            | list (e.g. `[0]`)                                                                                                                             | List of GPU device IDs; multi-GPU when providing multiple IDs                                   |
 
 
-
-To see all available options and their defaults, run:
-
-```bash
-python main.py --help
-```
-
 ## Requirements
 
 ```text

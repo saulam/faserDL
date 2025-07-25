@@ -1,9 +1,7 @@
-matplotlib==3.10.3
 MinkowskiEngine==0.5.4
 numpy==2.3.2
-packaging==25.0
 pytorch_lightning==2.0.0
-ROOT==0.0.1
+ROOT==6.34.00
 scikit_learn==1.7.1
 scipy==1.16.0
 timm==0.6.13
