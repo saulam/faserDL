@@ -3,7 +3,7 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 01.25
 
-Description: Training script - stage 1: semantic segmentation.
+Description: pre-training script.
 """
 
 import os

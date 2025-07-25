@@ -1,9 +1,9 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 07.25
 
-Description: Updated training script with four .fit() calls for fine-tuning.
+Description: fine-tuning script.
 """
 
 import os
@@ -73,17 +73,17 @@ def main():
     print(f"eff. batch size   = {args.batch_size * denom}")
 
     # Transfer weights from pre-trained model
-    base_model = args.model()
+    model = args.model()
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
-    filtered = {k: v for k, v in state_dict().items() if k in base_model.state_dict()}
+    filtered = {k: v for k, v in state_dict().items() if k in model.state_dict()}
     if "cls_token" in filtered:
         # Handle cls_token expansion if needed
-        target_shape = base_model.state_dict()["cls_tokens"].shape  # (1, num_cls, emb_dim)
+        target_shape = model.state_dict()["cls_tokens"].shape  # (1, num_cls, emb_dim)
         _, num_cls, _ = target_shape
         filtered["cls_tokens"] = filtered["cls_token"].repeat(1, num_cls, 1).contiguous()
-    mismatched = base_model.load_state_dict(filtered, strict=False)
+    mismatched = model.load_state_dict(filtered, strict=False)
     print("missing keys:", mismatched.missing_keys)
     print("unexpected keys:", mismatched.unexpected_keys)
     print("Weights transferred succesfully")
@@ -118,7 +118,7 @@ def main():
     tb_logger.log_hyperparams(vars(args))
 
     # Lightning model
-    lightning_model = ViTFineTuner(model=base_model, args=args)
+    lightning_model = ViTFineTuner(model=model, args=args)
 
     # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(

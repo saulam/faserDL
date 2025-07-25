@@ -174,8 +174,7 @@ class MinkViT(vit.VisionTransformer):
         sparse_tensor,
     ):
         """
-        Buckets feats by event ID, pads to a dense tensor,
-        and returns an index‐map you can use to scatter back.
+        Buckets feats by event ID, pads to a dense tensor.
     
         Args:
             sparse_tensor: MinkowskiEngine sparse tensor with
@@ -183,10 +182,9 @@ class MinkViT(vit.VisionTransformer):
                            .F of shape [N, C] (features).
     
         Returns:
-            padded_feats: [B, L_max, C] float, zero‑padded features
-            mask:         [B, L_max] bool, True = real voxel
-            lengths:      [B] long, number of voxels per event
-            idx_map:      [B, L_max] long, original-voxel indices (−1=pad)
+            padded_feats:  [B, L_max, C] float, zero‑padded features
+            padded_coords: [B, L_max] int, flat position ids.
+            mask:          [B, L_max] bool, True = real voxel.
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
@@ -197,18 +195,15 @@ class MinkViT(vit.VisionTransformer):
         sorted_eids, perm     = event_ids.sort()
         sorted_feats          = feats[perm]
         sorted_spatial_coords = spatial_coords[perm]
-        sorted_idx            = perm  # remembers original row indices
     
         uniq_ids, counts = torch.unique_consecutive(sorted_eids,
                                                     return_counts=True)
         counts_list = counts.tolist()    
         feat_groups   = torch.split(sorted_feats, counts_list, dim=0)
         coord_groups  = torch.split(sorted_spatial_coords, counts_list, dim=0)
-        idx_groups    = torch.split(sorted_idx, counts_list, dim=0)
         
         padded_feats  = pad_sequence(feat_groups, batch_first=True, padding_value=0.0)
         padded_coords = pad_sequence(coord_groups, batch_first=True, padding_value=0)
-        idx_map       = pad_sequence(idx_groups, batch_first=True, padding_value=-1)
     
         lengths = counts
         L_max   = int(lengths.max().item())
@@ -221,12 +216,12 @@ class MinkViT(vit.VisionTransformer):
         d_idx = padded_coords[..., 2]
         padded_coords = h_idx * (Gw * Gd) + w_idx * Gd + d_idx
     
-        return padded_feats, padded_coords, mask, lengths, idx_map
+        return padded_feats, padded_coords, mask
         
 
     def forward_features(self, x_sparse, glob):
         x_sparse = self.downsample_layers(x_sparse)
-        x, pos, attn_mask, _, _ = self.group_voxels_by_event(x_sparse)
+        x, pos, attn_mask = self.group_voxels_by_event(x_sparse)
         x = x + self.pos_embed(pos)
 
         # add cls token

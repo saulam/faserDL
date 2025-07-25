@@ -29,7 +29,7 @@ save_top_k=1
 checkpoint_path="checkpoints_final"
 checkpoint_name="enc_v5.1b_mae_nersc_v21"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/mae_v5.1b_nersc_v2/loss_val_total/last.ckpt"
+load_checkpoint="checkpoints_final/maevit_v5.1b_v1/loss_val_total/last.ckpt"
 gpus=(0)
 
 python -m train.finetune \

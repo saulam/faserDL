@@ -218,10 +218,11 @@ class MinkMAEViT(nn.Module):
                            .F of shape [N, C] (features).
     
         Returns:
-            padded_feats: [B, L_max, C] float, zero‑padded features
-            mask:         [B, L_max] bool, True = real voxel
-            lengths:      [B] long, number of voxels per event
-            idx_map:      [B, L_max] long, original-voxel indices (−1=pad)
+            padded_feats:  [B, L_max, C] float, zero‑padded features
+            padded_coords: [B, L_max] int, flat position ids.
+            mask:          [B, L_max] bool, True = real voxel.
+            lengths:       [B] long, number of voxels per event
+            idx_map:       [B, L_max] long, original-voxel indices (−1=pad)
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
