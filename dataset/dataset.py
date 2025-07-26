@@ -10,100 +10,138 @@ import pickle as pk
 import numpy as np
 import torch
 import os
-import sys
 from glob import glob
 from torch.utils.data import Dataset
 from utils import ini_argparse
 from utils.augmentations import *
-import MinkowskiEngine as ME
 
 
 class SparseFASERCALDataset(Dataset):
+    """
+    A PyTorch Dataset for handling sparse FASERCal data.
+    """
     def __init__(self, args):
         """
-        Initializes the SparseFASERCALDataset class.
-
-        Args:
-        root (str): Root directory containing the data files.
-        shuffle (bool): Whether to shuffle the dataset (default: False).
+        Initialises the dataset.
         """
         self.root = args.dataset_path
-        self.data_files = self.processed_file_names
-        self.stage1 = args.stage1
+        self.data_files = sorted(glob(f'{self.root}/*.npz'))
+
+        # Configuration from args
         self.train = args.train
+        self.stage1 = args.stage1
         self.augmentations_enabled = False
-        self.is_v5 = True if 'v5' in args.dataset_path else False 
-        self.total_events = self.__len__
-        with open(self.root + "/metadata.pkl", "rb") as fd:
-            self.metadata = pk.load(fd)
-            self.metadata['x'] = np.array(self.metadata['x'])
-            self.metadata['y'] = np.array(self.metadata['y'])
-            self.metadata['z'] = np.array(self.metadata['z'])
-        self.module_size = int((self.metadata['z'][:,1]==0).sum())
         self.standardize_input = args.standardize_input
         self.standardize_output = args.standardize_output
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
+        self.mixup = args.mixup
+
+        # Load metadata
+        with open(os.path.join(self.root, "metadata.pkl"), "rb") as fd:
+            self.metadata = pk.load(fd)
+            for key in ['x', 'y', 'z']:
+                self.metadata[key] = np.array(self.metadata[key])
+
+        self.module_size = int((self.metadata['z'][:, 1] == 0).sum())
         self.num_modules = int(self.metadata['z'][:, 1].max() + 1)
+        self.primary_vertices = None
 
-            
-    @property
-    def processed_dir(self):
-        """
-        Returns the processed directory path.
-
-        Returns:
-        str: Path to the processed directory.
-        """
-        return f'{self.root}'
-    
-    
-    @property
-    def processed_file_names(self):
-        """
-        Returns a list of processed file names.
-
-        Returns:
-        list: List of file names.
-        """
-        return sorted(glob(f'{self.processed_dir}/*.npz'))
-    
     
     def __len__(self):
-        """
-        Returns the total number of data files.
-
-        Returns:
-        int: Number of data files.
-        """
+        """Returns the total number of samples in the dataset."""
         return len(self.data_files)
 
-    
-    def _augment(self, coords_ori, modules_ori, feats_ori, labels_ori, dirs_ori, rear_cal_modules_ori, primary_vertex_ori):
-        coords, modules, feats = coords_ori.copy(), modules_ori.copy(), feats_ori.copy()
-        primary_vertex = primary_vertex_ori.copy()
-        rear_cal_modules = rear_cal_modules_ori.copy()
-        labels = [x.copy() for x in labels_ori]
-        dirs = [x.copy() for x in dirs_ori]
+        
+    def calc_primary_vertices(self):
+        self.primary_vertices = np.array([np.load(f)["primary_vertex"] for f in self.data_files])
+        print("Primary vertices pre-loaded.")
 
-        # mirror
-        coords, modules, dirs, rear_cal_modules, primary_vertex = mirror(coords, modules, dirs, rear_cal_modules, primary_vertex, self.metadata, selected_axes=['x', 'y'])
-        # rotate
-        coords, dirs, rear_cal_modules, primary_vertex = rotate_90(coords, dirs, rear_cal_modules, primary_vertex, self.metadata, selected_axes=['z'])
-        # translate
-        #coords, modules, primary_vertex = translate(coords, modules, primary_vertex, self.metadata, selected_axes=['x', 'y', 'z'])
-        # drop voxels
-        coords, modules, feats, labels = drop(coords, modules, feats, labels, std_dev=0.1)
-        # shift feature values
-        feats = shift_q_gaussian(feats, std_dev=0.05)
-        # keep within limits
-        #coords, feats, labels = self.within_limits(coords, feats, labels, voxelised=True, mask_axes=[2])
-        if coords.shape[0] < 2:
-            return coords_ori, modules_ori, feats_ori, labels_ori, dirs_ori, rear_cal_modules_ori, primary_vertex_ori
+    
+    def _augment(self, coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations=None):
+        if transformations is None:
+            transformations = {}
+            
+        # Mirror
+        if 'mirror' in transformations:
+            flipped = transformations['mirror']
+            coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_mirror(
+                coords, modules, momentums, global_feats['rear_cal_modules'], 
+                primary_vertex, self.metadata, flipped,
+            )
+        else:
+            coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
+                coords, modules, momentums, global_feats['rear_cal_modules'], 
+                primary_vertex, self.metadata, selected_axes=['x', 'y'],
+            )
+            transformations['mirror'] = flipped
 
-        return coords, modules, feats, labels, dirs, rear_cal_modules, primary_vertex
+        # Rotation
+        if 'rotate' in transformations:
+            chosen_angles = transformations['rotate']
+            coords, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_rotate_90(
+                coords, momentums, global_feats['rear_cal_modules'], 
+                primary_vertex, self.metadata, chosen_angles,
+            )
+        else:
+            coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
+                coords, momentums, global_feats['rear_cal_modules'], 
+                primary_vertex, self.metadata, selected_axes=['z'],
+            )
+            transformations['rotate'] = chosen_angles
+
+        # Translation
+        if 'translate' in transformations:
+            shifts = transformations['translate']
+            coords, modules, global_feats['rear_cal_modules'], primary_vertex = apply_translate(
+                coords, modules, global_feats['rear_cal_modules'], 
+                primary_vertex, self.metadata, shifts,
+            )
+        else:
+            coords, modules, global_feats['rear_cal_modules'], primary_vertex, shifts = translate(
+                coords, modules, global_feats['rear_cal_modules'], 
+                primary_vertex, self.metadata, selected_axes=['x', 'y'],
+            )
+            transformations['translate'] = shifts
+
+        # Scaling
+        feats, momentums, global_feats, _ = scale_all_by_global_shift(
+            feats, momentums, global_feats, std_dev=0.1,
+        )
+
+        return coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations
+
     
-    
+    def voxelise(self, coords, reverse=False):
+        """
+        Voxelises or de-voxelises coordinates based on detector geometry.
+        Z-axis is handled differently due to non-uniform module spacing.
+        """
+        min_x, max_x = self.metadata['x'].min(), self.metadata['x'].max()
+        min_y, max_y = self.metadata['y'].min(), self.metadata['y'].max()
+        range_x = self.metadata['x'].shape[0] - 1
+        range_y = self.metadata['y'].shape[0] - 1
+
+        def forward_transform(values, min_val, max_val, range_max):
+            return range_max * (values - min_val) / (max_val - min_val)
+
+        def inverse_transform(values, min_val, max_val, range_max):
+            return min_val + (values / range_max) * (max_val - min_val)
+
+        transform = inverse_transform if reverse else forward_transform
+        
+        mapped = np.empty_like(coords, dtype=np.float32)
+        mapped[..., 0] = transform(coords[..., 0], min_x, max_x, range_x)
+        mapped[..., 1] = transform(coords[..., 1], min_y, max_y, range_y)
+        
+        if reverse:
+            mapped[..., 2] = self.metadata['z'][coords[..., 2].astype(int), 0]
+        else:
+            mapped[..., 2] = np.searchsorted(self.metadata['z'][:, 0], coords[..., 2])
+            
+        return mapped
+
+
     def within_limits(self, coords, feats=None, labels=None, voxelised=False, mask_axes=(0, 1, 2)):
         """
         Filters coordinates, features, and labels based on given axis limits.
@@ -129,350 +167,247 @@ class SparseFASERCALDataset(Dataset):
         labels_filtered = [x[mask] for x in labels] if labels is not None else None
         
         return coords_filtered, feats_filtered, labels_filtered
- 
 
-    def voxelise(self, coords, reverse=False):
-        """
-        Voxelises or unvoxelises given coordinates.
-        
-        Note: Voxelisation different for Z since module positions are not uniform.
-        """
-        min_x, max_x = self.metadata['x'].min(), self.metadata['x'].max()
-        min_y, max_y = self.metadata['y'].min(), self.metadata['y'].max()
-        range_x = self.metadata['x'].shape[0] - 1
-        range_y = self.metadata['y'].shape[0] - 1
-
-        def forward_transform(values, min_val, max_val, range_max):
-            return range_max * (values - min_val) / (max_val - min_val)
-
-        def inverse_transform(values, min_val, max_val, range_max):
-            return min_val + (values / range_max) * (max_val - min_val)
-
-        transform = inverse_transform if reverse else forward_transform
-
-        mapped = np.empty_like(coords, dtype=np.float32)
-        mapped[..., 0] = transform(coords[..., 0], min_x, max_x, range_x)
-        mapped[..., 1] = transform(coords[..., 1], min_y, max_y, range_y)
-        if reverse:
-            mapped[..., 2] = self.metadata['z'][coords[..., 2].astype(int), 0]
-        else:
-            mapped[..., 2] = np.searchsorted(self.metadata['z'][:, 0], coords[..., 2])
-
-        return mapped#.round()  # round needed only for augmentations
-    
     
     def normalise_seg_labels(self, seg_labels, primlepton_labels, smoothing=0.0, eps=1e-8):
         """
-        Normalise seg_labels by:
-        - Keeping the first column unchanged as it represents ghost identification.
-        - Normalising the second and third columns (energy depositions from electromagnetic and hadronic components) so that their sum equals (1 - first column value) per row.
-        - Appending a new column for primlepton_labels and zeroing out the original components when primlepton_labels == 1.
-    
-        Args:
-            seg_labels (np.ndarray): Array of shape (N, 3) with columns [ghost, em, had].
-            primlepton_labels (np.ndarray): Binary array of shape (N, 1) indicating primary lepton rows.
-            smoothing (float): Epsilon for label smoothing.
-            eps (float): Small epsilon to avoid division by zero.
-    
-        Returns:
-            np.ndarray: Array of shape (N, 4) with normalized [ghost, em, had, primlepton].
+        Normalizes segmentation labels and combines them into a final format.
+        [ghost, em, had] -> [ghost, em_norm, had_norm, primlepton]
         """
         labels = seg_labels.copy().astype(np.float32)
-    
         sum_vals = np.sum(labels[:, 1:], axis=1, keepdims=True)
         mask = sum_vals.squeeze() > eps
+        
+        # Normalize EM and Hadronic components to sum to (1 - ghost_fraction)
         labels[mask, 1:] = (1 - labels[mask, :1]) * (labels[mask, 1:] / sum_vals[mask])
+        
         prim = primlepton_labels.reshape(-1, 1).astype(labels.dtype)
         result = np.concatenate([labels, prim], axis=1)
+        
+        # Zero out other components if it's a primary lepton
         prim_mask = prim.squeeze() == 1
         result[prim_mask, :3] = 0.0
 
         if smoothing > 0:
-            return smooth_labels(result, smoothing=0.1)
-    
+            return smooth_labels(result, smoothing=smoothing)
+        
         return result
 
-        
-    def pdg2label(self, pdg, iscc, name=False):
-        """
-        PDG to label.
-        """
-        if iscc:
-            if pdg in [-12, 12]:
-                label = "CC nue" if name else 0
-            elif pdg in [-14, 14]:
-                label = "CC numu" if name else 1
-            elif pdg in [-16, 16]:
-                label = "CC nutau" if name else 2
-        else:
-            label = "NC" if name else 3
-
-        return label
     
+    def pdg2label(self, pdg, iscc):
+        """Converts PDG ID to a classification label (0-3)."""
+        if iscc:
+            if pdg in [-12, 12]: return 0  # CC nue
+            if pdg in [-14, 14]: return 1  # CC numu
+            if pdg in [-16, 16]: return 2  # CC nutau
+        return 3  # NC
+
     
     def decompose_momentum(self, momentum):
-        """
-        Given a 3D momentum vector or an array of N 3D momentum vectors, 
-        return the magnitudes and directions separately.
-        
-        Parameters:
-            momentum (np.ndarray): A (3,) or (N, 3) NumPy array representing momentum vector(s).
-            
-        Returns:
-            magnitude (np.ndarray): The magnitude(s) of the momentum vector(s).
-            direction (np.ndarray): A unit vector (or unit vectors) representing the direction(s) of the momentum.
-        """
-        momentum = np.atleast_2d(momentum)  # Converts (3,) -> (1, 3), leaves (N,3) unchanged
+        """Splits 3D momentum vectors into magnitude and direction."""
+        momentum = np.atleast_2d(momentum)
         magnitudes = np.linalg.norm(momentum, axis=1, keepdims=True)
         directions = np.divide(momentum, magnitudes, where=magnitudes != 0)
-    
-        if magnitudes.shape[0] == 1:
-            return magnitudes[0], directions[0]
-    
-        return magnitudes.flatten(), directions
-
-    
-    def reconstruct_momentum(self, magnitude, direction):
-        """
-        Given magnitude and direction, reconstruct the original momentum vector.
         
-        Parameters:
-            magnitude (float or np.ndarray): A scalar or an array of shape (N,) representing momentum magnitudes.
-            direction (np.ndarray): A (3,) or (N, 3) NumPy array representing unit direction vectors.
-            
-        Returns:
-            momentum (np.ndarray): The reconstructed momentum vector(s).
-        """
-        magnitude = np.atleast_1d(magnitude)
-        direction = np.atleast_2d(direction)  # Converts (3,) -> (1, 3), leaves (N,3) unchanged
-    
-        momentum = magnitude[:, np.newaxis] * direction
-    
-        return momentum[0] if magnitude.shape[0] == 1 else momentum
+        is_single_vector = magnitudes.shape[0] == 1
+        return magnitudes[0] if is_single_vector else magnitudes.flatten(), \
+               directions[0] if is_single_vector else directions
 
-
+        
     def preprocess(self, x, param_name, preprocessing=None, standardize=None):
-        if np.ndim(x) == 0:
-            x = np.atleast_1d(x)
-
+        """Applies a sequence of preprocessing steps (e.g., log, z-score)."""
+        x = np.atleast_1d(x)
         internal_name = param_name
-        if preprocessing == "sqrt":
-            if np.any(x < 0):
-                raise ValueError(f"{param_name}: negative values cannot take sqrt")
-            x = np.sqrt(x)
-            internal_name = param_name + "_sqrt"
-        elif preprocessing == "log":
-            if np.any(x <= -1):
-                raise ValueError(f"{param_name}: values <= -1 cannot take log1p")
-            x = np.log1p(x)
-            internal_name = param_name + "_log1p"
-
-        if standardize is not None:
-            stats = self.metadata[internal_name]
-            if standardize == "z-score":
-                # mean=0, std=1
-                if stats["std"] == 0:
-                    raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = (x - stats["mean"]) / stats["std"]
-            elif standardize == "unit-var":
-                # std=1
-                if stats["std"] == 0:
-                    raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x / stats["std"]
-            else:
-                # [0, 1] normalisation
-                rng = stats["max"] - stats["min"]
-                if rng == 0:
-                    raise ValueError(f"{param_name}: max and min are equal in metadata")
-                x = (x - stats["min"]) / rng
-
-        return x
-
-
-    def unpreprocess(self, x, param_name, preprocessing=None, standardize=None):
-        if np.ndim(x) == 0 or (isinstance(x, np.ndarray) and x.shape == ()):
-            x = np.atleast_1d(x)
-
-        internal_name = param_name
-        if preprocessing == "sqrt":
-            internal_name = param_name + "_sqrt"
-        elif preprocessing == "log":
-            internal_name = param_name + "_log1p"
-
-        if standardize is not None:
-            stats = self.metadata[internal_name]
-            if standardize == "z-score":
-                # mean=0, std=1
-                if stats["std"] == 0:
-                    raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x * stats["std"] + stats["mean"]
-            elif standardize == "unit-var":
-                # std=1
-                if stats["std"] == 0:
-                    raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x * stats["std"]
-            else:
-                # [0, 1] normalisation
-                rng = stats["max"] - stats["min"]
-                if rng == 0:
-                    raise ValueError(f"{param_name}: max and min are equal in metadata")
-                x = x * rng + stats["min"]
-
-        if preprocessing == "sqrt":
-            x = x ** 2
-        elif preprocessing == "log":
-            x = np.expm1(x)
-
-        return x
         
+        # Apply non-linear transformations first
+        if preprocessing == "sqrt":
+            if np.any(x < 0): raise ValueError(f"{param_name}: negative values cannot take sqrt")
+            x = np.sqrt(x)
+            internal_name += "_sqrt"
+        elif preprocessing == "log":
+            if np.any(x <= -1): raise ValueError(f"{param_name}: values <= -1 cannot take log1p")
+            x = np.log1p(x)
+            internal_name += "_log1p"
 
-    def get_param(self, data, param_name, preprocessing=None, standardize=None):
-        if param_name not in data:
-            return None
+        # Apply standardization
+        if standardize:
+            stats = self.metadata[internal_name]
+            std = stats.get("std", 1.0)
+            if std == 0: raise ValueError(f"{internal_name}: std is zero in metadata")
 
-        param = data[param_name]
-        param = self.preprocess(param, param_name, preprocessing, standardize)
+            if standardize == "z-score":
+                x = (x - stats["mean"]) / std
+            elif standardize == "unit-var":
+                x = x / std
+            else: # Min-max scaling
+                rng = stats["max"] - stats["min"]
+                if rng == 0: raise ValueError(f"{param_name}: max and min are equal")
+                x = (x - stats["min"]) / rng
+        return x
 
-        return param
 
-    
-    def __getitem__(self, idx):
+    def _prepare_event(self, idx, transformations=None):
         """
-        Retrieves a data sample by index.
-
-        Args:
-        idx (int): Index of the data sample.
-
-        Returns:
-        dict: Data sample with filename, coordinates, features, and labels.
+        Loads and processes a single event up through augmentations.
+        Returns a dict of intermediate arrays.
         """
         data = np.load(self.data_files[idx], allow_pickle=True)
-        
-        run_number = self.get_param(data, 'run_number')
-        event_id = self.get_param(data, 'event_id')
-        true_hits = self.get_param(data, 'true_hits')
-        reco_hits = self.get_param(data, 'reco_hits')
-        reco_hits_true = self.get_param(data, 'reco_hits_true')
-        in_neutrino_pdg = self.get_param(data, 'in_neutrino_pdg')
-        in_neutrino_energy = self.get_param(data, 'in_neutrino_energy')
-        out_lepton_pdg = self.get_param(data, 'out_lepton_pdg')
-        out_lepton_momentum = self.get_param(data, 'out_lepton_momentum')
-        vis_sp_momentum = self.get_param(data, 'vis_sp_momentum')
-        jet_momentum = self.get_param(data, 'jet_momentum')
-        is_cc = self.get_param(data, 'is_cc')
-        charm = self.get_param(data, 'charm')
-        e_vis = self.get_param(data, 'e_vis', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
-        pt_miss = self.get_param(data, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
-        faser_cal_energy = self.get_param(data, 'faser_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        faser_cal_modules = self.get_param(data, 'faser_cal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_cal_energy = self.get_param(data, 'rear_cal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_cal_modules = self.get_param(data, 'rear_cal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_hcal_energy = self.get_param(data, 'rear_hcal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_hcal_modules = self.get_param(data, 'rear_hcal_modules', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        rear_mucal_energy = self.get_param(data, 'rear_mucal_energy', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-
-        module_hits = np.bincount(reco_hits[:, 3].astype(int), minlength=self.num_modules)
-        module_hits = self.preprocess(module_hits, "module_hits", preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        event_hits = len(reco_hits)
-        event_hits = self.preprocess(event_hits, "event_hits", preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-        
+        reco_hits = data['reco_hits']
         primary_vertex = data['primary_vertex']
-        if not is_cc:
-            out_lepton_momentum.fill(0)
-        
-        # momentum -> direction + magnitude
-        out_lepton_momentum_mag, out_lepton_momentum_dir = self.decompose_momentum(out_lepton_momentum)
-        out_lepton_momentum_mag = self.preprocess(out_lepton_momentum_mag, 'out_lepton_momentum_magnitude', 
-                                                  preprocessing=self.preprocessing_output, standardize=self.standardize_output)
-        jet_momentum_mag, jet_momentum_dir = self.decompose_momentum(jet_momentum)
-        jet_momentum_mag = self.preprocess(jet_momentum_mag, 'jet_momentum_magnitude', 
-                                           preprocessing=self.preprocessing_output, standardize=self.standardize_output)
-
-        # retrieve coordiantes and features (energy deposited)
+        is_cc = data['is_cc']
+        in_neutrino_pdg = data['in_neutrino_pdg']
+        vis_sp_momentum = data['vis_sp_momentum']
+        seg_labels_raw = data['seg_labels']
+        primlepton_labels = data['primlepton_labels']
+        out_lepton_momentum = data['out_lepton_momentum']
+        jet_momentum = data['jet_momentum']
+        charm = data['charm']
+        global_feats = {
+            'e_vis':             data['e_vis'],
+            'faser_cal_energy':  data['faser_cal_energy'],
+            'rear_cal_energy':   data['rear_cal_energy'],
+            'rear_hcal_energy':  data['rear_hcal_energy'],
+            'rear_mucal_energy': data['rear_mucal_energy'],
+            'faser_cal_modules': data['faser_cal_modules'],
+            'rear_cal_modules':  data['rear_cal_modules'],
+            'rear_hcal_modules': data['rear_hcal_modules'],
+        }
+        # initial transformations
         coords = reco_hits[:, :3]
-        q = self.preprocess(reco_hits[:, 4].reshape(-1, 1), 'q', preprocessing=self.preprocessing_input, standardize=self.standardize_input)
-
-        # look-up hit modules
+        q = reco_hits[:, 4].reshape(-1, 1)
+        orig_coords = coords.copy()
         module_idx = np.searchsorted(self.metadata['z'][:, 0], coords[:, 2])
         modules = self.metadata['z'][module_idx, 1]
-        
-        # process labels
-        primlepton_labels = self.get_param(data, 'primlepton_labels')
-        seg_labels = self.get_param(data, 'seg_labels')
-        
-        # voxelise coordinates and prepare global features and labels
-        orig_coords = coords.copy()
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
-        
-        feats_global = np.concatenate([event_hits, faser_cal_energy, rear_cal_energy, rear_hcal_energy, rear_mucal_energy])   
-        flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])
-        primlepton_labels = primlepton_labels.reshape(-1, 1)
-        seg_labels = seg_labels.reshape(-1, 3)
 
-        # relative coords to each module
-        coords[:, 2] = coords[:, 2] % self.module_size
-
-        augmented, feats = False, q
-        if self.augmentations_enabled: 
-            # augmented event
-            (
-                coords, modules, feats, (primlepton_labels, seg_labels),
-                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum), rear_cal_modules, primary_vertex
-            ) = self._augment(
-                coords, modules, feats, (primlepton_labels, seg_labels),
-                (out_lepton_momentum_dir, jet_momentum_dir, vis_sp_momentum),
-                rear_cal_modules, primary_vertex
+        # augmentations (if applicable)
+        if self.train and self.augmentations_enabled:
+            coords, modules, q, (primlepton_labels, seg_labels_raw), \
+            (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
+            global_feats, _, transformations = self._augment(
+                coords, modules, q, (primlepton_labels, seg_labels_raw),
+                (out_lepton_momentum, jet_momentum, vis_sp_momentum),
+                global_feats, primary_vertex, transformations
             )
-            augmented = True
+            charm = smooth_labels(np.array([charm]), smoothing=0.1)
+            flavour_label = smooth_labels(
+                np.array([self.pdg2label(in_neutrino_pdg, is_cc)]),
+                smoothing=0.1,
+                num_classes=4
+            )
+            seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels, smoothing=0.1)
         else:
-            seg_labels = self.normalise_seg_labels(seg_labels, primlepton_labels, smoothing=0.0)
-          
-        if augmented:
-            # merge duplicated coordinates and finalise with augmentations
-            seg_labels = self.normalise_seg_labels(seg_labels, primlepton_labels, smoothing=0.1)
-            feats_global = shift_q_gaussian(feats_global, std_dev=0.05)
-            faser_cal_modules = shift_q_gaussian(faser_cal_modules, std_dev=0.05)
-            rear_cal_modules = shift_q_gaussian(rear_cal_modules, std_dev=0.05)
-            rear_hcal_modules = shift_q_gaussian(rear_hcal_modules, std_dev=0.05)
-            flavour_label = smooth_labels(flavour_label, smoothing = 0.1, num_classes = 4)
-            charm = smooth_labels(charm, smoothing = 0.1)
-        
-        # ptmiss
-        pt_miss = np.sqrt(np.array([vis_sp_momentum[0]**2 + vis_sp_momentum[1]**2]))
-        pt_miss = self.preprocess(pt_miss, 'pt_miss', preprocessing=self.preprocessing_output, standardize=self.standardize_output)
-        coords[:, 2] += (modules * self.module_size)
+            flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])
+            seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels)
+            if not is_cc:
+                out_lepton_momentum.fill(0)
 
-        # output
-        output = {}
-        if not self.train:
-            output['run_number'] = run_number
-            output['event_id'] = event_id
-            output['primary_vertex'] = primary_vertex
-            output['in_neutrino_pdg'] = in_neutrino_pdg
-            output['in_neutrino_energy'] = in_neutrino_energy
-            output['vis_sp_momentum'] = vis_sp_momentum
-        if not self.train or not self.stage1:
-            output['charm'] = torch.from_numpy(charm).float()
-            output['e_vis'] = torch.from_numpy(e_vis).float()
-            output['pt_miss'] = torch.from_numpy(pt_miss).float()
-            output['out_lepton_momentum_mag'] = torch.from_numpy(out_lepton_momentum_mag).float()
-            output['out_lepton_momentum_dir'] = torch.from_numpy(out_lepton_momentum_dir).float()
-            output['jet_momentum_mag'] = torch.from_numpy(jet_momentum_mag).float()
-            output['jet_momentum_dir'] = torch.from_numpy(jet_momentum_dir).float()
+        # decompose momentum
+        out_lepton_magnitude, out_lepton_dir = self.decompose_momentum(out_lepton_momentum)
+        jet_magnitude, jet_dir = self.decompose_momentum(jet_momentum)
+
+        return {
+            'coords': coords,
+            'modules': modules,
+            'q': q,
+            'seg_labels': seg_labels,
+            'primlepton_labels': primlepton_labels,
+            'out_lepton_momentum_mag': out_lepton_magnitude,
+            'out_lepton_momentum_dir': out_lepton_dir,
+            'jet_momentum_mag': jet_magnitude,
+            'jet_momentum_dir': jet_dir,
+            'global_feats': global_feats,
+            'flavour_label': flavour_label,
+            'charm': charm,
+            'vis_sp_momentum': vis_sp_momentum,
+            'e_vis': global_feats['e_vis'],
+            'primary_vertex': primary_vertex,
+            'transformations': transformations,
+        }
+
+    
+    def _finalise_event(self, event):
+        """
+        Applies preprocessing and converts arrays into the final torch tensors output.
+        """
+        # Preprocess features
+        feats = self.preprocess(event['q'], 'q', self.preprocessing_input, self.standardize_input)
+        event_hits = self.preprocess(
+            len(event['q']), 'event_hits', self.preprocessing_input, self.standardize_input
+        )
+        module_hits = np.bincount(event['modules'].astype(int), minlength=self.num_modules)
+        module_hits = self.preprocess(
+            module_hits, 'module_hits', self.preprocessing_input, self.standardize_input
+        )
+        feats_global = np.concatenate([
+            event_hits,
+            self.preprocess(event['global_feats']['faser_cal_energy'], 'faser_cal_energy', self.preprocessing_input, self.standardize_input),
+            self.preprocess(event['global_feats']['rear_cal_energy'], 'rear_cal_energy', self.preprocessing_input, self.standardize_input),
+            self.preprocess(event['global_feats']['rear_hcal_energy'], 'rear_hcal_energy', self.preprocessing_input, self.standardize_input),
+            self.preprocess(event['global_feats']['rear_mucal_energy'], 'rear_mucal_energy', self.preprocessing_input, self.standardize_input)
+        ])
+        faser_mod = self.preprocess(event['global_feats']['faser_cal_modules'], 'faser_cal_modules', self.preprocessing_input, self.standardize_input)
+        rear_cal_mod = self.preprocess(event['global_feats']['rear_cal_modules'], 'rear_cal_modules', self.preprocessing_input, self.standardize_input)
+        rear_hcal_mod = self.preprocess(event['global_feats']['rear_hcal_modules'], 'rear_hcal_modules', self.preprocessing_input, self.standardize_input)
+
+        # Preprocess outputs
+        pt_miss = np.sqrt(event['vis_sp_momentum'][0]**2 + event['vis_sp_momentum'][1]**2)
+        pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output, self.standardize_output)
+        e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output, self.standardize_output)
+        out_mag = self.preprocess(event['out_lepton_momentum_mag'], 'out_lepton_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+        jet_mag = self.preprocess(event['jet_momentum_mag'], 'jet_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+
+        # Assemble output
+        output = {
+            'coords': torch.from_numpy(event['coords']).float(),
+            'modules': torch.from_numpy(event['modules']).long(),
+            'feats': torch.from_numpy(feats).float(),
+            'feats_global': torch.from_numpy(feats_global).float(),
+            'faser_cal_modules': torch.from_numpy(faser_mod).float(),
+            'rear_cal_modules': torch.from_numpy(rear_cal_mod).float(),
+            'rear_hcal_modules': torch.from_numpy(rear_hcal_mod).float(),
+            'flavour_label': torch.from_numpy(event['flavour_label']),
+        }
         if self.stage1:
-            output['seg_labels'] = torch.from_numpy(seg_labels).float()
-        output['flavour_label'] = torch.from_numpy(flavour_label)
-        output['orig_coords'] = orig_coords
-        output['coords'] = torch.from_numpy(coords.reshape(-1, 3)).float()
-        output['modules'] = torch.from_numpy(modules).long()
-        output['feats'] = torch.from_numpy(feats).float()
-        output['feats_global'] = torch.from_numpy(feats_global).float()
-        output['module_hits'] = torch.from_numpy(module_hits).float()
-        output['faser_cal_modules'] = torch.from_numpy(faser_cal_modules).float()
-        output['rear_cal_modules'] = torch.from_numpy(rear_cal_modules).float()
-        output['rear_hcal_modules'] = torch.from_numpy(rear_hcal_modules).float()
-        output['is_cc'] = torch.from_numpy(is_cc).float()
-
+            output['seg_labels'] = torch.from_numpy(event['seg_labels']).float()
+        if not self.train or not self.stage1:
+            output.update({
+                'charm': torch.from_numpy(np.atleast_1d(event['charm'])).float(),
+                'e_vis': torch.from_numpy(np.atleast_1d(e_vis)).float(),
+                'pt_miss': torch.from_numpy(np.atleast_1d(pt_miss)).float(),
+                'out_lepton_momentum_mag': torch.from_numpy(np.atleast_1d(out_mag)).float(),
+                'out_lepton_momentum_dir': torch.from_numpy(event['out_lepton_momentum_dir']).float(),
+                'jet_momentum_mag': torch.from_numpy(np.atleast_1d(jet_mag)).float(),
+                'jet_momentum_dir': torch.from_numpy(event['jet_momentum_dir']).float(),
+            })
         return output
 
+
+    def _mixup(self, event1, event2, alpha=0.8):
+        """
+        Performs mixup of two prepared events with weight alpha, handling overlapping voxels.
+        Coordinates and module indices are concatenated; features and labels are mixed.
+        """
+        return event1
+        
+
+    def __getitem__(self, idx):
+        event = self._prepare_event(idx)
+        '''
+        if self.train and self.augmentations_enabled and not self.stage1:
+            # find candidate with similar vertex for mixup
+            primary_vertex = self.primary_vertices[idx]
+            candidate_indices = np.random.randint(len(self), size=5000)
+            candidate_vertices = self.primary_vertices[candidate_indices]
+            dists = np.linalg.norm(candidate_vertices - primary_vertex, axis=1)
+            within_threshold = np.where(dists < 50)[0]
+            if within_threshold.size > 0:
+                selected_idx = candidate_indices[within_threshold[0]]
+            else:
+                selected_idx = candidate_indices[np.argmin(dists)]
+    
+            event2 = self._prepare_event(selected_idx, event['transformations'])
+            event = self._mixup(event, event2, alpha=self.mixup)
+        '''
+        return self._finalise_event(event)

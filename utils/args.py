@@ -34,6 +34,7 @@ def ini_argparse(
     parser.add_argument("--standardize_output", type=str, default=None, help="standarisation type to output (z-score / uni-var / norm)")
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
+    parser.add_argument("--mixup", type=float, default=0.8, help="mixup alpha")
     parser.add_argument("-d", "--dataset_path", type=str, default="/scratch/salonso/sparse-nns/faser/events_v3_new", help="Dataset path")
     parser.add_argument('--model', type=model_type, default='base', help='Which model size to use (base / large / huge')
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Percentage of masked patches during pre-training")

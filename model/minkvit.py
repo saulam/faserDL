@@ -141,7 +141,6 @@ class MinkViT(vit.VisionTransformer):
             if lin.bias is not None:
                 nn.init.constant_(lin.bias, 0)
 
-
     def _init_weights(self, m):
         # we use xavier_uniform following official JAX ViT:
         if isinstance(m, MinkowskiConvolution):

@@ -53,6 +53,9 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     train_set.data_files = extract_files(train_split.indices)
     val_set.data_files = extract_files(val_split.indices)
     test_set.data_files = extract_files(test_split.indices)
+
+    if args.train and args.augmentations_enabled and not args.stage1:
+        train_set.calc_primary_vertices()
     
     train_set.augmentations_enabled = args.augmentations_enabled
     collate_fn = collate_test if test else collate_sparse_minkowski
@@ -83,29 +86,16 @@ def collate_test(batch):
 
     for ev_idx, sample in enumerate(batch):
         coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        '''
-        for m in torch.unique(mods):
-            mask = (mods == m)
-            coords_list.append(coords[mask])
-            feats_list.append(feats[mask])
-            module_to_event.append(ev_idx)
-            module_pos.append(int(m))
-        '''
         coords_list.append(coords)
         feats_list.append(feats)
-        module_to_event.append(ev_idx)
-        module_pos.append(0)
 
     ret = {
         'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'module_hits': torch.stack([d['module_hits'] for d in batch]),
         'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
         'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
         'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
         'c': coords_list,
-        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
-        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = [
@@ -130,29 +120,16 @@ def collate_sparse_minkowski(batch):
 
     for ev_idx, sample in enumerate(batch):
         coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        '''
-        for m in torch.unique(mods):
-            mask = (mods == m)
-            coords_list.append(coords[mask])
-            feats_list.append(feats[mask])
-            module_to_event.append(ev_idx)
-            module_pos.append(int(m))
-        '''
         coords_list.append(coords)
         feats_list.append(feats)
-        module_to_event.append(ev_idx)
-        module_pos.append(0)
 
     ret = {
         'f': torch.cat(feats_list, dim=0),
         'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'module_hits': torch.stack([d['module_hits'] for d in batch]),
         'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
         'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
         'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
         'c': coords_list,
-        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
-        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
     }
     
     optional_keys = {
@@ -176,7 +153,6 @@ def arrange_sparse_minkowski(data, device):
         coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
         device=device
     )
-    module_hits = data['module_hits']
     faser_cal = data['faser_cal_modules']
     rear_cal = data['rear_cal_modules']
     rear_hcal = data['rear_hcal_modules']

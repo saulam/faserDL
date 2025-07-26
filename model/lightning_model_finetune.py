@@ -65,14 +65,6 @@ class ViTFineTuner(pl.LightningModule):
         self.weight_decay = args.weight_decay
         self.eps = args.eps
 
-        '''
-        # For layer-wise lr decay
-        self.encoder_block_counts = [
-            len(self.model.encoder_layers[i]) 
-            for i in range(self.model.nb_elayers)
-        ]
-        '''
-
     
     def on_save_checkpoint(self, checkpoint):
         if self.ema is not None:
