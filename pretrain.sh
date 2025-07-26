@@ -23,7 +23,7 @@ log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
 checkpoint_name="maevit_v5.1b_v1"
-early_stop_patience=30
+early_stop_patience=100
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
 gpus=(0 1)
 

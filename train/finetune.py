@@ -10,7 +10,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from functools import partial
-from utils import transfer_weights, CustomFinetuningReversed, ini_argparse, split_dataset, supervised_pixel_contrastive_loss, focal_loss, dice_loss
+from utils import ini_argparse, split_dataset
 from dataset import SparseFASERCALDataset
 from model import *
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
@@ -77,12 +77,14 @@ def main():
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
-    filtered = {k: v for k, v in state_dict().items() if k in model.state_dict()}
+    filtered = {k: v for k, v in state_dict.items() if k in model.state_dict()}
     if "cls_token" in filtered:
         # Handle cls_token expansion if needed
         target_shape = model.state_dict()["cls_tokens"].shape  # (1, num_cls, emb_dim)
         _, num_cls, _ = target_shape
         filtered["cls_tokens"] = filtered["cls_token"].repeat(1, num_cls, 1).contiguous()
+        print("Loaded CLS token weights.")
+        del model.cls_token
     mismatched = model.load_state_dict(filtered, strict=False)
     print("missing keys:", mismatched.missing_keys)
     print("unexpected keys:", mismatched.unexpected_keys)

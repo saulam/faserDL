@@ -14,6 +14,7 @@ import MinkowskiEngine as ME
 import timm.models.vision_transformer as vit
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence 
+from timm.models.layers import trunc_normal_
 from MinkowskiEngine import (
     MinkowskiConvolution,
     MinkowskiConvolutionTranspose,
@@ -77,26 +78,24 @@ class MinkViT(vit.VisionTransformer):
         )
 
         embed_dim = encoder_dims[-1]
-        del self.pos_embed, self.patch_embed, self.head
+        del self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
         self.global_feats_encoder = GlobalFeatureEncoder(embed_dim)
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
 
         self.global_pool = global_pool
         if self.global_pool:
             embed_dim = kwargs['embed_dim']
-            self.fc_norm = norm_layer(embed_dim)
-
             del self.norm  # remove the original norm
 
         self.branch_tokens = {
             "flavour": 0,
-            "charm": 1,
-            "e_vis": 2,
-            "pt_miss": 3,
-            "lepton_momentum_mag": 4,
-            "lepton_momentum_dir": 4,
-            "jet_momentum_mag": 5,
-            "jet_momentum_dir": 5,
+            "charm": 0,
+            "e_vis": 0,
+            "pt_miss": 0,
+            "lepton_momentum_mag": 0,
+            "lepton_momentum_dir": 0,
+            "jet_momentum_mag": 0,
+            "jet_momentum_dir": 0,
         }
         branch_out_channels = {
             "flavour": 4,
@@ -130,10 +129,17 @@ class MinkViT(vit.VisionTransformer):
             self.pos_embed.weight.copy_(torch.from_numpy(pos_embed).float())
             self.pos_embed.weight.requires_grad_(False)
 
-        # init cls token
-        nn.init.normal_(self.cls_token, std=0.02)
+        # init cls tokens
+        nn.init.normal_(self.cls_tokens, std=0.02)
 
         self.apply(self._init_weights)
+
+        # init heads
+        for name in self.branch_tokens.keys():
+            lin = self.heads[name][2]
+            trunc_normal_(lin.weight, std=2e-5)
+            if lin.bias is not None:
+                nn.init.constant_(lin.bias, 0)
 
 
     def _init_weights(self, m):

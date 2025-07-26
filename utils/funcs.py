@@ -58,7 +58,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     collate_fn = collate_test if test else collate_sparse_minkowski
     persistent = args.num_workers > 0
 
-    def create_loader(ds, shuffle):
+    def create_loader(ds, shuffle, drop_last):
         return DataLoader(
             ds,
             batch_size=args.batch_size,
@@ -66,13 +66,14 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
             shuffle=shuffle,
             pin_memory=True,
             persistent_workers=persistent,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
+            drop_last=drop_last,
         )
 
     return (
-        create_loader(train_set, shuffle=True),
-        create_loader(val_set, shuffle=False),
-        create_loader(test_set, shuffle=False),
+        create_loader(train_set, shuffle=True, drop_last=True),
+        create_loader(val_set, shuffle=False, drop_last=True),
+        create_loader(test_set, shuffle=False, drop_last=False),
     )
 
 

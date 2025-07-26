@@ -400,3 +400,56 @@ def add_gaussian_noise(probs, std=0.05, shuffle_prob=0.01):
 
     return noisy_probs
 
+
+def smooth_labels(targets, smoothing: float, num_classes: int = None):
+    """
+    Apply label smoothing.
+
+    Parameters
+    ----------
+    targets : array-like, shape (N,) or (N, C)
+        - If num_classes is provided: 1-D array of integer class labels in [0, num_classes-1].
+        - Else:
+          - 1-D (N,) or 2-D (N,1): binary labels or probabilities for the positive class.
+          - 2-D (N, C) with C>1: one-hot or soft multi-class labels.
+    smoothing : float in [0, 1)
+        amount of smoothing to apply.
+    num_classes : int, optional
+        number of classes to one‑hot encode 1-D `targets` into before smoothing.
+    
+    Returns
+    -------
+    smoothed : ndarray of shape (N,) or (N, C)
+        smoothed probabilities.
+    """
+    targets = np.asarray(targets, dtype=np.float32)
+    if smoothing <= 0:
+        return targets
+
+    # If user supplied num_classes, force multi-class path
+    if num_classes is not None:
+        if targets.ndim != 1:
+            raise ValueError("With num_classes set, targets must be 1-D class indices.")
+        N = targets.shape[0]
+        C = num_classes
+        # one-hot encode
+        one_hot = np.zeros((N, C), dtype=np.float32)
+        one_hot[np.arange(N), targets.astype(int)] = 1.0
+        # smooth
+        return one_hot * (1.0 - smoothing) + smoothing / float(C)
+
+    # --- binary classification case ---
+    if targets.ndim == 1 or (targets.ndim == 2 and targets.shape[1] == 1):
+        probs = targets.reshape(-1)
+        smooth_pos = probs * (1.0 - smoothing) + 0.5 * smoothing
+        return smooth_pos.reshape(targets.shape)
+
+    # --- multi‑class classification case ---
+    elif targets.ndim == 2:
+        N, C = targets.shape
+        return targets * (1.0 - smoothing) + smoothing / float(C)
+
+    else:
+        raise ValueError(f"Unsupported target shape {targets.shape}, must be 1-D or 2-D.")
+
+

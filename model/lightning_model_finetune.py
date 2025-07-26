@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
 from torch_ema import ExponentialMovingAverage
-from utils import param_groups_lrd, MAPE, SphericalAngularLoss, arrange_sparse_minkowski, CustomLambdaLR, CombinedScheduler
+from utils import param_groups_lrd, MAPE, SphericalAngularLoss, arrange_sparse_minkowski, arrange_truth, CustomLambdaLR, CombinedScheduler
 
 
 class ViTFineTuner(pl.LightningModule):
@@ -108,15 +108,14 @@ class ViTFineTuner(pl.LightningModule):
             self.ema.update()
         
     
-    def forward(self, x, x_glob, module_to_event, module_pos):
-        return self.model(x, x_glob, module_to_event, module_pos)
+    def forward(self, x, x_glob):
+        return self.model(x, x_glob)
 
 
     def _arrange_batch(self, batch):
         batch_input, *batch_input_global = arrange_sparse_minkowski(batch, self.device)
-        batch_module_to_event, batch_module_pos = batch['module_to_event'], batch['module_pos']
         target = arrange_truth(batch)
-        return batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target
+        return batch_input, *batch_input_global, target
 
 
     def compute_losses(self, batch_output, target):
@@ -141,7 +140,7 @@ class ViTFineTuner(pl.LightningModule):
         targ_jet_momentum_dir = target['jet_momentum_dir']
 
         # CC
-        mask_cc = targ_flavour < 3
+        mask_cc = targ_flavour < 3 if targ_flavour.ndim==1 else targ_flavour.argmax(dim=1) < 3
         out_lepton_momentum_mag = out_lepton_momentum_mag[mask_cc]
         out_lepton_momentum_dir = out_lepton_momentum_dir[mask_cc]
         targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask_cc]
@@ -208,14 +207,14 @@ class ViTFineTuner(pl.LightningModule):
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, *batch_input_global, batch_module_to_event, batch_module_pos, target = self._arrange_batch(batch)
+        batch_input, *batch_input_global, target = self._arrange_batch(batch)
 
         # Forward pass
-        batch_output = self.forward(batch_input, batch_input_global, batch_module_to_event, batch_module_pos)
+        batch_output = self.forward(batch_input, batch_input_global)
         loss, part_losses = self.compute_losses(batch_output, target)
   
         # Retrieve current learning rate
-        lr = self.get_lr_for_module(self.model.branches["flavour"])
+        lr = self.get_lr_for_module(self.model.heads["flavour"])
 
         return loss, part_losses, batch_size, lr
 
