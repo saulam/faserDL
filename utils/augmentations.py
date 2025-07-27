@@ -7,7 +7,6 @@ Description:
     Auxiliary functions for data augmentations.
 """
 
-
 import torch
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -29,6 +28,87 @@ ROTATIONS = {
           270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
 }
 
+
+def augment(
+    coords, 
+    modules, 
+    feats, 
+    labels, 
+    momentums, 
+    global_feats, 
+    primary_vertex,
+    metadata,
+    transformations=None, 
+    aug_prob=0.8
+):
+    """
+    Performs augmentations.
+    """
+    if transformations is None:
+        transformations = {}
+        
+    # Mirror
+    if 'mirror' in transformations:
+        flipped = transformations['mirror']
+        coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_mirror(
+            coords, modules, momentums, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, flipped,
+        )
+    else:
+        flipped = []
+        if np.random.random() < aug_prob:
+            coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
+                coords, modules, momentums, global_feats['rear_cal_modules'], 
+                primary_vertex, metadata, selected_axes=['x', 'y'],
+            )
+        transformations['mirror'] = flipped                
+
+    # Rotation
+    if 'rotate' in transformations:
+        chosen_angles = transformations['rotate']
+        coords, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_rotate_90(
+            coords, momentums, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, chosen_angles,
+        )
+    else:
+        chosen_angles = {}
+        if np.random.random() < aug_prob:
+            coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
+                coords, momentums, global_feats['rear_cal_modules'], 
+                primary_vertex, metadata, selected_axes=['z'],
+            )
+        transformations['rotate'] = chosen_angles
+
+    # Translation
+    if 'translate' in transformations:
+        shifts = transformations['translate']
+        coords, modules, global_feats['rear_cal_modules'], primary_vertex = apply_translate(
+            coords, modules, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, shifts,
+        )
+    else:
+        shifts = {}
+        if np.random.random() < aug_prob:
+            coords, modules, global_feats['rear_cal_modules'], primary_vertex, shifts = translate(
+                coords, modules, global_feats['rear_cal_modules'], 
+                primary_vertex, metadata, selected_axes=['x', 'y'],
+            )
+        transformations['translate'] = shifts
+
+    # Scaling
+    if np.random.random() < aug_prob:
+        feats, momentums, global_feats, _ = scale_all_by_global_shift(
+            feats, momentums, global_feats, std_dev=0.1,
+        )
+
+    # Dropping
+    if np.random.random() < aug_prob:
+        coords, modules, feats, labels = drop_hits(
+            coords, modules, feats, labels, max_drop=0.05, min_hits=5,
+        )
+
+    return coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations
+    
 
 def mirror(
     coords,

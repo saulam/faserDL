@@ -14,7 +14,7 @@ from glob import glob
 from torch.utils.data import Dataset
 from sklearn.neighbors import NearestNeighbors
 from utils import ini_argparse
-from utils.augmentations import *
+from utils.augmentations import augment, smooth_labels
 
 
 class SparseFASERCALDataset(Dataset):
@@ -59,74 +59,6 @@ class SparseFASERCALDataset(Dataset):
         self.nn = NearestNeighbors(n_neighbors=51, algorithm='auto')  # +1 to exclude self
         self.nn.fit(self.primary_vertices)
         print("Primary vertices pre-loaded, and NN trained.")
-
-    
-    def _augment(self, coords, modules, feats, labels, momentums, global_feats, primary_vertex, 
-                 transformations=None, aug_prob=0.8):
-        if transformations is None:
-            transformations = {}
-            
-        # Mirror
-        if 'mirror' in transformations:
-            flipped = transformations['mirror']
-            coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_mirror(
-                coords, modules, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, self.metadata, flipped,
-            )
-        else:
-            flipped = []
-            if np.random.random() < aug_prob:
-                coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
-                    coords, modules, momentums, global_feats['rear_cal_modules'], 
-                    primary_vertex, self.metadata, selected_axes=['x', 'y'],
-                )
-            transformations['mirror'] = flipped                
-
-        # Rotation
-        if 'rotate' in transformations:
-            chosen_angles = transformations['rotate']
-            coords, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_rotate_90(
-                coords, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, self.metadata, chosen_angles,
-            )
-        else:
-            chosen_angles = {}
-            if np.random.random() < aug_prob:
-                coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
-                    coords, momentums, global_feats['rear_cal_modules'], 
-                    primary_vertex, self.metadata, selected_axes=['z'],
-                )
-            transformations['rotate'] = chosen_angles
-
-        # Translation
-        if 'translate' in transformations:
-            shifts = transformations['translate']
-            coords, modules, global_feats['rear_cal_modules'], primary_vertex = apply_translate(
-                coords, modules, global_feats['rear_cal_modules'], 
-                primary_vertex, self.metadata, shifts,
-            )
-        else:
-            shifts = {}
-            if np.random.random() < aug_prob:
-                coords, modules, global_feats['rear_cal_modules'], primary_vertex, shifts = translate(
-                    coords, modules, global_feats['rear_cal_modules'], 
-                    primary_vertex, self.metadata, selected_axes=['x', 'y'],
-                )
-            transformations['translate'] = shifts
-
-        # Scaling
-        if np.random.random() < aug_prob:
-            feats, momentums, global_feats, _ = scale_all_by_global_shift(
-                feats, momentums, global_feats, std_dev=0.1,
-            )
-
-        # Dropping
-        if np.random.random() < aug_prob:
-            coords, modules, feats, labels = drop_hits(
-                coords, modules, feats, labels, max_drop=0.05, min_hits=5,
-            )
-
-        return coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations
 
     
     def voxelise(self, coords, reverse=False):
@@ -233,6 +165,16 @@ class SparseFASERCALDataset(Dataset):
         return magnitudes[0] if is_single_vector else magnitudes.flatten(), \
                directions[0] if is_single_vector else directions
 
+    
+    def reconstruct_momentum(self, magnitude, direction):
+        """
+        Given magnitude and direction, reconstruct the original momentum vector.
+        """
+        magnitude = np.atleast_1d(magnitude)
+        direction = np.atleast_2d(direction)  # Converts (3,) -> (1, 3), leaves (N,3) unchanged
+        momentum = magnitude[:, np.newaxis] * direction
+        return momentum[0] if magnitude.shape[0] == 1 else momentum
+
         
     def preprocess(self, x, param_name, preprocessing=None, standardize=None):
         """Applies a sequence of preprocessing steps (e.g., log, z-score)."""
@@ -265,6 +207,44 @@ class SparseFASERCALDataset(Dataset):
                 x = (x - stats["min"]) / rng
         return x
 
+
+    def unpreprocess(self, x, param_name, preprocessing=None, standardize=None):
+        """Reverses the preprocessing."""
+        if np.ndim(x) == 0 or (isinstance(x, np.ndarray) and x.shape == ()):
+            x = np.atleast_1d(x)
+
+        internal_name = param_name
+        if preprocessing == "sqrt":
+            internal_name = param_name + "_sqrt"
+        elif preprocessing == "log":
+            internal_name = param_name + "_log1p"
+
+        if standardize is not None:
+            stats = self.metadata[internal_name]
+            if standardize == "z-score":
+                # mean=0, std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x * stats["std"] + stats["mean"]
+            elif standardize == "unit-var":
+                # std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x * stats["std"]
+            else:
+                # [0, 1] normalisation
+                rng = stats["max"] - stats["min"]
+                if rng == 0:
+                    raise ValueError(f"{param_name}: max and min are equal in metadata")
+                x = x * rng + stats["min"]
+
+        if preprocessing == "sqrt":
+            x = x ** 2
+        elif preprocessing == "log":
+            x = np.expm1(x)
+
+        return x
+        
 
     def _prepare_event(self, idx, transformations=None):
         """
@@ -305,10 +285,10 @@ class SparseFASERCALDataset(Dataset):
         if self.train and self.augmentations_enabled:
             coords, modules, q, (primlepton_labels, seg_labels_raw), \
             (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
-            global_feats, _, transformations = self._augment(
+            global_feats, _, transformations = augment(
                 coords, modules, q, (primlepton_labels, seg_labels_raw),
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
-                global_feats, primary_vertex, transformations
+                global_feats, primary_vertex, self.metadata, transformations
             )
             charm = smooth_labels(np.array([charm]), smoothing=0.1)
             flavour_label = smooth_labels(
