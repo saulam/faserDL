@@ -1,7 +1,7 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 07.25
 
 Description: Dataset file.
 """
@@ -12,6 +12,7 @@ import torch
 import os
 from glob import glob
 from torch.utils.data import Dataset
+from sklearn.neighbors import NearestNeighbors
 from utils import ini_argparse
 from utils.augmentations import *
 
@@ -35,7 +36,7 @@ class SparseFASERCALDataset(Dataset):
         self.standardize_output = args.standardize_output
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
-        self.mixup = args.mixup
+        self.mixup_alpha = args.mixup_alpha
 
         # Load metadata
         with open(os.path.join(self.root, "metadata.pkl"), "rb") as fd:
@@ -55,10 +56,13 @@ class SparseFASERCALDataset(Dataset):
         
     def calc_primary_vertices(self):
         self.primary_vertices = np.array([np.load(f)["primary_vertex"] for f in self.data_files])
-        print("Primary vertices pre-loaded.")
+        self.nn = NearestNeighbors(n_neighbors=51, algorithm='auto')  # +1 to exclude self
+        self.nn.fit(self.primary_vertices)
+        print("Primary vertices pre-loaded, and NN trained.")
 
     
-    def _augment(self, coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations=None):
+    def _augment(self, coords, modules, feats, labels, momentums, global_feats, primary_vertex, 
+                 transformations=None, aug_prob=0.8):
         if transformations is None:
             transformations = {}
             
@@ -70,11 +74,13 @@ class SparseFASERCALDataset(Dataset):
                 primary_vertex, self.metadata, flipped,
             )
         else:
-            coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
-                coords, modules, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, self.metadata, selected_axes=['x', 'y'],
-            )
-            transformations['mirror'] = flipped
+            flipped = []
+            if np.random.random() < aug_prob:
+                coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
+                    coords, modules, momentums, global_feats['rear_cal_modules'], 
+                    primary_vertex, self.metadata, selected_axes=['x', 'y'],
+                )
+            transformations['mirror'] = flipped                
 
         # Rotation
         if 'rotate' in transformations:
@@ -84,10 +90,12 @@ class SparseFASERCALDataset(Dataset):
                 primary_vertex, self.metadata, chosen_angles,
             )
         else:
-            coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
-                coords, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, self.metadata, selected_axes=['z'],
-            )
+            chosen_angles = {}
+            if np.random.random() < aug_prob:
+                coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
+                    coords, momentums, global_feats['rear_cal_modules'], 
+                    primary_vertex, self.metadata, selected_axes=['z'],
+                )
             transformations['rotate'] = chosen_angles
 
         # Translation
@@ -98,16 +106,25 @@ class SparseFASERCALDataset(Dataset):
                 primary_vertex, self.metadata, shifts,
             )
         else:
-            coords, modules, global_feats['rear_cal_modules'], primary_vertex, shifts = translate(
-                coords, modules, global_feats['rear_cal_modules'], 
-                primary_vertex, self.metadata, selected_axes=['x', 'y'],
-            )
+            shifts = {}
+            if np.random.random() < aug_prob:
+                coords, modules, global_feats['rear_cal_modules'], primary_vertex, shifts = translate(
+                    coords, modules, global_feats['rear_cal_modules'], 
+                    primary_vertex, self.metadata, selected_axes=['x', 'y'],
+                )
             transformations['translate'] = shifts
 
         # Scaling
-        feats, momentums, global_feats, _ = scale_all_by_global_shift(
-            feats, momentums, global_feats, std_dev=0.1,
-        )
+        if np.random.random() < aug_prob:
+            feats, momentums, global_feats, _ = scale_all_by_global_shift(
+                feats, momentums, global_feats, std_dev=0.1,
+            )
+
+        # Dropping
+        if np.random.random() < aug_prob:
+            coords, modules, feats, labels = drop_hits(
+                coords, modules, feats, labels, max_drop=0.05, min_hits=5,
+            )
 
         return coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations
 
@@ -164,7 +181,10 @@ class SparseFASERCALDataset(Dataset):
 
         coords_filtered = coords[mask]
         feats_filtered = feats[mask] if feats is not None else None
-        labels_filtered = [x[mask] for x in labels] if labels is not None else None
+        if isinstance(labels, (list, tuple)):
+            labels_filtered = [x[mask] for x in labels]
+        else:
+            labels_filtered = labels[mask] if labels is not None else None
         
         return coords_filtered, feats_filtered, labels_filtered
 
@@ -313,10 +333,8 @@ class SparseFASERCALDataset(Dataset):
             'q': q,
             'seg_labels': seg_labels,
             'primlepton_labels': primlepton_labels,
-            'out_lepton_momentum_mag': out_lepton_magnitude,
-            'out_lepton_momentum_dir': out_lepton_dir,
-            'jet_momentum_mag': jet_magnitude,
-            'jet_momentum_dir': jet_dir,
+            'out_lepton_momentum': out_lepton_momentum,
+            'jet_momentum': jet_momentum,
             'global_feats': global_feats,
             'flavour_label': flavour_label,
             'charm': charm,
@@ -325,6 +343,180 @@ class SparseFASERCALDataset(Dataset):
             'primary_vertex': primary_vertex,
             'transformations': transformations,
         }
+
+
+    def _mixup_physical(self, event1, event2, alpha=0.8):
+        """
+        Performs mixup of two prepared events with weight alpha, handling overlapping voxels.
+        Follows some physical constraints.
+        Coordinates and module indices are concatenated; features and labels are mixed.
+        """
+        # Calculate primary-lepton charge fraction per module in event2
+        mod2_all = event2['modules']
+        q2_all = event2['q'].squeeze()
+        prim2 = event2['primlepton_labels'].squeeze()
+        mask2 = (prim2 == 0)
+        noprim_frac2 = q2_all[mask2].sum() / q2_all.sum()
+        noprim_frac2_mod = np.zeros(self.num_modules, dtype=np.float32)
+        for m in range(self.num_modules):
+            mask_m = (mod2_all == m)
+            total_q = q2_all[mask_m].sum()
+            noprim_q = q2_all[np.logical_and(mask_m, prim2 == 0)].sum()
+            noprim_frac2_mod[m] = noprim_q / total_q if total_q > 0 else 0.0
+            
+        # event2: drop primary-lepton hits
+        coords2 = event2['coords'][mask2]
+        modules2 = event2['modules'][mask2]
+        q2_raw = event2['q'][mask2]
+        seg2_raw = event2['seg_labels'][mask2]
+
+        # event1
+        prim1 = event1['primlepton_labels'].squeeze()
+        coords1 = event1['coords']
+        modules1 = event1['modules']
+        q1_raw = event1['q']
+        seg1_raw = event1['seg_labels']
+
+        # weight features and labels: event1=alpha, event2=1-alpha
+        q1 = q1_raw * alpha
+        q2 = q2_raw * (1.0 - alpha)
+        seg1 = seg1_raw * alpha
+        seg2 = seg2_raw * (1.0 - alpha)
+
+        # concatenate all voxel-level arrays
+        coords = np.concatenate([coords1, coords2], axis=0)
+        modules = np.concatenate([modules1, modules2], axis=0)
+        q = np.concatenate([q1, q2], axis=0)
+        seg = np.concatenate([seg1, seg2], axis=0)
+        
+        # deduplicate overlapping voxels: aggregate q and seg
+        keys = np.concatenate([coords, modules.reshape(-1,1)], axis=1)
+        unique_keys, inv = np.unique(keys, axis=0, return_inverse=True)
+        new_coords = unique_keys[:, :3]
+        new_modules = unique_keys[:, 3].astype(int)
+        new_q = np.zeros((unique_keys.shape[0], q.shape[1]), dtype=q.dtype)
+        new_seg = np.zeros((unique_keys.shape[0], seg.shape[1]), dtype=seg.dtype)
+        for i in range(q.shape[1]):
+            new_q[:, i] = np.bincount(inv, weights=q[:, i], minlength=unique_keys.shape[0])
+        for j in range(seg.shape[1]):
+            new_seg[:, j] = np.bincount(inv, weights=seg[:, j], minlength=unique_keys.shape[0])
+        coords, modules, q, seg = new_coords, new_modules, new_q, new_seg
+
+        # mix global features (only related to FASERCal, keep the rest as for event 1)
+        gf1, gf2 = event1['global_feats'], event2['global_feats']
+        mixed_gf = {}        
+        mixed_gf['faser_cal_modules'] = gf1['faser_cal_modules'] * alpha + gf2['faser_cal_modules'] * (1.-alpha) * noprim_frac2_mod
+        mixed_gf['rear_cal_modules']  = gf1['rear_cal_modules']  * alpha
+        mixed_gf['rear_hcal_modules'] = gf1['rear_hcal_modules'] * alpha
+        mixed_gf['faser_cal_energy']  = gf1['faser_cal_energy']  * alpha + gf2['faser_cal_energy']  * (1.-alpha) * noprim_frac2
+        mixed_gf['rear_cal_energy']   = gf1['rear_cal_energy']   * alpha
+        mixed_gf['rear_hcal_energy']  = gf1['rear_hcal_energy']  * alpha
+        mixed_gf['rear_mucal_energy'] = gf1['rear_mucal_energy'] * alpha
+        
+        # mix scalars
+        mixed_flav    = event1['flavour_label']                 # flavour from event1 only
+        mixed_lep_mom = event1['out_lepton_momentum'] * alpha   # prim leptom from event1 only
+        mixed_jet     = event1['jet_momentum']        * alpha + event2['jet_momentum']    * (1.-alpha)
+        mixed_vis_sp  = event1['vis_sp_momentum']     * alpha + event2['vis_sp_momentum'] * (1.-alpha)
+        mixed_charm   = event1['charm']               * alpha + event2['charm']           * (1.-alpha)
+        mixed_evis    = event1['e_vis']               * alpha + event2['e_vis']           * (1.-alpha) * noprim_frac2
+
+        # Filter out voxels outside the detector
+        coords, q, seg = self.within_limits(coords, feats=q, labels=seg, voxelised=True)
+        
+        mixed_event = {
+            'coords': coords,
+            'modules': modules,
+            'q': q,
+            'seg_labels': seg,
+            'global_feats': mixed_gf,
+            'flavour_label': mixed_flav,
+            'out_lepton_momentum': mixed_lep_mom,
+            'jet_momentum': mixed_jet,
+            'vis_sp_momentum': mixed_vis_sp,
+            'charm': mixed_charm,
+            'e_vis': mixed_evis,
+        }
+        return mixed_event
+
+
+    def _mixup(self, event1, event2, alpha=0.8):
+        """
+        Performs mixup of two prepared events with weight alpha, handling overlapping voxels.
+        Coordinates and module indices are concatenated; features and labels are mixed.
+        """
+        lam_mix = np.random.beta(alpha, alpha)
+        
+        # event1
+        coords1 = event1['coords']
+        modules1 = event1['modules']
+        q1_raw = event1['q']
+        seg1_raw = event1['seg_labels']
+        
+        # event2
+        coords2 = event2['coords']
+        modules2 = event2['modules']
+        q2_raw = event2['q']
+        seg2_raw = event2['seg_labels']
+
+        # weight features and labels: event1=lam_mix, event2=1-lam_mix
+        q1 = q1_raw * lam_mix
+        q2 = q2_raw * (1.0 - lam_mix)
+        seg1 = seg1_raw * lam_mix
+        seg2 = seg2_raw * (1.0 - lam_mix)
+
+        # concatenate all voxel-level arrays
+        coords = np.concatenate([coords1, coords2], axis=0)
+        modules = np.concatenate([modules1, modules2], axis=0)
+        q = np.concatenate([q1, q2], axis=0)
+        seg = np.concatenate([seg1, seg2], axis=0)
+        
+        # deduplicate overlapping voxels: aggregate q and seg
+        keys = np.concatenate([coords, modules.reshape(-1,1)], axis=1)
+        unique_keys, inv = np.unique(keys, axis=0, return_inverse=True)
+        new_coords = unique_keys[:, :3]
+        new_modules = unique_keys[:, 3].astype(int)
+        new_q = np.zeros((unique_keys.shape[0], q.shape[1]), dtype=q.dtype)
+        new_seg = np.zeros((unique_keys.shape[0], seg.shape[1]), dtype=seg.dtype)
+        for i in range(q.shape[1]):
+            new_q[:, i] = np.bincount(inv, weights=q[:, i], minlength=unique_keys.shape[0])
+        for j in range(seg.shape[1]):
+            new_seg[:, j] = np.bincount(inv, weights=seg[:, j], minlength=unique_keys.shape[0])
+        coords, modules, q, seg = new_coords, new_modules, new_q, new_seg
+
+        # mix global features
+        gf1, gf2 = event1['global_feats'], event2['global_feats']
+        mixed_gf = {}
+        for key in ['faser_cal_energy','rear_cal_energy','rear_hcal_energy','rear_mucal_energy']:
+            mixed_gf[key] = gf1[key]*lam_mix + gf2[key]*(1-lam_mix)
+        for key in ['faser_cal_modules','rear_cal_modules','rear_hcal_modules']:
+            mixed_gf[key] = gf1[key]*lam_mix + gf2[key]*(1-lam_mix)
+        
+        # mix scalars
+        mixed_vis_sp  = event1['vis_sp_momentum']     * lam_mix + event2['vis_sp_momentum']     * (1-lam_mix)
+        mixed_e_vis   = event1['e_vis']               * lam_mix + event2['e_vis']               * (1-lam_mix)
+        mixed_flavour = event1['flavour_label']       * lam_mix + event2['flavour_label']       * (1-lam_mix)
+        mixed_charm   = event1['charm']               * lam_mix + event2['charm']               * (1-lam_mix)
+        mixed_lep_mom = event1['out_lepton_momentum'] * lam_mix + event2['out_lepton_momentum'] * (1-lam_mix)
+        mixed_jet     = event1['jet_momentum']        * lam_mix + event2['jet_momentum']        * (1-lam_mix)
+
+        # Filter out voxels outside the detector
+        coords, q, seg = self.within_limits(coords, feats=q, labels=seg, voxelised=True)
+        
+        mixed_event = {
+            'coords': coords,
+            'modules': modules,
+            'q': q,
+            'seg_labels': seg,
+            'global_feats': mixed_gf,
+            'flavour_label': mixed_flavour,
+            'out_lepton_momentum': mixed_lep_mom,
+            'jet_momentum': mixed_jet,
+            'vis_sp_momentum': mixed_vis_sp,
+            'charm': mixed_charm,
+            'e_vis': mixed_e_vis,
+        }
+        return mixed_event
 
     
     def _finalise_event(self, event):
@@ -351,12 +543,16 @@ class SparseFASERCALDataset(Dataset):
         rear_cal_mod = self.preprocess(event['global_feats']['rear_cal_modules'], 'rear_cal_modules', self.preprocessing_input, self.standardize_input)
         rear_hcal_mod = self.preprocess(event['global_feats']['rear_hcal_modules'], 'rear_hcal_modules', self.preprocessing_input, self.standardize_input)
 
+        # Decompose momentum
+        out_lepton_magnitude, out_lepton_dir = self.decompose_momentum(event['out_lepton_momentum'])
+        jet_magnitude, jet_dir = self.decompose_momentum(event['jet_momentum'])
+
         # Preprocess outputs
         pt_miss = np.sqrt(event['vis_sp_momentum'][0]**2 + event['vis_sp_momentum'][1]**2)
         pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output, self.standardize_output)
         e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output, self.standardize_output)
-        out_mag = self.preprocess(event['out_lepton_momentum_mag'], 'out_lepton_momentum_magnitude', self.preprocessing_output, self.standardize_output)
-        jet_mag = self.preprocess(event['jet_momentum_mag'], 'jet_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+        out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+        jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output, self.standardize_output)
 
         # Assemble output
         output = {
@@ -377,37 +573,20 @@ class SparseFASERCALDataset(Dataset):
                 'e_vis': torch.from_numpy(np.atleast_1d(e_vis)).float(),
                 'pt_miss': torch.from_numpy(np.atleast_1d(pt_miss)).float(),
                 'out_lepton_momentum_mag': torch.from_numpy(np.atleast_1d(out_mag)).float(),
-                'out_lepton_momentum_dir': torch.from_numpy(event['out_lepton_momentum_dir']).float(),
+                'out_lepton_momentum_dir': torch.from_numpy(out_lepton_dir).float(),
                 'jet_momentum_mag': torch.from_numpy(np.atleast_1d(jet_mag)).float(),
-                'jet_momentum_dir': torch.from_numpy(event['jet_momentum_dir']).float(),
+                'jet_momentum_dir': torch.from_numpy(jet_dir).float(),
             })
         return output
-
-
-    def _mixup(self, event1, event2, alpha=0.8):
-        """
-        Performs mixup of two prepared events with weight alpha, handling overlapping voxels.
-        Coordinates and module indices are concatenated; features and labels are mixed.
-        """
-        return event1
         
 
     def __getitem__(self, idx):
         event = self._prepare_event(idx)
-        '''
-        if self.train and self.augmentations_enabled and not self.stage1:
+        if self.train and self.augmentations_enabled and not self.stage1 and self.mixup_alpha > 0:
             # find candidate with similar vertex for mixup
-            primary_vertex = self.primary_vertices[idx]
-            candidate_indices = np.random.randint(len(self), size=5000)
-            candidate_vertices = self.primary_vertices[candidate_indices]
-            dists = np.linalg.norm(candidate_vertices - primary_vertex, axis=1)
-            within_threshold = np.where(dists < 50)[0]
-            if within_threshold.size > 0:
-                selected_idx = candidate_indices[within_threshold[0]]
-            else:
-                selected_idx = candidate_indices[np.argmin(dists)]
-    
+            _, indices = self.nn.kneighbors(self.primary_vertices[idx].reshape(1, -1))
+            selected_idx = np.random.choice(indices[0][1:])
             event2 = self._prepare_event(selected_idx, event['transformations'])
-            event = self._mixup(event, event2, alpha=self.mixup)
-        '''
+            event = self._mixup(event, event2, alpha=self.mixup_alpha)
+
         return self._finalise_event(event)

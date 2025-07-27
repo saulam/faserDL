@@ -13,12 +13,14 @@ import torch.nn.functional as F
 import MinkowskiEngine as ME
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence
+from timm.models.layers import trunc_normal_
 from MinkowskiEngine import (
     MinkowskiConvolution,
     MinkowskiConvolutionTranspose,
-    MinkowskiGELU,
+    MinkowskiDepthwiseConvolution,
+    MinkowskiLinear,
 )
-from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoder, MinkowskiLayerNorm
+from .utils import BlockWithMask, BlockSparse, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
         
 
 class MinkMAEViT(nn.Module):
@@ -68,27 +70,38 @@ class MinkMAEViT(nn.Module):
         self.register_buffer('patch_size', torch.tensor(patch_size))
     
         # downsample blocks
-        def _down_blk(in_c, out_c, ks):
+        def _down_blk(in_c, out_c, ks, stem=False):
+            if stem:
+                return nn.Sequential(
+                    MinkowskiConvolution(
+                        in_c, out_c, kernel_size=ks, stride=ks,
+                        bias=True, dimension=D
+                    ),
+                    MinkowskiLayerNorm(out_c, eps=1e-6),
+                )
             return nn.Sequential(
+                MinkowskiLayerNorm(in_c, eps=1e-6),
                 MinkowskiConvolution(
                     in_c, out_c, kernel_size=ks, stride=ks,
                     bias=True, dimension=D
                 ),
-                MinkowskiLayerNorm(out_c, eps=1e-6),
-                MinkowskiGELU(),
             )
+        def _down_convnextv2_blk(c):
+            return BlockSparse(dim=c, kernel_size=1, drop_path=0., D=D)
     
         self.downsample_layers = nn.Sequential(
-            _down_blk(in_chans, encoder_dims[0], kernel_size[0]),
+            _down_blk(in_chans, encoder_dims[0], kernel_size[0], stem=True),
+            _down_convnextv2_blk(encoder_dims[0]),
             _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
+            _down_convnextv2_blk(encoder_dims[1]),
             _down_blk(encoder_dims[1], encoder_dims[2], kernel_size[2]),
         )
-    
+            
         embed_dim = encoder_dims[-1]
     
         # MAE encoder
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.global_feats_encoder = GlobalFeatureEncoder(embed_dim)
+        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
         self.blocks = nn.ModuleList([
             BlockWithMask(
@@ -116,33 +129,31 @@ class MinkMAEViT(nn.Module):
         # upsample blocks
         def _up_blk(in_c, out_c, ks):
             return nn.Sequential(
+                MinkowskiLayerNorm(in_c, eps=1e-6),
                 MinkowskiConvolutionTranspose(
                     in_c, out_c, kernel_size=ks, stride=ks,
                     bias=True, dimension=D
                 ),
-                MinkowskiLayerNorm(out_c, eps=1e-6),
-                MinkowskiGELU(),
             )
+        def _up_convnextv2_blk(c, ks):
+            return BlockSparse(dim=c, kernel_size=ks, drop_path=0., D=D)
 
-        up_out_dim = encoder_dims[0]//2
         self.upsample_layers = nn.Sequential(
             _up_blk(encoder_dims[2], encoder_dims[1], kernel_size[2]),
+            _up_convnextv2_blk(encoder_dims[1], ks=3),
             _up_blk(encoder_dims[1], encoder_dims[0], kernel_size[1]),
-            _up_blk(encoder_dims[0], up_out_dim, kernel_size[0]),
+            _up_convnextv2_blk(encoder_dims[0], ks=3),
+            _up_blk(encoder_dims[0], encoder_dims[0], kernel_size[0]),
         )
 
         # regression head
         self.reg_head = nn.Sequential(
-            MinkowskiConvolution(up_out_dim, up_out_dim, kernel_size=1, stride=1, bias=True, dimension=D),
-            MinkowskiGELU(),
-            MinkowskiConvolution(up_out_dim, in_chans, kernel_size=1, stride=1, bias=True, dimension=D)
+            MinkowskiConvolution(encoder_dims[0], in_chans, kernel_size=1, stride=1, bias=True, dimension=D)
         )
         
         # classification head
         self.cls_head = nn.Sequential(
-            MinkowskiConvolution(up_out_dim, up_out_dim, kernel_size=1, stride=1, bias=True, dimension=D),
-            MinkowskiGELU(),
-            MinkowskiConvolution(up_out_dim, out_chans, kernel_size=1, stride=1, bias=True, dimension=D)
+            MinkowskiConvolution(encoder_dims[0], out_chans, kernel_size=1, stride=1, bias=True, dimension=D)
         )
     
         self.initialize_weights()
@@ -172,36 +183,29 @@ class MinkMAEViT(nn.Module):
 
 
     def _init_weights(self, m):
-        # we use xavier_uniform following official JAX ViT:
-        if isinstance(m, MinkowskiConvolution) or isinstance(m, MinkowskiConvolutionTranspose):
-            torch.nn.init.xavier_uniform_(m.kernel)
+        if isinstance(m, MinkowskiConvolution):
+            trunc_normal_(m.kernel, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Conv2d):
-            w = m.weight.data
-            torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        elif isinstance(m, MinkowskiConvolutionTranspose):
+            trunc_normal_(m.kernel, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+        elif isinstance(m, MinkowskiDepthwiseConvolution):
+            trunc_normal_(m.kernel, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, MinkowskiLinear):
+            trunc_normal_(m.linear.weight, std=.02)
+            if m.linear.bias is not None:
+                nn.init.constant_(m.linear.bias, 0)
         elif isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.LSTM):
-            for name, param in m.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param.data)
-                elif 'bias_ih' in name:
-                    # zero then set forget gate bias
-                    param.data.zero_()
-                    hidden_size = m.hidden_size
-                    param.data[hidden_size:2*hidden_size].fill_(1)
-                elif 'bias_hh' in name:
-                    param.data.zero_()
 
     
     def group_voxels_by_event(
@@ -345,9 +349,8 @@ class MinkMAEViT(nn.Module):
 
         # keep valid voxels
         attn_mask = attn_mask[:, 1:]
-        keep = rand_mask.bool() & attn_mask
-        flat_out  = x[keep]
-        flat_idx  = idx_map[keep]
+        flat_out = x[attn_mask]
+        flat_idx = idx_map[attn_mask]
 
         # embed back to original dimension
         out_feats = self.final_embed(flat_out).to(x_sparse.F.dtype)
@@ -368,10 +371,12 @@ class MinkMAEViT(nn.Module):
         preds_C  = pred_reg.C
 
         # build a mask in the upsampled lattice
-        masked_coords      = x_sparse.C[flat_idx]
-        key_masked         = self._patch_key(masked_coords)
-        key_pred           = self._patch_key(preds_C)
-        mask_up            = torch.isin(key_pred, key_masked.unique())
+        keep          = rand_mask.bool() & attn_mask
+        flat_idx_keep = idx_map[keep]
+        masked_coords = x_sparse.C[flat_idx_keep]
+        key_masked    = self._patch_key(masked_coords)
+        key_pred      = self._patch_key(preds_C)
+        mask_up       = torch.isin(key_pred, key_masked.unique())
     
         return pred_reg, pred_cls, mask_up
 
@@ -411,7 +416,7 @@ class MinkMAEViT(nn.Module):
         """        
         latent, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
         preds_reg, preds_cls, mask_up = self.forward_decoder(latent, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore)
-        #assert (x.C==preds_reg.C).all() and (x.C==preds_cls.C).all()  # always true!
+        assert (x.C==preds_reg.C).all() and (x.C==preds_cls.C).all()  # always true!
         total_loss, individual_losses = self.forward_loss(x.F, cls_labels, preds_reg.F, preds_cls.F, mask_up)
         
         return total_loss, individual_losses, preds_reg, preds_cls, mask_up

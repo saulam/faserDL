@@ -18,12 +18,12 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="maevit_v5.1b_v1"
+name="pretrain_v5.1b_v1"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="maevit_v5.1b_v1"
-early_stop_patience=100
+checkpoint_name="pretrain_v5.1b_v1"
+early_stop_patience=200
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
 gpus=(0 1)
 

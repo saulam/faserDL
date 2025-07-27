@@ -138,15 +138,18 @@ class SparseFASERCALDataset(Dataset):
         z = np.unique(np.stack((data['reco_hits'][:, 2], data['reco_hits'][:, 3]), axis=1), axis=0)
         q = data['reco_hits'][:, 4].round().astype(int)
         e_vis = np.array([e_vis])
+        pt_miss = np.array([pt_miss])
         if is_cc:
             e_vis_cc = e_vis
             e_vis_nc = np.array([])
-            pt_miss = np.array([])
+            pt_miss_cc = pt_miss
+            pt_miss_nc = np.array([])
             out_lepton_momentum = out_lepton_momentum.reshape(1, 3)
         else:
             e_vis_cc = np.array([])
             e_vis_nc = e_vis
-            pt_miss = np.array([pt_miss])
+            pt_miss_cc = np.array([])
+            pt_miss_nc = pt_miss
             out_lepton_momentum = np.array([]).reshape(0, 3)
         jet_momentum = jet_momentum.reshape(1, 3)
 
@@ -166,7 +169,7 @@ class SparseFASERCALDataset(Dataset):
 
         return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
                 "e_vis": e_vis, "e_vis_cc": e_vis_cc, "e_vis_nc": e_vis_nc, 
-                "pt_miss": pt_miss,
+                "pt_miss": pt_miss, "pt_miss_cc": pt_miss_cc, "pt_miss_nc": pt_miss_nc,
                 "out_lepton_momentum": out_lepton_momentum,
                 "jet_momentum": jet_momentum,
                 "faser_cal_energy": faser_cal_energy,
@@ -194,6 +197,8 @@ def collate(batch):
     e_vis_cc = np.concatenate([x['e_vis_cc'] for x in batch])
     e_vis_nc = np.concatenate([x['e_vis_nc'] for x in batch])
     pt_miss = np.concatenate([x['pt_miss'] for x in batch])
+    pt_miss_cc = np.concatenate([x['pt_miss_cc'] for x in batch])
+    pt_miss_nc = np.concatenate([x['pt_miss_nc'] for x in batch])
     out_lepton_momentum = np.concatenate([x['out_lepton_momentum'] for x in batch])
     jet_momentum = np.concatenate([x['jet_momentum'] for x in batch])
     faser_cal_energy = np.concatenate([x['faser_cal_energy'] for x in batch])
@@ -211,7 +216,7 @@ def collate(batch):
     
     return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
             "e_vis": e_vis, "e_vis_cc": e_vis_cc, "e_vis_nc": e_vis_nc,
-            "pt_miss": pt_miss,
+            "pt_miss": pt_miss, "pt_miss_cc": pt_miss_cc, "pt_miss_nc": pt_miss_nc,
             "out_lepton_momentum": out_lepton_momentum,
             "jet_momentum": jet_momentum,
             "faser_cal_energy": faser_cal_energy,
@@ -238,6 +243,8 @@ e_vis = []
 e_vis_cc = []
 e_vis_nc = []
 pt_miss = []
+pt_miss_cc = []
+pt_miss_nc = []
 out_lepton_momentum = []
 jet_momentum = []
 faser_cal_energy = []
@@ -263,6 +270,8 @@ for i, batch in t:
     e_vis_cc.append(batch["e_vis_cc"])
     e_vis_nc.append(batch["e_vis_nc"])
     pt_miss.append(batch["pt_miss"])
+    pt_miss_cc.append(batch["pt_miss_cc"])
+    pt_miss_nc.append(batch["pt_miss_nc"])
     out_lepton_momentum.append(batch["out_lepton_momentum"])
     jet_momentum.append(batch["jet_momentum"])
     faser_cal_energy.append(batch["faser_cal_energy"])
@@ -287,6 +296,8 @@ e_vis = np.concatenate(e_vis)
 e_vis_cc = np.concatenate(e_vis_cc)
 e_vis_nc = np.concatenate(e_vis_nc)
 pt_miss = np.concatenate(pt_miss)
+pt_miss_cc = np.concatenate(pt_miss_cc)
+pt_miss_nc = np.concatenate(pt_miss_nc)
 out_lepton_momentum = np.concatenate(out_lepton_momentum)
 out_lepton_momentum_magnitude = np.linalg.norm(out_lepton_momentum, axis=1)
 jet_momentum = np.concatenate(jet_momentum)
@@ -313,7 +324,7 @@ def get_dict(x):
             'max': x.max()}
 
 # assemble base metadata
-base_keys = ['e_vis', 'e_vis_cc', 'e_vis_nc', 'pt_miss',
+base_keys = ['e_vis', 'e_vis_cc', 'e_vis_nc', 'pt_miss', 'pt_miss_cc', 'pt_miss_nc',
              'out_lepton_momentum_magnitude', 'jet_momentum_magnitude', 
              'in_neutrino_energy', 'out_lepton_energy',
              'faser_cal_energy', 'faser_cal_modules',
