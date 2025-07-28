@@ -247,7 +247,7 @@ class ViTFineTuner(pl.LightningModule):
         """Configure optimiser with LR groups, plus warmup & cosine schedulers."""
         param_groups = param_groups_lrd(
             self.model, 
-            weight_decay=self.weight_decay, 
+            weight_decay=self.weight_decay,
             layer_decay=self.layer_decay)
 
         for param_group in param_groups:

@@ -66,7 +66,7 @@ def get_layer_id_for_vit(name, num_layers):
     Assign a parameter with its layer id
     Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L33
     """
-    if name.startswith('cls_tokens') or name.startswith('global_feats_encoder'):
+    if name.startswith('cls_token') or name.startswith('global_feats_encoder'):
         return 0
     elif name.startswith('downsample_layers'):
         return 0

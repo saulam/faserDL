@@ -4,19 +4,19 @@
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
 model="base"
 eps=1e-12
-batch_size=256
+batch_size=512
 mixup_alpha=0.0
 preprocessing_input="sqrt"
 standardize_input="unit-var"
 preprocessing_output="log"
 standardize_output="unit-var"
 epochs=100
-num_workers=8
+num_workers=16
 blr=1e-3
 layer_decay=0.75
 accum_grad_batches=1
 warmup_steps=5
-cosine_annealing_steps=20
+cosine_annealing_steps=75
 weight_decay=0.05
 beta1=0.9
 beta2=0.999
@@ -30,7 +30,7 @@ checkpoint_path="checkpoints_final"
 checkpoint_name="finetune_v5.1b_v2"
 early_stop_patience=10
 load_checkpoint="checkpoints_final/maevit_v5.1b_v1/loss_val_total/last.ckpt"
-gpus=(0 1)
+gpus=(1)
 
 python -m train.finetune \
     --train \

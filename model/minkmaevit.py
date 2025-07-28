@@ -17,10 +17,9 @@ from timm.models.layers import trunc_normal_
 from MinkowskiEngine import (
     MinkowskiConvolution,
     MinkowskiConvolutionTranspose,
-    MinkowskiDepthwiseConvolution,
-    MinkowskiLinear,
+    MinkowskiGELU,
 )
-from .utils import BlockWithMask, BlockSparse, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
+from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
         
 
 class MinkMAEViT(nn.Module):
@@ -70,30 +69,19 @@ class MinkMAEViT(nn.Module):
         self.register_buffer('patch_size', torch.tensor(patch_size))
     
         # downsample blocks
-        def _down_blk(in_c, out_c, ks, stem=False):
-            if stem:
-                return nn.Sequential(
-                    MinkowskiConvolution(
-                        in_c, out_c, kernel_size=ks, stride=ks,
-                        bias=True, dimension=D
-                    ),
-                    MinkowskiLayerNorm(out_c, eps=1e-6),
-                )
+        def _down_blk(in_c, out_c, ks):
             return nn.Sequential(
-                MinkowskiLayerNorm(in_c, eps=1e-6),
                 MinkowskiConvolution(
-                    in_c, out_c, kernel_size=ks, stride=ks,
-                    bias=True, dimension=D
+                    in_c, out_c, kernel_size=ks, stride=ks, dimension=D,
+                    bias=False,  # no bias to match dense convolutions
                 ),
+                MinkowskiLayerNorm(out_c, eps=1e-6),
+                MinkowskiGELU(),
             )
-        def _down_convnextv2_blk(c):
-            return BlockSparse(dim=c, kernel_size=1, drop_path=0., D=D)
-    
+
         self.downsample_layers = nn.Sequential(
-            _down_blk(in_chans, encoder_dims[0], kernel_size[0], stem=True),
-            _down_convnextv2_blk(encoder_dims[0]),
+            _down_blk(in_chans, encoder_dims[0], kernel_size[0]),
             _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
-            _down_convnextv2_blk(encoder_dims[1]),
             _down_blk(encoder_dims[1], encoder_dims[2], kernel_size[2]),
         )
             
@@ -129,20 +117,17 @@ class MinkMAEViT(nn.Module):
         # upsample blocks
         def _up_blk(in_c, out_c, ks):
             return nn.Sequential(
-                MinkowskiLayerNorm(in_c, eps=1e-6),
                 MinkowskiConvolutionTranspose(
                     in_c, out_c, kernel_size=ks, stride=ks,
                     bias=True, dimension=D
                 ),
+                MinkowskiLayerNorm(out_c, eps=1e-6),
+                MinkowskiGELU(),
             )
-        def _up_convnextv2_blk(c, ks):
-            return BlockSparse(dim=c, kernel_size=ks, drop_path=0., D=D)
 
         self.upsample_layers = nn.Sequential(
             _up_blk(encoder_dims[2], encoder_dims[1], kernel_size[2]),
-            _up_convnextv2_blk(encoder_dims[1], ks=3),
             _up_blk(encoder_dims[1], encoder_dims[0], kernel_size[1]),
-            _up_convnextv2_blk(encoder_dims[0], ks=3),
             _up_blk(encoder_dims[0], encoder_dims[0], kernel_size[0]),
         )
 
@@ -191,14 +176,6 @@ class MinkMAEViT(nn.Module):
             trunc_normal_(m.kernel, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, MinkowskiDepthwiseConvolution):
-            trunc_normal_(m.kernel, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, MinkowskiLinear):
-            trunc_normal_(m.linear.weight, std=.02)
-            if m.linear.bias is not None:
-                nn.init.constant_(m.linear.bias, 0)
         elif isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:

@@ -20,7 +20,7 @@ from MinkowskiEngine import (
     MinkowskiConvolutionTranspose,
     MinkowskiGELU,
 )
-from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoder, MinkowskiLayerNorm
+from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoder, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
 
 
 class MinkViT(vit.VisionTransformer):
@@ -80,6 +80,13 @@ class MinkViT(vit.VisionTransformer):
         embed_dim = encoder_dims[-1]
         del self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
         self.global_feats_encoder = GlobalFeatureEncoder(embed_dim)
+        self.global_feats_cls = GlobalFeatureEncoderSimple(embed_dim, hidden=True, norm_layer=norm_layer)
+        self.cls_gate = nn.Sequential(
+            nn.Linear(2 * embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.Sigmoid()
+        )
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
 
         self.global_pool = global_pool
@@ -87,17 +94,7 @@ class MinkViT(vit.VisionTransformer):
             embed_dim = kwargs['embed_dim']
             del self.norm  # remove the original norm
 
-        self.branch_tokens = {
-            "flavour": 0,
-            "charm": 0,
-            "e_vis": 0,
-            "pt_miss": 0,
-            "lepton_momentum_mag": 0,
-            "lepton_momentum_dir": 0,
-            "jet_momentum_mag": 0,
-            "jet_momentum_dir": 0,
-        }
-        branch_out_channels = {
+        self.head_channels = {
             "flavour": 4,
             "charm": 1,
             "e_vis": 1,
@@ -107,14 +104,12 @@ class MinkViT(vit.VisionTransformer):
             "jet_momentum_mag": 1,
             "jet_momentum_dir": 3,
         }
-        self.num_cls = 1 if global_pool else max(self.branch_tokens.values()) + 1
-        self.cls_tokens = nn.Parameter(torch.zeros(1, self.num_cls, embed_dim))
         self.heads = nn.ModuleDict()
-        for name in self.branch_tokens.keys():
+        for name in self.head_channels.keys():
             self.heads[name] = nn.Sequential(
                 norm_layer(embed_dim),
                 nn.Dropout(drop_rate),
-                nn.Linear(embed_dim, branch_out_channels[name])
+                nn.Linear(embed_dim, self.head_channels[name])
             )
             
         self.initialize_weights()
@@ -129,50 +124,33 @@ class MinkViT(vit.VisionTransformer):
             self.pos_embed.weight.copy_(torch.from_numpy(pos_embed).float())
             self.pos_embed.weight.requires_grad_(False)
 
-        # init cls tokens
-        nn.init.normal_(self.cls_tokens, std=0.02)
-
         self.apply(self._init_weights)
 
         # init heads
-        for name in self.branch_tokens.keys():
+        for name in self.head_channels.keys():
             lin = self.heads[name][2]
             trunc_normal_(lin.weight, std=2e-5)
             if lin.bias is not None:
                 nn.init.constant_(lin.bias, 0)
 
+    
     def _init_weights(self, m):
-        # we use xavier_uniform following official JAX ViT:
         if isinstance(m, MinkowskiConvolution):
-            torch.nn.init.xavier_uniform_(m.kernel)
+            trunc_normal_(m.kernel, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Conv2d):
-            w = m.weight.data
-            torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        elif isinstance(m, MinkowskiConvolutionTranspose):
+            trunc_normal_(m.kernel, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.LSTM):
-            for name, param in m.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param.data)
-                elif 'bias_ih' in name:
-                    # zero then set forget gate bias
-                    param.data.zero_()
-                    hidden_size = m.hidden_size
-                    param.data[hidden_size:2*hidden_size].fill_(1)
-                elif 'bias_hh' in name:
-                    param.data.zero_()
-
+            
     
     def group_voxels_by_event(
         self,
@@ -231,8 +209,8 @@ class MinkViT(vit.VisionTransformer):
 
         # add cls token
         glob_emb = self.global_feats_encoder(glob).unsqueeze(1)  # (B, 1, D)
-        cls = self.cls_tokens + glob_emb                            
-        cls_attn = attn_mask.new_ones((x.size(0), self.num_cls))
+        cls = self.cls_token + glob_emb                            
+        cls_attn = attn_mask.new_ones((x.size(0), 1))
         x = torch.cat((cls, x), dim=1)
         attn_mask = torch.cat([cls_attn, attn_mask], dim=1)
         x = self.pos_drop(x)
@@ -244,18 +222,19 @@ class MinkViT(vit.VisionTransformer):
             outcome = x[:, 1:, :].mean(dim=1)  # global pool without cls token
         else:
             x = self.norm(x)
-            outcome = x[:, :self.num_cls]
+            outcome = x[:, 0]
 
         return outcome
 
     
-    def forward_head(self, x):
+    def forward_head(self, x, glob):
+        glob_emb = self.global_feats_cls(glob)
+        gate = self.cls_gate(torch.cat([x, glob_emb], dim=-1))
+        x = gate * x + (1 - gate) * glob_emb
+        
         outputs = {}
         for i, (name, head) in enumerate(self.heads.items()):
-            if self.global_pool:
-                output = head(x)
-            else:
-                output = head(x[:, self.branch_tokens[name]])
+            output = head(x)
             if name == "flavour" or name == "charm":
                 outputs[f"out_{name}"] = output
             elif "_dir" in name:
@@ -267,7 +246,7 @@ class MinkViT(vit.VisionTransformer):
         
     def forward(self, x, x_glob):
         x = self.forward_features(x, x_glob)
-        x = self.forward_head(x)
+        x = self.forward_head(x, x_glob)
         return x
 
         
@@ -329,7 +308,7 @@ def vit_base(**kwargs):
         encoder_dims=[192, 384, 768],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         embed_dim=768, depth=12, num_heads=12, drop_rate=0.,
-        mlp_ratio=4.0, qkv_bias=True, 
+        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=BlockWithMask, drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
@@ -341,7 +320,7 @@ def vit_large(**kwargs):
         encoder_dims=[252, 504, 1008],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         embed_dim=1008, depth=24, num_heads=16, drop_rate=0.,
-        mlp_ratio=4.0, qkv_bias=True, 
+        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=BlockWithMask, drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
@@ -353,7 +332,7 @@ def vit_huge(**kwargs):
         encoder_dims=[324, 648, 1296],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         embed_dim=1296, depth=32, num_heads=16, drop_rate=0.,
-        mlp_ratio=4.0, qkv_bias=True,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=BlockWithMask, drop_path_rate=0.1,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
