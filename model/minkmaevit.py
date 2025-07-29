@@ -75,7 +75,7 @@ class MinkMAEViT(nn.Module):
             return nn.Sequential(
                 MinkowskiConvolution(
                     in_c, out_c, kernel_size=ks, stride=ks, dimension=D,
-                    bias=False,  # no bias to match dense convolutions
+                    bias=True,
                 ),
                 MinkowskiLayerNorm(out_c, eps=1e-6),
                 MinkowskiGELU(),
@@ -199,14 +199,12 @@ class MinkMAEViT(nn.Module):
         sorted_eids, perm     = event_ids.sort()
         sorted_feats          = feats[perm]
         sorted_spatial_coords = spatial_coords[perm]
-        sorted_idx            = perm  # remembers original row indices
     
         uniq_ids, counts = torch.unique_consecutive(sorted_eids,
                                                     return_counts=True)
         counts_list   = counts.tolist()    
         feat_groups   = torch.split(sorted_feats, counts_list, dim=0)
         coord_groups  = torch.split(sorted_spatial_coords, counts_list, dim=0)
-        idx_groups    = torch.split(sorted_idx, counts_list, dim=0)
         
         padded_feats  = pad_sequence(feat_groups, batch_first=True, padding_value=0.0)
         padded_coords = pad_sequence(coord_groups, batch_first=True, padding_value=0)
@@ -220,9 +218,9 @@ class MinkMAEViT(nn.Module):
         h_idx = padded_coords[..., 0]
         w_idx = padded_coords[..., 1]
         d_idx = padded_coords[..., 2]
-        padded_coords = h_idx * (Gw * Gd) + w_idx * Gd + d_idx
+        padded_idx = h_idx * (Gw * Gd) + w_idx * Gd + d_idx
     
-        return padded_feats, padded_coords, attn_mask, lengths
+        return padded_feats, padded_idx, attn_mask, lengths
 
 
     def build_patch_occupancy_map(self, x):
@@ -282,8 +280,8 @@ class MinkMAEViT(nn.Module):
     def forward_encoder(self, x_sparse, glob, mask_ratio):
         # patchify and mask
         x_sparse = self.downsample_layers(x_sparse)
-        x, pos, orig_attn_mask, lengths = self.group_voxels_by_event(x_sparse)
-        x = x + self.pos_embed(pos)
+        x, idx, orig_attn_mask, lengths = self.group_voxels_by_event(x_sparse)
+        x = x + self.pos_embed(idx)
         x, attn_mask, rand_mask, ids_restore = self.random_masking(
             x, orig_attn_mask, mask_ratio
         )
@@ -299,10 +297,10 @@ class MinkMAEViT(nn.Module):
         for blk in self.blocks:
             x = blk(x, attn_mask=attn_mask)
         x = self.norm(x)
-        return x, x_sparse, pos, orig_attn_mask, rand_mask, ids_restore
+        return x, x_sparse, idx, orig_attn_mask, rand_mask, ids_restore
 
     
-    def forward_decoder(self, x, pos, attn_mask, rand_mask, ids_restore, idx_map):
+    def forward_decoder(self, x, idx, attn_mask, rand_mask, ids_restore, idx_map):
         # embed tokens
         x = self.decoder_embed(x)
 
@@ -314,7 +312,7 @@ class MinkMAEViT(nn.Module):
         x_ = torch.gather(
             x_, 1, ids_restore.unsqueeze(-1).repeat(1, 1, D)
         )
-        x_ = x_ + self.decoder_pos_embed(pos)                 # add pos emb
+        x_ = x_ + self.decoder_pos_embed(idx)                 # add pos emb
         x = torch.cat([x[:, :1, :], x_], dim=1)               # add cls token
         cls_attn = attn_mask.new_ones((x.size(0), 1))
         attn_mask = torch.cat([cls_attn, attn_mask], dim=1)
@@ -333,7 +331,7 @@ class MinkMAEViT(nn.Module):
         pred_cls = self.decoder_pred_cls(flat_out)
 
         event_ids, slot_ids = torch.nonzero(keep_mask, as_tuple=True)
-        patch_ids = pos[event_ids, slot_ids]
+        patch_ids = idx[event_ids, slot_ids]
         idx_targets = idx_map[event_ids, patch_ids]
 
         return pred_occ, pred_reg, pred_cls, idx_targets
@@ -365,7 +363,7 @@ class MinkMAEViT(nn.Module):
         return total_loss, dict(occ=loss_occ, reg=loss_reg, cls=loss_cls)
         
 
-    def forward(self, x, x_glob, cls_labels, mask_ratio=0.5):
+    def forward(self, x, x_glob, cls_labels, mask_ratio=0.75):
         """
         Forward pass through the encoder-decoder network.
 
@@ -379,8 +377,8 @@ class MinkMAEViT(nn.Module):
             A dictionary with voxel predictions.
         """
         idx_map = self.build_patch_occupancy_map(x)
-        latent, x_sparse, pos, attn_mask, rand_mask, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
-        pred_occ, pred_reg, pred_cls, idx_targets = self.forward_decoder(latent, pos, attn_mask, rand_mask, ids_restore, idx_map)
+        latent, x_sparse, idx, attn_mask, rand_mask, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
+        pred_occ, pred_reg, pred_cls, idx_targets = self.forward_decoder(latent, idx, attn_mask, rand_mask, ids_restore, idx_map)
         total_loss, individual_losses = self.forward_loss(x.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets)
         
         return total_loss, individual_losses, pred_occ, pred_reg, pred_cls, idx_targets
