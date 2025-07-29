@@ -4,12 +4,12 @@
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
 model="base"
 eps=1e-12
-batch_size=32
+batch_size=256
 preprocessing_input="sqrt"
 standardize_input="z-score"
 mask_ratio=0.75
 epochs=800
-num_workers=8
+num_workers=16
 blr=1.5e-4
 accum_grad_batches=1
 warmup_steps=40
@@ -18,14 +18,14 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="pretrain_v5.1b_v2"
+name="pretrain_v5.1b_remove"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v5.1b_v2"
+checkpoint_name="pretrain_v5.1b_remove"
 early_stop_patience=200
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
-gpus=(0)
+gpus=(0 1)
 
 python -m train.pretrain \
     --train \

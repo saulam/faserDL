@@ -80,13 +80,6 @@ class MinkViT(vit.VisionTransformer):
         embed_dim = encoder_dims[-1]
         del self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
         self.global_feats_encoder = GlobalFeatureEncoder(embed_dim)
-        self.global_feats_cls = GlobalFeatureEncoderSimple(embed_dim, hidden=True, norm_layer=norm_layer)
-        self.cls_gate = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.Sigmoid()
-        )
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
 
         self.global_pool = global_pool
@@ -227,11 +220,7 @@ class MinkViT(vit.VisionTransformer):
         return outcome
 
     
-    def forward_head(self, x, glob):
-        glob_emb = self.global_feats_cls(glob)
-        gate = self.cls_gate(torch.cat([x, glob_emb], dim=-1))
-        x = gate * x + (1 - gate) * glob_emb
-        
+    def forward_head(self, x):        
         outputs = {}
         for i, (name, head) in enumerate(self.heads.items()):
             output = head(x)
@@ -246,7 +235,7 @@ class MinkViT(vit.VisionTransformer):
         
     def forward(self, x, x_glob):
         x = self.forward_features(x, x_glob)
-        x = self.forward_head(x, x_glob)
+        x = self.forward_head(x)
         return x
 
         

@@ -226,7 +226,8 @@ class ViTFineTuner(pl.LightningModule):
         # log the actual sigmas (exp(log_sigma))
         for name, param in self.named_parameters():
             if 'log_sigma' in name:
-                self.log(f'uncertainty/{name}', torch.exp(param), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+                log_sigma = -param if any(k in name for k in ['flavour', 'charm']) else -2 * param
+                self.log(f'uncertainty/{name}', torch.exp(log_sigma), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 
@@ -257,7 +258,7 @@ class ViTFineTuner(pl.LightningModule):
         # group uncertainty params
         param_groups.append({
             'params': list(self.log_sigma_params),
-            'lr': 1e-5,
+            'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })
         

@@ -62,7 +62,7 @@ class MAEPreTrainer(pl.LightningModule):
         batch_input, *batch_input_global, cls_labels = self._arrange_batch(batch)
 
         # Forward pass
-        loss, part_losses, _, _, _ = self.forward(
+        loss, part_losses, *_ = self.forward(
             batch_input, batch_input_global, cls_labels, mask_ratio=self.mask_ratio)
   
         lr = self.optimizers().param_groups[0]['lr']

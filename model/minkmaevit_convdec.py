@@ -38,7 +38,7 @@ class MinkMAEViT(nn.Module):
         decoder_num_heads=16,
         mlp_ratio=4.0,
         norm_layer=nn.LayerNorm,
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0},
+        loss_weights={'reg': 1.0, 'cls': 1.0},
     ):
         """
         Args:
@@ -58,8 +58,6 @@ class MinkMAEViT(nn.Module):
         assert H % p_h == 0 and W % p_w == 0 and D_img % p_d == 0, \
             "img_size must be divisible by patch_size"
 
-        self.in_chans = in_chans
-        self.out_chans = out_chans
         self.loss_weights = loss_weights
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
         self.num_patches = (
@@ -113,18 +111,34 @@ class MinkMAEViT(nn.Module):
             )
             for _ in range(decoder_depth)
         ])
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        self.final_embed = nn.Linear(decoder_embed_dim, embed_dim) 
+    
+        # upsample blocks
+        def _up_blk(in_c, out_c, ks):
+            return nn.Sequential(
+                MinkowskiConvolutionTranspose(
+                    in_c, out_c, kernel_size=ks, stride=ks,
+                    bias=True, dimension=D
+                ),
+                MinkowskiLayerNorm(out_c, eps=1e-6),
+                MinkowskiGELU(),
+            )
+
+        self.upsample_layers = nn.Sequential(
+            _up_blk(encoder_dims[2], encoder_dims[1], kernel_size[2]),
+            _up_blk(encoder_dims[1], encoder_dims[0], kernel_size[1]),
+            _up_blk(encoder_dims[0], encoder_dims[0], kernel_size[0]),
+        )
+
+        # regression head
+        self.reg_head = nn.Sequential(
+            MinkowskiConvolution(encoder_dims[0], in_chans, kernel_size=1, stride=1, bias=True, dimension=D)
+        )
         
-        self.decoder_pred_occ = nn.Sequential(
-            norm_layer(decoder_embed_dim),
-            nn.Linear(decoder_embed_dim, self.patch_voxels, bias=True),
-        )
-        self.decoder_pred_reg = nn.Sequential(
-            norm_layer(decoder_embed_dim),
-            nn.Linear(decoder_embed_dim, self.patch_voxels * in_chans, bias=True),
-        )
-        self.decoder_pred_cls = nn.Sequential(
-            norm_layer(decoder_embed_dim),
-            nn.Linear(decoder_embed_dim, self.patch_voxels * out_chans, bias=True),
+        # classification head
+        self.cls_head = nn.Sequential(
+            MinkowskiConvolution(encoder_dims[0], out_chans, kernel_size=1, stride=1, bias=True, dimension=D)
         )
     
         self.initialize_weights()
@@ -187,8 +201,9 @@ class MinkMAEViT(nn.Module):
         Returns:
             padded_feats:  [B, L_max, C] float, zero‑padded features
             padded_coords: [B, L_max] int, flat position ids.
-            attn_mask:     [B, L_max] bool, True = real voxel.
+            mask:          [B, L_max] bool, True = real voxel.
             lengths:       [B] long, number of voxels per event
+            idx_map:       [B, L_max] long, original-voxel indices (−1=pad)
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
@@ -203,18 +218,19 @@ class MinkMAEViT(nn.Module):
     
         uniq_ids, counts = torch.unique_consecutive(sorted_eids,
                                                     return_counts=True)
-        counts_list   = counts.tolist()    
+        counts_list = counts.tolist()    
         feat_groups   = torch.split(sorted_feats, counts_list, dim=0)
         coord_groups  = torch.split(sorted_spatial_coords, counts_list, dim=0)
         idx_groups    = torch.split(sorted_idx, counts_list, dim=0)
         
         padded_feats  = pad_sequence(feat_groups, batch_first=True, padding_value=0.0)
         padded_coords = pad_sequence(coord_groups, batch_first=True, padding_value=0)
+        idx_map       = pad_sequence(idx_groups, batch_first=True, padding_value=-1)
     
-        lengths   = counts
-        L_max     = int(lengths.max().item())
-        arange    = torch.arange(L_max, device=feats.device)
-        attn_mask = arange.unsqueeze(0) < lengths.unsqueeze(1)
+        lengths = counts
+        L_max   = int(lengths.max().item())
+        arange  = torch.arange(L_max, device=feats.device)
+        mask    = arange.unsqueeze(0) < lengths.unsqueeze(1)
 
         Gh, Gw, Gd = self.grid_size
         h_idx = padded_coords[..., 0]
@@ -222,39 +238,8 @@ class MinkMAEViT(nn.Module):
         d_idx = padded_coords[..., 2]
         padded_coords = h_idx * (Gw * Gd) + w_idx * Gd + d_idx
     
-        return padded_feats, padded_coords, attn_mask, lengths
+        return padded_feats, padded_coords, mask, lengths, idx_map
 
-
-    def build_patch_occupancy_map(self, x):
-        """
-        From the original sparse tensor coordinates, build a [B, N_patches, P] mapping
-        with the raw id of the actual hit in that sub‐voxel.
-        """
-        coords     = x.C
-        device     = coords.device
-        event_ids  = coords[:, 0].long()
-        x_, y_, z_ = coords[:, 1:].unbind(-1)
-    
-        p_h, p_w, p_d        = self.patch_size.tolist()
-        G_h, G_w, G_d        = self.grid_size
-        P                    = self.patch_voxels
-        Np                   = self.num_patches
-        B                    = int(event_ids.max().item()) + 1
-        N                    = coords.shape[0]
-    
-        patch_idx = (x_ // p_h) * (G_w * G_d) \
-                  + (y_ // p_w) * G_d \
-                  + (z_ // p_d)
-        sub_idx   = (x_ % p_h) * (p_w * p_d) \
-                  + (y_ % p_w) * p_d \
-                  + (z_ % p_d)
-
-        raw_inds = torch.arange(N, device=device)
-        idx_map = torch.full ((B, Np, P), -1, dtype=torch.long, device=device)
-        idx_map [event_ids, patch_idx, sub_idx] = raw_inds
-    
-        return idx_map
-    
     
     def random_masking(self, x, attn_mask, mask_ratio):
         """
@@ -278,11 +263,26 @@ class MinkMAEViT(nn.Module):
         rand_mask = torch.gather(rand_mask, 1, ids_restore)
         return x_masked, attn_mask_masked, rand_mask, ids_restore
 
+
+    def _patch_key(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Compute a 1‑D patch key: batch_index * num_patches + flat_patch_index.
+        """
+        batch_idx = coords[:, 0]
+        spatial = coords[:, 1:] // self.patch_size
+        h, w, d = spatial.unbind(-1)
+        flat = (
+            h * (self.grid_size[1] * self.grid_size[2])
+            + w * self.grid_size[2]
+            + d
+        )
+        return batch_idx * self.num_patches + flat
+
     
     def forward_encoder(self, x_sparse, glob, mask_ratio):
         # patchify and mask
         x_sparse = self.downsample_layers(x_sparse)
-        x, pos, orig_attn_mask, lengths = self.group_voxels_by_event(x_sparse)
+        x, pos, orig_attn_mask, lengths, idx_map = self.group_voxels_by_event(x_sparse)
         x = x + self.pos_embed(pos)
         x, attn_mask, rand_mask, ids_restore = self.random_masking(
             x, orig_attn_mask, mask_ratio
@@ -299,10 +299,10 @@ class MinkMAEViT(nn.Module):
         for blk in self.blocks:
             x = blk(x, attn_mask=attn_mask)
         x = self.norm(x)
-        return x, x_sparse, pos, orig_attn_mask, rand_mask, ids_restore
+        return x, x_sparse, pos, orig_attn_mask, rand_mask, idx_map, ids_restore
 
     
-    def forward_decoder(self, x, pos, attn_mask, rand_mask, ids_restore, idx_map):
+    def forward_decoder(self, x, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore):
         # embed tokens
         x = self.decoder_embed(x)
 
@@ -322,47 +322,60 @@ class MinkMAEViT(nn.Module):
         # run transformer blocks
         for blk in self.decoder_blocks:
             x = blk(x, attn_mask=attn_mask)
-        x = x[:, 1:]
+        x = self.decoder_norm(x)[:, 1:]
 
+        # keep valid voxels
         attn_mask = attn_mask[:, 1:]
-        keep_mask = rand_mask.bool() & attn_mask
-        flat_out = x[keep_mask]
+        flat_out = x[attn_mask]
+        flat_idx = idx_map[attn_mask]
 
-        pred_occ = self.decoder_pred_occ(flat_out)
-        pred_reg = self.decoder_pred_reg(flat_out)
-        pred_cls = self.decoder_pred_cls(flat_out)
+        # embed back to original dimension
+        out_feats = self.final_embed(flat_out).to(x_sparse.F.dtype)
 
-        event_ids, slot_ids = torch.nonzero(keep_mask, as_tuple=True)
-        patch_ids = pos[event_ids, slot_ids]
-        idx_targets = idx_map[event_ids, patch_ids]
-
-        return pred_occ, pred_reg, pred_cls, idx_targets
-
-
-    def forward_loss(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets, smooth=0.1):
-        mask_targets = (idx_targets >= 0)
-        mask_flat    = mask_targets.view(-1)
-        idx_flat     = idx_targets.view(-1)[mask_flat]
-
-        targ_occ = mask_targets.float()
-        if self.training and smooth > 0:
-            targ_occ = targ_occ * (1.0 - smooth) + 0.5 * smooth
-        loss_occ = F.binary_cross_entropy_with_logits(pred_occ, targ_occ)
-
-        pred_reg   = pred_reg.view(-1, self.in_chans)[mask_flat]
-        targ_reg   = targ_reg[idx_flat]
-        loss_reg   = F.mse_loss(pred_reg, targ_reg)
-
-        pred_cls   = pred_cls.view(-1, self.out_chans)[mask_flat]
-        targ_cls   = targ_cls[idx_flat]
-        loss_cls   = F.cross_entropy(pred_cls, targ_cls)
-
-        total_loss = (
-            self.loss_weights['occ'] * loss_occ +
-            self.loss_weights['reg'] * loss_reg +
-            self.loss_weights['cls'] * loss_cls
+        # embeddings of masked voxels to sparse tensor
+        new_F = x_sparse.F.clone()
+        new_F[flat_idx] = out_feats
+        x_sparse = ME.SparseTensor(
+            features=new_F,
+            coordinate_manager=x_sparse.coordinate_manager,
+            coordinate_map_key=x_sparse.coordinate_map_key,
         )
-        return total_loss, dict(occ=loss_occ, reg=loss_reg, cls=loss_cls)
+
+        # upsample and get predictions
+        x_sparse_up = self.upsample_layers(x_sparse)
+        pred_reg = self.reg_head(x_sparse_up)
+        pred_cls = self.cls_head(x_sparse_up)
+        preds_C  = pred_reg.C
+
+        # build a mask in the upsampled lattice
+        keep          = rand_mask.bool() & attn_mask
+        flat_idx_keep = idx_map[keep]
+        masked_coords = x_sparse.C[flat_idx_keep]
+        key_masked    = self._patch_key(masked_coords)
+        key_pred      = self._patch_key(preds_C)
+        mask_up       = torch.isin(key_pred, key_masked.unique())
+    
+        return pred_reg, pred_cls, mask_up
+
+
+    def forward_loss(self, targ_reg, targ_cls, pred_reg, pred_cls, mask):
+        targ_reg_masked = targ_reg[mask]
+        targ_cls_masked = targ_cls[mask]
+        pred_reg_masked = pred_reg[mask]
+        pred_cls_masked = pred_cls[mask]
+
+        total_loss = 0.
+        losses = {}
+        
+        loss_reg = F.mse_loss(pred_reg_masked, targ_reg_masked, reduction='mean')
+        losses['reg'] = loss_reg
+        total_loss += loss_reg * self.loss_weights['reg']
+        
+        loss_cls = F.cross_entropy(pred_cls_masked, targ_cls_masked, reduction='mean')
+        losses['cls'] = loss_cls
+        total_loss += loss_cls * self.loss_weights['cls']
+
+        return total_loss, losses
         
 
     def forward(self, x, x_glob, cls_labels, mask_ratio=0.5):
@@ -377,13 +390,13 @@ class MinkMAEViT(nn.Module):
 
         Returns:
             A dictionary with voxel predictions.
-        """
-        idx_map = self.build_patch_occupancy_map(x)
-        latent, x_sparse, pos, attn_mask, rand_mask, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
-        pred_occ, pred_reg, pred_cls, idx_targets = self.forward_decoder(latent, pos, attn_mask, rand_mask, ids_restore, idx_map)
-        total_loss, individual_losses = self.forward_loss(x.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets)
+        """        
+        latent, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
+        preds_reg, preds_cls, mask_up = self.forward_decoder(latent, x_sparse, pos, attn_mask, rand_mask, idx_map, ids_restore)
+        assert (x.C==preds_reg.C).all() and (x.C==preds_cls.C).all()  # always true!
+        total_loss, individual_losses = self.forward_loss(x.F, cls_labels, preds_reg.F, preds_cls.F, mask_up)
         
-        return total_loss, individual_losses, pred_occ, pred_reg, pred_cls, idx_targets
+        return total_loss, individual_losses, preds_reg, preds_cls, mask_up
 
         
     def replace_depthwise_with_channelwise(self):
@@ -446,7 +459,7 @@ def mae_vit_base(**kwargs):
         depth=12, num_heads=12,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0}, **kwargs)
+        loss_weights={'reg': 1.0, 'cls': 1.0}, **kwargs)
     return model
     
 
@@ -458,7 +471,7 @@ def mae_vit_large(**kwargs):
         depth=24, num_heads=16,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0}, **kwargs)
+        loss_weights={'reg': 1.0, 'cls': 1.0}, **kwargs)
     return model
 
 
@@ -470,5 +483,5 @@ def mae_vit_huge(**kwargs):
         depth=32, num_heads=16,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0}, **kwargs)
+        loss_weights={'reg': 1.0, 'cls': 1.0}, **kwargs)
     return model

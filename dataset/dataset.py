@@ -256,6 +256,7 @@ class SparseFASERCALDataset(Dataset):
         primary_vertex = data['primary_vertex']
         is_cc = data['is_cc']
         in_neutrino_pdg = data['in_neutrino_pdg']
+        in_neutrino_energy = data['in_neutrino_energy']
         vis_sp_momentum = data['vis_sp_momentum']
         seg_labels_raw = data['seg_labels']
         primlepton_labels = data['primlepton_labels']
@@ -322,6 +323,9 @@ class SparseFASERCALDataset(Dataset):
             'e_vis': global_feats['e_vis'],
             'primary_vertex': primary_vertex,
             'transformations': transformations,
+            'in_neutrino_pdg': in_neutrino_pdg,
+            'in_neutrino_energy': in_neutrino_energy,
+            'is_cc': is_cc,
         }
 
 
@@ -556,6 +560,12 @@ class SparseFASERCALDataset(Dataset):
                 'out_lepton_momentum_dir': torch.from_numpy(out_lepton_dir).float(),
                 'jet_momentum_mag': torch.from_numpy(np.atleast_1d(jet_mag)).float(),
                 'jet_momentum_dir': torch.from_numpy(jet_dir).float(),
+            })
+        if not self.train:
+            output.update({
+                'in_neutrino_pdg': event['in_neutrino_pdg'],
+                'in_neutrino_energy': event['in_neutrino_energy'],
+                'is_cc': event['is_cc'],
             })
         return output
         

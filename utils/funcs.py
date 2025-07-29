@@ -107,7 +107,7 @@ def collate_test(batch):
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm']
+            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'flavour_label', 'charm']
                         else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
                         else [d[key] for d in batch])
     
