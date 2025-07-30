@@ -5,9 +5,9 @@ dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
 model="base"
 eps=1e-12
 batch_size=512
-mixup_alpha=0.8
-preprocessing_input="sqrt"
-standardize_input="unit-var"
+mixup_alpha=0.0
+preprocessing_input="none"
+standardize_input="z-score"
 preprocessing_output="log"
 standardize_output="unit-var"
 epochs=100
@@ -23,14 +23,15 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_mixup_v2"
+name="finetune_v5.1b_nopre_v1"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_mixup_v2"
+checkpoint_name="finetune_v5.1b_nopre_v1"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/maevit_v5.1b_v1/loss_val_total/last.ckpt"
-gpus=(1)
+#load_checkpoint="checkpoints_final/maevit_v5.1b_v1/loss_val_total/last.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_nersc_v1/loss_val_total/last.ckpt"
+gpus=(0)
 
 python -m train.finetune \
     --train \

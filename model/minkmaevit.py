@@ -13,10 +13,8 @@ import torch.nn.functional as F
 import MinkowskiEngine as ME
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence
-from timm.models.layers import trunc_normal_
 from MinkowskiEngine import (
     MinkowskiConvolution,
-    MinkowskiConvolutionTranspose,
     MinkowskiGELU,
 )
 from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
@@ -74,8 +72,8 @@ class MinkMAEViT(nn.Module):
         def _down_blk(in_c, out_c, ks):
             return nn.Sequential(
                 MinkowskiConvolution(
-                    in_c, out_c, kernel_size=ks, stride=ks, dimension=D,
-                    bias=True,
+                    in_c, out_c, kernel_size=ks, stride=ks, 
+                    bias=True, dimension=D,
                 ),
                 MinkowskiLayerNorm(out_c, eps=1e-6),
                 MinkowskiGELU(),
@@ -86,10 +84,9 @@ class MinkMAEViT(nn.Module):
             _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
             _down_blk(encoder_dims[1], encoder_dims[2], kernel_size[2]),
         )
-            
-        embed_dim = encoder_dims[-1]
     
         # MAE encoder
+        embed_dim = encoder_dims[-1]
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
@@ -147,23 +144,21 @@ class MinkMAEViT(nn.Module):
             self.decoder_pos_embed.weight.requires_grad_(False)
 
         # init tokens
-        nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.cls_token, std=.02)
+        nn.init.normal_(self.mask_token, std=.02)
 
         self.apply(self._init_weights)
 
 
     def _init_weights(self, m):
         if isinstance(m, MinkowskiConvolution):
-            trunc_normal_(m.kernel, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, MinkowskiConvolutionTranspose):
-            trunc_normal_(m.kernel, std=0.02)
+            # initialize conv like nn.Linear
+            w = m.kernel.data
+            torch.nn.init.xavier_uniform_(w.view(-1, w.size(2)))
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
+            torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -171,13 +166,13 @@ class MinkMAEViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     
-    def group_voxels_by_event(
+    def group_patches_by_event(
         self,
         sparse_tensor,
     ):
         """
-        Buckets feats by event ID, pads to a dense tensor,
-        and returns an index‐map you can use to scatter back.
+        Buckets patches into feats and (flattened) positions to padded dense tensors,
+        and calculates the corresponding attention mask.
     
         Args:
             sparse_tensor: MinkowskiEngine sparse tensor with
@@ -188,7 +183,6 @@ class MinkMAEViT(nn.Module):
             padded_feats:  [B, L_max, C] float, zero‑padded features
             padded_coords: [B, L_max] int, flat position ids.
             attn_mask:     [B, L_max] bool, True = real voxel.
-            lengths:       [B] long, number of voxels per event
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
@@ -209,18 +203,17 @@ class MinkMAEViT(nn.Module):
         padded_feats  = pad_sequence(feat_groups, batch_first=True, padding_value=0.0)
         padded_coords = pad_sequence(coord_groups, batch_first=True, padding_value=0)
     
-        lengths   = counts
-        L_max     = int(lengths.max().item())
+        L_max     = int(counts.max().item())
         arange    = torch.arange(L_max, device=feats.device)
-        attn_mask = arange.unsqueeze(0) < lengths.unsqueeze(1)
+        attn_mask = arange.unsqueeze(0) < counts.unsqueeze(1)
 
-        Gh, Gw, Gd = self.grid_size
+        G_h, G_w, G_d = self.grid_size
         h_idx = padded_coords[..., 0]
         w_idx = padded_coords[..., 1]
         d_idx = padded_coords[..., 2]
-        padded_idx = h_idx * (Gw * Gd) + w_idx * Gd + d_idx
+        padded_idx = h_idx * (G_w * G_d) + w_idx * G_d + d_idx
     
-        return padded_feats, padded_idx, attn_mask, lengths
+        return padded_feats, padded_idx, attn_mask
 
 
     def build_patch_occupancy_map(self, x):
@@ -263,13 +256,13 @@ class MinkMAEViT(nn.Module):
 
         Source: https://github.com/facebookresearch/mae/blob/main/models_mae.py
         """
-        B, L, D = x.shape
+        B, L, C = x.shape
         len_keep = int(L * (1 - mask_ratio))
         noise = torch.rand(B, L, device=x.device)
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
         ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        x_masked = torch.gather(x, 1, ids_keep.unsqueeze(-1).repeat(1, 1, C))
         attn_mask_masked = torch.gather(attn_mask, 1, ids_keep)
         rand_mask = torch.ones(B, L, device=x.device)
         rand_mask[:, :len_keep] = 0
@@ -280,7 +273,7 @@ class MinkMAEViT(nn.Module):
     def forward_encoder(self, x_sparse, glob, mask_ratio):
         # patchify and mask
         x_sparse = self.downsample_layers(x_sparse)
-        x, idx, orig_attn_mask, lengths = self.group_voxels_by_event(x_sparse)
+        x, idx, orig_attn_mask = self.group_patches_by_event(x_sparse)
         x = x + self.pos_embed(idx)
         x, attn_mask, rand_mask, ids_restore = self.random_masking(
             x, orig_attn_mask, mask_ratio
@@ -305,12 +298,12 @@ class MinkMAEViT(nn.Module):
         x = self.decoder_embed(x)
 
         # append mask tokens to sequence
-        B, L, D = x.shape
+        B, L, C = x.shape
         num_mask = ids_restore.shape[1] + 1 - L
         mask_tokens = self.mask_token.repeat(B, num_mask, 1)
         x_ = torch.cat((x[:, 1:, :], mask_tokens), dim=1)
         x_ = torch.gather(
-            x_, 1, ids_restore.unsqueeze(-1).repeat(1, 1, D)
+            x_, 1, ids_restore.unsqueeze(-1).repeat(1, 1, C)
         )
         x_ = x_ + self.decoder_pos_embed(idx)                 # add pos emb
         x = torch.cat([x[:, :1, :], x_], dim=1)               # add cls token
@@ -322,15 +315,15 @@ class MinkMAEViT(nn.Module):
             x = blk(x, attn_mask=attn_mask)
         x = x[:, 1:]
 
-        attn_mask = attn_mask[:, 1:]
-        keep_mask = rand_mask.bool() & attn_mask
-        flat_out = x[keep_mask]
+        attn_mask       = attn_mask[:, 1:]
+        prediction_mask = rand_mask.bool() & attn_mask
+        flat_out        = x[prediction_mask]
 
         pred_occ = self.decoder_pred_occ(flat_out)
         pred_reg = self.decoder_pred_reg(flat_out)
         pred_cls = self.decoder_pred_cls(flat_out)
 
-        event_ids, slot_ids = torch.nonzero(keep_mask, as_tuple=True)
+        event_ids, slot_ids = torch.nonzero(prediction_mask, as_tuple=True)
         patch_ids = idx[event_ids, slot_ids]
         idx_targets = idx_map[event_ids, patch_ids]
 

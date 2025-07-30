@@ -17,7 +17,6 @@ from torch.nn.utils.rnn import pad_sequence
 from timm.models.layers import trunc_normal_
 from MinkowskiEngine import (
     MinkowskiConvolution,
-    MinkowskiConvolutionTranspose,
     MinkowskiGELU,
 )
 from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoder, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
@@ -79,7 +78,7 @@ class MinkViT(vit.VisionTransformer):
 
         embed_dim = encoder_dims[-1]
         del self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
-        self.global_feats_encoder = GlobalFeatureEncoder(embed_dim)
+        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
         self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
 
         self.global_pool = global_pool
@@ -129,15 +128,13 @@ class MinkViT(vit.VisionTransformer):
     
     def _init_weights(self, m):
         if isinstance(m, MinkowskiConvolution):
-            trunc_normal_(m.kernel, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, MinkowskiConvolutionTranspose):
-            trunc_normal_(m.kernel, std=0.02)
+            # initialize conv like nn.Linear
+            w = m.kernel.data
+            torch.nn.init.xavier_uniform_(w.view(-1, w.size(2)))
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
+            torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -145,12 +142,13 @@ class MinkViT(vit.VisionTransformer):
             nn.init.constant_(m.weight, 1.0)
             
     
-    def group_voxels_by_event(
+    def group_patches_by_event(
         self,
         sparse_tensor,
     ):
         """
-        Buckets feats by event ID, pads to a dense tensor.
+        Buckets patches into feats and (flattened) positions to padded dense tensors,
+        and calculates the corresponding attention mask.
     
         Args:
             sparse_tensor: MinkowskiEngine sparse tensor with
@@ -160,7 +158,7 @@ class MinkViT(vit.VisionTransformer):
         Returns:
             padded_feats:  [B, L_max, C] float, zero‑padded features
             padded_coords: [B, L_max] int, flat position ids.
-            mask:          [B, L_max] bool, True = real voxel.
+            attn_mask:     [B, L_max] bool, True = real voxel.
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
@@ -174,31 +172,30 @@ class MinkViT(vit.VisionTransformer):
     
         uniq_ids, counts = torch.unique_consecutive(sorted_eids,
                                                     return_counts=True)
-        counts_list = counts.tolist()    
+        counts_list   = counts.tolist()    
         feat_groups   = torch.split(sorted_feats, counts_list, dim=0)
         coord_groups  = torch.split(sorted_spatial_coords, counts_list, dim=0)
         
         padded_feats  = pad_sequence(feat_groups, batch_first=True, padding_value=0.0)
         padded_coords = pad_sequence(coord_groups, batch_first=True, padding_value=0)
     
-        lengths = counts
-        L_max   = int(lengths.max().item())
-        arange  = torch.arange(L_max, device=feats.device)
-        mask    = arange.unsqueeze(0) < lengths.unsqueeze(1)
+        L_max     = int(counts.max().item())
+        arange    = torch.arange(L_max, device=feats.device)
+        attn_mask = arange.unsqueeze(0) < counts.unsqueeze(1)
 
-        Gh, Gw, Gd = self.grid_size
+        G_h, G_w, G_d = self.grid_size
         h_idx = padded_coords[..., 0]
         w_idx = padded_coords[..., 1]
         d_idx = padded_coords[..., 2]
-        padded_coords = h_idx * (Gw * Gd) + w_idx * Gd + d_idx
+        padded_idx = h_idx * (G_w * G_d) + w_idx * G_d + d_idx
     
-        return padded_feats, padded_coords, mask
+        return padded_feats, padded_idx, attn_mask
         
 
     def forward_features(self, x_sparse, glob):
         x_sparse = self.downsample_layers(x_sparse)
-        x, pos, attn_mask = self.group_voxels_by_event(x_sparse)
-        x = x + self.pos_embed(pos)
+        x, idx, attn_mask = self.group_patches_by_event(x_sparse)
+        x = x + self.pos_embed(idx)
 
         # add cls token
         glob_emb = self.global_feats_encoder(glob).unsqueeze(1)  # (B, 1, D)
