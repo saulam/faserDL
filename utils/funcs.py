@@ -177,6 +177,17 @@ def arrange_truth(data):
     return output
 
 
+def weighted_loss(L, s):
+    """
+    Calculates the uncertainty-weighted loss for any task.
+    L: The raw loss for the task (e.g., MSE, BCE, CrossEntropy).
+    s: The learnable log-variance parameter for the task.
+
+    https://arxiv.org/pdf/1705.07115
+    """
+    return torch.exp(-s) * L + 0.5 * s
+
+
 class CustomLambdaLR(LambdaLR):
     def __init__(self, optimizer, warmup_steps):
         """

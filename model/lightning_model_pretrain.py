@@ -15,7 +15,8 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import timm.optim.optim_factory as optim_factory
 from utils import (
-    arrange_sparse_minkowski, arrange_truth, CustomLambdaLR, CombinedScheduler
+    arrange_sparse_minkowski, arrange_truth, 
+    CustomLambdaLR, CombinedScheduler, weighted_loss
 )
 from functools import partial
 from packaging import version
@@ -41,6 +42,16 @@ class MAEPreTrainer(pl.LightningModule):
         self.preprocessing_input = args.preprocessing_input
         self.standardize_input = args.standardize_input
 
+        # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
+        self.log_sigma_occ = nn.Parameter(torch.zeros(()))
+        self.log_sigma_reg = nn.Parameter(torch.zeros(()))
+        self.log_sigma_cls = nn.Parameter(torch.zeros(()))
+        self._uncertainty_params = {
+            "occ": self.log_sigma_occ,
+            "reg": self.log_sigma_reg,
+            "cls": self.log_sigma_cls,
+        }
+
 
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
@@ -55,6 +66,38 @@ class MAEPreTrainer(pl.LightningModule):
         batch_input, *global_params = arrange_sparse_minkowski(batch, self.device)
         seg_labels = arrange_truth(batch)['seg_labels']
         return batch_input, *global_params, seg_labels
+
+
+    def compute_losses(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets, smooth=0.1):
+        mask_targets = (idx_targets >= 0)
+        mask_flat    = mask_targets.view(-1)
+        idx_flat     = idx_targets.view(-1)[mask_flat]
+
+        targ_occ = mask_targets.float()
+        if self.model.training and smooth > 0:
+            targ_occ = targ_occ * (1.0 - smooth) + 0.5 * smooth
+        loss_occ = F.binary_cross_entropy_with_logits(pred_occ, targ_occ)
+
+        pred_reg   = pred_reg.view(-1, self.model.in_chans)[mask_flat]
+        targ_reg   = targ_reg[idx_flat]
+        loss_reg   = F.mse_loss(pred_reg, targ_reg)
+
+        pred_cls   = pred_cls.view(-1, self.model.out_chans)[mask_flat]
+        targ_cls   = targ_cls[idx_flat]
+        loss_cls   = F.cross_entropy(pred_cls, targ_cls)
+
+        part_losses = {
+            'occ': loss_occ,
+            'reg': loss_reg,
+            'cls': loss_cls,
+        }
+        total_loss = ( 
+            weighted_loss(loss_occ, self.log_sigma_occ) +
+            weighted_loss(loss_reg, self.log_sigma_reg) +
+            weighted_loss(loss_cls, self.log_sigma_cls)
+        )
+
+        return total_loss, part_losses
         
     
     def common_step(self, batch):
@@ -62,8 +105,12 @@ class MAEPreTrainer(pl.LightningModule):
         batch_input, *batch_input_global, cls_labels = self._arrange_batch(batch)
 
         # Forward pass
-        loss, part_losses, *_ = self.forward(
+        pred_occ, pred_reg, pred_cls, idx_targets = self.forward(
             batch_input, batch_input_global, cls_labels, mask_ratio=self.mask_ratio)
+
+        loss, part_losses = self.compute_losses(
+            batch_input.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets
+        )
   
         lr = self.optimizers().param_groups[0]['lr']
         
@@ -79,7 +126,12 @@ class MAEPreTrainer(pl.LightningModule):
         for key, value in part_losses.items():
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
-        
+
+        # log the actual sigmas (exp(-log_sigma))
+        for key, log_sigma in self._uncertainty_params.items():
+            uncertainty = torch.exp(-log_sigma)
+            self.log(f'uncertainty/{key}', uncertainty, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+                
         return loss
 
 
@@ -100,6 +152,11 @@ class MAEPreTrainer(pl.LightningModule):
         param_groups = optim_factory.param_groups_weight_decay(
             self.model, self.weight_decay,
         )
+        param_groups.append({
+            'params': list(self._uncertainty_params.values()),
+            'lr': self.lr * 0.1,
+            'weight_decay': 0.0,
+        })
         optimizer = torch.optim.AdamW(
             param_groups,
             lr=self.lr,

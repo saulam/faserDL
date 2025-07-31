@@ -146,6 +146,7 @@ class GlobalFeatureEncoderSimple(nn.Module):
     def __init__(
         self,
         embed_dim: int,
+        dropout: float = 0.1,
         hidden: bool = False,
         norm_layer: nn.Module = None,
     ):
@@ -165,11 +166,14 @@ class GlobalFeatureEncoderSimple(nn.Module):
             layers += [
                 nn.Linear(global_feature_dim, embed_dim * 4),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(embed_dim * 4, embed_dim),
             ]
         else:
-            layers.append(nn.Linear(global_feature_dim, embed_dim))
+            layers += [
+                nn.Linear(global_feature_dim, embed_dim),
+                nn.Dropout(dropout),
+            ]
 
         if norm_layer is not None:
             layers.append(norm_layer(embed_dim))

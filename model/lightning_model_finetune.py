@@ -13,7 +13,11 @@ import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
 from torch_ema import ExponentialMovingAverage
-from utils import param_groups_lrd, MAPE, SphericalAngularLoss, arrange_sparse_minkowski, arrange_truth, CustomLambdaLR, CombinedScheduler
+from utils import (
+    param_groups_lrd, MAPE, SphericalAngularLoss, 
+    arrange_sparse_minkowski, arrange_truth, 
+    CustomLambdaLR, CombinedScheduler, weighted_loss
+)
 
 
 class ViTFineTuner(pl.LightningModule):
@@ -40,17 +44,16 @@ class ViTFineTuner(pl.LightningModule):
         self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
         self.log_sigma_jet_momentum_mag = nn.Parameter(torch.zeros(()))
         self.log_sigma_jet_momentum_dir = nn.Parameter(torch.zeros(()))
-        self._uncertainty_params = [
-            self.log_sigma_flavour,
-            self.log_sigma_charm,
-            self.log_sigma_e_vis,
-            self.log_sigma_pt_miss,
-            self.log_sigma_lepton_momentum_mag,
-            self.log_sigma_lepton_momentum_dir,
-            self.log_sigma_jet_momentum_mag,
-            self.log_sigma_jet_momentum_dir,
-        ]
-        self.log_sigma_params = set(self._uncertainty_params)
+        self._uncertainty_params = {
+            "flavour":              self.log_sigma_flavour,
+            "charm":                self.log_sigma_charm,
+            "e_vis":                self.log_sigma_e_vis,
+            "pt_miss":              self.log_sigma_pt_miss,
+            "lepton_momentum_mag":  self.log_sigma_lepton_momentum_mag,
+            "lepton_momentum_dir":  self.log_sigma_lepton_momentum_dir,
+            "jet_momentum_mag":     self.log_sigma_jet_momentum_mag,
+            "jet_momentum_dir":     self.log_sigma_jet_momentum_dir,
+        }
         
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
@@ -142,15 +145,6 @@ class ViTFineTuner(pl.LightningModule):
         mask_nc = ~mask_cc
         out_pt_miss = out_pt_miss[mask_nc]
         targ_pt_miss = targ_pt_miss[mask_nc]
-        
-        def weighted_regression(L, s):
-            # (1/2) e^(–2s) L + s
-            return 0.5 * torch.exp(-2*s) * L + s
-        
-        def weighted_classification(L, s):
-            # different for classification since it's already a likelihood
-            # exp(-s) * L + s
-            return torch.exp(-1*s) * L + s
 
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
@@ -162,24 +156,26 @@ class ViTFineTuner(pl.LightningModule):
         loss_jet_momentum_mag = self.loss_jet_momentum_mag(out_jet_momentum_mag, targ_jet_momentum_mag)
         loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
         
-        part_losses = {'flavour': loss_flavour,
-                       'charm': loss_charm,
-                       'e_vis': loss_e_vis,
-                       'pt_miss': loss_pt_miss,
-                       'lepton_momentum_mag': loss_lepton_momentum_mag,
-                       'lepton_momentum_dir': loss_lepton_momentum_dir,
-                       'jet_momentum_mag': loss_jet_momentum_mag,
-                       'jet_momentum_dir': loss_jet_momentum_dir,
-                       }
-        total_loss = ( weighted_classification(loss_flavour, self.log_sigma_flavour)
-                     + weighted_classification(loss_charm, self.log_sigma_charm)
-                     + weighted_regression(loss_e_vis, self.log_sigma_e_vis)
-                     + weighted_regression(loss_pt_miss, self.log_sigma_pt_miss)
-                     + weighted_regression(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag)
-                     + weighted_regression(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir)
-                     + weighted_regression(loss_jet_momentum_mag, self.log_sigma_jet_momentum_mag)
-                     + weighted_regression(loss_jet_momentum_dir, self.log_sigma_jet_momentum_dir)
-                   )
+        part_losses = {
+            'flavour': loss_flavour,
+            'charm': loss_charm,
+            'e_vis': loss_e_vis,
+            'pt_miss': loss_pt_miss,
+            'lepton_momentum_mag': loss_lepton_momentum_mag,
+            'lepton_momentum_dir': loss_lepton_momentum_dir,
+            'jet_momentum_mag': loss_jet_momentum_mag,
+            'jet_momentum_dir': loss_jet_momentum_dir,
+        }
+        total_loss = (
+            weighted_loss(loss_flavour, self.log_sigma_flavour) +
+            weighted_loss(loss_charm, self.log_sigma_charm) +
+            weighted_loss(loss_e_vis, self.log_sigma_e_vis) +
+            weighted_loss(loss_pt_miss, self.log_sigma_pt_miss) +
+            weighted_loss(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag) +
+            weighted_loss(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir) +
+            weighted_loss(loss_jet_momentum_mag, self.log_sigma_jet_momentum_mag) +
+            weighted_loss(loss_jet_momentum_dir, self.log_sigma_jet_momentum_dir)
+        )
 
         return total_loss, part_losses
 
@@ -223,11 +219,10 @@ class ViTFineTuner(pl.LightningModule):
             self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
         
-        # log the actual sigmas (exp(log_sigma))
-        for name, param in self.named_parameters():
-            if 'log_sigma' in name:
-                log_sigma = -param if any(k in name for k in ['flavour', 'charm']) else -2 * param
-                self.log(f'uncertainty/{name}', torch.exp(log_sigma), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        # log the actual sigmas (exp(-log_sigma))
+        for key, log_sigma in self._uncertainty_params.items():
+            uncertainty = torch.exp(-log_sigma)
+            self.log(f'uncertainty/{key}', uncertainty, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 
@@ -257,7 +252,7 @@ class ViTFineTuner(pl.LightningModule):
 
         # group uncertainty params
         param_groups.append({
-            'params': list(self.log_sigma_params),
+            'params': list(self._uncertainty_params.values()),
             'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })

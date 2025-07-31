@@ -39,7 +39,7 @@ def augment(
     primary_vertex,
     metadata,
     transformations=None, 
-    aug_prob=0.8
+    aug_prob=1.0
 ):
     """
     Performs augmentations.

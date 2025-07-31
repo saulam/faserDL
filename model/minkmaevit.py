@@ -36,7 +36,6 @@ class MinkMAEViT(nn.Module):
         decoder_num_heads=16,
         mlp_ratio=4.0,
         norm_layer=nn.LayerNorm,
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0},
     ):
         """
         Args:
@@ -58,7 +57,6 @@ class MinkMAEViT(nn.Module):
 
         self.in_chans = in_chans
         self.out_chans = out_chans
-        self.loss_weights = loss_weights
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
         self.num_patches = (
             self.grid_size[0] 
@@ -226,12 +224,12 @@ class MinkMAEViT(nn.Module):
         event_ids  = coords[:, 0].long()
         x_, y_, z_ = coords[:, 1:].unbind(-1)
     
-        p_h, p_w, p_d        = self.patch_size.tolist()
-        G_h, G_w, G_d        = self.grid_size
-        P                    = self.patch_voxels
-        Np                   = self.num_patches
-        B                    = int(event_ids.max().item()) + 1
-        N                    = coords.shape[0]
+        p_h, p_w, p_d  = self.patch_size.tolist()
+        G_h, G_w, G_d  = self.grid_size
+        P              = self.patch_voxels
+        Np             = self.num_patches
+        B              = int(event_ids.max().item()) + 1
+        N              = coords.shape[0]
     
         patch_idx = (x_ // p_h) * (G_w * G_d) \
                   + (y_ // p_w) * G_d \
@@ -328,32 +326,6 @@ class MinkMAEViT(nn.Module):
         idx_targets = idx_map[event_ids, patch_ids]
 
         return pred_occ, pred_reg, pred_cls, idx_targets
-
-
-    def forward_loss(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets, smooth=0.1):
-        mask_targets = (idx_targets >= 0)
-        mask_flat    = mask_targets.view(-1)
-        idx_flat     = idx_targets.view(-1)[mask_flat]
-
-        targ_occ = mask_targets.float()
-        if self.training and smooth > 0:
-            targ_occ = targ_occ * (1.0 - smooth) + 0.5 * smooth
-        loss_occ = F.binary_cross_entropy_with_logits(pred_occ, targ_occ)
-
-        pred_reg   = pred_reg.view(-1, self.in_chans)[mask_flat]
-        targ_reg   = targ_reg[idx_flat]
-        loss_reg   = F.mse_loss(pred_reg, targ_reg)
-
-        pred_cls   = pred_cls.view(-1, self.out_chans)[mask_flat]
-        targ_cls   = targ_cls[idx_flat]
-        loss_cls   = F.cross_entropy(pred_cls, targ_cls)
-
-        total_loss = (
-            self.loss_weights['occ'] * loss_occ +
-            self.loss_weights['reg'] * loss_reg +
-            self.loss_weights['cls'] * loss_cls
-        )
-        return total_loss, dict(occ=loss_occ, reg=loss_reg, cls=loss_cls)
         
 
     def forward(self, x, x_glob, cls_labels, mask_ratio=0.75):
@@ -372,9 +344,8 @@ class MinkMAEViT(nn.Module):
         idx_map = self.build_patch_occupancy_map(x)
         latent, x_sparse, idx, attn_mask, rand_mask, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
         pred_occ, pred_reg, pred_cls, idx_targets = self.forward_decoder(latent, idx, attn_mask, rand_mask, ids_restore, idx_map)
-        total_loss, individual_losses = self.forward_loss(x.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets)
         
-        return total_loss, individual_losses, pred_occ, pred_reg, pred_cls, idx_targets
+        return pred_occ, pred_reg, pred_cls, idx_targets
 
         
     def replace_depthwise_with_channelwise(self):
@@ -437,7 +408,7 @@ def mae_vit_base(**kwargs):
         depth=12, num_heads=12,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0}, **kwargs)
+    )
     return model
     
 
@@ -449,7 +420,7 @@ def mae_vit_large(**kwargs):
         depth=24, num_heads=16,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0}, **kwargs)
+    )
     return model
 
 
@@ -461,5 +432,5 @@ def mae_vit_huge(**kwargs):
         depth=32, num_heads=16,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        loss_weights={'occ': 1.0, 'reg': 1.0, 'cls': 1.0}, **kwargs)
+    )
     return model

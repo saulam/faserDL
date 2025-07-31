@@ -19,7 +19,7 @@ from MinkowskiEngine import (
     MinkowskiConvolution,
     MinkowskiGELU,
 )
-from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoder, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
+from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
 
 
 class MinkViT(vit.VisionTransformer):
