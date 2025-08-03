@@ -54,8 +54,15 @@ def main():
 
     # Dataset and splits
     dataset = SparseFASERCALDataset(args)
+    extra_dataset = None
+    if args.extra_dataset_path is not None:
+        args.dataset_path = args.extra_dataset_path
+        extra_dataset = SparseFASERCALDataset(args)
+        
     print("- Dataset size: {} events".format(len(dataset)))
-    train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
+    train_loader, valid_loader, test_loader = split_dataset(
+        dataset, args, splits=[0.6, 0.1, 0.3], extra_dataset=extra_dataset
+    )
 
     # Calculate arguments for scheduler
     nb_batches = len(train_loader)
@@ -73,7 +80,10 @@ def main():
     print(f"eff. batch size   = {args.batch_size * denom}")
 
     # Transfer weights from pre-trained model
-    model = args.model()
+    model = args.model(
+        drop_rate = args.dropout,
+        drop_path_rate = args.drop_path_rate,
+    )
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
@@ -86,6 +96,14 @@ def main():
     # define the list of losses to monitor
     monitor_losses = [
         "loss/val_total",
+        "loss/val_flavour",
+        "loss/val_charm",
+        "loss/val_e_vis",
+        "loss/val_pt_miss",
+        "loss/val_jet_momentum_dir",
+        "loss/val_jet_momentum_mag",
+        "loss/val_lepton_momentum_dir",
+        "loss/val_lepton_momentum_mag",
     ]
     
     # helper to build a fresh checkpoint callback list

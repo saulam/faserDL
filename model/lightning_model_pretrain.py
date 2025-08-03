@@ -41,6 +41,7 @@ class MAEPreTrainer(pl.LightningModule):
         self.metadata = metadata
         self.preprocessing_input = args.preprocessing_input
         self.standardize_input = args.standardize_input
+        self.label_smoothing = args.label_smoothing
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
@@ -68,14 +69,14 @@ class MAEPreTrainer(pl.LightningModule):
         return batch_input, *global_params, seg_labels
 
 
-    def compute_losses(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets, smooth=0.1):
+    def compute_losses(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets):
         mask_targets = (idx_targets >= 0)
         mask_flat    = mask_targets.view(-1)
         idx_flat     = idx_targets.view(-1)[mask_flat]
 
         targ_occ = mask_targets.float()
-        if self.model.training and smooth > 0:
-            targ_occ = targ_occ * (1.0 - smooth) + 0.5 * smooth
+        if self.model.training and self.label_smoothing > 0:
+            targ_occ = targ_occ * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
         loss_occ = F.binary_cross_entropy_with_logits(pred_occ, targ_occ)
 
         pred_reg   = pred_reg.view(-1, self.model.in_chans)[mask_flat]
@@ -109,7 +110,7 @@ class MAEPreTrainer(pl.LightningModule):
             batch_input, batch_input_global, cls_labels, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
-            batch_input.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets
+            batch_input.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets,
         )
   
         lr = self.optimizers().param_groups[0]['lr']

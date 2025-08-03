@@ -14,11 +14,11 @@ import numpy as np
 import torch
 import MinkowskiEngine as ME
 from sklearn.model_selection import KFold
-from torch.utils.data import random_split, Subset, DataLoader
+from torch.utils.data import random_split, ConcatDataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
 
-def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
+def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, extra_dataset=None):
     """
     Splits the dataset into training, validation, and test sets based on the given splits.
 
@@ -28,6 +28,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
         splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
         seed (int): Seed for reproducibility. Default is 7.
         test (bool): Whether to use collate_test or collate_sparse_minkowski. Default is False.
+        extra_dataset (torch.utils.data.Dataset or None): Extra dataset to append to the training loader. Default is None.
 
     Returns:
         tuple: DataLoader objects for training, validation, and test sets.
@@ -56,8 +57,15 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
 
     if args.train and args.augmentations_enabled and not args.stage1:
         train_set.calc_primary_vertices()
-    
+
     train_set.augmentations_enabled = args.augmentations_enabled
+
+    if extra_dataset is not None:
+        #if args.train and args.augmentations_enabled and not args.stage1:
+        #    extra_dataset.calc_primary_vertices()
+        extra_dataset.augmentations_enabled = args.augmentations_enabled
+        train_set = ConcatDataset([train_set, extra_dataset])
+    
     collate_fn = collate_test if test else collate_sparse_minkowski
     persistent = args.num_workers > 0
 

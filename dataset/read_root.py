@@ -18,15 +18,23 @@ import json
 
 version = "5.1"
 version_reco = version + "b"
-path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
-true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
-output_dir = '/scratch2/salonso/faser/events_v{}'.format(version_reco)
-
+#path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
+#true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
+#reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
+#output_dir = '/scratch2/salonso/faser/events_v{}'.format(version_reco)
+#charm_path = "/scratch2/salonso/faser/FASERCALDATA_v{}/charm_events.json".format(version)
+path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau/".format(version)
+true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau/*".format(version))
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau/*".format(version))
+output_dir = '/scratch2/salonso/faser/events_v{}_tau'.format(version_reco)
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
+charm_path = None
 
-with open(path + "charm_events.json", 'r') as file:
-    charm_events = json.load(file)
+if charm_path is not None:
+    with open(charm_path, 'r') as file:
+        charm_events = json.load(file)
+else:
+    charm_events = None
 
 # Placeholder for class objects
 tcal_event = ROOT.TcalEvent()
@@ -238,7 +246,7 @@ def generate_events(number, chunks, disable):
             geom_detector = tporeco_event.geom_detector
             
             run_number, event_id = po_event.run_number, po_event.event_id
-            charm = event_id in charm_events
+            charm = event_id in charm_events if charm_events is not None else -1
             primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             is_cc = bool(po_event.isCC)
             e_vis = po_event.Evis

@@ -146,6 +146,11 @@ class ViTFineTuner(pl.LightningModule):
         out_pt_miss = out_pt_miss[mask_nc]
         targ_pt_miss = targ_pt_miss[mask_nc]
 
+        # Mask events with no charm label
+        mask_charm = targ_charm >= 0
+        out_charm = out_charm[mask_charm]
+        targ_charm = targ_charm[mask_charm]
+
         # losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm = self.loss_charm(out_charm, targ_charm)

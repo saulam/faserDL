@@ -2,11 +2,14 @@
 
 # Default arguments
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
+metadata_path="/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata.pkl"
 model="base"
 eps=1e-12
 batch_size=256
 preprocessing_input="sqrt"
 standardize_input="z-score"
+label_smoothing=0.1
+dropout=0.0
 mask_ratio=0.75
 epochs=800
 num_workers=16
@@ -18,11 +21,11 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="pretrain_v5.1b_v2"
+name="pretrain_v5.1b_dlnu_sqrt_v2"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v5.1b_v2"
+checkpoint_name="pretrain_v5.1b_dlnu_sqrt_v2"
 early_stop_patience=200
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
 gpus=(0 1)
@@ -32,11 +35,14 @@ python -m train.pretrain \
     --stage1 \
     --augmentations_enabled \
     --dataset_path $dataset_path \
+    --metadata_path $metadata_path \
     --model $model \
     --eps $eps \
     --batch_size $batch_size \
     --preprocessing_input $preprocessing_input \
     --standardize_input $standardize_input \
+    --label_smoothing $label_smoothing \
+    --dropout $dropout \
     --mask_ratio $mask_ratio \
     --epochs $epochs \
     --num_workers $num_workers \

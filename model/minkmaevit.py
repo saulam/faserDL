@@ -35,6 +35,7 @@ class MinkMAEViT(nn.Module):
         decoder_depth=8,
         decoder_num_heads=16,
         mlp_ratio=4.0,
+        drop_rate=0.,
         norm_layer=nn.LayerNorm,
     ):
         """
@@ -91,7 +92,8 @@ class MinkMAEViT(nn.Module):
         self.blocks = nn.ModuleList([
             BlockWithMask(
                 embed_dim, num_heads, mlp_ratio,
-                qkv_bias=True, norm_layer=norm_layer
+                qkv_bias=True, drop=drop_rate,
+                norm_layer=norm_layer
             )
             for _ in range(depth)
         ])
@@ -104,7 +106,8 @@ class MinkMAEViT(nn.Module):
         self.decoder_blocks = nn.ModuleList([
             BlockWithMask(
                 decoder_embed_dim, decoder_num_heads, mlp_ratio,
-                qkv_bias=True, norm_layer=norm_layer
+                qkv_bias=True, drop=drop_rate,
+                norm_layer=norm_layer
             )
             for _ in range(decoder_depth)
         ])

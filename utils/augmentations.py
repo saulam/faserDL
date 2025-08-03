@@ -495,11 +495,11 @@ def smooth_labels(targets, smoothing: float, num_classes: int = None):
     smoothed : ndarray of shape (N,) or (N, C)
         smoothed probabilities.
     """
-    targets = np.asarray(targets, dtype=np.float32)
     if smoothing <= 0:
         return targets
+    targets = np.asarray(targets, dtype=np.float32)
 
-    # If user supplied num_classes, force multi-class path
+    # If supplied num_classes, force multi-class path
     if num_classes is not None:
         if targets.ndim != 1:
             raise ValueError("With num_classes set, targets must be 1-D class indices.")

@@ -36,10 +36,11 @@ class SparseFASERCALDataset(Dataset):
         self.standardize_output = args.standardize_output
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
+        self.label_smoothing = args.label_smoothing
         self.mixup_alpha = args.mixup_alpha
 
         # Load metadata
-        with open(os.path.join(self.root, "metadata.pkl"), "rb") as fd:
+        with open(args.metadata_path, "rb") as fd:
             self.metadata = pk.load(fd)
             for key in ['x', 'y', 'z']:
                 self.metadata[key] = np.array(self.metadata[key])
@@ -291,13 +292,13 @@ class SparseFASERCALDataset(Dataset):
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
                 global_feats, primary_vertex, self.metadata, transformations
             )
-            charm = smooth_labels(np.array([charm]), smoothing=0.1)
+            charm = smooth_labels(np.array([charm]), smoothing=self.label_smoothing)
             flavour_label = smooth_labels(
                 np.array([self.pdg2label(in_neutrino_pdg, is_cc)]),
-                smoothing=0.1,
+                smoothing=self.label_smoothing,
                 num_classes=4
             )
-            seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels, smoothing=0.1)
+            seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels, smoothing=self.label_smoothing)
         else:
             flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])
             seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels)

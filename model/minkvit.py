@@ -293,9 +293,9 @@ def vit_base(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         encoder_dims=[192, 384, 768],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=768, depth=12, num_heads=12, drop_rate=0.,
+        embed_dim=768, depth=12, num_heads=12,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask, drop_path_rate=0.1,
+        block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
     
@@ -305,9 +305,9 @@ def vit_large(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         encoder_dims=[252, 504, 1008],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=1008, depth=24, num_heads=16, drop_rate=0.,
+        embed_dim=1008, depth=24, num_heads=16,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask, drop_path_rate=0.1,
+        block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -317,8 +317,8 @@ def vit_huge(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         encoder_dims=[324, 648, 1296],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=1296, depth=32, num_heads=16, drop_rate=0.,
+        embed_dim=1296, depth=32, num_heads=16,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask, drop_path_rate=0.1,
+        block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model

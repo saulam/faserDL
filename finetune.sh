@@ -2,42 +2,47 @@
 
 # Default arguments
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b"
+extra_dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b_tau"
+metadata_path="/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata.pkl"
 model="base"
 eps=1e-12
 batch_size=512
 mixup_alpha=0.0
-preprocessing_input="none"
+preprocessing_input="sqrt"
 standardize_input="z-score"
 preprocessing_output="log"
 standardize_output="unit-var"
-epochs=100
+label_smoothing=0.1
+dropout=0.0
+drop_path_rate=0.1
+epochs=75
 num_workers=16
 blr=1e-3
 layer_decay=0.75
 accum_grad_batches=1
 warmup_steps=5
-cosine_annealing_steps=75
+cosine_annealing_steps=70
 weight_decay=0.05
 beta1=0.9
 beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_nopre_v1"
+name="finetune_v5.1b_dlnu_sqrt_v5"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_nopre_v1"
+checkpoint_name="finetune_v5.1b_dlnu_sqrt_v5"
 early_stop_patience=10
-#load_checkpoint="checkpoints_final/maevit_v5.1b_v1/loss_val_total/last.ckpt"
-load_checkpoint="checkpoints_final/pretrain_v5.1b_nersc_v1/loss_val_total/last.ckpt"
-gpus=(0)
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_sqrt_v1/loss_val_total/last.ckpt"
+gpus=(0 1)
 
 python -m train.finetune \
     --train \
     --stage2 \
     --augmentations_enabled \
     --dataset_path $dataset_path \
+    --metadata_path $metadata_path \
     --model $model \
     --eps $eps \
     --mixup_alpha $mixup_alpha \
@@ -46,6 +51,9 @@ python -m train.finetune \
     --standardize_input $standardize_input \
     --preprocessing_output $preprocessing_output \
     --standardize_output $standardize_output \
+    --label_smoothing $label_smoothing \
+    --dropout $dropout \
+    --drop_path_rate $drop_path_rate \
     --epochs $epochs \
     --num_workers $num_workers \
     --blr $blr \
