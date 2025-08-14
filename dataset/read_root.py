@@ -7,7 +7,7 @@ Description: script to generate numpy files.
 """
 
 
-from ROOT import TFile, TTree, std
+from ROOT import TFile
 import ROOT
 import glob
 import numpy as np
@@ -18,17 +18,17 @@ import json
 
 version = "5.1"
 version_reco = version + "b"
-#path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
-#true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
-#reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
-#output_dir = '/scratch2/salonso/faser/events_v{}'.format(version_reco)
-#charm_path = "/scratch2/salonso/faser/FASERCALDATA_v{}/charm_events.json".format(version)
-path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau/".format(version)
-true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau/*".format(version))
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau/*".format(version))
-output_dir = '/scratch2/salonso/faser/events_v{}_tau'.format(version_reco)
+path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
+true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
+output_dir = '/scratch/salonso/sparse-nns/faser/events_v{}2'.format(version_reco)
+charm_path = "/scratch2/salonso/faser/FASERCALDATA_v{}/charm_events.json".format(version)
+#path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau/".format(version)
+#true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau/*".format(version))
+#reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau/*".format(version))
+#output_dir = '/scratch2/salonso/faser/events_v{}_tau'.format(version_reco)
+#charm_path = None
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
-charm_path = None
 
 if charm_path is not None:
     with open(charm_path, 'r') as file:
@@ -261,6 +261,7 @@ def generate_events(number, chunks, disable):
             out_lepton_pdg = out_lepton.m_pdg_id
             out_lepton_momentum = np.array([out_lepton.m_px, out_lepton.m_py, out_lepton.m_pz])
             out_lepton_energy = out_lepton.m_energy
+            tauvis_momentum = np.array([po_event.tauvis_px, po_event.tauvis_py, po_event.tauvis_pz])
 
             # Extract views
             xz_view = tporeco_event.Get2DViewXPS()
@@ -324,17 +325,18 @@ def generate_events(number, chunks, disable):
                 true_hits=true_hits,
                 reco_hits=reco_hits,
                 reco_hits_true=np.array(reco_hits_true, dtype=object),
-                xz_proj = xz_proj,
-                yz_proj = yz_proj,
-                xy_projs = np.array(xy_projs, dtype=object),
-                tk_tracks=np.array(tk_tracks, dtype=object),
-                ps_tracks=ps_tracks,
+                #xz_proj = xz_proj,
+                #yz_proj = yz_proj,
+                #xy_projs = np.array(xy_projs, dtype=object),
+                #tk_tracks=np.array(tk_tracks, dtype=object),
+                #ps_tracks=ps_tracks,
                 in_neutrino_pdg=in_neutrino_pdg,
                 in_neutrino_momentum=in_neutrino_momentum,
                 in_neutrino_energy=in_neutrino_energy,
                 out_lepton_pdg=out_lepton_pdg,
                 out_lepton_momentum=out_lepton_momentum,
                 out_lepton_energy=out_lepton_energy,
+                tauvis_momentum=tauvis_momentum,
                 rear_cal_energy=rear_cal_energy,
                 rear_cal_modules=rear_cal_modules,
                 rear_hcal_energy=rear_hcal_energy,

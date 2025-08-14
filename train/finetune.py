@@ -83,6 +83,7 @@ def main():
     model = args.model(
         drop_rate = args.dropout,
         drop_path_rate = args.drop_path_rate,
+        metadata = dataset.metadata,
     )
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
@@ -97,13 +98,17 @@ def main():
     monitor_losses = [
         "loss/val_total",
         "loss/val_flavour",
-        "loss/val_charm",
-        "loss/val_e_vis",
-        "loss/val_pt_miss",
-        "loss/val_jet_momentum_dir",
-        "loss/val_jet_momentum_mag",
-        "loss/val_lepton_momentum_dir",
-        "loss/val_lepton_momentum_mag",
+        #"loss/val_charm",
+        #"loss/val_vis_sp_momentum_mag",
+        #"loss/val_vis_sp_momentum_dir",
+        #"loss/val_lepton_momentum_mag",
+        #"loss/val_lepton_momentum_dir",
+        #"loss/val_e_vis",
+        #"loss/val_pt_miss",
+        #"loss/val_jet_momentum_dir",
+        #"loss/val_jet_momentum_mag",
+        #"loss/val_lepton_momentum_dir",
+        #"loss/val_lepton_momentum_mag",
     ]
     
     # helper to build a fresh checkpoint callback list

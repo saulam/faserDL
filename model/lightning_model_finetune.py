@@ -6,15 +6,13 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 2 (transfer learning from stage 1): classification and regression tasks.
 """
 
-import re
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import pytorch_lightning as pl
+from typing import Any
 from torch_ema import ExponentialMovingAverage
 from utils import (
-    param_groups_lrd, MAPE, SphericalAngularLoss, 
+    param_groups_lrd, KinematicsMultiTaskLoss,
     arrange_sparse_minkowski, arrange_truth, 
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
@@ -24,35 +22,51 @@ class ViTFineTuner(pl.LightningModule):
     def __init__(self, model, args):
         super(ViTFineTuner, self).__init__()
         self.model = model
+        self.preprocessing_output = args.preprocessing_output
+        self.standardize_output = args.standardize_output
+        stats = model.metadata
+
+        def get_or(d: dict, key: str, default: Any) -> Any:
+            return d[key] if key in d else default
         
         # Loss functions
+        self.loss_iscc = nn.BCEWithLogitsLoss()
         self.loss_flavour = nn.CrossEntropyLoss()
         self.loss_charm = nn.BCEWithLogitsLoss()
-        self.loss_evis = MAPE(preprocessing=args.preprocessing_output)
-        self.loss_ptmiss = MAPE(preprocessing=args.preprocessing_output)
-        self.loss_lepton_momentum_mag = MAPE(preprocessing=args.preprocessing_output)
-        self.loss_lepton_momentum_dir = SphericalAngularLoss()
-        self.loss_jet_momentum_mag = MAPE(preprocessing=args.preprocessing_output)
-        self.loss_jet_momentum_dir = SphericalAngularLoss()
+        self.crit = KinematicsMultiTaskLoss(
+            s_vis_xyz=stats["vis"]["s_xyz"],  s_vis_mag=stats["vis"]["s_mag"],
+            s_lep_xyz=stats["lep"]["s_xyz"],  s_lep_mag=stats["lep"]["s_mag"],
+            s_jet_xyz=get_or(stats.get("jet_loss_scales", {}), "s_xyz", stats["vis"]["s_xyz"]),
+            s_jet_mag=get_or(stats.get("jet_loss_scales", {}), "s_mag", stats["vis"]["s_mag"]),
+            tau_ptmiss_cc=stats.get("vis_tau_ptmiss_cc", stats["vis"]["tau_ptmiss"]),
+            tau_ptmiss_nc=stats.get("vis_tau_ptmiss_nc", stats["vis"]["tau_ptmiss"]),
+            tau_evis_cc=stats.get("vis_tau_evis_cc", stats["vis"]["tau_evis"]),
+            tau_evis_nc=stats.get("vis_tau_evis_nc", stats["vis"]["tau_evis"]),
+            zero_attractor_w=0.1,
+            jet_aux_w=0.2,           # 0.0 to disable aux jet loss
+            latent_prior_w=1e-3,     # tiny; only used if we pass latents
+            huber_delta=1.0,
+            lam_mag=1.0, lam_dir=1.0
+        )
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
+        self.log_sigma_iscc = nn.Parameter(torch.zeros(()))
         self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
         self.log_sigma_charm = nn.Parameter(torch.zeros(()))
-        self.log_sigma_e_vis = nn.Parameter(torch.zeros(()))
-        self.log_sigma_pt_miss = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lepton_momentum_mag = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lepton_momentum_dir = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_momentum_mag = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_momentum_dir = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep = nn.Parameter(torch.zeros(()))
+        self.log_sigma_ptmiss = nn.Parameter(torch.zeros(()))
+        self.log_sigma_evis = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
-            "flavour":              self.log_sigma_flavour,
-            "charm":                self.log_sigma_charm,
-            "e_vis":                self.log_sigma_e_vis,
-            "pt_miss":              self.log_sigma_pt_miss,
-            "lepton_momentum_mag":  self.log_sigma_lepton_momentum_mag,
-            "lepton_momentum_dir":  self.log_sigma_lepton_momentum_dir,
-            "jet_momentum_mag":     self.log_sigma_jet_momentum_mag,
-            "jet_momentum_dir":     self.log_sigma_jet_momentum_dir,
+            "is_cc":   self.log_sigma_iscc,
+            "flavour": self.log_sigma_flavour,
+            "charm":   self.log_sigma_charm,
+            "vis":     self.log_sigma_vis,
+            "lep":     self.log_sigma_lep,
+            "ptmiss":  self.log_sigma_ptmiss,
+            "evis":    self.log_sigma_evis,
+            "jet":     self.log_sigma_jet,
         }
         
         self.warmup_steps = args.warmup_steps
@@ -114,73 +128,73 @@ class ViTFineTuner(pl.LightningModule):
 
 
     def compute_losses(self, batch_output, target):
-        # pred
+        # ---- predicted outputs -----
+        out_iscc    = batch_output['out_iscc'].squeeze()
         out_flavour = batch_output['out_flavour']
-        out_charm = batch_output['out_charm'].squeeze()
-        out_e_vis = batch_output['out_e_vis'].squeeze()
-        out_pt_miss = batch_output['out_pt_miss'].squeeze()
-        out_lepton_momentum_mag = batch_output['out_lepton_momentum_mag'].squeeze()
-        out_lepton_momentum_dir = batch_output['out_lepton_momentum_dir']
-        out_jet_momentum_mag = batch_output['out_jet_momentum_mag'].squeeze()
-        out_jet_momentum_dir = batch_output['out_jet_momentum_dir']
+        out_charm   = batch_output['out_charm'].squeeze()
+        out_vis     = batch_output['out_vis']
+        out_lep     = batch_output['out_lep']
 
-        # true
-        targ_flavour = target['flavour_label']
-        targ_charm = target['charm']
-        targ_e_vis = target['e_vis']
-        targ_pt_miss = target['pt_miss']
-        targ_lepton_momentum_mag = target['out_lepton_momentum_mag']
-        targ_lepton_momentum_dir = target['out_lepton_momentum_dir']
-        targ_jet_momentum_mag = target['jet_momentum_mag']
-        targ_jet_momentum_dir = target['jet_momentum_dir']
+        # ---- true outputs -----
+        targ_iscc                = target['is_cc']
+        targ_flavour             = target['flavour_label']
+        targ_charm               = target['charm']
+        targ_vis_sp_momentum     = target['vis_sp_momentum']
+        targ_lepton_momentum     = target['out_lepton_momentum']
 
-        # CC
-        mask_cc = targ_flavour < 3 if targ_flavour.ndim==1 else targ_flavour.argmax(dim=1) < 3
-        out_lepton_momentum_mag = out_lepton_momentum_mag[mask_cc]
-        out_lepton_momentum_dir = out_lepton_momentum_dir[mask_cc]
-        targ_lepton_momentum_mag = targ_lepton_momentum_mag[mask_cc]
-        targ_lepton_momentum_dir = targ_lepton_momentum_dir[mask_cc]
-        
-        # NC
-        mask_nc = ~mask_cc
-        out_pt_miss = out_pt_miss[mask_nc]
-        targ_pt_miss = targ_pt_miss[mask_nc]
-
-        # Mask events with no charm label
-        mask_charm = targ_charm >= 0
-        out_charm = out_charm[mask_charm]
-        targ_charm = targ_charm[mask_charm]
+        outs = self.crit(
+            p_vis_hat=out_vis["p_cart"],
+            p_lep_hat=out_lep["p_cart"],
+            p_vis_true=targ_vis_sp_momentum,
+            p_lep_true=targ_lepton_momentum,
+            is_cc=targ_iscc>0.5,
+            p_jet_true=targ_vis_sp_momentum - targ_lepton_momentum,  # if aux jet loss
+            p_jet_hat=None,                                          # derive from vis/lepton
+            vis_latents=out_vis.get("latents"),
+            lep_latents=out_lep.get("latents"),
+        )
 
         # losses
-        loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
-        loss_charm = self.loss_charm(out_charm, targ_charm)
-        loss_e_vis = self.loss_evis(out_e_vis, targ_e_vis)
-        loss_pt_miss = self.loss_ptmiss(out_pt_miss, targ_pt_miss)
-        loss_lepton_momentum_mag = self.loss_lepton_momentum_mag(out_lepton_momentum_mag, targ_lepton_momentum_mag)
-        loss_lepton_momentum_dir = self.loss_lepton_momentum_dir(out_lepton_momentum_dir, targ_lepton_momentum_dir)
-        loss_jet_momentum_mag = self.loss_jet_momentum_mag(out_jet_momentum_mag, targ_jet_momentum_mag)
-        loss_jet_momentum_dir = self.loss_jet_momentum_dir(out_jet_momentum_dir, targ_jet_momentum_dir)
-        
+        m_cc         = (targ_iscc > 0.5).to(out_vis["p_cart"].dtype).view(-1)
+        loss_iscc    = self.loss_iscc(out_iscc, targ_iscc)
+        loss_flavour = self.loss_flavour(out_flavour[m_cc.bool()], targ_flavour[m_cc.bool()])
+        loss_charm   = self.loss_charm(out_charm, targ_charm)
+        loss_vis     = outs["L_vis"]
+        loss_lep     = outs["L_lep_cc"] + outs["L_lep_zero"]
+        loss_ptmiss  = outs["L_ptmiss"]
+        loss_evis    = outs["L_evis"]
+        loss_jet     = outs["jet_aux_weight"] * outs["L_jet"]
+
         part_losses = {
+            'is_cc': loss_iscc,
             'flavour': loss_flavour,
             'charm': loss_charm,
-            'e_vis': loss_e_vis,
-            'pt_miss': loss_pt_miss,
-            'lepton_momentum_mag': loss_lepton_momentum_mag,
-            'lepton_momentum_dir': loss_lepton_momentum_dir,
-            'jet_momentum_mag': loss_jet_momentum_mag,
-            'jet_momentum_dir': loss_jet_momentum_dir,
+            'vis_comp': outs["L_vis_comp"].mean(),
+            'vis_mag': outs["L_vis_mag"].mean(),
+            'vis_dir': outs["L_vis_dir"].mean(),
+            'vis': outs["L_vis"].mean(),
+            'lep_comp': outs["L_lep_comp"].mean(),
+            'lep_mag': outs["L_lep_mag"].mean(),
+            'lep_dir': outs["L_lep_dir"].mean(),
+            'lep_cc': (outs["L_lep_cc"][m_cc>0.5].mean() if (m_cc>0.5).any() else torch.tensor(0., device=self.device)),
+            'lep_zero': outs["L_lep_zero"].mean(),
+            'evis': outs["L_evis"].mean(),
+            'pt_miss': loss_ptmiss.mean(),
+            'jet_comp': outs["L_jet_comp"].mean(),
+            'jet_mag': outs["L_jet_mag"].mean(),
+            'jet_dir': outs["L_jet_dir"].mean(),
+            'jet': (outs["L_jet"][m_cc>0.5].mean() if (outs["jet_aux_weight"]>0 and (m_cc>0.5).any()) else torch.tensor(0., device=self.device)),            
         }
         total_loss = (
+            weighted_loss(loss_iscc,    self.log_sigma_iscc) +
             weighted_loss(loss_flavour, self.log_sigma_flavour) +
-            weighted_loss(loss_charm, self.log_sigma_charm) +
-            weighted_loss(loss_e_vis, self.log_sigma_e_vis) +
-            weighted_loss(loss_pt_miss, self.log_sigma_pt_miss) +
-            weighted_loss(loss_lepton_momentum_mag, self.log_sigma_lepton_momentum_mag) +
-            weighted_loss(loss_lepton_momentum_dir, self.log_sigma_lepton_momentum_dir) +
-            weighted_loss(loss_jet_momentum_mag, self.log_sigma_jet_momentum_mag) +
-            weighted_loss(loss_jet_momentum_dir, self.log_sigma_jet_momentum_dir)
-        )
+            weighted_loss(loss_charm,   self.log_sigma_charm) +
+            weighted_loss(loss_vis,     self.log_sigma_vis) +
+            weighted_loss(loss_lep,     self.log_sigma_lep) +
+            weighted_loss(loss_ptmiss,  self.log_sigma_ptmiss) +
+            weighted_loss(loss_evis,    self.log_sigma_evis) +
+            weighted_loss(loss_jet,     self.log_sigma_jet)
+        ).mean()
 
         return total_loss, part_losses
 

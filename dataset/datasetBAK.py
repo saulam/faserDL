@@ -153,83 +153,66 @@ class SparseFASERCALDataset(Dataset):
             if pdg in [-12, 12]: return 0  # CC nue
             if pdg in [-14, 14]: return 1  # CC numu
             if pdg in [-16, 16]: return 2  # CC nutau
-        return 0  # NC (not used)
+        return 3  # NC
 
-
+    
     def decompose_momentum(self, momentum):
         """Splits 3D momentum vectors into magnitude and direction."""
-        if not isinstance(momentum, torch.Tensor):
-            momentum = torch.as_tensor(momentum)
-        momentum = torch.atleast_2d(momentum)
-        magnitudes = torch.linalg.norm(momentum, dim=1, keepdim=True)
-        directions = torch.where(magnitudes != 0, momentum / magnitudes, torch.zeros_like(momentum))
+        momentum = np.atleast_2d(momentum)
+        magnitudes = np.linalg.norm(momentum, axis=1, keepdims=True)
+        directions = np.divide(momentum, magnitudes, where=magnitudes != 0)
         
         is_single_vector = magnitudes.shape[0] == 1
-        return (magnitudes[0] if is_single_vector else magnitudes.flatten(),
-                directions[0] if is_single_vector else directions)
+        return magnitudes[0] if is_single_vector else magnitudes.flatten(), \
+               directions[0] if is_single_vector else directions
 
-
+    
     def reconstruct_momentum(self, magnitude, direction):
-        """Given magnitude and direction, reconstruct the original momentum vector."""
-        if not isinstance(magnitude, torch.Tensor):
-            magnitude = torch.as_tensor(magnitude)
-        if not isinstance(direction, torch.Tensor):
-            direction = torch.as_tensor(direction)
-        direction = torch.atleast_2d(direction)
-        if magnitude.ndim == 0:
-            magnitude = torch.atleast_1d(magnitude)
-        if magnitude.device != direction.device:
-            magnitude = magnitude.to(direction.device)
-        if magnitude.dtype != direction.dtype:
-            magnitude = magnitude.to(direction.dtype)
-        momentum = magnitude[:, None] * direction
+        """
+        Given magnitude and direction, reconstruct the original momentum vector.
+        """
+        magnitude = np.atleast_1d(magnitude)
+        direction = np.atleast_2d(direction)  # Converts (3,) -> (1, 3), leaves (N,3) unchanged
+        momentum = magnitude[:, np.newaxis] * direction
         return momentum[0] if magnitude.shape[0] == 1 else momentum
 
-
+        
     def preprocess(self, x, param_name, preprocessing=None, standardize=None):
         """Applies a sequence of preprocessing steps (e.g., log, z-score)."""
-        if not isinstance(x, torch.Tensor):
-            x = torch.as_tensor(x)
-        x = torch.atleast_1d(x)
+        x = np.atleast_1d(x)
         internal_name = param_name
         
+        # Apply non-linear transformations first
         if preprocessing == "sqrt":
-            if torch.any(x < 0).item(): raise ValueError(f"{param_name}: negative values cannot take sqrt")
-            x = torch.sqrt(x)
+            if np.any(x < 0): raise ValueError(f"{param_name}: negative values cannot take sqrt")
+            x = np.sqrt(x)
             internal_name += "_sqrt"
         elif preprocessing == "log":
-            if torch.any(x <= -1).item(): raise ValueError(f"{param_name}: values <= -1 cannot take log1p")
-            x = torch.log1p(x)
+            if np.any(x <= -1): raise ValueError(f"{param_name}: values <= -1 cannot take log1p")
+            x = np.log1p(x)
             internal_name += "_log1p"
 
+        # Apply standardization
         if standardize:
             stats = self.metadata[internal_name]
-            to_t = lambda v: torch.as_tensor(v, dtype=x.dtype, device=x.device)
-            std = to_t(stats.get("std", 1.0))
-            zero_cmp = torch.isclose(std, to_t(0.0))
-            zero_std = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
+            std = stats.get("std", 1.0)
+            if std == 0: raise ValueError(f"{internal_name}: std is zero in metadata")
 
             if standardize == "z-score":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = (x - to_t(stats["mean"])) / std
+                x = (x - stats["mean"]) / std
             elif standardize == "unit-var":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
                 x = x / std
-            else:
-                rng = to_t(stats["max"]) - to_t(stats["min"])
-                zero_cmp = torch.isclose(rng, to_t(0.0))
-                zero_rng = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
-                if zero_rng: raise ValueError(f"{internal_name}: max and min are equal in metadata")
-                x = (x - to_t(stats["min"])) / rng
+            else: # Min-max scaling
+                rng = stats["max"] - stats["min"]
+                if rng == 0: raise ValueError(f"{param_name}: max and min are equal")
+                x = (x - stats["min"]) / rng
         return x
 
 
     def unpreprocess(self, x, param_name, preprocessing=None, standardize=None):
         """Reverses the preprocessing."""
-        if not isinstance(x, torch.Tensor):
-            x = torch.as_tensor(x)
-        if x.ndim == 0:
-            x = torch.atleast_1d(x)
+        if np.ndim(x) == 0 or (isinstance(x, np.ndarray) and x.shape == ()):
+            x = np.atleast_1d(x)
 
         internal_name = param_name
         if preprocessing == "sqrt":
@@ -239,27 +222,27 @@ class SparseFASERCALDataset(Dataset):
 
         if standardize is not None:
             stats = self.metadata[internal_name]
-            to_t = lambda v: torch.as_tensor(v, dtype=x.dtype, device=x.device)
-            std = to_t(stats.get("std", 1.0))
-            zero_cmp = torch.isclose(std, to_t(0.0))
-            zero_std = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
             if standardize == "z-score":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x * to_t(stats["std"]) + to_t(stats["mean"])
+                # mean=0, std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x * stats["std"] + stats["mean"]
             elif standardize == "unit-var":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x * to_t(stats["std"])
+                # std=1
+                if stats["std"] == 0:
+                    raise ValueError(f"{internal_name}: std is zero in metadata")
+                x = x * stats["std"]
             else:
-                rng = to_t(stats["max"]) - to_t(stats["min"])
-                zero_cmp = torch.isclose(rng, to_t(0.0))
-                zero_rng = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
-                if zero_rng: raise ValueError(f"{internal_name}: max and min are equal in metadata")
-                x = x * rng + to_t(stats["min"])
+                # [0, 1] normalisation
+                rng = stats["max"] - stats["min"]
+                if rng == 0:
+                    raise ValueError(f"{param_name}: max and min are equal in metadata")
+                x = x * rng + stats["min"]
 
         if preprocessing == "sqrt":
             x = x ** 2
         elif preprocessing == "log":
-            x = torch.expm1(x)
+            x = np.expm1(x)
 
         return x
         
@@ -282,7 +265,6 @@ class SparseFASERCALDataset(Dataset):
         primlepton_labels = data['primlepton_labels']
         out_lepton_momentum = data['out_lepton_momentum']
         jet_momentum = data['jet_momentum']
-        tauvis_momentum = data['tauvis_momentum']
         charm = data['charm']
         global_feats = {
             'e_vis':             data['e_vis'],
@@ -303,9 +285,6 @@ class SparseFASERCALDataset(Dataset):
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
 
-        if is_cc and in_neutrino_pdg in [-16, 16]:  # nutau:
-            out_lepton_momentum = tauvis_momentum
-
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
             coords, modules, q, (primlepton_labels, seg_labels_raw), \
@@ -319,15 +298,18 @@ class SparseFASERCALDataset(Dataset):
             flavour_label = smooth_labels(
                 np.array([self.pdg2label(in_neutrino_pdg, is_cc)]),
                 smoothing=self.label_smoothing,
-                num_classes=3
+                num_classes=4
             )
-            is_cc = smooth_labels(np.array([float(is_cc)]), smoothing=self.label_smoothing)
             seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels, smoothing=self.label_smoothing)
         else:
             flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])
             seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels)
             if not is_cc:
                 out_lepton_momentum.fill(0)
+
+        # decompose momentum
+        out_lepton_magnitude, out_lepton_dir = self.decompose_momentum(out_lepton_momentum)
+        jet_magnitude, jet_dir = self.decompose_momentum(jet_momentum)
 
         return {
             'run_number': run_number,
@@ -337,7 +319,6 @@ class SparseFASERCALDataset(Dataset):
             'q': q,
             'seg_labels': seg_labels,
             'primlepton_labels': primlepton_labels,
-            'vis_sp_momentum': vis_sp_momentum,
             'out_lepton_momentum': out_lepton_momentum,
             'jet_momentum': jet_momentum,
             'global_feats': global_feats,
@@ -351,6 +332,101 @@ class SparseFASERCALDataset(Dataset):
             'in_neutrino_energy': in_neutrino_energy,
             'is_cc': is_cc,
         }
+
+
+    def _mixup_physical(self, event1, event2, alpha=0.8):
+        """
+        Performs mixup of two prepared events with weight alpha, handling overlapping voxels.
+        Follows some physical constraints.
+        Coordinates and module indices are concatenated; features and labels are mixed.
+        """
+        # Calculate primary-lepton charge fraction per module in event2
+        mod2_all = event2['modules']
+        q2_all = event2['q'].squeeze()
+        prim2 = event2['primlepton_labels'].squeeze()
+        mask2 = (prim2 == 0)
+        noprim_frac2 = q2_all[mask2].sum() / q2_all.sum()
+        noprim_frac2_mod = np.zeros(self.num_modules, dtype=np.float32)
+        for m in range(self.num_modules):
+            mask_m = (mod2_all == m)
+            total_q = q2_all[mask_m].sum()
+            noprim_q = q2_all[np.logical_and(mask_m, prim2 == 0)].sum()
+            noprim_frac2_mod[m] = noprim_q / total_q if total_q > 0 else 0.0
+            
+        # event2: drop primary-lepton hits
+        coords2 = event2['coords'][mask2]
+        modules2 = event2['modules'][mask2]
+        q2_raw = event2['q'][mask2]
+        seg2_raw = event2['seg_labels'][mask2]
+
+        # event1
+        prim1 = event1['primlepton_labels'].squeeze()
+        coords1 = event1['coords']
+        modules1 = event1['modules']
+        q1_raw = event1['q']
+        seg1_raw = event1['seg_labels']
+
+        # weight features and labels: event1=alpha, event2=1-alpha
+        q1 = q1_raw * alpha
+        q2 = q2_raw * (1.0 - alpha)
+        seg1 = seg1_raw * alpha
+        seg2 = seg2_raw * (1.0 - alpha)
+
+        # concatenate all voxel-level arrays
+        coords = np.concatenate([coords1, coords2], axis=0)
+        modules = np.concatenate([modules1, modules2], axis=0)
+        q = np.concatenate([q1, q2], axis=0)
+        seg = np.concatenate([seg1, seg2], axis=0)
+        
+        # deduplicate overlapping voxels: aggregate q and seg
+        keys = np.concatenate([coords, modules.reshape(-1,1)], axis=1)
+        unique_keys, inv = np.unique(keys, axis=0, return_inverse=True)
+        new_coords = unique_keys[:, :3]
+        new_modules = unique_keys[:, 3].astype(int)
+        new_q = np.zeros((unique_keys.shape[0], q.shape[1]), dtype=q.dtype)
+        new_seg = np.zeros((unique_keys.shape[0], seg.shape[1]), dtype=seg.dtype)
+        for i in range(q.shape[1]):
+            new_q[:, i] = np.bincount(inv, weights=q[:, i], minlength=unique_keys.shape[0])
+        for j in range(seg.shape[1]):
+            new_seg[:, j] = np.bincount(inv, weights=seg[:, j], minlength=unique_keys.shape[0])
+        coords, modules, q, seg = new_coords, new_modules, new_q, new_seg
+
+        # mix global features (only related to FASERCal, keep the rest as for event 1)
+        gf1, gf2 = event1['global_feats'], event2['global_feats']
+        mixed_gf = {}        
+        mixed_gf['faser_cal_modules'] = gf1['faser_cal_modules'] * alpha + gf2['faser_cal_modules'] * (1.-alpha) * noprim_frac2_mod
+        mixed_gf['rear_cal_modules']  = gf1['rear_cal_modules']  * alpha
+        mixed_gf['rear_hcal_modules'] = gf1['rear_hcal_modules'] * alpha
+        mixed_gf['faser_cal_energy']  = gf1['faser_cal_energy']  * alpha + gf2['faser_cal_energy']  * (1.-alpha) * noprim_frac2
+        mixed_gf['rear_cal_energy']   = gf1['rear_cal_energy']   * alpha
+        mixed_gf['rear_hcal_energy']  = gf1['rear_hcal_energy']  * alpha
+        mixed_gf['rear_mucal_energy'] = gf1['rear_mucal_energy'] * alpha
+        
+        # mix scalars
+        mixed_flav    = event1['flavour_label']                 # flavour from event1 only
+        mixed_lep_mom = event1['out_lepton_momentum'] * alpha   # prim leptom from event1 only
+        mixed_jet     = event1['jet_momentum']        * alpha + event2['jet_momentum']    * (1.-alpha)
+        mixed_vis_sp  = event1['vis_sp_momentum']     * alpha + event2['vis_sp_momentum'] * (1.-alpha)
+        mixed_charm   = event1['charm']               * alpha + event2['charm']           * (1.-alpha)
+        mixed_evis    = event1['e_vis']               * alpha + event2['e_vis']           * (1.-alpha) * noprim_frac2
+
+        # Filter out voxels outside the detector
+        coords, q, seg = self.within_limits(coords, feats=q, labels=seg, voxelised=True)
+        
+        mixed_event = {
+            'coords': coords,
+            'modules': modules,
+            'q': q,
+            'seg_labels': seg,
+            'global_feats': mixed_gf,
+            'flavour_label': mixed_flav,
+            'out_lepton_momentum': mixed_lep_mom,
+            'jet_momentum': mixed_jet,
+            'vis_sp_momentum': mixed_vis_sp,
+            'charm': mixed_charm,
+            'e_vis': mixed_evis,
+        }
+        return mixed_event
 
 
     def _mixup(self, event1, event2, alpha=0.8):
@@ -406,13 +482,12 @@ class SparseFASERCALDataset(Dataset):
             mixed_gf[key] = gf1[key]*lam_mix + gf2[key]*(1-lam_mix)
         
         # mix scalars
-        mixed_vis_sp     = event1['vis_sp_momentum']     * lam_mix + event2['vis_sp_momentum']     * (1-lam_mix)
-        mixed_e_vis      = event1['e_vis']               * lam_mix + event2['e_vis']               * (1-lam_mix)
-        mixed_flavour    = event1['flavour_label']       * lam_mix + event2['flavour_label']       * (1-lam_mix)
-        mixed_charm      = event1['charm']               * lam_mix + event2['charm']               * (1-lam_mix)
-        mixed_vis_sp_mom = event1['vis_sp_momentum']     * lam_mix + event2['vis_sp_momentum']     * (1-lam_mix)
-        mixed_lep_mom    = event1['out_lepton_momentum'] * lam_mix + event2['out_lepton_momentum'] * (1-lam_mix)
-        mixed_jet        = event1['jet_momentum']        * lam_mix + event2['jet_momentum']        * (1-lam_mix)
+        mixed_vis_sp  = event1['vis_sp_momentum']     * lam_mix + event2['vis_sp_momentum']     * (1-lam_mix)
+        mixed_e_vis   = event1['e_vis']               * lam_mix + event2['e_vis']               * (1-lam_mix)
+        mixed_flavour = event1['flavour_label']       * lam_mix + event2['flavour_label']       * (1-lam_mix)
+        mixed_charm   = event1['charm']               * lam_mix + event2['charm']               * (1-lam_mix)
+        mixed_lep_mom = event1['out_lepton_momentum'] * lam_mix + event2['out_lepton_momentum'] * (1-lam_mix)
+        mixed_jet     = event1['jet_momentum']        * lam_mix + event2['jet_momentum']        * (1-lam_mix)
 
         # Filter out voxels outside the detector
         coords, q, seg = self.within_limits(coords, feats=q, labels=seg, voxelised=True)
@@ -424,7 +499,6 @@ class SparseFASERCALDataset(Dataset):
             'seg_labels': seg,
             'global_feats': mixed_gf,
             'flavour_label': mixed_flavour,
-            'vis_sp_momentum': mixed_vis_sp_mom,
             'out_lepton_momentum': mixed_lep_mom,
             'jet_momentum': mixed_jet,
             'vis_sp_momentum': mixed_vis_sp,
@@ -443,7 +517,11 @@ class SparseFASERCALDataset(Dataset):
         event_hits = self.preprocess(
             len(event['q']), 'event_hits', self.preprocessing_input, self.standardize_input
         )
-        feats_global = torch.cat([
+        module_hits = np.bincount(event['modules'].astype(int), minlength=self.num_modules)
+        module_hits = self.preprocess(
+            module_hits, 'module_hits', self.preprocessing_input, self.standardize_input
+        )
+        feats_global = np.concatenate([
             event_hits,
             self.preprocess(event['global_feats']['faser_cal_energy'], 'faser_cal_energy', self.preprocessing_input, self.standardize_input),
             self.preprocess(event['global_feats']['rear_cal_energy'], 'rear_cal_energy', self.preprocessing_input, self.standardize_input),
@@ -454,35 +532,26 @@ class SparseFASERCALDataset(Dataset):
         rear_cal_mod = self.preprocess(event['global_feats']['rear_cal_modules'], 'rear_cal_modules', self.preprocessing_input, self.standardize_input)
         rear_hcal_mod = self.preprocess(event['global_feats']['rear_hcal_modules'], 'rear_hcal_modules', self.preprocessing_input, self.standardize_input)
 
-        vis_sp_momentum = event['vis_sp_momentum']
-        out_lepton_momentum = event['out_lepton_momentum']
-        jet_momentum = event['jet_momentum']
-
         # Decompose momentum
-        vis_magnitude, vis_dir = self.decompose_momentum(vis_sp_momentum)
-        out_lepton_magnitude, out_lepton_dir = self.decompose_momentum(out_lepton_momentum)
-        jet_magnitude, jet_dir = self.decompose_momentum(jet_momentum)
+        out_lepton_magnitude, out_lepton_dir = self.decompose_momentum(event['out_lepton_momentum'])
+        jet_magnitude, jet_dir = self.decompose_momentum(event['jet_momentum'])
 
         # Preprocess outputs
-        #pt_miss = torch.tensor([np.sqrt(event['vis_sp_momentum'][0]**2 + event['vis_sp_momentum'][1]**2)])
-        #pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output, self.standardize_output)
-        #e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output, self.standardize_output)
-        vis_sp_momentum = self.preprocess(vis_sp_momentum, 'vis_sp_momentum')
-        out_lepton_momentum = self.preprocess(out_lepton_momentum, 'out_lepton_momentum')
-        jet_momentum = self.preprocess(jet_momentum, 'jet_momentum')
-        #vis_mag = self.preprocess(vis_magnitude, 'vis_sp_momentum_magnitude', self.preprocessing_output, self.standardize_output)
-        #out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output, self.standardize_output)
-        #jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+        pt_miss = np.sqrt(event['vis_sp_momentum'][0]**2 + event['vis_sp_momentum'][1]**2)
+        pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output, self.standardize_output)
+        e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output, self.standardize_output)
+        out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+        jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output, self.standardize_output)
 
         # Assemble output
         output = {
             'coords': torch.from_numpy(event['coords']).float(),
             'modules': torch.from_numpy(event['modules']).long(),
-            'feats': feats.float(),
-            'feats_global': feats_global.float(),
-            'faser_cal_modules': faser_mod.float(),
-            'rear_cal_modules': rear_cal_mod.float(),
-            'rear_hcal_modules': rear_hcal_mod.float(),
+            'feats': torch.from_numpy(feats).float(),
+            'feats_global': torch.from_numpy(feats_global).float(),
+            'faser_cal_modules': torch.from_numpy(faser_mod).float(),
+            'rear_cal_modules': torch.from_numpy(rear_cal_mod).float(),
+            'rear_hcal_modules': torch.from_numpy(rear_hcal_mod).float(),
             'flavour_label': torch.from_numpy(event['flavour_label']),
         }
         if self.stage1:
@@ -490,18 +559,12 @@ class SparseFASERCALDataset(Dataset):
         if not self.train or not self.stage1:
             output.update({
                 'charm': torch.from_numpy(np.atleast_1d(event['charm'])).float(),
-                #'e_vis': e_vis.float(),
-                #'pt_miss': pt_miss.float(),
-                'vis_sp_momentum': vis_sp_momentum.float(),
-                #'vis_sp_momentum_mag': vis_mag.float(),
-                #'vis_sp_momentum_dir': vis_dir.float(),
-                'out_lepton_momentum': out_lepton_momentum.float(),
-                #'out_lepton_momentum_mag': out_mag.float(),
-                #'out_lepton_momentum_dir': out_lepton_dir.float(),
-                'jet_momentum': jet_momentum.float(),
-                #'jet_momentum_mag': jet_mag.float(),
-                #'jet_momentum_dir': jet_dir.float(),
-                'is_cc': torch.tensor(event['is_cc']).reshape(1,).float(),
+                'e_vis': torch.from_numpy(np.atleast_1d(e_vis)).float(),
+                'pt_miss': torch.from_numpy(np.atleast_1d(pt_miss)).float(),
+                'out_lepton_momentum_mag': torch.from_numpy(np.atleast_1d(out_mag)).float(),
+                'out_lepton_momentum_dir': torch.from_numpy(out_lepton_dir).float(),
+                'jet_momentum_mag': torch.from_numpy(np.atleast_1d(jet_mag)).float(),
+                'jet_momentum_dir': torch.from_numpy(jet_dir).float(),
             })
         if not self.train:
             output.update({
@@ -509,6 +572,7 @@ class SparseFASERCALDataset(Dataset):
                 'event_id': event['event_id'],
                 'in_neutrino_pdg': event['in_neutrino_pdg'],
                 'in_neutrino_energy': event['in_neutrino_energy'],
+                'is_cc': event['is_cc'],
             })
         return output
         

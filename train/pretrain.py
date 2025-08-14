@@ -74,7 +74,9 @@ def main():
     print(f"eff. batch size   = {args.batch_size * denom}")
 
     # Initialise the model
-    model = args.model()
+    model = args.model(
+        drop_rate = args.dropout,
+    )
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))

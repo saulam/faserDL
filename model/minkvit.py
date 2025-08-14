@@ -22,6 +22,50 @@ from MinkowskiEngine import (
 from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
 
 
+class CylindricalHeadNormalized(nn.Module):
+    """
+    pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)   (>=0)
+    pz:  uZ = mu_uZ + sigma_uZ*zz,  pz = k_Z * expm1(uZ)   (>=0)
+    phi: via normalised (cos_phi, sin_phi)
+    """
+    def __init__(self, k_T, mu_uT, sigma_uT, k_Z, mu_uZ, sigma_uZ, hidden=128):
+        super().__init__()
+        self.k_T, self.mu_uT, self.sigma_uT = float(k_T), float(mu_uT), float(max(sigma_uT,1e-8))
+        self.k_Z, self.mu_uZ, self.sigma_uZ = float(k_Z), float(mu_uZ), float(max(sigma_uZ,1e-8))
+        self.mlp = nn.Linear(hidden, 4)
+
+    def forward(self, x, eps=1e-8):
+        zT, a, b, zz = self.mlp(x).unbind(-1)
+
+        # angle
+        norm = torch.sqrt(a*a + b*b + eps)
+        cos_phi = a / norm
+        sin_phi = b / norm
+
+        # pT via log1p/expm1
+        uT = self.mu_uT + self.sigma_uT * zT
+        pT = self.k_T * torch.expm1(uT)
+        pT = torch.clamp(pT, min=0.0)
+
+        # pz via log1p/expm1
+        uZ = self.mu_uZ + self.sigma_uZ * zz
+        pz = self.k_Z * torch.expm1(uZ)
+        pz = torch.clamp(pz, min=0.0)
+
+        px, py = pT * cos_phi, pT * sin_phi
+        p_cart = torch.stack([px, py, pz], dim=-1)
+        latents = torch.stack([zT, zz], dim=-1)
+
+        return {
+            "p_cart": p_cart,   # (B,3)
+            "pT": pT,
+            "cos_phi": cos_phi,
+            "sin_phi": sin_phi,
+            "pz": pz,
+            "latents": latents
+        }
+
+
 class MinkViT(vit.VisionTransformer):
     """ 
     Vision Transformer with MinkowskiEngine patching 
@@ -34,10 +78,12 @@ class MinkViT(vit.VisionTransformer):
         encoder_dims=[192, 256, 384],
         kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
         global_pool=False,
+        metadata=None,
         **kwargs
     ):
         super(MinkViT, self).__init__(**kwargs)
         
+        self.metadata = metadata
         norm_layer = kwargs['norm_layer']
         in_chans = kwargs['in_chans']
         drop_rate = kwargs['drop_rate']
@@ -87,21 +133,20 @@ class MinkViT(vit.VisionTransformer):
             del self.norm  # remove the original norm
 
         self.head_channels = {
-            "flavour": 4,
+            "iscc": 1,
+            "flavour": 3,
             "charm": 1,
-            "e_vis": 1,
-            "pt_miss": 1,
-            "lepton_momentum_mag": 1,
-            "lepton_momentum_dir": 3,
-            "jet_momentum_mag": 1,
-            "jet_momentum_dir": 3,
+            "vis": 3,
+            "lep": 3,
         }
         self.heads = nn.ModuleDict()
         for name in self.head_channels.keys():
             self.heads[name] = nn.Sequential(
                 norm_layer(embed_dim),
                 nn.Dropout(drop_rate),
-                nn.Linear(embed_dim, self.head_channels[name])
+                nn.Linear(embed_dim, self.head_channels[name]) 
+                if name not in metadata 
+                else self.make_head_from_stats(metadata[name], hidden=embed_dim)
             )
             
         self.initialize_weights()
@@ -121,11 +166,19 @@ class MinkViT(vit.VisionTransformer):
         # init heads
         for name in self.head_channels.keys():
             lin = self.heads[name][2]
-            trunc_normal_(lin.weight, std=2e-5)
-            if lin.bias is not None:
-                nn.init.constant_(lin.bias, 0)
+            if name in self.metadata:
+                # if head is a CylindricalHeadNormalized
+                lin = lin.mlp
+                trunc_normal_(lin.weight, std=2e-5)
+                if lin.bias is not None:
+                    with torch.no_grad():
+                        lin.bias.copy_(torch.tensor([0., 0., 0., 0.], dtype=torch.float))
+            else:
+                trunc_normal_(lin.weight, std=2e-5)
+                if lin.bias is not None:
+                    nn.init.constant_(lin.bias, 0)
 
-    
+
     def _init_weights(self, m):
         if isinstance(m, MinkowskiConvolution):
             # initialize conv like nn.Linear
@@ -141,6 +194,22 @@ class MinkViT(vit.VisionTransformer):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
             
+
+    def make_head_from_stats(self, stats_entry, hidden=128):
+        """
+        stats_entry: a dict like stats['vis'] or stats['lep']
+                    with keys: mu_logpT, sigma_logpT, mu_pz, sigma_pz, eps_T
+        """
+        return CylindricalHeadNormalized(
+            k_T=stats_entry["k_T"],
+            mu_uT=stats_entry["mu_uT"],
+            sigma_uT=stats_entry["sigma_uT"],
+            k_Z=stats_entry["k_Z"],
+            mu_uZ=stats_entry["mu_uZ"],
+            sigma_uZ=stats_entry["sigma_uZ"],
+            hidden=hidden,
+        )
+    
     
     def group_patches_by_event(
         self,
@@ -221,12 +290,7 @@ class MinkViT(vit.VisionTransformer):
         outputs = {}
         for i, (name, head) in enumerate(self.heads.items()):
             output = head(x)
-            if name == "flavour" or name == "charm":
-                outputs[f"out_{name}"] = output
-            elif "_dir" in name:
-                outputs[f"out_{name}"] = F.normalize(output, dim=-1)
-            else:
-                outputs[f"out_{name}"] = F.softplus(output)
+            outputs[f"out_{name}"] = output
         return outputs
         
         

@@ -55,7 +55,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
     val_set.data_files = extract_files(val_split.indices)
     test_set.data_files = extract_files(test_split.indices)
 
-    if args.train and args.augmentations_enabled and not args.stage1:
+    if args.train and args.augmentations_enabled and not args.stage1 and args.mixup_alpha > 0:
         train_set.calc_primary_vertices()
 
     train_set.augmentations_enabled = args.augmentations_enabled
@@ -109,14 +109,16 @@ def collate_test(batch):
     optional_keys = [
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
-        'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
+        'charm', 'e_vis', 'pt_miss', 
+        'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
+        'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir', 
+        'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
     ]
     
     for key in optional_keys:
         if key in batch[0]:
             ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'flavour_label', 'charm']
-                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
+                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'vis_sp_momentum_mag', 'out_lepton_momentum_mag', 'jet_momentum_mag']
                         else [d[key] for d in batch])
     
     return ret
@@ -142,14 +144,16 @@ def collate_sparse_minkowski(batch):
     
     optional_keys = {
         'primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm',
-        'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
-        'jet_momentum_mag', 'jet_momentum_dir',
+        'e_vis', 'pt_miss', 'vis_sp_momentum', 'out_lepton_momentum',
+        'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
+        'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir', 
+        'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
     }
     
     for key in optional_keys:
         if key in batch[0]:
-            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
-                        else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_dir', 'jet_momentum_dir']
+            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'vis_sp_momentum_mag', 'out_lepton_momentum_mag', 'jet_momentum_mag']
+                        else torch.stack([d[key] for d in batch]) if key in ['vis_sp_momentum', 'out_lepton_momentum', 'jet_momentum', 'vis_sp_momentum_dir', 'out_lepton_momentum_dir', 'jet_momentum_dir']
                         else [d[key] for d in batch])
     
     return ret
@@ -174,8 +178,10 @@ def arrange_truth(data):
     optional_keys = [
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
-        'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
+        'charm', 'e_vis', 'pt_miss', 
+        'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
+        'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
+        'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
     ]
     
     for key in optional_keys:
