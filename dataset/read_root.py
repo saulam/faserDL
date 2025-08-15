@@ -22,19 +22,11 @@ path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
 true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
 reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
 output_dir = '/scratch/salonso/sparse-nns/faser/events_v{}2'.format(version_reco)
-charm_path = "/scratch2/salonso/faser/FASERCALDATA_v{}/charm_events.json".format(version)
 #path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau/".format(version)
 #true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau/*".format(version))
 #reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau/*".format(version))
 #output_dir = '/scratch2/salonso/faser/events_v{}_tau'.format(version_reco)
-#charm_path = None
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
-
-if charm_path is not None:
-    with open(charm_path, 'r') as file:
-        charm_events = json.load(file)
-else:
-    charm_events = None
 
 # Placeholder for class objects
 tcal_event = ROOT.TcalEvent()
@@ -138,57 +130,63 @@ def get_tracks(tktracks):
         })
     return tracks
 
-def contains_primary_lepton(hits, lepton_pdg, is_cc):
-    """
-    Checks if a primary lepton is present in the hit data (satisfies the following conditions):
-        - ftrackID equals fprimaryID.
-        - fparentID equals 0.
-        - fPDG is equal to the PDG of the primary lepton.
-    """
-    if not is_cc:
-        return False
-    
-    condition = (hits[:, TRACK_ID] == hits[:, PRIMARY_ID]) & (hits[:, PARENT_ID] == 0) & (np.isin(hits[:, PDG], lepton_pdg))
-    return np.any(condition)
-
 def process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc):
     """
-    Process a list of labels into binary classification arrays:
-        - seg_labels: A (num_hits, 3) numpy array where each row represents:
-            - Column 0: Ghost label (1 if ghost, 0 if not)
-            - Column 1: Sum of energy depositions for muonic + electromagnetic components
-            - Column 2: Sum of energy depositions for hadronic components
-    
-        - primlepton_labels: A (num_hits, 1) numpy array where each element is:
-            - 1 if the voxel belongs to the primary lepton, 0 otherwise
+    Returns:
+        seg_labels: (num_hits, 4) array:
+            [:,0] -> Ghost label (1 if ghost, 0 otherwise)
+            [:,1] -> (muonic + electromagnetic) E_dep, with any primary-lepton E subtracted
+            [:,2] -> hadronic E_dep, with any primary-lepton E subtracted
+            [:,3] -> primary-lepton E_dep (energy from hits that satisfy primary-lepton criteria)
     """
     num_hits = len(reco_hits_true)
-    seg_labels = np.zeros((num_hits, 3))
-    primlepton_labels = np.zeros((num_hits,))
+    seg_labels = np.zeros((num_hits, 4), dtype=np.float32)
 
     for i, reco_hit_true in enumerate(reco_hits_true):
+        # Ghost voxel
         if reco_hit_true[0] == -1:
-            # Assign ghost label
-            seg_labels[i] = [1, 0, 0]
-            primlepton_labels[i] = 0
+            seg_labels[i] = [1.0, 0.0, 0.0, 0.0]
             continue
 
         try:
             matched_hits = true_hits[reco_hit_true]
-        except:
-            assert False, "Not true information found for reco hits."
+        except Exception:
+            assert False, "No true information found for reco hits."
             
-        all_pdgs = matched_hits[:, PDG]
-        
-        # Compute energy depositions
-        m_edepo = matched_hits[np.isin(all_pdgs, MUONIC_PDGS), ENERGY].sum()
-        e_edepo = matched_hits[np.isin(all_pdgs, ELECTROMAGNETIC_PDGS), ENERGY].sum()
-        h_edepo = matched_hits[~np.isin(all_pdgs, list(MUONIC_PDGS) + list(ELECTROMAGNETIC_PDGS)), ENERGY].sum()
-        
-        primlepton_labels[i] = contains_primary_lepton(matched_hits, out_lepton_pdg, is_cc)
-        seg_labels[i] = [0, m_edepo + e_edepo, h_edepo]
+        pdgs = matched_hits[:, PDG]
+        energies = matched_hits[:, ENERGY]
+
+        # Base masks
+        mu_mask  = np.isin(pdgs, MUONIC_PDGS)
+        em_mask  = np.isin(pdgs, ELECTROMAGNETIC_PDGS)
+        muem_mask = mu_mask | em_mask
+        had_mask = ~(muem_mask)
+
+        # Primary-lepton mask (only if CC)
+        if is_cc:
+            primary_mask = (
+                (matched_hits[:, TRACK_ID] == matched_hits[:, PRIMARY_ID]) &
+                (matched_hits[:, PARENT_ID] == 0) &
+                np.isin(pdgs, out_lepton_pdg)
+            )
+        else:
+            primary_mask = np.zeros_like(pdgs, dtype=bool)
+
+        # Raw sums
+        muem_sum = energies[muem_mask].sum() if np.any(muem_mask) else 0.0
+        had_sum  = energies[had_mask].sum() if np.any(had_mask)  else 0.0
+        prim_sum = energies[primary_mask].sum() if np.any(primary_mask) else 0.0
+
+        # Subtract the primary-lepton energy from the matching buckets
+        muem_primary = energies[muem_mask & primary_mask].sum() if np.any(muem_mask & primary_mask) else 0.0
+        had_primary  = energies[had_mask  & primary_mask].sum() if np.any(had_mask  & primary_mask) else 0.0
+        muem_sum -= muem_primary
+        had_sum  -= had_primary
+
+        # [ghost_flag, mu+em (minus prim), had (minus prim), prim]
+        seg_labels[i] = [0.0, muem_sum, had_sum, prim_sum]
     
-    return np.expand_dims(primlepton_labels, axis=1), seg_labels
+    return seg_labels
 
 def divide_list_into_chunks(input_list, num_chunks=1):
     """
@@ -246,7 +244,7 @@ def generate_events(number, chunks, disable):
             geom_detector = tporeco_event.geom_detector
             
             run_number, event_id = po_event.run_number, po_event.event_id
-            charm = event_id in charm_events if charm_events is not None else -1
+            charm = po_event.isCharmed()
             primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             is_cc = bool(po_event.isCC)
             e_vis = po_event.Evis
@@ -307,7 +305,7 @@ def generate_events(number, chunks, disable):
                 print("Skipping event {} with {} hits".format(event_id, reco_hits.shape[0]))
                 continue
 
-            primlepton_labels, seg_labels = process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc)
+            seg_labels = process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc)
             
             # Save event data
             np.savez_compressed(
@@ -344,7 +342,6 @@ def generate_events(number, chunks, disable):
                 faser_cal_energy=faser_cal_energy,
                 faser_cal_modules=faser_cal_modules,
                 rear_mucal_energy=rear_mucal_energy,
-                primlepton_labels=primlepton_labels,
                 seg_labels=seg_labels,
             )
 
@@ -366,4 +363,3 @@ if __name__ == "__main__":
   
     generate_events(number, chunks, disable)
     print("{}/{} Done!".format(number, chunks))
-

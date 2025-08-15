@@ -122,10 +122,9 @@ class SparseFASERCALDataset(Dataset):
         return coords_filtered, feats_filtered, labels_filtered
 
     
-    def normalise_seg_labels(self, seg_labels, primlepton_labels, smoothing=0.0, eps=1e-8):
+    def normalise_seg_labels(self, seg_labels, smoothing=0.0, eps=1e-8):
         """
-        Normalizes segmentation labels and combines them into a final format.
-        [ghost, em, had] -> [ghost, em_norm, had_norm, primlepton]
+        Normalises segmentation labels and combines them into a final format.
         """
         labels = seg_labels.copy().astype(np.float32)
         sum_vals = np.sum(labels[:, 1:], axis=1, keepdims=True)
@@ -133,18 +132,11 @@ class SparseFASERCALDataset(Dataset):
         
         # Normalize EM and Hadronic components to sum to (1 - ghost_fraction)
         labels[mask, 1:] = (1 - labels[mask, :1]) * (labels[mask, 1:] / sum_vals[mask])
-        
-        prim = primlepton_labels.reshape(-1, 1).astype(labels.dtype)
-        result = np.concatenate([labels, prim], axis=1)
-        
-        # Zero out other components if it's a primary lepton
-        prim_mask = prim.squeeze() == 1
-        result[prim_mask, :3] = 0.0
 
         if smoothing > 0:
-            return smooth_labels(result, smoothing=smoothing)
+            return smooth_labels(labels, smoothing=smoothing)
         
-        return result
+        return labels
 
     
     def pdg2label(self, pdg, iscc):
@@ -279,7 +271,6 @@ class SparseFASERCALDataset(Dataset):
         in_neutrino_energy = data['in_neutrino_energy']
         vis_sp_momentum = data['vis_sp_momentum']
         seg_labels_raw = data['seg_labels']
-        primlepton_labels = data['primlepton_labels']
         out_lepton_momentum = data['out_lepton_momentum']
         jet_momentum = data['jet_momentum']
         tauvis_momentum = data['tauvis_momentum']
@@ -308,10 +299,10 @@ class SparseFASERCALDataset(Dataset):
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
-            coords, modules, q, (primlepton_labels, seg_labels_raw), \
+            coords, modules, q, (seg_labels_raw,), \
             (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
             global_feats, _, transformations = augment(
-                coords, modules, q, (primlepton_labels, seg_labels_raw),
+                coords, modules, q, (seg_labels_raw,),
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
                 global_feats, primary_vertex, self.metadata, transformations
             )
@@ -322,10 +313,10 @@ class SparseFASERCALDataset(Dataset):
                 num_classes=3
             )
             is_cc = smooth_labels(np.array([float(is_cc)]), smoothing=self.label_smoothing)
-            seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels, smoothing=self.label_smoothing)
+            seg_labels = self.normalise_seg_labels(seg_labels_raw, smoothing=self.label_smoothing)
         else:
             flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])
-            seg_labels = self.normalise_seg_labels(seg_labels_raw, primlepton_labels)
+            seg_labels = self.normalise_seg_labels(seg_labels_raw)
             if not is_cc:
                 out_lepton_momentum.fill(0)
 
@@ -336,7 +327,6 @@ class SparseFASERCALDataset(Dataset):
             'modules': modules,
             'q': q,
             'seg_labels': seg_labels,
-            'primlepton_labels': primlepton_labels,
             'vis_sp_momentum': vis_sp_momentum,
             'out_lepton_momentum': out_lepton_momentum,
             'jet_momentum': jet_momentum,

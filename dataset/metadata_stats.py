@@ -386,7 +386,7 @@ class SparseFASERCALDataset(Dataset):
                 "event_hits": event_hits,
                }
 
-dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v5.1b")
+dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v5.1b2")
 
 def collate(batch):
     pdg = np.unique(np.concatenate([x['pdg'] for x in batch]))
