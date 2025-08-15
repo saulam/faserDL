@@ -4,6 +4,7 @@ log*/
 tb_logs/
 lightning_logs/
 core
+.vscode*
 out*
 notebook*
 checkpoint*/
