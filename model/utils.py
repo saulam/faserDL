@@ -282,8 +282,119 @@ class GlobalFeatureEncoder(nn.Module):
         # Combine
         global_embed = fcal_feat + ecal_feat + hcal_feat + scalars_feat
         return self.dropout(global_embed)
+    
+
+class SeparableDCT3D(nn.Module):
+    def __init__(self, patch_size, Kxyz):
+        super().__init__()
+        p_h, p_w, p_d = patch_size
+        Kx, Ky, Kz = Kxyz
+        def dct_1d(L, K, device=None, dtype=None):
+            x = torch.arange(L, dtype=torch.float32, device=device).unsqueeze(1)  # [L,1]
+            k = torch.arange(K, dtype=torch.float32, device=device).unsqueeze(0)  # [1,K]
+            M = torch.cos(torch.pi * (x + 0.5) * k / L)
+            M[:, 0] /= torch.sqrt(torch.tensor(L, dtype=M.dtype, device=M.device))
+            if K > 1:
+                scale = torch.sqrt(torch.tensor(2.0 / L, dtype=M.dtype, device=M.device))
+                M[:, 1:] *= scale
+            return M
+        self.register_buffer('Bx', dct_1d(p_h, Kx))  # [p_h, Kx]
+        self.register_buffer('By', dct_1d(p_w, Ky))  # [p_w, Ky]
+        self.register_buffer('Bz', dct_1d(p_d, Kz))  # [p_d, Kz]
+        self.Kx, self.Ky, self.Kz = Kx, Ky, Kz
+        self.P = p_h * p_w * p_d
+        self.patch_size = (p_h, p_w, p_d)
+
+    @property
+    def K_total(self):
+        return self.Kx * self.Ky * self.Kz
+
+    def expand(self, coeff):  # coeff: [N, H, Kx, Ky, Kz]
+        t = torch.einsum('nhkyz,ik->nhiyz', coeff, self.Bx)  # [N,H,p_h,Ky,Kz]
+        t = torch.einsum('nhiyz,jy->nhijz', t, self.By)      # [N,H,p_h,p_w,Kz]
+        t = torch.einsum('nhijz,kz->nhijk', t, self.Bz)      # [N,H,p_h,p_w,p_d]
+        return t.reshape(t.size(0), t.size(1), -1)           # [N,H,P]
 
 
+class SharedLatentVoxelHead(nn.Module):
+    """
+    One projection -> H×(Kx*Ky*Kz) coeffs
+    Expand once to V ∈ R^{P×H}
+    Then tiny 1x1 'convs' (linear) produce occ/cls/reg.
+    """
+    def __init__(self, in_dim, basis: SeparableDCT3D,
+                 H=16, out_ch_reg=1, out_ch_cls=4, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.basis = basis
+        self.H = H
+        self.norm = norm_layer(in_dim)
+        self.proj = nn.Linear(in_dim, H * basis.K_total)
+
+        # 1x1 "convs" from latent H to outputs at each voxel
+        self.to_occ = nn.Linear(H, 1)
+        self.to_reg = nn.Linear(H, out_ch_reg)
+        self.to_cls = nn.Linear(H, out_ch_cls)
+
+    def forward(self, token_emb):  # [N_tokens, D]
+        x = self.norm(token_emb)
+        coef = self.proj(x)                     # [N, H*Ktot]
+        N = coef.size(0)
+        coef = coef.view(N, self.H,
+                         self.basis.Kx, self.basis.Ky, self.basis.Kz)
+        V = self.basis.expand(coef)             # [N, H, P]
+
+        # per-voxel linear maps (vectorized)
+        Vt = V.transpose(1, 2)                  # [N, P, H]
+        occ = self.to_occ(Vt).squeeze(-1)       # [N, P]
+        reg = self.to_reg(Vt)                   # [N, P, out_ch_reg]
+        cls = self.to_cls(Vt)                   # [N, P, out_ch_cls]
+        return occ, reg, cls
+
+
+class CylindricalHeadNormalized(nn.Module):
+    """
+    pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)   (>=0)
+    pz:  uZ = mu_uZ + sigma_uZ*zz,  pz = k_Z * expm1(uZ)   (>=0)
+    phi: via normalised (cos_phi, sin_phi)
+    """
+    def __init__(self, k_T, mu_uT, sigma_uT, k_Z, mu_uZ, sigma_uZ, hidden=128):
+        super().__init__()
+        self.k_T, self.mu_uT, self.sigma_uT = float(k_T), float(mu_uT), float(max(sigma_uT,1e-8))
+        self.k_Z, self.mu_uZ, self.sigma_uZ = float(k_Z), float(mu_uZ), float(max(sigma_uZ,1e-8))
+        self.mlp = nn.Linear(hidden, 4)
+
+    def forward(self, x, eps=1e-8):
+        zT, a, b, zz = self.mlp(x).unbind(-1)
+
+        # angle
+        norm = torch.sqrt(a*a + b*b + eps)
+        cos_phi = a / norm
+        sin_phi = b / norm
+
+        # pT via log1p/expm1
+        uT = self.mu_uT + self.sigma_uT * zT
+        pT = self.k_T * torch.expm1(uT)
+        pT = torch.clamp(pT, min=0.0)
+
+        # pz via log1p/expm1
+        uZ = self.mu_uZ + self.sigma_uZ * zz
+        pz = self.k_Z * torch.expm1(uZ)
+        pz = torch.clamp(pz, min=0.0)
+
+        px, py = pT * cos_phi, pT * sin_phi
+        p_cart = torch.stack([px, py, pz], dim=-1)
+        latents = torch.stack([zT, zz], dim=-1)
+
+        return {
+            "p_cart": p_cart,   # (B,3)
+            "pT": pT,
+            "cos_phi": cos_phi,
+            "sin_phi": sin_phi,
+            "pz": pz,
+            "latents": latents
+        }
+    
+    
 class MinkowskiLayerNorm(nn.Module):
     """ Channel-wise layer normalization for sparse tensors.
     """

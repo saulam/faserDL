@@ -23,7 +23,6 @@ class ViTFineTuner(pl.LightningModule):
         super(ViTFineTuner, self).__init__()
         self.model = model
         self.preprocessing_output = args.preprocessing_output
-        self.standardize_output = args.standardize_output
         stats = model.metadata
 
         def get_or(d: dict, key: str, default: Any) -> Any:

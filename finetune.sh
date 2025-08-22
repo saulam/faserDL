@@ -1,57 +1,52 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b2"
-extra_dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b_tau2"
-metadata_path="/scratch/salonso/sparse-nns/faser/events_v5.1b2/metadata_stats.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1*"
+extra_dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b_tau_train"
+metadata_path="/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata_stats.pkl"
 model="base"
 eps=1e-12
 batch_size=512
 mixup_alpha=0.0
-preprocessing_input="sqrt"
-standardize_input="z-score"
+preprocessing_input="log"
 preprocessing_output="log"
-standardize_output="z-score"
-label_smoothing=0.1
+label_smoothing=0.0
 dropout=0.0
 drop_path_rate=0.1
-epochs=100
+epochs=50
 num_workers=16
 blr=1e-3
 layer_decay=0.75
 accum_grad_batches=1
 warmup_steps=5
-cosine_annealing_steps=95
+cosine_annealing_steps=45
 weight_decay=0.05
 beta1=0.9
 beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_dlnu_sqrt_new_v4"
+name="finetune_v5.1b_dlnu_log_base_v5"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_dlnu_sqrt_new_v4"
+checkpoint_name="finetune_v5.1b_dlnu_log_base_v5"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_sqrt_v1/loss_val_total/last.ckpt"
-#load_checkpoint="checkpoints_final/pretrain_v5.1b_nersc_sqrt_v2/loss_val_cls/epoch=1056-step=68705.ckpt"
-gpus=(1)
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v5/loss_val_total/last.ckpt"
+gpus=(0 1)
 
 python -m train.finetune \
     --train \
     --stage2 \
     --augmentations_enabled \
-    --dataset_path $dataset_path \
+    --dataset_path "$dataset_path" \
     --metadata_path $metadata_path \
     --model $model \
     --eps $eps \
     --mixup_alpha $mixup_alpha \
     --batch_size $batch_size \
     --preprocessing_input $preprocessing_input \
-    --standardize_input $standardize_input \
     --preprocessing_output $preprocessing_output \
-    --standardize_output $standardize_output \
     --label_smoothing $label_smoothing \
     --dropout $dropout \
     --drop_path_rate $drop_path_rate \

@@ -40,7 +40,6 @@ class MAEPreTrainer(pl.LightningModule):
         self.eps = args.eps
         self.metadata = metadata
         self.preprocessing_input = args.preprocessing_input
-        self.standardize_input = args.standardize_input
         self.label_smoothing = args.label_smoothing
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
@@ -59,16 +58,134 @@ class MAEPreTrainer(pl.LightningModule):
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
 
     
-    def forward(self, x, x_glob, cls_labels, mask_ratio):
-        return self.model(x, x_glob, cls_labels, mask_ratio)
+    def forward(self, x, x_glob, mask_ratio):
+        return self.model(x, x_glob, mask_ratio)
 
 
     def _arrange_batch(self, batch):
         batch_input, *global_params = arrange_sparse_minkowski(batch, self.device)
         seg_labels = arrange_truth(batch)['seg_labels']
         return batch_input, *global_params, seg_labels
+    
+
+    def _occ_supervision_mask(
+        self,
+        idx_targets: torch.Tensor,       # [M, P], -1 => empty sub-voxel, >=0 => raw index of hit
+        patch_shape: tuple,              # (p_h, p_w, p_d)
+        dilate: int = 1,                 # r voxels around the signal inside each patch
+        neg_ratio: float = 6.0,          # |N| ≈ neg_ratio × |P| (per token)
+        max_negs_per_token: int = 4096,  # hard cap per token
+    ):
+        """
+        Returns:
+        sup_mask: [M, P] bool  — which sub-voxels to supervise for occupancy
+        sup_targ: [M, P] float — 1 for positives, 0 for border + sampled negatives
+        pos_mask: [M, P] bool  — convenience for your reg/cls heads
+        """
+        device = idx_targets.device
+        M, P   = idx_targets.shape
+        p_h, p_w, p_d = patch_shape
+
+        pos_mask = (idx_targets >= 0)                                    # [M, P]
+
+        # --- B: border via voxel dilation (inside each patch) ---
+        occ = pos_mask.float().view(M, 1, p_h, p_w, p_d)                 # [M,1,ph,pw,pd]
+        if dilate > 0:
+            ksz = 2 * dilate + 1
+            kernel = torch.ones((1, 1, ksz, ksz, ksz), device=device)    # depthwise over tokens
+            dil = F.conv3d(occ, kernel, padding=dilate) > 0              # [M,1,ph,pw,pd] -> bool
+        else:
+            dil = occ.bool()
+        dil = dil.view(M, P)                                             # [M, P]
+        border_mask = (~pos_mask) & dil                                  # empty-but-near-signal
+
+        # --- Far empties (eligible negatives) ---
+        far_empty = ~dil                                                  # outside dilation
+
+        # Per-token negative budget (variable k_i, clamped by availability and a hard cap)
+        pos_counts = pos_mask.sum(dim=1)                                  # [M]
+        far_counts = far_empty.sum(dim=1)                                 # [M]
+        want_negs  = (pos_counts * neg_ratio).to(torch.long)              # [M]
+        want_negs  = torch.minimum(want_negs, far_counts)                 # don’t ask for more than exist
+        want_negs  = torch.clamp(want_negs, max=max_negs_per_token)       # hard cap
+        K_max = int(want_negs.max().item())
+
+        # --- Sample N negatives per token, vectorized ---
+        sampled_neg_mask = torch.zeros_like(pos_mask, dtype=torch.bool)   # [M, P]
+        if K_max > 0:
+            # Random scores; invalidate non-eligible columns by setting to +inf
+            rnd = torch.rand(M, P, device=device)
+            rnd = rnd.masked_fill(~far_empty, float("inf"))               # only far empties compete
+
+            # Take K_max smallest per row (equivalent to sampling without replacement)
+            # We use topk on -rnd to get "smallest".
+            vals, idxs = torch.topk(-rnd, k=K_max, dim=1)                 # idxs: [M, K_max]
+
+            # Per-row mask to keep only the first k_i selections
+            keep = (torch.arange(K_max, device=device).unsqueeze(0) <
+                    want_negs.unsqueeze(1))                               # [M, K_max] bool
+
+            # Scatter to boolean mask without any Python loops
+            rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_max)  # [M, K_max]
+            sampled_neg_mask[rows[keep], idxs[keep]] = True
+
+        # --- Final supervision set ---
+        sup_mask = pos_mask | border_mask | sampled_neg_mask              # [M, P]
+        sup_targ = pos_mask.float()                                       # 1 for P, 0 for (B ∪ N)
+
+        return sup_mask, sup_targ, pos_mask
 
 
+    def compute_losses(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets):
+        """
+        targ_reg: [N_hits, C_in]        ground-truth charge/features at raw voxel ids
+        targ_cls: [N_hits] (long)       semantic class per raw voxel id
+        pred_occ: [M, P]                occupancy logits per masked token (P = p_h*p_w*p_d)
+        pred_reg: [M, P*C_in]
+        pred_cls: [M, P*C_out]
+        idx_targets: [M, P]             raw voxel ids or -1 for empty
+        """
+        # ----- OCCUPANCY: supervise only on P ∪ B ∪ N -----
+        p_h, p_w, p_d = self.model.patch_size.tolist()
+        sup_mask, sup_targ, pos_mask = self._occ_supervision_mask(
+            idx_targets,
+            patch_shape=(p_h, p_w, p_d),
+            dilate=getattr(self, "occ_dilate", 2),
+            neg_ratio=getattr(self, "occ_neg_ratio", 3.0),
+            max_negs_per_token=getattr(self, "occ_max_negs", 1024),
+        )
+
+        if self.model.training and getattr(self, "label_smoothing", 0.0) > 0.0:
+            eps = self.label_smoothing
+            sup_targ = sup_targ * (1.0 - eps) + 0.5 * eps
+
+        occ_logits  = pred_occ[sup_mask]
+        occ_targets = sup_targ[sup_mask]
+
+        loss_occ = F.binary_cross_entropy_with_logits(occ_logits, occ_targets)
+
+        # ----- REG / CLS: only on truly occupied sub-voxels -----
+        mask_flat = pos_mask.view(-1)                   # [M*P] bool
+        idx_flat  = idx_targets.view(-1)[mask_flat]     # raw voxel ids for occupied positions
+
+        pred_reg_v = pred_reg.view(-1, self.model.in_chans)[mask_flat]
+        targ_reg_v = targ_reg[idx_flat]
+        loss_reg   = F.mse_loss(pred_reg_v, targ_reg_v)
+
+        pred_cls_v = pred_cls.view(-1, self.model.out_chans)[mask_flat]
+        targ_cls_v = targ_cls[idx_flat]
+        loss_cls   = F.cross_entropy(pred_cls_v, targ_cls_v)
+
+        # ----- aggregate -----
+        part_losses = {'occ': loss_occ, 'reg': loss_reg, 'cls': loss_cls}
+        total_loss = (
+            weighted_loss(loss_occ, self.log_sigma_occ) +
+            weighted_loss(loss_reg, self.log_sigma_reg) +
+            weighted_loss(loss_cls, self.log_sigma_cls)
+        )
+        return total_loss, part_losses
+
+    '''
     def compute_losses(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets):
         mask_targets = (idx_targets >= 0)
         mask_flat    = mask_targets.view(-1)
@@ -99,15 +216,15 @@ class MAEPreTrainer(pl.LightningModule):
         )
 
         return total_loss, part_losses
-        
+    '''
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
         batch_input, *batch_input_global, cls_labels = self._arrange_batch(batch)
 
         # Forward pass
-        pred_occ, pred_reg, pred_cls, idx_targets = self.forward(
-            batch_input, batch_input_global, cls_labels, mask_ratio=self.mask_ratio)
+        pred_occ, pred_reg, pred_cls, idx_targets, _, _ = self.forward(
+            batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
             batch_input.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets,

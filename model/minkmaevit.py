@@ -6,18 +6,13 @@ Date: 07.25
 Description: PyTorch MAE-ViT model with MinkowskiEngine patching.
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import MinkowskiEngine as ME
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence
-from MinkowskiEngine import (
-    MinkowskiConvolution,
-    MinkowskiGELU,
-)
-from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
+from MinkowskiEngine import MinkowskiConvolution
+from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, SeparableDCT3D, SharedLatentVoxelHead
         
 
 class MinkMAEViT(nn.Module):
@@ -27,8 +22,9 @@ class MinkMAEViT(nn.Module):
         out_chans=4, 
         D=3,
         img_size=(48, 48, 200),
-        encoder_dims=[192, 256, 384],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        module_depth_voxels=20,
+        embed_dim=384,
+        patch_size=(16, 16, 10),
         depth=24,
         num_heads=16,
         decoder_embed_dim=192,
@@ -49,13 +45,10 @@ class MinkMAEViT(nn.Module):
         super().__init__()
     
         # patch & grid setup
-        patch_size = np.prod(np.array(kernel_size), axis=0).tolist()
         H, W, D_img = img_size
         p_h, p_w, p_d = patch_size
-    
         assert H % p_h == 0 and W % p_w == 0 and D_img % p_d == 0, \
             "img_size must be divisible by patch_size"
-
         self.in_chans = in_chans
         self.out_chans = out_chans
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
@@ -66,29 +59,25 @@ class MinkMAEViT(nn.Module):
         )
         self.patch_voxels = p_h * p_w * p_d
         self.register_buffer('patch_size', torch.tensor(patch_size))
-    
-        # downsample blocks
-        def _down_blk(in_c, out_c, ks):
-            return nn.Sequential(
-                MinkowskiConvolution(
-                    in_c, out_c, kernel_size=ks, stride=ks, 
-                    bias=True, dimension=D,
-                ),
-                MinkowskiLayerNorm(out_c, eps=1e-6),
-                MinkowskiGELU(),
-            )
+        assert module_depth_voxels % p_d == 0, "module_depth_voxels must be divisible by patch depth"
+        self.module_depth_voxels = module_depth_voxels
+        self.module_depth_patches = module_depth_voxels // p_d
+        G_h, G_w, G_d = self.grid_size
+        assert G_d % self.module_depth_patches == 0, "grid depth must be multiple of module depth (in patches)"
+        self.num_modules = G_d // self.module_depth_patches
+        self.intra_grid_size = (G_h, G_w, self.module_depth_patches)     # H×W×(depth within module)
+        self.num_intra_positions = G_h * G_w * self.module_depth_patches
 
-        self.downsample_layers = nn.Sequential(
-            _down_blk(in_chans, encoder_dims[0], kernel_size[0]),
-            _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
-            _down_blk(encoder_dims[1], encoder_dims[2], kernel_size[2]),
+        self.patch_embed = MinkowskiConvolution(
+            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
+            bias=True, dimension=D,
         )
-    
+
         # MAE encoder
-        embed_dim = encoder_dims[-1]
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
-        self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
+        self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim) # frozen sin-cos
+        self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)        # learned
         self.blocks = nn.ModuleList([
             BlockWithMask(
                 embed_dim, num_heads, mlp_ratio,
@@ -102,7 +91,8 @@ class MinkMAEViT(nn.Module):
         # MAE decoder
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_pos_embed = nn.Embedding(self.num_patches, decoder_embed_dim)
+        self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim)  # frozen sin-cos
+        self.module_embed_dec = nn.Embedding(self.num_modules, decoder_embed_dim)                 # learned
         self.decoder_blocks = nn.ModuleList([
             BlockWithMask(
                 decoder_embed_dim, decoder_num_heads, mlp_ratio,
@@ -111,38 +101,49 @@ class MinkMAEViT(nn.Module):
             )
             for _ in range(decoder_depth)
         ])
-        
-        self.decoder_pred_occ = nn.Sequential(
-            norm_layer(decoder_embed_dim),
-            nn.Linear(decoder_embed_dim, self.patch_voxels, bias=True),
+
+        # Reconstruction heads
+        def _choose_Kxyz(patch_size, alpha=0.5, max_per_axis=16):
+            ph, pw, pd = patch_size
+            Ks = []
+            for dim in (ph, pw, pd):
+                K = min(int(round(alpha * dim)), max_per_axis, dim)
+                if dim >= 2:
+                    K = max(K, 2)   # at least 2 modes if dimension has >=2 voxels
+                Ks.append(K)
+            return tuple(Ks)
+        self.sep_basis = SeparableDCT3D(
+            self.patch_size.tolist(),
+            Kxyz=_choose_Kxyz(self.patch_size.tolist())
         )
-        self.decoder_pred_reg = nn.Sequential(
-            norm_layer(decoder_embed_dim),
-            nn.Linear(decoder_embed_dim, self.patch_voxels * in_chans, bias=True),
+        self.shared_voxel_head = SharedLatentVoxelHead(
+            decoder_embed_dim, self.sep_basis, H=16,
+            out_ch_reg=self.in_chans, out_ch_cls=self.out_chans,
+            norm_layer=norm_layer
         )
-        self.decoder_pred_cls = nn.Sequential(
-            norm_layer(decoder_embed_dim),
-            nn.Linear(decoder_embed_dim, self.patch_voxels * out_chans, bias=True),
-        )
-    
+
         self.initialize_weights()
 
 
     def initialize_weights(self):
         # init fixed pos embeddings
-        pos_embed = get_3d_sincos_pos_embed(
-            self.pos_embed.weight.shape[-1], self.grid_size, cls_token=False
+        enc_pos = get_3d_sincos_pos_embed(
+            self.intra_pos_embed.weight.shape[-1],
+            self.intra_grid_size,
+            cls_token=False
         )
         with torch.no_grad():
-            self.pos_embed.weight.copy_(torch.from_numpy(pos_embed).float())
-            self.pos_embed.weight.requires_grad_(False)
-        
-        decoder_pos = get_3d_sincos_pos_embed(
-            self.decoder_pos_embed.weight.shape[-1], self.grid_size, cls_token=False
+            self.intra_pos_embed.weight.copy_(torch.from_numpy(enc_pos).float())
+            self.intra_pos_embed.weight.requires_grad_(False)
+            
+        dec_pos = get_3d_sincos_pos_embed(
+            self.decoder_intra_pos_embed.weight.shape[-1],
+            self.intra_grid_size,
+            cls_token=False
         )
         with torch.no_grad():
-            self.decoder_pos_embed.weight.copy_(torch.from_numpy(decoder_pos).float())
-            self.decoder_pos_embed.weight.requires_grad_(False)
+            self.decoder_intra_pos_embed.weight.copy_(torch.from_numpy(dec_pos).float())
+            self.decoder_intra_pos_embed.weight.requires_grad_(False)
 
         # init tokens
         nn.init.normal_(self.cls_token, std=.02)
@@ -182,12 +183,11 @@ class MinkMAEViT(nn.Module):
     
         Returns:
             padded_feats:  [B, L_max, C] float, zero‑padded features
-            padded_coords: [B, L_max] int, flat position ids.
+            padded_idx:    [B, L_max] int, flat position ids.
             attn_mask:     [B, L_max] bool, True = real voxel.
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
-        N, C  = feats.shape
     
         event_ids             = coords[:, 0].long()
         spatial_coords        = coords[:, 1:] // self.patch_size
@@ -213,8 +213,14 @@ class MinkMAEViT(nn.Module):
         w_idx = padded_coords[..., 1]
         d_idx = padded_coords[..., 2]
         padded_idx = h_idx * (G_w * G_d) + w_idx * G_d + d_idx
+
+        d_mod      = (d_idx % self.module_depth_patches).long()
+        module_id  = (d_idx // self.module_depth_patches).long()
+        intra_idx  = (h_idx * (G_w * self.module_depth_patches)
+                    +  w_idx * self.module_depth_patches
+                    +  d_mod).long()
     
-        return padded_feats, padded_idx, attn_mask
+        return padded_feats, padded_idx, attn_mask, intra_idx, module_id
 
 
     def build_patch_occupancy_map(self, x):
@@ -243,11 +249,11 @@ class MinkMAEViT(nn.Module):
 
         raw_inds = torch.arange(N, device=device)
         idx_map = torch.full ((B, Np, P), -1, dtype=torch.long, device=device)
-        idx_map [event_ids, patch_idx, sub_idx] = raw_inds
+        idx_map[event_ids, patch_idx, sub_idx] = raw_inds
     
         return idx_map
     
-    
+
     def random_masking(self, x, attn_mask, mask_ratio):
         """
         Perform per-sample random masking by per-sample shuffling.
@@ -272,10 +278,14 @@ class MinkMAEViT(nn.Module):
 
     
     def forward_encoder(self, x_sparse, glob, mask_ratio):
-        # patchify and mask
-        x_sparse = self.downsample_layers(x_sparse)
-        x, idx, orig_attn_mask = self.group_patches_by_event(x_sparse)
-        x = x + self.pos_embed(idx)
+        # patchify
+        x_sparse = self.patch_embed(x_sparse)
+        x, idx, orig_attn_mask, intra_idx, module_id = self.group_patches_by_event(x_sparse)
+
+        # add positional embeddings
+        x = x + self.intra_pos_embed(intra_idx) + self.module_embed_enc(module_id)
+
+        # masking
         x, attn_mask, rand_mask, ids_restore = self.random_masking(
             x, orig_attn_mask, mask_ratio
         )
@@ -291,10 +301,13 @@ class MinkMAEViT(nn.Module):
         for blk in self.blocks:
             x = blk(x, attn_mask=attn_mask)
         x = self.norm(x)
-        return x, x_sparse, idx, orig_attn_mask, rand_mask, ids_restore
+        return x, idx, orig_attn_mask, rand_mask, ids_restore, intra_idx, module_id
 
     
-    def forward_decoder(self, x, idx, attn_mask, rand_mask, ids_restore, idx_map):
+    def forward_decoder(self, x, idx, attn_mask, rand_mask, ids_restore, idx_map, intra_idx, module_id):
+        assert intra_idx.shape[:2] == ids_restore.shape[:2], \
+            "Decoder intra_idx must match restored token grid"
+
         # embed tokens
         x = self.decoder_embed(x)
 
@@ -306,8 +319,13 @@ class MinkMAEViT(nn.Module):
         x_ = torch.gather(
             x_, 1, ids_restore.unsqueeze(-1).repeat(1, 1, C)
         )
-        x_ = x_ + self.decoder_pos_embed(idx)                 # add pos emb
-        x = torch.cat([x[:, :1, :], x_], dim=1)               # add cls token
+
+        # add positional embeddings
+        dec_pos = self.decoder_intra_pos_embed(intra_idx) + self.module_embed_dec(module_id)
+        x_ = x_ + dec_pos
+
+        # add back CLS
+        x = torch.cat([x[:, :1, :], x_], dim=1)
         cls_attn = attn_mask.new_ones((x.size(0), 1))
         attn_mask = torch.cat([cls_attn, attn_mask], dim=1)
 
@@ -320,18 +338,16 @@ class MinkMAEViT(nn.Module):
         prediction_mask = rand_mask.bool() & attn_mask
         flat_out        = x[prediction_mask]
 
-        pred_occ = self.decoder_pred_occ(flat_out)
-        pred_reg = self.decoder_pred_reg(flat_out)
-        pred_cls = self.decoder_pred_cls(flat_out)
+        pred_occ, pred_reg, pred_cls = self.shared_voxel_head(flat_out)
 
         event_ids, slot_ids = torch.nonzero(prediction_mask, as_tuple=True)
         patch_ids = idx[event_ids, slot_ids]
         idx_targets = idx_map[event_ids, patch_ids]
 
-        return pred_occ, pred_reg, pred_cls, idx_targets
+        return pred_occ, pred_reg, pred_cls, idx_targets, event_ids, patch_ids
         
 
-    def forward(self, x, x_glob, cls_labels, mask_ratio=0.75):
+    def forward(self, x, x_glob, mask_ratio=0.75):
         """
         Forward pass through the encoder-decoder network.
 
@@ -342,13 +358,14 @@ class MinkMAEViT(nn.Module):
             mask_ratio: mask probability.
 
         Returns:
-            A dictionary with voxel predictions.
+            Voxel predictions.
         """
         idx_map = self.build_patch_occupancy_map(x)
-        latent, x_sparse, idx, attn_mask, rand_mask, ids_restore = self.forward_encoder(x, x_glob, mask_ratio)
-        pred_occ, pred_reg, pred_cls, idx_targets = self.forward_decoder(latent, idx, attn_mask, rand_mask, ids_restore, idx_map)
-        
-        return pred_occ, pred_reg, pred_cls, idx_targets
+        latent, idx, attn_mask, rand_mask, ids_restore, intra_idx, module_id = self.forward_encoder(x, x_glob, mask_ratio)
+        pred_occ, pred_reg, pred_cls, idx_targets, row_event_ids, row_patch_ids = \
+            self.forward_decoder(latent, idx, attn_mask, rand_mask, ids_restore, idx_map, intra_idx, module_id)
+
+        return pred_occ, pred_reg, pred_cls, idx_targets, row_event_ids, row_patch_ids
 
         
     def replace_depthwise_with_channelwise(self):
@@ -403,11 +420,21 @@ class MinkMAEViT(nn.Module):
         return parent, components[-1]
 
 
+def mae_vit_tiny(**kwargs):
+    model = MinkMAEViT(
+        in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
+        embed_dim=384, patch_size=(48, 48, 2),
+        depth=12, num_heads=12,
+        decoder_embed_dim=288, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+    )
+    return model
+
+
 def mae_vit_base(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
-        encoder_dims=[192, 384, 768],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        embed_dim=768, patch_size=(48, 48, 2),
         depth=12, num_heads=12,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -418,8 +445,7 @@ def mae_vit_base(**kwargs):
 def mae_vit_large(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
-        encoder_dims=[252, 504, 1008],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        embed_dim=1008, patch_size=(48, 48, 2),
         depth=24, num_heads=16,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -430,8 +456,7 @@ def mae_vit_large(**kwargs):
 def mae_vit_huge(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
-        encoder_dims=[324, 648, 1296],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        embed_dim=1296, patch_size=(48, 48, 2),
         depth=32, num_heads=16,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),

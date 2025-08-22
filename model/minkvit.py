@@ -6,64 +6,15 @@ Date: 07.25
 Description: PyTorch ViT model with MinkowskiEngine patching.
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import MinkowskiEngine as ME
 import timm.models.vision_transformer as vit
 from functools import partial
 from torch.nn.utils.rnn import pad_sequence 
 from timm.models.layers import trunc_normal_
-from MinkowskiEngine import (
-    MinkowskiConvolution,
-    MinkowskiGELU,
-)
-from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, MinkowskiLayerNorm
-
-
-class CylindricalHeadNormalized(nn.Module):
-    """
-    pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)   (>=0)
-    pz:  uZ = mu_uZ + sigma_uZ*zz,  pz = k_Z * expm1(uZ)   (>=0)
-    phi: via normalised (cos_phi, sin_phi)
-    """
-    def __init__(self, k_T, mu_uT, sigma_uT, k_Z, mu_uZ, sigma_uZ, hidden=128):
-        super().__init__()
-        self.k_T, self.mu_uT, self.sigma_uT = float(k_T), float(mu_uT), float(max(sigma_uT,1e-8))
-        self.k_Z, self.mu_uZ, self.sigma_uZ = float(k_Z), float(mu_uZ), float(max(sigma_uZ,1e-8))
-        self.mlp = nn.Linear(hidden, 4)
-
-    def forward(self, x, eps=1e-8):
-        zT, a, b, zz = self.mlp(x).unbind(-1)
-
-        # angle
-        norm = torch.sqrt(a*a + b*b + eps)
-        cos_phi = a / norm
-        sin_phi = b / norm
-
-        # pT via log1p/expm1
-        uT = self.mu_uT + self.sigma_uT * zT
-        pT = self.k_T * torch.expm1(uT)
-        pT = torch.clamp(pT, min=0.0)
-
-        # pz via log1p/expm1
-        uZ = self.mu_uZ + self.sigma_uZ * zz
-        pz = self.k_Z * torch.expm1(uZ)
-        pz = torch.clamp(pz, min=0.0)
-
-        px, py = pT * cos_phi, pT * sin_phi
-        p_cart = torch.stack([px, py, pz], dim=-1)
-        latents = torch.stack([zT, zz], dim=-1)
-
-        return {
-            "p_cart": p_cart,   # (B,3)
-            "pT": pT,
-            "cos_phi": cos_phi,
-            "sin_phi": sin_phi,
-            "pz": pz,
-            "latents": latents
-        }
+from MinkowskiEngine import MinkowskiConvolution
+from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CylindricalHeadNormalized
 
 
 class MinkViT(vit.VisionTransformer):
@@ -75,8 +26,7 @@ class MinkViT(vit.VisionTransformer):
         self,
         D=3,
         img_size=(48, 48, 200),
-        encoder_dims=[192, 256, 384],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
+        module_depth_voxels=20,
         global_pool=False,
         metadata=None,
         **kwargs
@@ -87,15 +37,14 @@ class MinkViT(vit.VisionTransformer):
         norm_layer = kwargs['norm_layer']
         in_chans = kwargs['in_chans']
         drop_rate = kwargs['drop_rate']
+        embed_dim = kwargs['embed_dim']
+        patch_size = kwargs['patch_size']
 
         # patch & grid setup
-        patch_size = np.prod(np.array(kernel_size), axis=0).tolist()
         H, W, D_img = img_size
         p_h, p_w, p_d = patch_size
-    
         assert H % p_h == 0 and W % p_w == 0 and D_img % p_d == 0, \
             "img_size must be divisible by patch_size"
-
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
         self.num_patches = (
             self.grid_size[0] 
@@ -104,28 +53,23 @@ class MinkViT(vit.VisionTransformer):
         )
         self.patch_voxels = p_h * p_w * p_d
         self.register_buffer('patch_size', torch.tensor(patch_size))
-    
-        # downsample blocks
-        def _down_blk(in_c, out_c, ks):
-            return nn.Sequential(
-                MinkowskiConvolution(
-                    in_c, out_c, kernel_size=ks, stride=ks,
-                    bias=True, dimension=D
-                ),
-                MinkowskiLayerNorm(out_c, eps=1e-6),
-                MinkowskiGELU(),
-            )
+        assert module_depth_voxels % p_d == 0, "module_depth_voxels must be divisible by patch depth"
+        self.module_depth_voxels = module_depth_voxels
+        self.module_depth_patches = module_depth_voxels // p_d
+        G_h, G_w, G_d = self.grid_size
+        assert G_d % self.module_depth_patches == 0, "grid depth must be multiple of module depth (in patches)"
+        self.num_modules = G_d // self.module_depth_patches
+        self.intra_grid_size = (G_h, G_w, self.module_depth_patches)     # H×W×(depth within module)
+        self.num_intra_positions = G_h * G_w * self.module_depth_patches
 
-        self.downsample_layers = nn.Sequential(
-            _down_blk(in_chans, encoder_dims[0], kernel_size[0]),
-            _down_blk(encoder_dims[0], encoder_dims[1], kernel_size[1]),
-            _down_blk(encoder_dims[1], encoder_dims[2], kernel_size[2]),
+        del self.patch_embed, self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
+        self.patch_embed = MinkowskiConvolution(
+            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
+            bias=True, dimension=D,
         )
-
-        embed_dim = encoder_dims[-1]
-        del self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
         self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
-        self.pos_embed = nn.Embedding(self.num_patches, embed_dim)
+        self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim) # frozen sin-cos
+        self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)        # learned
 
         self.global_pool = global_pool
         if self.global_pool:
@@ -154,12 +98,14 @@ class MinkViT(vit.VisionTransformer):
 
     def initialize_weights(self):
         # init fixed pos embeddings
-        pos_embed = get_3d_sincos_pos_embed(
-            self.pos_embed.weight.shape[-1], self.grid_size, cls_token=False
+        enc_pos = get_3d_sincos_pos_embed(
+            self.intra_pos_embed.weight.shape[-1],
+            self.intra_grid_size,
+            cls_token=False
         )
         with torch.no_grad():
-            self.pos_embed.weight.copy_(torch.from_numpy(pos_embed).float())
-            self.pos_embed.weight.requires_grad_(False)
+            self.intra_pos_embed.weight.copy_(torch.from_numpy(enc_pos).float())
+            self.intra_pos_embed.weight.requires_grad_(False)
 
         self.apply(self._init_weights)
 
@@ -231,7 +177,6 @@ class MinkViT(vit.VisionTransformer):
         """
         coords = sparse_tensor.C
         feats  = sparse_tensor.F
-        N, C  = feats.shape
     
         event_ids             = coords[:, 0].long()
         spatial_coords        = coords[:, 1:] // self.patch_size
@@ -257,14 +202,23 @@ class MinkViT(vit.VisionTransformer):
         w_idx = padded_coords[..., 1]
         d_idx = padded_coords[..., 2]
         padded_idx = h_idx * (G_w * G_d) + w_idx * G_d + d_idx
+
+        d_mod      = (d_idx % self.module_depth_patches).long()
+        module_id  = (d_idx // self.module_depth_patches).long()
+        intra_idx  = (h_idx * (G_w * self.module_depth_patches)
+                    +  w_idx * self.module_depth_patches
+                    +  d_mod).long()
     
-        return padded_feats, padded_idx, attn_mask
+        return padded_feats, padded_idx, attn_mask, intra_idx, module_id
         
 
     def forward_features(self, x_sparse, glob):
-        x_sparse = self.downsample_layers(x_sparse)
-        x, idx, attn_mask = self.group_patches_by_event(x_sparse)
-        x = x + self.pos_embed(idx)
+        # patchify
+        x_sparse = self.patch_embed(x_sparse)
+        x, _, attn_mask, intra_idx, module_id = self.group_patches_by_event(x_sparse)
+
+        # add positional embeddings
+        x = x + self.intra_pos_embed(intra_idx) + self.module_embed_enc(module_id)
 
         # add cls token
         glob_emb = self.global_feats_encoder(glob).unsqueeze(1)  # (B, 1, D)
@@ -278,7 +232,10 @@ class MinkViT(vit.VisionTransformer):
             x = blk(x, attn_mask=attn_mask)
 
         if self.global_pool:
-            outcome = x[:, 1:, :].mean(dim=1)  # global pool without cls token
+            tok = x[:, 1:, :]
+            mask = attn_mask[:, 1:].to(tok.dtype)
+            denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            outcome = (tok * mask.unsqueeze(-1)).sum(dim=1) / denom
         else:
             x = self.norm(x)
             outcome = x[:, 0]
@@ -352,12 +309,22 @@ class MinkViT(vit.VisionTransformer):
         return parent, components[-1]
 
 
+def vit_tiny(**kwargs):
+    model = MinkViT(
+        in_chans=1, D=3, img_size=(48, 48, 200),
+        embed_dim=384, patch_size=(48, 48, 2),
+        depth=12, num_heads=12,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
+        block_fn=BlockWithMask,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
 def vit_base(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
-        encoder_dims=[192, 384, 768],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=768, depth=12, num_heads=12,
+        embed_dim=768, patch_size=(48, 48, 2),
+        depth=12, num_heads=12,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -367,9 +334,8 @@ def vit_base(**kwargs):
 def vit_large(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
-        encoder_dims=[252, 504, 1008],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=1008, depth=24, num_heads=16,
+        embed_dim=1008, patch_size=(48, 48, 2),
+        depth=24, num_heads=16,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -379,9 +345,8 @@ def vit_large(**kwargs):
 def vit_huge(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
-        encoder_dims=[324, 648, 1296],
-        kernel_size=[(4, 4, 5), (2, 2, 2), (2, 2, 1)],
-        embed_dim=1296, depth=32, num_heads=16,
+        embed_dim=1296, patch_size=(48, 48, 2),
+        depth=32, num_heads=16,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)

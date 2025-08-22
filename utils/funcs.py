@@ -92,6 +92,8 @@ def collate_test(batch):
     coords_list, feats_list = [], []
     module_to_event, module_pos = [], []
 
+    batch = [d for d in batch if len(d['coords']) > 0]  # Filter out empty samples
+
     for ev_idx, sample in enumerate(batch):
         coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
         coords_list.append(coords)
@@ -127,6 +129,8 @@ def collate_test(batch):
 def collate_sparse_minkowski(batch):
     coords_list, feats_list = [], []
     module_to_event, module_pos = [], []
+
+    batch = [d for d in batch if len(d['coords']) > 0]  # Filter out empty samples
 
     for ev_idx, sample in enumerate(batch):
         coords, mods, feats = sample['coords'], sample['modules'], sample['feats']

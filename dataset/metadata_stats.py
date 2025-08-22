@@ -1,11 +1,10 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 08.25
 
 Description: script to generate metadata.
 """
-
 
 import torch
 import os
@@ -17,19 +16,216 @@ from glob import glob
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import matplotlib.pyplot as plt
+import pickle as pk
 
-# ---------- robust helpers ----------
+# -------------------------
+# Robust stats helpers
+# -------------------------
+
+MADN_CONST = 1.482602218505602  # normalizing constant so MADN ~= std for Gaussian
+
 def _mad(x, axis=None):
     med = np.median(x, axis=axis, keepdims=True)
     return np.median(np.abs(x - med), axis=axis)
 
 def _madn(x, axis=None, eps=1e-12):
-    return np.maximum(_mad(x, axis=axis) / 0.6745, eps)
+    return np.maximum(_mad(x, axis=axis) * MADN_CONST, eps)
+
+def _transform_lookup(name: str):
+    if name == "identity":
+        return lambda x: x
+    if name == "log1p":
+        return np.log1p
+    if name == "sqrt":
+        return np.sqrt
+    raise ValueError(f"Unknown transform: {name}")
+
+# -------------------------
+# Robust params from Counter
+# -------------------------
+
+def _N(counter: Counter) -> int:
+    return sum(counter.values())
+
+def _weighted_median(counter: Counter):
+    """Lower weighted median: first value where cumulative count >= N/2."""
+    N = _N(counter)
+    if N == 0:
+        return 0.0
+    median_pos = N / 2
+    cum = 0
+    for val in sorted(counter):
+        cum += counter[val]
+        if cum >= median_pos:
+            return float(val)
+    return float(next(iter(counter)))
+
+def _mad_from_counter(counter: Counter, center: float):
+    """Weighted median of absolute deviations |x - center| (no expansion)."""
+    N = _N(counter)
+    if N == 0:
+        return 0.0
+    devs = {}
+    for v, cnt in counter.items():
+        d = abs(v - center)
+        devs[d] = devs.get(d, 0) + cnt
+    median_pos = N / 2
+    cum = 0
+    for d in sorted(devs):
+        cum += devs[d]
+        if cum >= median_pos:
+            return float(d)
+    return 0.0
+
+def _madn_from_counter(counter: Counter, center: float):
+    return _mad_from_counter(counter, center) * MADN_CONST
+
+def compute_robust_params_for_transform(q_counter: Counter, transform: str, eps: float = 1e-8):
+    """
+    Robust two-stage standardization:
+      1) k = MADN(q)  (robust scale in original space)
+      2) u = f(q / k) where f is monotone (identity|log1p|sqrt)
+      3) mu = median(u); sigma = MADN(u)
+    """
+    N = _N(q_counter)
+    if N == 0:
+        return {
+            "transform": transform,
+            "k": eps, "mu": 0.0, "sigma": 1.0,
+            "orig_median": 0.0, "orig_min": 0.0, "orig_max": 0.0,
+            "u_median": 0.0, "u_min": 0.0, "u_max": 0.0,
+        }
+
+    f = _transform_lookup(transform)
+
+    # k in original space (robust)
+    q_med = _weighted_median(q_counter)
+    k = max(_madn_from_counter(q_counter, q_med), eps)
+
+    # transformed stats u = f(q / k)
+    u_med = f(q_med / k)
+
+    # MAD in u-space (weighted)
+    devs_u = {}
+    for v, cnt in q_counter.items():
+        du = abs(f(v / k) - u_med)
+        devs_u[du] = devs_u.get(du, 0) + cnt
+    median_pos = N / 2
+    cum = 0
+    mad_u = 0.0
+    for d in sorted(devs_u):
+        cum += devs_u[d]
+        if cum >= median_pos:
+            mad_u = float(d)
+            break
+    sigma = max(mad_u * MADN_CONST, eps)
+
+    q_min = min(q_counter)
+    q_max = max(q_counter)
+    u_min = f(q_min / k)
+    u_max = f(q_max / k)
+
+    return {
+        "transform": transform,
+        "k": float(k),
+        "mu": float(u_med),
+        "sigma": float(sigma),
+        "orig_median": float(q_med),
+        "orig_min": float(q_min),
+        "orig_max": float(q_max),
+        "u_median": float(u_med),
+        "u_min": float(u_min),
+        "u_max": float(u_max),
+    }
+
+def add_robust_standardization_metadata(q_counter: Counter, metadata: dict, key_prefix: str = "q"):
+    """
+    Fills metadata with robust standardization parameters for:
+      - identity (no transform): key f"{key_prefix}"
+      - log1p:                     f"{key_prefix}_log1p"
+      - sqrt:                      f"{key_prefix}_sqrt"
+    """
+    meta_identity = compute_robust_params_for_transform(q_counter, "identity")
+    meta_log1p    = compute_robust_params_for_transform(q_counter, "log1p")
+    meta_sqrt     = compute_robust_params_for_transform(q_counter, "sqrt")
+
+    metadata[f"{key_prefix}"]       = meta_identity
+    metadata[f"{key_prefix}_log1p"] = meta_log1p
+    metadata[f"{key_prefix}_sqrt"]  = meta_sqrt
+
+    return metadata
+
+# -------------------------
+# Robust params from arrays (for base_keys)
+# -------------------------
+
+def compute_robust_params_for_array(arr: np.ndarray, transform: str, eps: float = 1e-8):
+    """
+    Same robust scheme as the Counter version, but for dense arrays:
+      1) k = MADN(arr)
+      2) u_i = f(arr_i / k)
+      3) mu = median(u), sigma = MADN(u)
+    Also returns optional mins/max for monitoring.
+    """
+    arr = np.asarray(arr).ravel()
+    if arr.size == 0:
+        return {
+            "transform": transform,
+            "k": eps, "mu": 0.0, "sigma": 1.0,
+            "orig_median": 0.0, "orig_min": 0.0, "orig_max": 0.0,
+            "u_median": 0.0, "u_min": 0.0, "u_max": 0.0,
+        }
+
+    f = _transform_lookup(transform)
+
+    # Robust scale k in original space
+    q_med = float(np.median(arr))
+    k = max(float(_madn(arr)), eps)
+
+    # Transformed values
+    u = f(arr / k)
+
+    mu = float(np.median(u))
+    sigma = max(float(_madn(u)), eps)
+
+    q_min = float(np.min(arr))
+    q_max = float(np.max(arr))
+    u_min = float(f(q_min / k))
+    u_max = float(f(q_max / k))
+
+    return {
+        "transform": transform,
+        "k": float(k),
+        "mu": float(mu),
+        "sigma": float(sigma),
+        "orig_median": float(q_med),
+        "orig_min": float(q_min),
+        "orig_max": float(q_max),
+        "u_median": float(mu),
+        "u_min": float(u_min),
+        "u_max": float(u_max),
+    }
+
+def add_robust_standardization_metadata_array(arr: np.ndarray, metadata: dict, key_prefix: str):
+    """
+    Mirrors add_robust_standardization_metadata but for arrays.
+    Produces:
+      - f"{key_prefix}"
+      - f"{key_prefix}_log1p"
+      - f"{key_prefix}_sqrt"
+    """
+    metadata[f"{key_prefix}"]       = compute_robust_params_for_array(arr, "identity")
+    metadata[f"{key_prefix}_log1p"] = compute_robust_params_for_array(arr, "log1p")
+    metadata[f"{key_prefix}_sqrt"]  = compute_robust_params_for_array(arr, "sqrt")
+    return metadata
+
+# -------------------------
+# Dataset (unchanged behavior)
+# -------------------------
 
 def _select_cc_leptons(p_lep_true: np.ndarray, is_cc=None, eps=1e-12):
     """
     Prefer CC-only rows using is_cc. If not provided, drop exact-zeros (NC) by norm.
-    Falls back to all rows if the selection would be empty.
     """
     if is_cc is not None:
         m = np.asarray(is_cc).astype(bool)
@@ -40,7 +236,6 @@ def _select_cc_leptons(p_lep_true: np.ndarray, is_cc=None, eps=1e-12):
     sel = p_lep_true[norms > eps]
     return sel if sel.shape[0] > 0 else p_lep_true
 
-# ---------- core stats ----------
 @dataclass
 class VectorStatsLog1p:
     # log1p/expm1 parameters for pT and pz (both >=0)
@@ -73,50 +268,48 @@ def compute_vector_stats_from_cartesian(
     assert p_true.ndim == 2 and p_true.shape[1] == 3, "p_true must be shape (N,3)"
     px, py, pz = p_true[:, 0], p_true[:, 1], p_true[:, 2]
 
-    # Guard: these heads assume non-negative pz. If tiny negatives exist, clamp them.
     if enforce_nonneg:
         pz = np.maximum(pz, 0.0)
 
     pT  = np.sqrt(px**2 + py**2)
     mag = np.sqrt(px**2 + py**2 + pz**2)
 
-    # --- log1p/expm1 parameterization stats for pT ---
+    # log1p/expm1 parameterization stats for pT
     if use_robust:
         k_T = float(max(_madn(pT), 1e-8))
-    else:
-        k_T = float(max(np.std(pT), 1e-8))
-    uT = np.log1p(pT / k_T)
-    if use_robust:
+        uT = np.log1p(pT / k_T)
         mu_uT   = float(np.median(uT))
         sigma_uT= float(max(_madn(uT), 1e-8))
     else:
+        k_T = float(max(np.std(pT), 1e-8))
+        uT = np.log1p(pT / k_T)
         mu_uT   = float(np.mean(uT))
         sigma_uT= float(max(np.std(uT), 1e-8))
 
-    # --- log1p/expm1 parameterization stats for pz (>=0) ---
+    # log1p/expm1 parameterization stats for pz (>=0)
     if use_robust:
         k_Z = float(max(_madn(pz), 1e-8))
-    else:
-        k_Z = float(max(np.std(pz), 1e-8))
-    uZ = np.log1p(pz / k_Z)
-    if use_robust:
+        uZ = np.log1p(pz / k_Z)
         mu_uZ   = float(np.median(uZ))
         sigma_uZ= float(max(_madn(uZ), 1e-8))
     else:
+        k_Z = float(max(np.std(pz), 1e-8))
+        uZ = np.log1p(pz / k_Z)
         mu_uZ   = float(np.mean(uZ))
         sigma_uZ= float(max(np.std(uZ), 1e-8))
 
-    # --- robust loss scales (used by Huber on Cartesian residuals) ---
+    # robust loss scales
     if use_robust:
         s_xyz = tuple(_madn(p_true, axis=0).astype(np.float64))
         s_mag = float(_madn(mag))
     else:
         s_xyz = tuple((np.std(p_true, axis=0) + 1e-12).astype(np.float64))
         s_mag = float(np.std(mag) + 1e-12)
+
     s_xyz = tuple(max(float(v), 1e-8) for v in s_xyz)
     s_mag = max(float(s_mag), 1e-8)
 
-    # --- residual floors (for analysis-aligned scalar residuals) ---
+    # residual floors
     tau_ptmiss = float(np.percentile(pT,  residual_floor_pct))
     tau_evis   = float(np.percentile(mag, residual_floor_pct))
 
@@ -127,24 +320,15 @@ def compute_vector_stats_from_cartesian(
         tau_ptmiss=tau_ptmiss, tau_evis=tau_evis,
     )
 
-
-# ---------- extended all-in-one ----------
 def compute_all_stats(
     p_vis_true: np.ndarray,
     p_lep_true: np.ndarray,
-    *,
-    p_jet_true: Optional[np.ndarray] = None,   # optional
-    is_cc: Optional[np.ndarray] = None,        # optional mask aligned with rows
-    # robust / floors config
+    p_jet_true: Optional[np.ndarray] = None,
+    is_cc: Optional[np.ndarray] = None,
     use_robust: bool = True,
     residual_floor_pct: float = 5.0,
-    # Option A eps for log(pT + eps)
-    eps_T_vis: float = 1e-6,
-    eps_T_lep: float = 1e-6,
-    eps_T_jet: float = 1e-6,
-    # jet stats controls
     jet_scales_cc_only: bool = True,          # CC-only loss scales for jet (recommended)
-    compute_jet_inversion_stats: bool = False # set True only if you plan to predict jet directly
+    compute_jet_inversion_stats: bool = False # set True only if planning to predict jet directly
 ) -> Dict[str, Dict]:
     """
     Returns a dict with:
@@ -153,49 +337,57 @@ def compute_all_stats(
       - (optional) 'jet_loss_scales': {'s_xyz': (..), 's_mag': ..}
       - (optional) 'jet': VectorStats as dict (if compute_jet_inversion_stats=True)
       - (optional) class-specific vis floors: vis_tau_ptmiss_cc/nc, vis_tau_evis_cc/nc
+
+    Notes:
+      * Output format/keys are intentionally unchanged.
+      * Uses robust statistics when use_robust=True.
     """
     out: Dict[str, Dict] = {}
 
-    # --- vis & lep (always computed) ---
+    # --- visible & lepton stats (always computed) ---
     vis_stats = compute_vector_stats_from_cartesian(
-        p_vis_true, use_robust=use_robust, 
-        residual_floor_pct=residual_floor_pct, enforce_nonneg=True,
+        p_vis_true,
+        use_robust=use_robust,
+        residual_floor_pct=residual_floor_pct,
+        enforce_nonneg=True,
     )
     p_lep_cc = _select_cc_leptons(p_lep_true, is_cc=is_cc)
     lep_stats = compute_vector_stats_from_cartesian(
-        p_lep_cc, use_robust=use_robust, 
-        residual_floor_pct=residual_floor_pct, enforce_nonneg=True,
+        p_lep_cc,
+        use_robust=use_robust,
+        residual_floor_pct=residual_floor_pct,
+        enforce_nonneg=True,
     )
     out["vis"] = asdict(vis_stats)
     out["lep"] = asdict(lep_stats)
 
-    # --- class-specific floors for vis (optional but handy) ---
+    # --- class-specific floors for vis (optional but useful) ---
     if is_cc is not None:
         mask = np.asarray(is_cc).astype(bool)
-        for tag, arr in [("cc", p_vis_true[mask]), ("nc", p_vis_true[~mask])]:
+        for tag, arr in (("cc", p_vis_true[mask]), ("nc", p_vis_true[~mask])):
             if arr.shape[0] > 0:
-                px, py, pz = arr[:,0], arr[:,1], arr[:,2]
-                pT = np.sqrt(px**2 + py**2)
+                px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
+                pT  = np.sqrt(px**2 + py**2)
                 mag = np.sqrt(px**2 + py**2 + pz**2)
                 out[f"vis_tau_ptmiss_{tag}"] = float(np.percentile(pT,  residual_floor_pct))
                 out[f"vis_tau_evis_{tag}"]   = float(np.percentile(mag, residual_floor_pct))
             else:
-                # fallback to global
+                # fallback to global floors
                 out[f"vis_tau_ptmiss_{tag}"] = out["vis"]["tau_ptmiss"]
                 out[f"vis_tau_evis_{tag}"]   = out["vis"]["tau_evis"]
 
-    # --- jet (optional) ---
+    # --- jet-related stats (optional) ---
     if p_jet_true is not None:
         assert p_jet_true.shape == p_vis_true.shape, "p_jet_true must be (N,3) aligned with p_vis_true"
 
-        # Loss scales for jet (recommended if adding jet aux loss)
+        # Loss scales for jet (used e.g. by auxiliary jet losses)
         if jet_scales_cc_only:
             if is_cc is None:
                 raise ValueError("is_cc mask is required when jet_scales_cc_only=True.")
             mask = np.asarray(is_cc).astype(bool)
             pJ = p_jet_true[mask]
             if pJ.shape[0] == 0:
-                pJ = p_jet_true   # graceful fallback
+                pJ = p_jet_true  # graceful fallback
         else:
             pJ = p_jet_true
 
@@ -208,95 +400,60 @@ def compute_all_stats(
 
         sJ_xyz = tuple(max(float(v), 1e-8) for v in sJ_xyz)
         sJ_mag = max(float(sJ_mag), 1e-8)
-
         out["jet_loss_scales"] = {"s_xyz": sJ_xyz, "s_mag": sJ_mag}
 
-        # Optional inversion stats if ever predicting jet directly (usually not needed)
+        # Optional inversion stats (only if you're directly predicting jet)
         if compute_jet_inversion_stats:
             jet_stats = compute_vector_stats_from_cartesian(
-                p_jet_true, use_robust=use_robust, 
-                residual_floor_pct=residual_floor_pct, enforce_nonneg=False
+                p_jet_true,
+                use_robust=use_robust,
+                residual_floor_pct=residual_floor_pct,
+                enforce_nonneg=False,
             )
             out["jet"] = asdict(jet_stats)
 
     return out
 
 
+# -------------------------
+# Dataset & Loader
+# -------------------------
+
 class SparseFASERCALDataset(Dataset):
     def __init__(self, root, shuffle=False, **kwargs):
-        """
-        Initializes the SparseFASERCALDataset class.
+        # Normalize root into a list
+        if isinstance(root, str):
+            root = [root]
+        self.roots = root
 
-        Args:
-        root (str): Root directory containing the data files.
-        shuffle (bool): Whether to shuffle the dataset (default: False).
-        """
-        self.root = root
         self.data_files = self.processed_file_names
         self.train = False
         self.total_events = self.__len__
 
     @property
-    def processed_dir(self):
-        """
-        Returns the processed directory path.
-
-        Returns:
-        str: Path to the processed directory.
-        """
-        return f'{self.root}'
+    def processed_dirs(self):
+        return self.roots
     
     @property
     def processed_file_names(self):
-        """
-        Returns a list of processed file names.
-
-        Returns:
-        list: List of file names.
-        """
-        return glob(f'{self.processed_dir}/*.npz')
+        files = []
+        for d in self.processed_dirs:
+            files.extend(glob(f'{d}/*.npz'))
+        return files
     
     def __len__(self):
-        """
-        Returns the total number of data files.
-
-        Returns:
-        int: Number of data files.
-        """
         return len(self.data_files)
 
     def collate_sparse_minkowski(self, batch):
-        """
-        Collates a batch of data into a format suitable for MinkowskiEngine.
-
-        Args:
-        batch (list): List of data dictionaries.
-
-        Returns:
-        dict: Collated data with coordinates, features, and labels.
-        """
         coords = [d['coords'].int() for d in batch if d['coords'] is not None]
         feats = torch.cat([d['feats'] for d in batch if d['coords'] is not None])
         labels = torch.cat([d['labels'] for d in batch if d['coords'] is not None])
-        
         return {'f': feats, 'c': coords, 'y': labels}
     
     def remove_empty_events(self, idx):
-        """
-        Removes empty events based on energy deposition threshold.
-
-        Args:
-        idx (int): Index of the data file.
-
-        Returns:
-        float: Maximum energy deposition in the filtered hits.
-        """
         data = np.load(self.data_files[idx])
         hits = data['hits']
-    
-        # Filter hits where energy (hits[:, 7]) is >= 0.5
         filtered_hits = hits[hits[:, 7] >= 0.5]
-    
         if filtered_hits.shape[0] > 0:
             np.savez(self.data_files[idx], filename=data['filename'], hits=filtered_hits)
             return filtered_hits[:, 7].max()
@@ -305,15 +462,6 @@ class SparseFASERCALDataset(Dataset):
             return 0
         
     def __getitem__(self, idx):
-        """
-        Retrieves a data sample by index.
-
-        Args:
-        idx (int): Index of the data sample.
-
-        Returns:
-        dict: Data sample with filename, coordinates, features, and labels.
-        """
         data = np.load(self.data_files[idx], allow_pickle=True)
 
         is_cc = data['is_cc'].item()
@@ -321,11 +469,11 @@ class SparseFASERCALDataset(Dataset):
         true_hits = data['true_hits']
         reco_hits = data['reco_hits']
         faser_cal_energy = data['faser_cal_energy'].item()
-        faser_cal_modules = data['faser_cal_modules']#.sum()
+        faser_cal_modules = data['faser_cal_modules']
         rear_cal_energy = data['rear_cal_energy'].item()
-        rear_cal_modules = data['rear_cal_modules']#.sum()
+        rear_cal_modules = data['rear_cal_modules']
         rear_hcal_energy = data['rear_hcal_energy'].item()
-        rear_hcal_modules = data['rear_hcal_modules']#.sum()
+        rear_hcal_modules = data['rear_hcal_modules']
         rear_mucal_energy = data['rear_mucal_energy'].item()
         vis_sp_momentum = data['vis_sp_momentum']
         out_lepton_momentum = data['out_lepton_momentum']
@@ -336,7 +484,10 @@ class SparseFASERCALDataset(Dataset):
         tauvis_momentum = data['tauvis_momentum']
 
         try:
-            pdg = np.unique(np.concatenate([true_hits[reco_hit_true if isinstance(reco_hit_true, list) else reco_hit_true.astype(int)][:, 3] for reco_hit, reco_hit_true in zip(reco_hits, reco_hits_true)]))
+            pdg = np.unique(np.concatenate([
+                true_hits[reco_hit_true if isinstance(reco_hit_true, list) else reco_hit_true.astype(int)][:, 3]
+                for reco_hit, reco_hit_true in zip(reco_hits, reco_hits_true)
+            ]))
         except:
             assert False, idx
             
@@ -344,17 +495,19 @@ class SparseFASERCALDataset(Dataset):
         y = np.unique(data['reco_hits'][:, 1])
         z = np.unique(np.stack((data['reco_hits'][:, 2], data['reco_hits'][:, 3]), axis=1), axis=0)
         q = data['reco_hits'][:, 4].round().astype(int)
+
         if is_cc:
             out_lepton_momentum = out_lepton_momentum.reshape(1, 3)
         else:
             out_lepton_momentum = np.zeros(shape=(1, 3))
         if is_cc and in_neutrino_pdg in [-16, 16]:  # nutau
             out_lepton_momentum = tauvis_momentum.reshape(1, 3)
+
         vis_sp_momentum = vis_sp_momentum.reshape(1, 3)
         jet_momentum = jet_momentum.reshape(1, 3)
 
         module_hits = np.bincount(reco_hits[:, 3].astype(int))
-        module_hits = module_hits[module_hits>0]
+        module_hits = module_hits[module_hits > 0]
         event_hits = np.array([reco_hits.shape[0]])
         rear_cal_energy = np.array([rear_cal_energy])
         rear_hcal_energy = np.array([rear_hcal_energy])
@@ -386,7 +539,13 @@ class SparseFASERCALDataset(Dataset):
                 "event_hits": event_hits,
                }
 
-dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v5.1b2")
+dataset = SparseFASERCALDataset(
+    [
+        "/scratch/salonso/sparse-nns/faser/events_v5.1b",
+        "/scratch/salonso/sparse-nns/faser/events_v5.1b_2",
+        "/scratch/salonso/sparse-nns/faser/events_v5.1b_tau_train",
+        "/scratch/salonso/sparse-nns/faser/events_v5.1b_tau_test",
+    ])
 
 def collate(batch):
     pdg = np.unique(np.concatenate([x['pdg'] for x in batch]))
@@ -410,7 +569,6 @@ def collate(batch):
     module_hits = np.concatenate([x['module_hits'] for x in batch])
     event_hits = np.concatenate([x['event_hits'] for x in batch])
     
-    
     return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
             "vis_sp_momentum": vis_sp_momentum,
             "out_lepton_momentum": out_lepton_momentum,
@@ -431,11 +589,15 @@ def collate(batch):
     
 loader = DataLoader(dataset, collate_fn=collate, batch_size=10, num_workers=10, drop_last=False, shuffle=False)
 
+# -------------------------
+# Aggregate
+# -------------------------
+
 pdg = []
 x = []
 y = []
 z = []
-q_counter = Counter()  # otherwise it explodes
+q_counter = Counter()  # memory-safe counter for q
 vis_sp_momentum = []
 out_lepton_momentum = []
 jet_momentum = []
@@ -499,114 +661,55 @@ event_hits = np.concatenate(event_hits)
 
 print("Done with concat")
 
+# -------------------------
+# Compute vector/jet stats (UNCHANGED OUTPUT SHAPE/KEYS)
+# -------------------------
 stats = compute_all_stats(
-        p_vis_true=vis_sp_momentum,
-        p_lep_true=out_lepton_momentum,
-        p_jet_true=jet_momentum,
-        is_cc=is_cc,
-        use_robust=True,
-        residual_floor_pct=5.0,
-        jet_scales_cc_only=True,
-        compute_jet_inversion_stats=False  # flip to True only if you plan a direct jet head
-    )
+    p_vis_true=vis_sp_momentum,
+    p_lep_true=out_lepton_momentum,
+    p_jet_true=jet_momentum,
+    is_cc=is_cc,
+    use_robust=True,
+    residual_floor_pct=5.0,
+    jet_scales_cc_only=True,
+    compute_jet_inversion_stats=False  # flip to True only if you plan a direct jet head
+)
 
-def get_dict(x, axis=None):
-    return {
-        'mean':   x.mean(axis=axis),
-        'median': np.median(x, axis=axis),
-        'std':    x.std(axis=axis),
-        'min':    x.min(axis=axis),
-        'max':    x.max(axis=axis),
-    }
-
-# assemble base metadata
-base_keys = ['in_neutrino_energy', 'out_lepton_energy',
-             'faser_cal_energy', 'faser_cal_modules',
-             'rear_cal_energy', 'rear_cal_modules',
-             'rear_hcal_energy', 'rear_hcal_modules',
-             'rear_mucal_energy', 'module_hits', 'event_hits',
-            ]
-
+# -------------------------
+# Assemble metadata
+# -------------------------
 metadata = {}
+
+# q robust standardization (Counter-based)
+add_robust_standardization_metadata(q_counter, metadata, key_prefix="q")
+
+# Robust metadata for base_keys (array-based)
+base_keys = [
+    'in_neutrino_energy', 'out_lepton_energy',
+    'faser_cal_energy', 'faser_cal_modules',
+    'rear_cal_energy', 'rear_cal_modules',
+    'rear_hcal_energy', 'rear_hcal_modules',
+    'rear_mucal_energy', 'module_hits', 'event_hits',
+]
+
 for key in base_keys:
     arr = locals()[key]
-    axis = None
-    metadata[key] = get_dict(arr, axis=axis)
-    metadata[f"{key}_log1p"] = get_dict(np.log1p(arr), axis=axis)
-    metadata[f"{key}_sqrt"]  = get_dict(np.sqrt(arr), axis=axis)
-
-# q_counter has been built via q_counter.update(batch["q"])
-total_hits = sum(q_counter.values())
-
-# compute raw-q stats
-q_mean = sum(val * cnt for val, cnt in q_counter.items()) / total_hits
-q2_mean = sum((val**2) * cnt for val, cnt in q_counter.items()) / total_hits
-q_std = np.sqrt(q2_mean - q_mean**2)
-
-# find median, min, max
-cum = 0
-median_pos = total_hits / 2
-for val in sorted(q_counter):
-    cum += q_counter[val]
-    if cum >= median_pos:
-        q_median = val
-        break
-q_min = min(q_counter)
-q_max = max(q_counter)
-
-# compute log1p-q stats
-#    E[log1p(q)], E[(log1p(q))^2], etc.
-q_lp_mean = sum(np.log1p(val)    * cnt for val, cnt in q_counter.items()) / total_hits
-q_lp2_mean= sum((np.log1p(val)**2)* cnt for val, cnt in q_counter.items()) / total_hits
-q_lp_std  = np.sqrt(q_lp2_mean - q_lp_mean**2)
-q_lp_median = np.log1p(q_median)
-q_lp_min    = np.log1p(q_min)
-q_lp_max    = np.log1p(q_max)
-
-# compute sqrt-q stats
-#    E[sqrt(q)], E[(sqrt(q))^2], etc.
-q_s_mean = sum(np.sqrt(val)    * cnt for val, cnt in q_counter.items()) / total_hits
-q_s2_mean= sum((np.sqrt(val)**2)* cnt for val, cnt in q_counter.items()) / total_hits
-q_s_std   = np.sqrt(q_s2_mean - q_s_mean**2)
-q_s_median = np.sqrt(q_median)
-q_s_min    = np.sqrt(q_min)
-q_s_max    = np.sqrt(q_max)
-
-# inject into metadata dict
-metadata['q'] = {
-    'mean':   q_mean,
-    'median': q_median,
-    'std':    q_std,
-    'min':    q_min,
-    'max':    q_max
-}
-metadata['q_log1p'] = {
-    'mean':   q_lp_mean,
-    'median': q_lp_median,
-    'std':    q_lp_std,
-    'min':    q_lp_min,
-    'max':    q_lp_max
-}
-metadata['q_sqrt'] = {
-    'mean':   q_s_mean,
-    'median': q_s_median,
-    'std':    q_s_std,
-    'min':    q_s_min,
-    'max':    q_s_max
-}
+    add_robust_standardization_metadata_array(arr, metadata, key_prefix=key)
 
 # include coordinate and pdg info
-metadata.update({'x': x, 'y': y, 'z': z,
-                 'ghost_pdg': set([-10000]),
-                 'muonic_pdg': set([-13,13]),
-                 'electromagnetic_pdg': set([-11,11,-15,15,22]),
-                 'hadronic_pdg': set([p for p in pdg if p not in [-10000,-13,13,-11,11,-15,15,22]])})
+metadata.update({
+    'x': x, 'y': y, 'z': z,
+    'ghost_pdg': set([-10000]),
+    'muonic_pdg': set([-13, 13]),
+    'electromagnetic_pdg': set([-11, 11, -15, 15, 22]),
+    'hadronic_pdg': set([p for p in pdg if p not in [-10000, -13, 13, -11, 11, -15, 15, 22]])
+})
 
+# merge vector/jet stats
 metadata = {**metadata, **stats}  # for Python < 3.9 compatibility
 
 # save metadata
-import pickle as pk
-with open("/scratch/salonso/sparse-nns/faser/events_v5.1b2/metadata_stats.pkl", "wb") as fd:
+with open("/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata_stats.pkl", "wb") as fd:
     pk.dump(metadata, fd)
 
 print("Metadata saved.")

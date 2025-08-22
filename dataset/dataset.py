@@ -32,12 +32,11 @@ class SparseFASERCALDataset(Dataset):
         self.train = args.train
         self.stage1 = args.stage1
         self.augmentations_enabled = False
-        self.standardize_input = args.standardize_input
-        self.standardize_output = args.standardize_output
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
         self.label_smoothing = args.label_smoothing
         self.mixup_alpha = args.mixup_alpha
+        self.crop_around_vertex = args.crop_around_vertex
 
         # Load metadata
         with open(args.metadata_path, "rb") as fd:
@@ -178,45 +177,65 @@ class SparseFASERCALDataset(Dataset):
         return momentum[0] if magnitude.shape[0] == 1 else momentum
 
 
-    def preprocess(self, x, param_name, preprocessing=None, standardize=None):
+    def robust_standardize(self, x, params):
+        k   = params["k"]
+        mu  = params["mu"]
+        sig = params["sigma"]
+        tname = params["transform"]
+
+        lookup = {
+            "identity": lambda u: u,
+            "log1p":    lambda u: torch.log1p(u),
+            "sqrt":     lambda u: torch.sqrt(u),
+        }
+        if tname not in lookup:
+            raise ValueError(f"Unknown transform: {tname}")
+
+        f = lookup[tname]
+        u = f(x / k)
+        z = (u - mu) / sig
+        return z
+
+
+    def robust_unstandardize(self, z, params):
+        k   = params["k"]
+        mu  = params["mu"]
+        sig = params["sigma"]
+        tname = params["transform"]
+
+        inv_lookup = {
+            "identity": lambda u: u,
+            "log1p":    lambda u: torch.expm1(u),
+            "sqrt":     lambda u: torch.square(u),
+        }
+        if tname not in inv_lookup:
+            raise ValueError(f"Unknown transform: {tname}")
+
+        u = z * sig + mu
+        x_over_k = inv_lookup[tname](u)
+        return x_over_k * k
+
+
+    def preprocess(self, x, param_name, preprocessing=None):
         """Applies a sequence of preprocessing steps (e.g., log, z-score)."""
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(x)
         x = torch.atleast_1d(x)
         internal_name = param_name
         
-        if preprocessing == "sqrt":
-            if torch.any(x < 0).item(): raise ValueError(f"{param_name}: negative values cannot take sqrt")
-            x = torch.sqrt(x)
-            internal_name += "_sqrt"
-        elif preprocessing == "log":
-            if torch.any(x <= -1).item(): raise ValueError(f"{param_name}: values <= -1 cannot take log1p")
-            x = torch.log1p(x)
-            internal_name += "_log1p"
+        if preprocessing is not None:
+            if preprocessing == "sqrt":
+                internal_name += "_sqrt"
+            elif preprocessing == "log":
+                internal_name += "_log1p"
 
-        if standardize:
             stats = self.metadata[internal_name]
-            to_t = lambda v: torch.as_tensor(v, dtype=x.dtype, device=x.device)
-            std = to_t(stats.get("std", 1.0))
-            zero_cmp = torch.isclose(std, to_t(0.0))
-            zero_std = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
-
-            if standardize == "z-score":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = (x - to_t(stats["mean"])) / std
-            elif standardize == "unit-var":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x / std
-            else:
-                rng = to_t(stats["max"]) - to_t(stats["min"])
-                zero_cmp = torch.isclose(rng, to_t(0.0))
-                zero_rng = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
-                if zero_rng: raise ValueError(f"{internal_name}: max and min are equal in metadata")
-                x = (x - to_t(stats["min"])) / rng
+            x = self.robust_standardize(x, params=stats)
+            
         return x
 
 
-    def unpreprocess(self, x, param_name, preprocessing=None, standardize=None):
+    def unpreprocess(self, x, param_name, preprocessing=None):
         """Reverses the preprocessing."""
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(x)
@@ -224,37 +243,17 @@ class SparseFASERCALDataset(Dataset):
             x = torch.atleast_1d(x)
 
         internal_name = param_name
-        if preprocessing == "sqrt":
-            internal_name = param_name + "_sqrt"
-        elif preprocessing == "log":
-            internal_name = param_name + "_log1p"
+        if preprocessing is not None:
+            if preprocessing == "sqrt":
+                internal_name = param_name + "_sqrt"
+            elif preprocessing == "log":
+                internal_name = param_name + "_log1p"
 
-        if standardize is not None:
             stats = self.metadata[internal_name]
-            to_t = lambda v: torch.as_tensor(v, dtype=x.dtype, device=x.device)
-            std = to_t(stats.get("std", 1.0))
-            zero_cmp = torch.isclose(std, to_t(0.0))
-            zero_std = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
-            if standardize == "z-score":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x * to_t(stats["std"]) + to_t(stats["mean"])
-            elif standardize == "unit-var":
-                if zero_std: raise ValueError(f"{internal_name}: std is zero in metadata")
-                x = x * to_t(stats["std"])
-            else:
-                rng = to_t(stats["max"]) - to_t(stats["min"])
-                zero_cmp = torch.isclose(rng, to_t(0.0))
-                zero_rng = zero_cmp.item() if zero_cmp.ndim == 0 else torch.any(zero_cmp).item()
-                if zero_rng: raise ValueError(f"{internal_name}: max and min are equal in metadata")
-                x = x * rng + to_t(stats["min"])
-
-        if preprocessing == "sqrt":
-            x = x ** 2
-        elif preprocessing == "log":
-            x = torch.expm1(x)
+            x = self.robust_unstandardize(x, params=stats)
 
         return x
-        
+
 
     def _prepare_event(self, idx, transformations=None):
         """
@@ -429,20 +428,18 @@ class SparseFASERCALDataset(Dataset):
         Applies preprocessing and converts arrays into the final torch tensors output.
         """
         # Preprocess features
-        feats = self.preprocess(event['q'], 'q', self.preprocessing_input, self.standardize_input)
-        event_hits = self.preprocess(
-            len(event['q']), 'event_hits', self.preprocessing_input, self.standardize_input
-        )
+        feats = self.preprocess(event['q'], 'q', self.preprocessing_input)
+        event_hits = self.preprocess(len(event['q']), 'event_hits', self.preprocessing_input)
         feats_global = torch.cat([
             event_hits,
-            self.preprocess(event['global_feats']['faser_cal_energy'], 'faser_cal_energy', self.preprocessing_input, self.standardize_input),
-            self.preprocess(event['global_feats']['rear_cal_energy'], 'rear_cal_energy', self.preprocessing_input, self.standardize_input),
-            self.preprocess(event['global_feats']['rear_hcal_energy'], 'rear_hcal_energy', self.preprocessing_input, self.standardize_input),
-            self.preprocess(event['global_feats']['rear_mucal_energy'], 'rear_mucal_energy', self.preprocessing_input, self.standardize_input)
+            self.preprocess(event['global_feats']['faser_cal_energy'], 'faser_cal_energy', self.preprocessing_input),
+            self.preprocess(event['global_feats']['rear_cal_energy'], 'rear_cal_energy', self.preprocessing_input),
+            self.preprocess(event['global_feats']['rear_hcal_energy'], 'rear_hcal_energy', self.preprocessing_input),
+            self.preprocess(event['global_feats']['rear_mucal_energy'], 'rear_mucal_energy', self.preprocessing_input)
         ])
-        faser_mod = self.preprocess(event['global_feats']['faser_cal_modules'], 'faser_cal_modules', self.preprocessing_input, self.standardize_input)
-        rear_cal_mod = self.preprocess(event['global_feats']['rear_cal_modules'], 'rear_cal_modules', self.preprocessing_input, self.standardize_input)
-        rear_hcal_mod = self.preprocess(event['global_feats']['rear_hcal_modules'], 'rear_hcal_modules', self.preprocessing_input, self.standardize_input)
+        faser_mod = self.preprocess(event['global_feats']['faser_cal_modules'], 'faser_cal_modules', self.preprocessing_input)
+        rear_cal_mod = self.preprocess(event['global_feats']['rear_cal_modules'], 'rear_cal_modules', self.preprocessing_input)
+        rear_hcal_mod = self.preprocess(event['global_feats']['rear_hcal_modules'], 'rear_hcal_modules', self.preprocessing_input)
 
         vis_sp_momentum = event['vis_sp_momentum']
         out_lepton_momentum = event['out_lepton_momentum']
@@ -455,20 +452,28 @@ class SparseFASERCALDataset(Dataset):
 
         # Preprocess outputs
         #pt_miss = torch.tensor([np.sqrt(event['vis_sp_momentum'][0]**2 + event['vis_sp_momentum'][1]**2)])
-        #pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output, self.standardize_output)
-        #e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output, self.standardize_output)
+        #pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output)
+        #e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output)
         vis_sp_momentum = self.preprocess(vis_sp_momentum, 'vis_sp_momentum')
         out_lepton_momentum = self.preprocess(out_lepton_momentum, 'out_lepton_momentum')
         jet_momentum = self.preprocess(jet_momentum, 'jet_momentum')
-        #vis_mag = self.preprocess(vis_magnitude, 'vis_sp_momentum_magnitude', self.preprocessing_output, self.standardize_output)
-        #out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output, self.standardize_output)
-        #jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output, self.standardize_output)
+        #vis_mag = self.preprocess(vis_magnitude, 'vis_sp_momentum_magnitude', self.preprocessing_output)
+        #out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output)
+        #jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output)
+
+        if self.crop_around_vertex:
+            # Keep coordinates around the primary vertex module
+            primary_vertex_module = event['primary_vertex'][2] // self.num_modules
+            coords_module = event['coords'][:, 2] // self.num_modules
+            vertex_mask = (coords_module >= primary_vertex_module - 1) & (coords_module <= primary_vertex_module + 4)
+        else:
+            vertex_mask = np.ones(event['coords'].shape[0], dtype=bool)
 
         # Assemble output
         output = {
-            'coords': torch.from_numpy(event['coords']).float(),
-            'modules': torch.from_numpy(event['modules']).long(),
-            'feats': feats.float(),
+            'coords': torch.from_numpy(event['coords'][vertex_mask]).float(),
+            'modules': torch.from_numpy(event['modules'][vertex_mask]).long(),
+            'feats': feats[vertex_mask].float(),
             'feats_global': feats_global.float(),
             'faser_cal_modules': faser_mod.float(),
             'rear_cal_modules': rear_cal_mod.float(),
@@ -476,7 +481,7 @@ class SparseFASERCALDataset(Dataset):
             'flavour_label': torch.from_numpy(event['flavour_label']),
         }
         if self.stage1:
-            output['seg_labels'] = torch.from_numpy(event['seg_labels']).float()
+            output['seg_labels'] = torch.from_numpy(event['seg_labels'][vertex_mask]).float()
         if not self.train or not self.stage1:
             output.update({
                 'charm': torch.from_numpy(np.atleast_1d(event['charm'])).float(),

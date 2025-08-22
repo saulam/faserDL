@@ -20,6 +20,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 torch.set_float32_matmul_precision("medium")
 pl_major = int(pl.__version__.split(".")[0])
 MODEL_FACTORIES = {
+    'tiny':  vit_tiny,
     'base':  vit_base,
     'large': vit_large,
     'huge':  vit_huge,
@@ -60,8 +61,8 @@ def main():
         extra_dataset = SparseFASERCALDataset(args)
         
     print("- Dataset size: {} events".format(len(dataset)))
-    train_loader, valid_loader, test_loader = split_dataset(
-        dataset, args, splits=[0.6, 0.1, 0.3], extra_dataset=extra_dataset
+    train_loader, valid_loader, _ = split_dataset(
+        dataset, args, splits=[0.75, 0.05, 0.2], extra_dataset=extra_dataset
     )
 
     # Calculate arguments for scheduler
