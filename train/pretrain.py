@@ -6,12 +6,13 @@ Date: 01.25
 Description: pre-training script.
 """
 
+import json
 import os
 import torch
 import pytorch_lightning as pl
-from functools import partial
-from utils import ini_argparse, split_dataset
-from dataset import SparseFASERCALDataset
+from pathlib import Path
+from utils import ini_argparse, split_dataset, create_loader
+from dataset import *
 from model import *
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
@@ -40,6 +41,17 @@ class CustomProgressBar(TQDMProgressBar):
         return bar
 
 
+def shard_pattern(split, meta, out_dir):
+    n = meta["splits"][split]["num_shards"]
+    # If no shards, return an empty pattern
+    if n == 0:
+        return ""
+    # zero-based inclusive brace range, e.g. {0000..0017}
+    start = "0000"
+    end = f"{n-1:04d}"
+    return str(out_dir / f"{split}-{{{start}..{end}}}.tar")
+
+
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
@@ -55,16 +67,35 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
     # Dataset
-    dataset = SparseFASERCALDataset(args)
-    extra_dataset = None
-    if args.extra_dataset_path is not None:
-        args.dataset_path = args.extra_dataset_path
-        extra_dataset = SparseFASERCALDataset(args)
+    if args.web_dataset_path is not None:
+        print("Iterable dataset")
+        args.web_dataset_path = Path(args.web_dataset_path)
+        with open(args.web_dataset_path / "metadata.json") as f:
+            meta = json.load(f)
+        train_pat = shard_pattern("train", meta, args.web_dataset_path)
+        val_pat   = shard_pattern("val", meta, args.web_dataset_path)
+        train_set = SparseFASERCALIterableDataset(
+            args, 'train', meta=meta, shard_pattern=train_pat, shardshuffle=args.shardshuffle, shuffle=args.shuffle
+        )
+        val_set = SparseFASERCALIterableDataset(
+            args, 'val', meta=meta, shard_pattern=val_pat, shardshuffle=args.shardshuffle, shuffle=args.shuffle
+        )
+        train_loader = create_loader(train_set, shuffle=False, drop_last=True, args=args)
+        valid_loader = create_loader(val_set, shuffle=False, drop_last=True, args=args)
+        metadata = train_set.metadata
+    else:
+        print("Standard dataset")
+        dataset = SparseFASERCALMapDataset(args)
+        extra_dataset = None
+        if args.extra_dataset_path is not None:
+            args.dataset_path = args.extra_dataset_path
+            extra_dataset = SparseFASERCALMapDataset(args)
 
-    print("- Dataset size: {} events".format(len(dataset)))
-    train_loader, valid_loader, _ = split_dataset(
-        dataset, args, splits=[0.75, 0.05, 0.2], extra_dataset=extra_dataset
-    )
+        print("- Dataset size: {} events".format(len(dataset)))
+        train_loader, valid_loader, _ = split_dataset(
+            dataset, args, splits=[0.75, 0.05, 0.2], extra_dataset=extra_dataset
+        )
+        metadata = dataset.metadata
 
     # Calculate arguments for scheduler
     nb_batches = len(train_loader)
@@ -123,12 +154,11 @@ def main():
     # Lightning model
     lightning_model = MAEPreTrainer(
         model=model,
-        metadata=dataset.metadata,
+        metadata=metadata,
         args=args)
  
     # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(
-        #num_sanity_val_steps=0,
         max_epochs=args.epochs,
         callbacks=callbacks,
         accelerator="gpu",

@@ -1,9 +1,8 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1*"
-extra_dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1b_tau_train"
-metadata_path="/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata_stats.pkl"
+web_dataset_path="/scratch/salonso/sparse-nns/faser/dataset"
+metadata_path="/scratch/salonso/sparse-nns/faser/dataset/metadata_stats.pkl"
 model="base"
 eps=1e-12
 batch_size=512
@@ -39,7 +38,7 @@ python -m train.finetune \
     --train \
     --stage2 \
     --augmentations_enabled \
-    --dataset_path "$dataset_path" \
+    --web_dataset_path "$web_dataset_path" \
     --metadata_path $metadata_path \
     --model $model \
     --eps $eps \

@@ -6,14 +6,13 @@ Date: 07.25
 Description: Dataset file.
 """
 
+import io
 import pickle as pk
 import numpy as np
 import torch
-import os
+import webdataset as wds
 from glob import glob
-from torch.utils.data import Dataset
-from sklearn.neighbors import NearestNeighbors
-from utils import ini_argparse
+from torch.utils.data import Dataset, IterableDataset
 from utils.augmentations import augment, smooth_labels
 
 
@@ -25,9 +24,6 @@ class SparseFASERCALDataset(Dataset):
         """
         Initialises the dataset.
         """
-        self.root = args.dataset_path
-        self.data_files = sorted(glob(f'{self.root}/*.npz'))
-
         # Configuration from args
         self.train = args.train
         self.stage1 = args.stage1
@@ -37,6 +33,7 @@ class SparseFASERCALDataset(Dataset):
         self.label_smoothing = args.label_smoothing
         self.mixup_alpha = args.mixup_alpha
         self.crop_around_vertex = args.crop_around_vertex
+        self.epoch = 0
 
         # Load metadata
         with open(args.metadata_path, "rb") as fd:
@@ -46,19 +43,6 @@ class SparseFASERCALDataset(Dataset):
 
         self.module_size = int((self.metadata['z'][:, 1] == 0).sum())
         self.num_modules = int(self.metadata['z'][:, 1].max() + 1)
-        self.primary_vertices = None
-
-    
-    def __len__(self):
-        """Returns the total number of samples in the dataset."""
-        return len(self.data_files)
-
-        
-    def calc_primary_vertices(self):
-        self.primary_vertices = np.array([np.load(f)["primary_vertex"] for f in self.data_files])
-        self.nn = NearestNeighbors(n_neighbors=51, algorithm='auto')  # +1 to exclude self
-        self.nn.fit(self.primary_vertices)
-        print("Primary vertices pre-loaded, and NN trained.")
 
     
     def voxelise(self, coords, reverse=False):
@@ -255,12 +239,11 @@ class SparseFASERCALDataset(Dataset):
         return x
 
 
-    def _prepare_event(self, idx, transformations=None):
+    def _prepare_event(self, data, transformations=None):
         """
         Loads and processes a single event up through augmentations.
         Returns a dict of intermediate arrays.
         """
-        data = np.load(self.data_files[idx], allow_pickle=True)
         run_number = data['run_number'].item()
         event_id = data['event_id'].item()
         reco_hits = data['reco_hits']
@@ -508,13 +491,59 @@ class SparseFASERCALDataset(Dataset):
         return output
         
 
-    def __getitem__(self, idx):
-        event = self._prepare_event(idx)
-        if self.train and self.augmentations_enabled and not self.stage1 and self.mixup_alpha > 0:
-            # find candidate with similar vertex for mixup
-            _, indices = self.nn.kneighbors(self.primary_vertices[idx].reshape(1, -1))
-            selected_idx = np.random.choice(indices[0][1:])
-            event2 = self._prepare_event(selected_idx, event['transformations'])
-            event = self._mixup(event, event2, alpha=self.mixup_alpha)
-
+    def _process_sample(self, data):
+        event = self._prepare_event(data)
         return self._finalise_event(event)
+
+
+class SparseFASERCALMapDataset(SparseFASERCALDataset, Dataset):
+    def __init__(self, args):
+        super().__init__(args)
+        self.root = args.dataset_path
+        self.data_files = sorted(glob(f'{self.root}/*.npz'))
+
+    def __len__(self):
+        """Returns the total number of samples in the dataset."""
+        return len(self.data_files)
+    
+    def __getitem__(self, idx):
+        data = np.load(self.data_files[idx], allow_pickle=True)
+        return self._process_sample(data)
+
+
+
+class SparseFASERCALIterableDataset(SparseFASERCALDataset, IterableDataset):
+    def __init__(self, args, split, meta, shard_pattern, shardshuffle=False, shuffle=0):
+        super().__init__(args)
+        self.shuffle = shuffle
+        self.shardshuffle = shardshuffle
+        self.shard_pattern = shard_pattern
+        self._len = meta["splits"][split]["num_samples"]
+
+    def __len__(self):
+        return self._len
+    
+    def _decode_npz_only(self, sample):
+        """Decode .npz files from bytes into numpy objects."""
+        for k in list(sample.keys()):
+            if k.endswith(".npz") and not hasattr(sample[k], "files"):
+                sample[k] = np.load(io.BytesIO(sample[k]), allow_pickle=True)
+        return sample
+    
+    def __iter__(self):
+        dataset = (
+            wds.WebDataset(
+                self.shard_pattern,
+                shardshuffle=self.shardshuffle,
+                empty_check=True,
+                nodesplitter=wds.split_by_node,
+                workersplitter=wds.split_by_worker,
+            )
+            .with_epoch(self.epoch)
+            .shuffle(self.shuffle)
+            .map(self._decode_npz_only)
+            .to_tuple("data.npz")
+        )
+
+        for data, in dataset:
+            yield self._process_sample(data)

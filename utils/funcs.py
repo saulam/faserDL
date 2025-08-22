@@ -67,30 +67,32 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
         train_set = ConcatDataset([train_set, extra_dataset])
     
     collate_fn = collate_test if test else collate_sparse_minkowski
-    persistent = args.num_workers > 0
-
-    def create_loader(ds, shuffle, drop_last):
-        return DataLoader(
-            ds,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            shuffle=shuffle,
-            pin_memory=True,
-            persistent_workers=persistent,
-            collate_fn=collate_fn,
-            drop_last=drop_last,
-        )
 
     return (
-        create_loader(train_set, shuffle=True, drop_last=True),
-        create_loader(val_set, shuffle=False, drop_last=True),
-        create_loader(test_set, shuffle=False, drop_last=False),
+        create_loader(train_set, shuffle=True, drop_last=True, collate_fn=collate_fn, args=args),
+        create_loader(val_set, shuffle=False, drop_last=True, collate_fn=collate_fn, args=args),
+        create_loader(test_set, shuffle=False, drop_last=False, collate_fn=collate_fn, args=args),
+    )
+
+
+def create_loader(ds, shuffle, drop_last, collate_fn=None, args=None):
+    if collate_fn is None:
+        collate_fn = collate_sparse_minkowski
+    persistent = args.num_workers > 0
+    return DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=shuffle,
+        pin_memory=True,
+        persistent_workers=persistent,
+        collate_fn=collate_fn,
+        drop_last=drop_last,
     )
 
 
 def collate_test(batch):
     coords_list, feats_list = [], []
-    module_to_event, module_pos = [], []
 
     batch = [d for d in batch if len(d['coords']) > 0]  # Filter out empty samples
 
@@ -128,7 +130,6 @@ def collate_test(batch):
 
 def collate_sparse_minkowski(batch):
     coords_list, feats_list = [], []
-    module_to_event, module_pos = [], []
 
     batch = [d for d in batch if len(d['coords']) > 0]  # Filter out empty samples
 

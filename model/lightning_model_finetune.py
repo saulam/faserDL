@@ -107,6 +107,20 @@ class ViTFineTuner(pl.LightningModule):
                 self.model.parameters(),
                 decay=self.ema_decay,
             )
+
+
+    def on_train_epoch_start(self):
+        raw = getattr(self.trainer, "train_dataloader", None)
+        if raw is None:
+            raw = getattr(self.trainer, "train_dataloaders", None)
+        if raw is None:
+            return
+
+        loaders = raw if isinstance(raw, (list, tuple)) else [raw]
+        for dl in loaders:
+            ds = getattr(dl, "dataset", None)
+            if hasattr(ds, "set_epoch"):
+                ds.set_epoch(self.trainer.current_epoch)
             
     
     def on_before_zero_grad(self, optimizer):

@@ -57,6 +57,20 @@ class MAEPreTrainer(pl.LightningModule):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
 
+
+    def on_train_epoch_start(self):
+        raw = getattr(self.trainer, "train_dataloader", None)
+        if raw is None:
+            raw = getattr(self.trainer, "train_dataloaders", None)
+        if raw is None:
+            return
+
+        loaders = raw if isinstance(raw, (list, tuple)) else [raw]
+        for dl in loaders:
+            ds = getattr(dl, "dataset", None)
+            if hasattr(ds, "set_epoch"):
+                ds.set_epoch(self.trainer.current_epoch)
+
     
     def forward(self, x, x_glob, mask_ratio):
         return self.model(x, x_glob, mask_ratio)
@@ -185,38 +199,6 @@ class MAEPreTrainer(pl.LightningModule):
         )
         return total_loss, part_losses
 
-    '''
-    def compute_losses(self, targ_reg, targ_cls, pred_occ, pred_reg, pred_cls, idx_targets):
-        mask_targets = (idx_targets >= 0)
-        mask_flat    = mask_targets.view(-1)
-        idx_flat     = idx_targets.view(-1)[mask_flat]
-
-        targ_occ = mask_targets.float()
-        if self.model.training and self.label_smoothing > 0:
-            targ_occ = targ_occ * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
-        loss_occ = F.binary_cross_entropy_with_logits(pred_occ, targ_occ)
-
-        pred_reg   = pred_reg.view(-1, self.model.in_chans)[mask_flat]
-        targ_reg   = targ_reg[idx_flat]
-        loss_reg   = F.mse_loss(pred_reg, targ_reg)
-
-        pred_cls   = pred_cls.view(-1, self.model.out_chans)[mask_flat]
-        targ_cls   = targ_cls[idx_flat]
-        loss_cls   = F.cross_entropy(pred_cls, targ_cls)
-
-        part_losses = {
-            'occ': loss_occ,
-            'reg': loss_reg,
-            'cls': loss_cls,
-        }
-        total_loss = ( 
-            weighted_loss(loss_occ, self.log_sigma_occ) +
-            weighted_loss(loss_reg, self.log_sigma_reg) +
-            weighted_loss(loss_cls, self.log_sigma_cls)
-        )
-
-        return total_loss, part_losses
-    '''
     
     def common_step(self, batch):
         batch_size = len(batch["c"])
