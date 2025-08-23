@@ -3,6 +3,8 @@
 # Default arguments
 web_dataset_path="/scratch/salonso/sparse-nns/faser/dataset"
 metadata_path="/scratch/salonso/sparse-nns/faser/dataset/metadata_stats.pkl"
+shardshuffle=200
+shuffle=2000
 model="base"
 eps=1e-12
 batch_size=512
@@ -40,6 +42,8 @@ python -m train.finetune \
     --augmentations_enabled \
     --web_dataset_path "$web_dataset_path" \
     --metadata_path $metadata_path \
+    --shardshuffle $shardshuffle \
+    --shuffle $shuffle \
     --model $model \
     --eps $eps \
     --mixup_alpha $mixup_alpha \

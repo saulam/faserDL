@@ -82,6 +82,8 @@ def main():
         train_loader = create_loader(train_set, shuffle=False, drop_last=True, args=args)
         valid_loader = create_loader(val_set, shuffle=False, drop_last=True, args=args)
         metadata = train_set.metadata
+        nb_batches_train = len(train_set) // args.batch_size
+        nb_batches_val = len(valid_loader) // args.batch_size
     else:
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
@@ -95,16 +97,17 @@ def main():
             dataset, args, splits=[0.75, 0.05, 0.2], extra_dataset=extra_dataset
         )
         metadata = dataset.metadata
+        nb_batches_train = len(train_loader)
+        nb_batches_val = len(valid_loader)
 
     # Calculate arguments for scheduler
-    nb_batches = len(train_loader)
     denom = args.accum_grad_batches * nb_gpus
     if args.blr is not None:
         # overwrite lr by linearly-scaled blr if args.blr is defined
         args.lr = args.blr * (args.batch_size * denom) / 256.
-    args.scheduler_steps = nb_batches * args.cosine_annealing_steps // denom
-    args.warmup_steps = nb_batches * args.warmup_steps // denom
-    args.start_cosine_step = (nb_batches * args.epochs // denom) - args.scheduler_steps
+    args.scheduler_steps = nb_batches_train * args.cosine_annealing_steps // denom
+    args.warmup_steps = nb_batches_train * args.warmup_steps // denom
+    args.start_cosine_step = (nb_batches_train * args.epochs // denom) - args.scheduler_steps
     print(f"lr                = {args.lr}")
     print(f"scheduler_steps   = {args.scheduler_steps}")
     print(f"warmup_steps      = {args.warmup_steps}")
@@ -172,6 +175,8 @@ def main():
 
     # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(
+        limit_train_batches=nb_batches_train//denom,
+        limit_val_batches=nb_batches_val//denom,
         max_epochs=args.epochs,
         callbacks=callbacks,
         accelerator="gpu",

@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1*"
+web_dataset_path="/scratch/salonso/sparse-nns/faser/dataset"
 metadata_path="/scratch/salonso/sparse-nns/faser/dataset/metadata_stats.pkl"
 shardshuffle=200
 shuffle=4000
-model="tiny"
+model="base"
 eps=1e-12
 batch_size=512
 preprocessing_input="log"
@@ -22,11 +22,11 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="pretrain_v5.1b_dlnu_log_base_v8"
+name="pretrain_v5.1b_dlnu_log_base_v7"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v5.1b_dlnu_log_base_v8"
+checkpoint_name="pretrain_v5.1b_dlnu_log_base_v7"
 early_stop_patience=200
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
 gpus=(0 1)
@@ -35,8 +35,10 @@ python -m train.pretrain \
     --train \
     --stage1 \
     --augmentations_enabled \
-    --dataset_path "$dataset_path" \
+    --web_dataset_path "$web_dataset_path" \
     --metadata_path $metadata_path \
+    --shardshuffle $shardshuffle \
+    --shuffle $shuffle \
     --model $model \
     --eps $eps \
     --batch_size $batch_size \

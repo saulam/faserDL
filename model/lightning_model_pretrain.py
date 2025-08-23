@@ -84,68 +84,89 @@ class MAEPreTrainer(pl.LightningModule):
 
     def _occ_supervision_mask(
         self,
-        idx_targets: torch.Tensor,       # [M, P], -1 => empty sub-voxel, >=0 => raw index of hit
-        patch_shape: tuple,              # (p_h, p_w, p_d)
-        dilate: int = 1,                 # r voxels around the signal inside each patch
-        neg_ratio: float = 6.0,          # |N| ≈ neg_ratio × |P| (per token)
-        max_negs_per_token: int = 4096,  # hard cap per token
+        idx_targets: torch.Tensor,          # [M, P], -1 => empty sub-voxel, >=0 => raw index of hit
+        patch_shape: tuple,                 # (p_h, p_w, p_d)
+        dilate: int = 1,                    # r voxels around the signal inside each patch
+        neg_ratio: float = 6.0,             # |N_far| ≈ neg_ratio × |P|  (per partially-occupied token)
+        max_negs_per_token: int = 4096,     # hard cap per token
+        empty_neg_quota_frac: float = 0.10, # fraction of P to sample in fully-empty tokens
     ):
         """
         Returns:
-        sup_mask: [M, P] bool  — which sub-voxels to supervise for occupancy
-        sup_targ: [M, P] float — 1 for positives, 0 for border + sampled negatives
-        pos_mask: [M, P] bool  — convenience for your reg/cls heads
+            sup_mask: [M, P] bool  — which sub-voxels to supervise for occupancy
+            sup_targ: [M, P] float — 1 for positives, 0 for border + sampled negatives
+            pos_mask: [M, P] bool  — true occupied sub-voxels (for reg/cls supervision)
+
+        Notes:
+        - Positives: idx_targets >= 0
+        - Border: dilation around positives (inside patch)
+        - Negatives: union of
+                (1) far-empty subvoxels in partially-occupied patches
+                (2) sampled subvoxels from fully-empty patches
         """
         device = idx_targets.device
         M, P   = idx_targets.shape
         p_h, p_w, p_d = patch_shape
 
-        pos_mask = (idx_targets >= 0)                                    # [M, P]
+        # --- Positives ---
+        pos_mask = (idx_targets >= 0)                                         # [M, P]
 
-        # --- B: border via voxel dilation (inside each patch) ---
-        occ = pos_mask.float().view(M, 1, p_h, p_w, p_d)                 # [M,1,ph,pw,pd]
+        # --- Border (dilation around positives) ---
+        occ = pos_mask.float().view(M, 1, p_h, p_w, p_d)                      # [M,1,ph,pw,pd]
         if dilate > 0:
             ksz = 2 * dilate + 1
-            kernel = torch.ones((1, 1, ksz, ksz, ksz), device=device)    # depthwise over tokens
-            dil = F.conv3d(occ, kernel, padding=dilate) > 0              # [M,1,ph,pw,pd] -> bool
+            kernel = torch.ones((1, 1, ksz, ksz, ksz), device=device)
+            dil = F.conv3d(occ, kernel, padding=dilate) > 0                   # [M,1,ph,pw,pd]
         else:
             dil = occ.bool()
-        dil = dil.view(M, P)                                             # [M, P]
-        border_mask = (~pos_mask) & dil                                  # empty-but-near-signal
+        dil = dil.view(M, P)                                                  # [M, P]
+        border_mask = (~pos_mask) & dil                                       # [M, P]
 
-        # --- Far empties (eligible negatives) ---
-        far_empty = ~dil                                                  # outside dilation
+        # ---------- Negatives (1): far-empty in partially-occupied tokens ----------
+        far_empty = ~dil                                                      # [M, P]
+        partially_occupied = (pos_mask.sum(dim=1) > 0)                        # [M]
+        eligible_far = far_empty & (~pos_mask) & (~border_mask)
+        eligible_far = eligible_far & partially_occupied.unsqueeze(1)
 
-        # Per-token negative budget (variable k_i, clamped by availability and a hard cap)
-        pos_counts = pos_mask.sum(dim=1)                                  # [M]
-        far_counts = far_empty.sum(dim=1)                                 # [M]
-        want_negs  = (pos_counts * neg_ratio).to(torch.long)              # [M]
-        want_negs  = torch.minimum(want_negs, far_counts)                 # don’t ask for more than exist
-        want_negs  = torch.clamp(want_negs, max=max_negs_per_token)       # hard cap
-        K_max = int(want_negs.max().item())
+        pos_counts = pos_mask.sum(dim=1)                                      # [M]
+        far_counts = eligible_far.sum(dim=1)                                  # [M]
+        want_negs_far = (pos_counts * neg_ratio).to(torch.long)               # [M]
+        want_negs_far = torch.minimum(want_negs_far, far_counts)
+        want_negs_far = torch.clamp(want_negs_far, max=max_negs_per_token)
+        K_far = int(want_negs_far.max().item())
 
-        # --- Sample N negatives per token, vectorized ---
-        sampled_neg_mask = torch.zeros_like(pos_mask, dtype=torch.bool)   # [M, P]
-        if K_max > 0:
-            # Random scores; invalidate non-eligible columns by setting to +inf
+        sampled_far = torch.zeros_like(pos_mask, dtype=torch.bool)            # [M, P]
+        if K_far > 0:
             rnd = torch.rand(M, P, device=device)
-            rnd = rnd.masked_fill(~far_empty, float("inf"))               # only far empties compete
+            rnd = rnd.masked_fill(~eligible_far, float("inf"))
+            _, idxs = torch.topk(-rnd, k=K_far, dim=1)                        # [M, K_far]
+            keep = (torch.arange(K_far, device=device).unsqueeze(0) <
+                    want_negs_far.unsqueeze(1))                               # [M, K_far] bool
+            rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_far)
+            sampled_far[rows[keep], idxs[keep]] = True
 
-            # Take K_max smallest per row (equivalent to sampling without replacement)
-            # We use topk on -rnd to get "smallest".
-            vals, idxs = torch.topk(-rnd, k=K_max, dim=1)                 # idxs: [M, K_max]
+        # ---------- Negatives (2): fully-empty tokens ----------
+        fully_empty = (pos_mask.sum(dim=1) == 0)                              # [M]
+        eligible_empty = fully_empty.unsqueeze(1).expand(M, P) & (~border_mask)
+        quota_empty = int(min(max_negs_per_token, max(1, round(empty_neg_quota_frac * P))))
+        sampled_empty = torch.zeros_like(pos_mask, dtype=torch.bool)
+        if quota_empty > 0 and fully_empty.any():
+            rnd2 = torch.rand(M, P, device=device)
+            rnd2 = rnd2.masked_fill(~eligible_empty, float("inf"))
+            k2 = min(quota_empty, P)
+            _, idxs2 = torch.topk(-rnd2, k=k2, dim=1)                         # [M, k2]
 
-            # Per-row mask to keep only the first k_i selections
-            keep = (torch.arange(K_max, device=device).unsqueeze(0) <
-                    want_negs.unsqueeze(1))                               # [M, K_max] bool
+            rows2 = torch.arange(M, device=device).unsqueeze(1).expand(-1, k2)  # [M, k2]
+            # build mask by membership test instead of row assignment
+            keep_mat = torch.isin(rows2, fully_empty.nonzero(as_tuple=True)[0])
+            sampled_empty[rows2[keep_mat], idxs2[keep_mat]] = True
 
-            # Scatter to boolean mask without any Python loops
-            rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_max)  # [M, K_max]
-            sampled_neg_mask[rows[keep], idxs[keep]] = True
+        # ---------- Combine negatives ----------
+        sampled_neg_mask = sampled_far | sampled_empty
 
-        # --- Final supervision set ---
-        sup_mask = pos_mask | border_mask | sampled_neg_mask              # [M, P]
-        sup_targ = pos_mask.float()                                       # 1 for P, 0 for (B ∪ N)
+        # ---------- Final supervision ----------
+        sup_mask = pos_mask | border_mask | sampled_neg_mask                  # [M, P]
+        sup_targ = pos_mask.float()                                           # 1 for positives, 0 otherwise
 
         return sup_mask, sup_targ, pos_mask
 
