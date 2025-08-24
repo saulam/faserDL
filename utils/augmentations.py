@@ -7,10 +7,7 @@ Description:
     Auxiliary functions for data augmentations.
 """
 
-import torch
 import numpy as np
-from scipy.spatial.transform import Rotation as R
-from utils import ini_argparse, random_rotation_saul
 
 
 ROTATIONS = {
@@ -39,6 +36,7 @@ def augment(
     primary_vertex,
     metadata,
     transformations=None, 
+    stage1 = False,
     aug_prob=1.0
 ):
     """
@@ -59,7 +57,7 @@ def augment(
         if np.random.random() < aug_prob:
             coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
                 coords, modules, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, metadata, selected_axes=['x', 'y'],
+                primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['x', 'y'],
             )
         transformations['mirror'] = flipped                
 
@@ -75,7 +73,7 @@ def augment(
         if np.random.random() < aug_prob:
             coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
                 coords, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, metadata, selected_axes=['z'],
+                primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
             )
         transformations['rotate'] = chosen_angles
 
@@ -100,6 +98,10 @@ def augment(
         feats, momentums, global_feats, _ = scale_all_by_global_shift(
             feats, momentums, global_feats, std_dev=0.1,
         )
+
+    # Jitter
+    if np.random.random() < aug_prob:
+        feats = jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0)
 
     # Dropping
     if np.random.random() < aug_prob:
@@ -218,7 +220,8 @@ def rotate_90(
     chosen_angles: Dict[str,int] = {}
     for ax in ['x', 'y', 'z']:
         if ax in selected_axes:
-            angle = int(np.random.choice([0, 90, 180, 270]))
+            choices = [0, 90, 180, 270] if ax == 'z' else [0, 180]
+            angle = int(np.random.choice(choices))
             chosen_angles[ax] = angle
             R_final = R_final @ ROTATIONS[ax][angle]
 
@@ -472,6 +475,22 @@ def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
     }
 
     return scaled_feats, scaled_momentums, scaled_global_feats, shift
+
+
+def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):
+    """
+    Additive Gaussian jitter to voxel energies.
+    
+    Args:
+        feats (Tensor): voxel energies, shape [N] or [B, ...]
+        sigma (float): std dev of Gaussian noise (in same units as feats)
+        clamp_min (float): minimum value after jitter (default=0 for energies)
+    
+    Returns:
+        Tensor of same shape as feats, jittered.
+    """
+    noise = np.random.randn(*feats.shape) * sigma
+    return (feats + noise).clip(min=clamp_min)
 
 
 def smooth_labels(targets, smoothing: float, num_classes: int = None):

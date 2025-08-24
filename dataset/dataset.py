@@ -286,7 +286,7 @@ class SparseFASERCALDataset(Dataset):
             global_feats, _, transformations = augment(
                 coords, modules, q, (seg_labels_raw,),
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
-                global_feats, primary_vertex, self.metadata, transformations
+                global_feats, primary_vertex, self.metadata, transformations, self.stage1
             )
             charm = smooth_labels(np.array([charm]), smoothing=self.label_smoothing)
             flavour_label = smooth_labels(

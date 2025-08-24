@@ -8,6 +8,7 @@ Description:
 """
 
 
+from typing import Optional, Sequence, Union
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -623,6 +624,35 @@ def sigmoid_focal_loss_star(
     elif reduction == "sum":
         loss = loss.sum()
 
+    return loss
+
+
+def soft_focal_cross_entropy(
+    logits: torch.Tensor,              # [N, C]
+    target: torch.Tensor,              # [N, C] (soft labels; rows sum≈1)
+    gamma: float = 2.0,
+    alpha: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
+    reduction: str = "mean",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Focal cross-entropy that supports SOFT targets.
+      loss_i = - sum_c t_ic * (1 - p_ic)^gamma * log p_ic * alpha_c
+    """
+    logp = F.log_softmax(logits, dim=-1)
+    p    = logp.exp()
+
+    mod  = (1.0 - p).clamp_min(eps).pow(gamma)             # [N, C]
+    loss = -target * mod * logp                            # [N, C]
+
+    if alpha is not None:
+        if not torch.is_tensor(alpha):
+            alpha = logits.new_tensor(alpha, dtype=loss.dtype)
+        loss = loss * alpha.view(1, -1)                    # broadcast [1, C]
+
+    loss = loss.sum(dim=-1)                                # [N]
+    if reduction == "mean": return loss.mean()
+    if reduction == "sum":  return loss.sum()
     return loss
 
 
