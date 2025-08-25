@@ -117,6 +117,7 @@ def main():
     # Transfer weights from pre-trained model
     model = args.model(
         drop_rate = args.dropout,
+        attn_drop_rate = args.attn_dropout,
         drop_path_rate = args.drop_path_rate,
         metadata = metadata,
     )

@@ -118,6 +118,11 @@ def main():
     # Initialise the model
     model = args.model(
         drop_rate = args.dropout,
+        attn_drop_rate = args.attn_dropout,
+        drop_path_rate = args.drop_path_rate,
+        drop_rate_dec = args.dropout_dec,
+        attn_drop_rate_dec = args.attn_dropout_dec,
+        drop_path_rate_dec = args.drop_path_rate_dec,
     )
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
