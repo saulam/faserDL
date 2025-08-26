@@ -14,7 +14,8 @@ from functools import partial
 from torch.nn.utils.rnn import pad_sequence 
 from timm.models.layers import trunc_normal_
 from MinkowskiEngine import MinkowskiConvolution
-from .utils import BlockWithMask, get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CylindricalHeadNormalized
+from timm.models.vision_transformer import Block
+from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CylindricalHeadNormalized
 
 
 class MinkViT(vit.VisionTransformer):
@@ -48,7 +49,7 @@ class MinkViT(vit.VisionTransformer):
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
         self.num_patches = (
             self.grid_size[0] 
-            * self.grid_size[1] 
+            * self.grid_size[1]
             * self.grid_size[2]
         )
         self.patch_voxels = p_h * p_w * p_d
@@ -62,12 +63,34 @@ class MinkViT(vit.VisionTransformer):
         self.intra_grid_size = (G_h, G_w, self.module_depth_patches)     # H×W×(depth within module)
         self.num_intra_positions = G_h * G_w * self.module_depth_patches
 
-        del self.patch_embed, self.pos_embed, self.patch_embed, self.norm_pre, self.fc_norm, self.head
+        # patch embedding
+        del self.patch_embed, self.pos_embed, self.norm_pre, self.fc_norm, self.head
         self.patch_embed = MinkowskiConvolution(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
             bias=True, dimension=D,
         )
+
+        # Precompute dense patch templates
+        mh = torch.arange(G_h)
+        mw = torch.arange(G_w)
+        md = torch.arange(G_d)
+        HH, WW, DD = torch.meshgrid(mh, mw, md, indexing='ij')
+
+        flat_ids = (HH * (G_w * G_d) + WW * G_d + DD).reshape(-1)         # [Np]
+        d_mod    = (DD % self.module_depth_patches).reshape(-1)           # [Np]
+        module   = (DD // self.module_depth_patches).reshape(-1)          # [Np]
+        intra    = (HH * (G_w * self.module_depth_patches)
+                   + WW * self.module_depth_patches + d_mod).reshape(-1)  # [Np]
+
+        self.register_buffer('idx_template',       flat_ids.long())       # [Np]
+        self.register_buffer('intra_idx_template', intra.long())          # [Np]
+        self.register_buffer('module_id_template', module.long())         # [Np]
+
+        # experimenting
         self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
+        self.cross_attn   = nn.MultiheadAttention(embed_dim, kwargs['num_heads'], batch_first=True)
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim) # frozen sin-cos
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)        # learned
 
@@ -157,88 +180,64 @@ class MinkViT(vit.VisionTransformer):
         )
     
     
-    def group_patches_by_event(
-        self,
-        sparse_tensor,
-    ):
-        """
-        Buckets patches into feats and (flattened) positions to padded dense tensors,
-        and calculates the corresponding attention mask.
-    
-        Args:
-            sparse_tensor: MinkowskiEngine sparse tensor with
-                           .C of shape [N, 4] (coords, with C[:,0]=event_id)
-                           .F of shape [N, C] (features).
-    
-        Returns:
-            padded_feats:  [B, L_max, C] float, zero‑padded features
-            padded_coords: [B, L_max] int, flat position ids.
-            attn_mask:     [B, L_max] bool, True = real voxel.
-        """
-        coords = sparse_tensor.C
-        feats  = sparse_tensor.F
-    
-        event_ids             = coords[:, 0].long()
-        spatial_coords        = coords[:, 1:] // self.patch_size
-        sorted_eids, perm     = event_ids.sort()
-        sorted_feats          = feats[perm]
-        sorted_spatial_coords = spatial_coords[perm]
-    
-        uniq_ids, counts = torch.unique_consecutive(sorted_eids,
-                                                    return_counts=True)
-        counts_list   = counts.tolist()    
-        feat_groups   = torch.split(sorted_feats, counts_list, dim=0)
-        coord_groups  = torch.split(sorted_spatial_coords, counts_list, dim=0)
-        
-        padded_feats  = pad_sequence(feat_groups, batch_first=True, padding_value=0.0)
-        padded_coords = pad_sequence(coord_groups, batch_first=True, padding_value=0)
-    
-        L_max     = int(counts.max().item())
-        arange    = torch.arange(L_max, device=feats.device)
-        attn_mask = arange.unsqueeze(0) < counts.unsqueeze(1)
+    def densify_patches(self, x_sparse):
+        coords = x_sparse.C.long()  # [N,4]
+        feats  = x_sparse.F
 
+        B      = int(coords[:, 0].max().item()) + 1
         G_h, G_w, G_d = self.grid_size
-        h_idx = padded_coords[..., 0]
-        w_idx = padded_coords[..., 1]
-        d_idx = padded_coords[..., 2]
-        padded_idx = h_idx * (G_w * G_d) + w_idx * G_d + d_idx
+        Np     = self.num_patches
+        C      = feats.size(1)
 
-        d_mod      = (d_idx % self.module_depth_patches).long()
-        module_id  = (d_idx // self.module_depth_patches).long()
-        intra_idx  = (h_idx * (G_w * self.module_depth_patches)
-                    +  w_idx * self.module_depth_patches
-                    +  d_mod).long()
-    
-        return padded_feats, padded_idx, attn_mask, intra_idx, module_id
+        # convert from voxel coords to patch-grid coords
+        h = coords[:, 1] // self.patch_size[0]
+        w = coords[:, 2] // self.patch_size[1]
+        d = coords[:, 3] // self.patch_size[2]
+
+        patch_ids = (h * (G_w * G_d)) + (w * G_d) + d
+        batch_ids = coords[:, 0]
+
+        # scatter into dense tensor
+        dense = feats.new_zeros(B, Np, C)
+        dense[batch_ids, patch_ids, :] = feats
+
+        idx       = self.idx_template.unsqueeze(0).expand(B, -1)
+        intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
+        module_id = self.module_id_template.unsqueeze(0).expand(B, -1)
+
+        return dense, idx, intra_idx, module_id
         
 
     def forward_features(self, x_sparse, glob):
         # patchify
         x_sparse = self.patch_embed(x_sparse)
-        x, _, attn_mask, intra_idx, module_id = self.group_patches_by_event(x_sparse)
+        x, _, intra_idx, module_id = self.densify_patches(x_sparse)
 
         # add positional embeddings
         x = x + self.intra_pos_embed(intra_idx) + self.module_embed_enc(module_id)
 
         # add cls token
-        glob_emb = self.global_feats_encoder(glob).unsqueeze(1)  # (B, 1, D)
-        cls = self.cls_token + glob_emb                            
-        cls_attn = attn_mask.new_ones((x.size(0), 1))
+        #glob_emb = self.global_feats_encoder(glob).unsqueeze(1)  # (B, 1, D)
+        #cls = self.cls_token + glob_emb   
+        cls = self.cls_token.expand(x.size(0), -1, -1)                         
         x = torch.cat((cls, x), dim=1)
-        attn_mask = torch.cat([cls_attn, attn_mask], dim=1)
         x = self.pos_drop(x)
 
         for blk in self.blocks:
-            x = blk(x, attn_mask=attn_mask)
+            x = blk(x)
 
         if self.global_pool:
-            tok = x[:, 1:, :]
-            mask = attn_mask[:, 1:].to(tok.dtype)
-            denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-            outcome = (tok * mask.unsqueeze(-1)).sum(dim=1) / denom
+            outcome = x[:, 1:, :].mean(dim=1)
         else:
             x = self.norm(x)
             outcome = x[:, 0]
+
+        # experimenting
+        glob_emb = self.global_feats_encoder(glob).unsqueeze(1)  # (B, 1, D)
+        y, _ = self.cross_attn(query=glob_emb, key=x, value=x)
+        gate = torch.sigmoid(self.alpha)
+        outcome = outcome + gate * y.squeeze(1)
+        # end experimenting
 
         return outcome
 
@@ -314,8 +313,8 @@ def vit_tiny(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=384, patch_size=(48, 48, 2),
         depth=12, num_heads=12,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
+        block_fn=Block,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -326,7 +325,7 @@ def vit_base(**kwargs):
         embed_dim=768, patch_size=(48, 48, 2),
         depth=12, num_heads=12,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask,
+        block_fn=Block,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
     
@@ -336,8 +335,8 @@ def vit_large(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=1008, patch_size=(48, 48, 2),
         depth=24, num_heads=16,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
+        block_fn=Block,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
@@ -347,7 +346,7 @@ def vit_huge(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=1296, patch_size=(48, 48, 2),
         depth=32, num_heads=16,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
-        block_fn=BlockWithMask,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
+        block_fn=Block,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model

@@ -10,3 +10,5 @@ notebook*
 checkpoint*/
 *db
 INSTALL
+*bak*
+*copy*

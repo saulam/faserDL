@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import timm.optim.optim_factory as optim_factory
 from utils import (
-    arrange_sparse_minkowski, arrange_truth, soft_focal_cross_entropy,
+    arrange_sparse_minkowski, arrange_truth, soft_focal_cross_entropy, soft_focal_bce_with_logits,
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
 
@@ -126,24 +126,20 @@ class MAEPreTrainer(pl.LightningModule):
         # Global budget: proportional to positives
         beta = getattr(self, "occ_empty_beta", 0.75)
         target_total_negs = int(min(total_neg, round(beta * int(pos_counts.item()))))
+        
+        # Proportional quota per token (floored)
+        q_r = (neg_counts_r.float() / max(1, total_neg) * target_total_negs).floor().to(torch.long)
+        q_r = torch.minimum(q_r, neg_counts_r)  # can't exceed available
+        K_max = int(q_r.max().item())
 
-        # Nothing to sample
-        if target_total_negs == 0 or total_neg == 0:
-            sampled_neg_mask = torch.zeros_like(eligible_neg, dtype=torch.bool)
-        else:
-            # Proportional quota per token (floored)
-            q_r = (neg_counts_r.float() / max(1, total_neg) * target_total_negs).floor().to(torch.long)
-            q_r = torch.minimum(q_r, neg_counts_r)  # can't exceed available
-            K_max = int(q_r.max().item())
-
-            sampled_neg_mask = torch.zeros_like(eligible_neg, dtype=torch.bool)
-            if K_max > 0:
-                # Random scores; pick top-k per row according to q_r
-                rnd = torch.rand(M, P, device=device).masked_fill(~eligible_neg, float("inf"))
-                _, idxs = torch.topk(-rnd, k=K_max, dim=1)                                   # [M, K_max]
-                rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_max)
-                keep = (torch.arange(K_max, device=device).unsqueeze(0) < q_r.unsqueeze(1))  # [M, K_max]
-                sampled_neg_mask[rows[keep], idxs[keep]] = True
+        sampled_neg_mask = torch.zeros_like(eligible_neg, dtype=torch.bool)
+        if K_max > 0:
+            # Random scores; pick top-k per row according to q_r
+            rnd = torch.rand(M, P, device=device).masked_fill(~eligible_neg, float("inf"))
+            _, idxs = torch.topk(-rnd, k=K_max, dim=1)                                   # [M, K_max]
+            rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_max)
+            keep = (torch.arange(K_max, device=device).unsqueeze(0) < q_r.unsqueeze(1))  # [M, K_max]
+            sampled_neg_mask[rows[keep], idxs[keep]] = True
 
         # Final OCC supervision
         sup_mask = pos_mask | border_mask | sampled_neg_mask
@@ -164,6 +160,8 @@ class MAEPreTrainer(pl.LightningModule):
         C_in       = self.model.in_chans
         C_out      = self.model.out_chans
         p_h, p_w, p_d = self.model.patch_size.tolist()
+        focal_gamma = getattr(self, "focal_gamma", 1.5)
+        focal_alpha = getattr(self, "focal_alpha", None)
 
         # Masks & negatives
         sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask = self._occ_supervision_mask(
@@ -180,8 +178,11 @@ class MAEPreTrainer(pl.LightningModule):
             sup_targ = sup_targ * (1.0 - eps) + 0.5 * eps
         occ_logits_sup = pred_occ[sup_mask]
         occ_targ_sup   = sup_targ[sup_mask]
-        occ_losses = F.binary_cross_entropy_with_logits(
-            occ_logits_sup, occ_targ_sup, reduction='none'
+        #occ_losses = F.binary_cross_entropy_with_logits(
+        #    occ_logits_sup, occ_targ_sup, reduction='none'
+        #)  # [N_sup]
+        occ_losses = soft_focal_bce_with_logits(
+            occ_logits_sup, occ_targ_sup, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
         )  # [N_sup]
         loss_occ = occ_losses.mean()
         occ_pos_loss = occ_losses[(pos_mask | border_mask)[sup_mask]].mean()
@@ -192,7 +193,7 @@ class MAEPreTrainer(pl.LightningModule):
         flat_idx_targets = idx_targets.view(-1)
         pos_idx = torch.where(pos_mask.view(-1))[0]
         neg_idx = torch.where(sampled_neg_mask.view(-1))[0]
-        all_idx = torch.cat([pos_idx, neg_idx], dim=0)                 # [N_all]
+        all_idx = torch.cat([pos_idx, neg_idx], dim=0)               # [N_all]
         N_pos, N_neg = pos_idx.numel(), neg_idx.numel()
         N_all = all_idx.numel()
 
@@ -209,6 +210,9 @@ class MAEPreTrainer(pl.LightningModule):
 
         targ_cls_flat = pred_cls_flat.new_zeros(N_all, C_out)
         targ_cls_flat[:, ghost_idx] = 1.0
+        if self.model.training and getattr(self, "label_smoothing", 0.0) > 0.0:
+            eps = self.label_smoothing
+            targ_cls_flat = targ_cls_flat * (1.0 - eps) + eps / targ_cls_flat.shape[-1]
         if N_pos > 0:
             raw_pos = flat_idx_targets[pos_idx]
             targ_cls_flat[:N_pos] = targ_cls[raw_pos]
@@ -224,9 +228,6 @@ class MAEPreTrainer(pl.LightningModule):
         reg_neg_loss = reg_row[N_pos:].mean()
 
         # CLS
-        focal_gamma = getattr(self, "focal_gamma", 1.5)
-        focal_alpha = getattr(self, "focal_alpha", None)
-
         cls_row = soft_focal_cross_entropy(
             pred_cls_flat, targ_cls_flat, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
         ) # [N_all]
@@ -245,6 +246,7 @@ class MAEPreTrainer(pl.LightningModule):
             weighted_loss(loss_reg, self.log_sigma_reg) +
             weighted_loss(loss_cls, self.log_sigma_cls)
         )
+
         return total_loss, part_losses
 
     

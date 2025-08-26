@@ -7,7 +7,6 @@ Description:
     Custom loss functions.
 """
 
-
 from typing import Optional, Sequence, Union
 import torch
 import torch.nn as nn
@@ -625,6 +624,50 @@ def sigmoid_focal_loss_star(
         loss = loss.sum()
 
     return loss
+
+
+def soft_focal_bce_with_logits(
+    logits: torch.Tensor, 
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
+    reduction: str = "mean",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Focal binary cross-entropy (sigmoid) that supports SOFT targets.
+      For each logit x and target t in [0,1], with p = sigmoid(x).
+    """
+    target = target.to(dtype=logits.dtype)
+
+    # Stable logs: log(sigmoid(x)) and log(1 - sigmoid(x))
+    log_p   = F.logsigmoid(logits)      # = -softplus(-x)
+    log_1mp = F.logsigmoid(-logits)     # = -softplus(x)
+    p       = torch.sigmoid(logits)
+
+    mod_pos = (1.0 - p).clamp_min(eps).pow(gamma)
+    mod_neg = p.clamp_min(eps).pow(gamma)
+
+    if alpha is None:
+        alpha_pos = alpha_neg = 1.0
+    else:
+        if not torch.is_tensor(alpha):
+            alpha = logits.new_tensor(alpha, dtype=logits.dtype)
+        if alpha.numel() == 1:
+            alpha_pos = alpha
+            alpha_neg = 1.0 - alpha
+        elif alpha.numel() == 2:
+            alpha_pos, alpha_neg = alpha.reshape(-1)
+        else:
+            raise ValueError("alpha must be None, a scalar, or a length-2 sequence/tensor")
+
+    loss_pos = -target * mod_pos * log_p * alpha_pos
+    loss_neg = -(1.0 - target) * mod_neg * log_1mp * alpha_neg
+    loss = loss_pos + loss_neg
+    if reduction == "mean": return loss.mean()
+    if reduction == "sum":  return loss.sum()
+    return loss
+
 
 
 def soft_focal_cross_entropy(

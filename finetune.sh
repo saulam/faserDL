@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default arguments
-web_dataset_path="/scratch/salonso/sparse-nns/faser/dataset"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1*"
 metadata_path="/scratch/salonso/sparse-nns/faser/dataset/metadata_stats.pkl"
 shardshuffle=200
 shuffle=2000
@@ -11,8 +11,9 @@ batch_size=512
 mixup_alpha=0.0
 preprocessing_input="log"
 preprocessing_output="log"
-label_smoothing=0.0
+label_smoothing=0.02
 dropout=0.0
+attn_dropout=0.0
 drop_path_rate=0.1
 epochs=50
 num_workers=16
@@ -27,23 +28,21 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_dlnu_log_base_v5"
+name="finetune_v5.1b_dlnu_log_base_clariden_0_25_v2"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_dlnu_log_base_v5"
+checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_25_v2"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v5/loss_val_total/last.ckpt"
-gpus=(0 1)
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_clariden_0_25_v1/loss_val_total/last.ckpt"
+gpus=(1)
 
 python -m train.finetune \
     --train \
     --stage2 \
     --augmentations_enabled \
-    --web_dataset_path "$web_dataset_path" \
+    --dataset_path "$dataset_path" \
     --metadata_path $metadata_path \
-    --shardshuffle $shardshuffle \
-    --shuffle $shuffle \
     --model $model \
     --eps $eps \
     --mixup_alpha $mixup_alpha \

@@ -204,6 +204,7 @@ def weighted_loss(L, s):
 
     https://arxiv.org/pdf/1705.07115
     """
+    s = torch.clamp(s, -3.0, 3.0)
     return torch.exp(-s) * L + 0.5 * s
 
 
