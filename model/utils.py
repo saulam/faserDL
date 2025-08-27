@@ -76,6 +76,33 @@ class BlockWithMask(Block):
         return x
         
 
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0., init_gamma=1e-4):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.gamma = nn.Parameter(torch.ones(dim) * init_gamma)
+
+    def forward(self, q_in, kv_in):  # q_in: [B, Nt, C], kv_in: [B, Nc, C]
+        B, Nt, C = q_in.shape
+        _, Nc, _ = kv_in.shape
+        q = self.q(q_in).reshape(B, Nt, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.k(kv_in).reshape(B, Nc, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = self.v(kv_in).reshape(B, Nc, self.num_heads, C // self.num_heads).transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale              # [B, h, Nt, Nc]
+        attn = self.attn_drop(attn.softmax(dim=-1))
+        x = (attn @ v).transpose(1, 2).reshape(B, Nt, C)           # [B, Nt, C]
+        x = self.proj(x)
+        return self.proj_drop(x) * self.gamma
+    
+
 def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     """
     grid_size: int (for cubic grid) or tuple of ints (H, W, D)
