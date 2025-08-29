@@ -124,14 +124,13 @@ class MinkViT(vit.VisionTransformer):
         ])
         self.inter_norm = norm_layer(embed_dim)
         
-        # experimenting
+        # Cross attention and heads
         self.cross_attn = CrossAttention(
             embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
         )
         self.global_pool = global_pool
         if self.global_pool:
             del self.inter_norm  # remove the original inter norm
-
         self.head_channels = {
             "iscc": 1,
             "flavour": 3,

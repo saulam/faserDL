@@ -1044,3 +1044,96 @@ def generate_positive_and_negative_masks(labels1: torch.Tensor, labels2: torch.T
 
     return positive_mask, negative_mask
 
+
+@torch.no_grad()
+def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
+    cid = class_id.to(torch.int64); eid = event_id.to(torch.int64)
+    key = (eid << 32) | cid
+    uniq_key, inv_group = torch.unique(key, return_inverse=True)   # groups G
+    G = uniq_key.numel()
+    group_eid = (uniq_key >> 32)
+    ord_g = torch.argsort(group_eid)
+    ge_sorted = group_eid[ord_g]
+
+    first = torch.ones_like(ge_sorted, dtype=torch.bool)
+    first[1:] = ge_sorted[1:] != ge_sorted[:-1]
+    starts = torch.nonzero(first, as_tuple=False).squeeze(1)
+    counts = torch.diff(torch.cat([starts, ge_sorted.new_tensor([ge_sorted.numel()])]))
+    E = starts.numel()
+
+    pos = torch.arange(G, device=class_id.device)
+    start_for_pos = starts.repeat_interleave(counts)
+    rank_sorted = pos - start_for_pos
+    rank_in_event = torch.empty(G, dtype=torch.long, device=class_id.device)
+    rank_in_event[ord_g] = rank_sorted
+    eidx_for_pos = torch.arange(E, device=class_id.device).repeat_interleave(counts)
+    eidx_for_group = torch.empty(G, dtype=torch.long, device=class_id.device)
+    eidx_for_group[ord_g] = eidx_for_pos
+    offset = torch.zeros(E, dtype=torch.long, device=class_id.device)
+    if E > 1: offset[1:] = torch.cumsum(counts[:-1], dim=0)
+    return inv_group, {"ord_g": ord_g, "rank": rank_in_event, "eidx": eidx_for_group, "counts": counts, "offset": offset}
+
+
+def prototype_contrastive_loss_vectorized(
+    z: torch.Tensor, class_id: torch.Tensor, event_id: torch.Tensor,
+    num_neg: int = 64, temperature: float = 0.07, normalize: bool = True,
+) -> torch.Tensor:
+    if z.numel() == 0: return z.new_zeros(())
+    valid = class_id >= 0
+    if not torch.any(valid): return z.new_zeros(())
+
+    z = z[valid]; cid = class_id[valid].long(); eid = event_id[valid].long()
+    if normalize: z = F.normalize(z, dim=-1)
+
+    inv_group, Pidx = _build_grouping(eid, cid)              # [M], dict
+    G = int(Pidx["rank"].numel())
+    D = z.size(1)
+
+    # prototypes per (event, class)
+    P = z.new_zeros((G, D))
+    P.index_add_(0, inv_group, z)
+    cnt = torch.bincount(inv_group, minlength=G).clamp_min_(1).unsqueeze(1).to(P.dtype)
+    P = P / cnt
+    if normalize: P = F.normalize(P, dim=-1)
+
+    g = inv_group
+    local_pos = Pidx["rank"][g]
+    eidx = Pidx["eidx"][g]
+    Ue = Pidx["counts"][eidx]
+    off = Pidx["offset"][eidx]
+
+    keep = Ue >= 2
+    if not torch.any(keep): return z.new_zeros(())
+
+    z = z[keep]; g = g[keep]; local_pos = local_pos[keep]; Ue = Ue[keep]; off = off[keep]
+    P_pos = P[g]
+
+    # per-hit effective negatives (cap at Ue-1)
+    K = num_neg
+    K_eff = torch.clamp(Ue - 1, max=K)                    # [M’]
+    M = z.size(0)
+    if M == 0: return z.new_zeros(())
+
+    # sample local indices in [0..K_eff-1], then map to [0..Ue-1] skipping the positive
+    ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
+    rnd = torch.rand(M, K, device=z.device, dtype=ftype)
+    # scale by K_eff (broadcast), floor, long
+    neg_raw = torch.floor(rnd * K_eff.unsqueeze(1).to(ftype)).to(torch.long)       # [M,K], each col < K_eff
+    neg_local = neg_raw + (neg_raw >= local_pos.unsqueeze(1)).to(torch.long)       # skip positive
+
+    # Map to global group ids via event-contiguous layout
+    base = off.unsqueeze(1) + neg_local                                            # [M,K]
+    neg_group = Pidx["ord_g"][base]
+    P_negs = P[neg_group]                                                          # [M,K,D]
+
+    # Mask columns where col >= K_eff (unused slots)
+    col = torch.arange(K, device=z.device).unsqueeze(0)                            # [1,K]
+    neg_valid = col < K_eff.unsqueeze(1)                                           # [M,K]
+
+    # logits
+    pos_sim = (z * P_pos).sum(-1, keepdim=True)                                    # [M,1]
+    neg_sim = torch.einsum('md,mkd->mk', z, P_negs)                                # [M,K]
+    neg_sim = neg_sim.masked_fill(~neg_valid, float('-inf'))
+    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature
+    targets = torch.zeros(M, dtype=torch.long, device=z.device)
+    return F.cross_entropy(logits, targets, reduction="mean")

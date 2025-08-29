@@ -13,28 +13,26 @@ import glob
 import numpy as np
 import tqdm
 import argparse
-import json
 
 
 version = "5.1"
-version_reco = version + "b"
-version = version + "_2"
-version_reco = version_reco + "_2"
-path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
-true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
-output_dir = '/scratch/salonso/sparse-nns/faser/events_v{}'.format(version_reco)
-#path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau2/".format(version)
-#true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau2/*".format(version))
-#reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau2/*".format(version))
-#output_dir = '/scratch/salonso/sparse-nns/faser/events_v{}_tau_test'.format(version_reco)
+version_reco = version# + "b"
+#version = version + "_tau"
+#version_reco = version_reco + "_tau"
+path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau3/".format(version)
+true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau3/*".format(version))
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau3/*".format(version_reco))
+output_dir = '/scratch/salonso/sparse-nns/faser/events_new_v{}b_tau_3'.format(version_reco)
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
 
 # Placeholder for class objects
 tcal_event = ROOT.TcalEvent()
 tporeco_event = ROOT.TPORecoEvent()
 
+
+# -----------------------------
 # Constants for indexing arrays
+# -----------------------------
 TRACK_ID = 0
 PARENT_ID = 1
 PRIMARY_ID = 2
@@ -48,71 +46,238 @@ ENERGY = 8
 MUONIC_PDGS = [-13, 13]
 ELECTROMAGNETIC_PDGS = [-11, 11, -15, 15, 22]
 
+
+# -----------------------------
+# True hits
+# -----------------------------
 def get_true_hits(tcal_event):
     """
     Extracts true hit information from the tcal_event and filters valid hits.
+    Returns:
+        np.ndarray of shape (N_true, 9) with columns:
+        [TRACK_ID, PARENT_ID, PRIMARY_ID, PDG, X, Y, Z, MODULE, ENERGY]
+        or None if no valid hits.
     """
     all_hits_list = []
     for track in tcal_event.getfTracks():
         hits_info = []
         for hit_id, energy in zip(track.fhitIDs, track.fEnergyDeposits):
-            # Skip hits that are not of the correct type or have zero energy deposition
             if tcal_event.getChannelTypefromID(hit_id) != 0 or energy == 0:
                 continue
-            
-            # Get hit position and module information
-            position = tcal_event.getChannelXYZfromID(hit_id)
+
+            pos = tcal_event.getChannelXYZfromID(hit_id)
             module = tcal_event.getChannelModulefromID(hit_id)
-            
-            # Store hit information in an array
-            hit_info = np.array([
+
+            hits_info.append(np.array([
                 track.ftrackID, track.fparentID, track.fprimaryID, track.fPDG,
-                position.x(), position.y(), position.z(), module, energy
-            ])
-            hits_info.append(hit_info)
+                pos.x(), pos.y(), pos.z(), module, energy
+            ], dtype=np.float64))
 
         if hits_info:
             all_hits_list.append(np.stack(hits_info))
-    
-    return np.concatenate(all_hits_list) if all_hits_list else None
 
-def get_reco_hits(fPORecoEvent, tcal_event, true_hits):
+    if not all_hits_list:
+        return None
+
+    hits = np.concatenate(all_hits_list, axis=0)
+
+    # Cast numeric columns
+    hits = hits.astype(object)
+    hits[:, TRACK_ID:PARENT_ID+1] = hits[:, TRACK_ID:PARENT_ID+1].astype(np.int32)
+    hits[:, PRIMARY_ID]           = hits[:, PRIMARY_ID].astype(np.int32)
+    hits[:, PDG]                  = hits[:, PDG].astype(np.int32)
+    hits[:, MODULE]               = hits[:, MODULE].astype(np.int16)
+    hits[:, ENERGY]               = hits[:, ENERGY].astype(np.float32)
+    hits[:, X_POS:Z_POS+1]        = hits[:, X_POS:Z_POS+1].astype(np.float32)
+    hits = np.array(hits.tolist())
+    return hits
+
+
+# -----------------------------
+# Mapping builder (CSR with weights)
+# -----------------------------
+def _build_true_spatial_index(true_hits):
+    """Map (x,y,z) -> list of true hit indices."""
+    if true_hits is None or true_hits.shape[0] == 0:
+        return {}
+
+    coords = true_hits[:, [X_POS, Y_POS, Z_POS]]
+    keys = [tuple(row) for row in coords]
+    index = {}
+    for idx, key in enumerate(keys):
+        index.setdefault(key, []).append(idx)
+    for k, v in index.items():
+        index[k] = np.asarray(v, dtype=np.int32)
+    return index
+
+
+def get_reco_hits_and_csr_map(fPORecoEvent, tcal_event, true_hits):
     """
-    Processes reconstructed hits from the event and attempts to match them with true hits.
+    Processes reconstructed hits and builds CSR-style mapping from reco -> true.
+
+    Returns:
+        reco_hits: (N_reco, 6) float32 array [x,y,z,module,RawEnergy,ghost_flag]
+        true_index: 1D int32 array of concatenated true indices
+        indptr: 1D int32 array of length N_reco+1 (CSR row pointer)
+        ghost_mask: 1D bool array (True if ghost or unmatched)
+        link_weight: 1D float32 array, same length as true_index
+                     (fraction of reco energy attributed to each true hit)
     """
     num_voxels = len(fPORecoEvent.PSvoxelmap)
-    reco_hits = np.zeros((num_voxels, 6))
-    hit_true = []
+    reco_hits = np.zeros((num_voxels, 6), dtype=np.float32)
+    ghost_mask = np.zeros(num_voxels, dtype=bool)
+
+    spatial_index = _build_true_spatial_index(true_hits)
+    matched_lists, weight_lists = [], []
 
     for i, (voxel_id, psvoxel_3d) in enumerate(fPORecoEvent.PSvoxelmap):
-        # Retrieve position and module information
-        position = tcal_event.getChannelXYZfromID(voxel_id)
-        
-        # Store reconstructed hit data
-        reco_hits[i] = [
-            position.x(), position.y(), position.z(),
-            tcal_event.getChannelModulefromID(voxel_id),
-            psvoxel_3d.RawEnergy, psvoxel_3d.ghost
-        ]
+        pos = tcal_event.getChannelXYZfromID(voxel_id)
+        module = tcal_event.getChannelModulefromID(voxel_id)
+
+        reco_hits[i, 0:3] = [pos.x(), pos.y(), pos.z()]
+        reco_hits[i, 3] = module
+        reco_hits[i, 4] = psvoxel_3d.RawEnergy
+        reco_hits[i, 5] = float(psvoxel_3d.ghost)
 
         if psvoxel_3d.ghost == 0:
-            # Find matches within spatial threshold
-            matched_hits = find_within_threshold(true_hits, *reco_hits[i, :3])
-            hit_true.append(matched_hits if matched_hits.size else [-1])
-            if not matched_hits.size:
-                reco_hits[i, 5] = 2.  # Mark as unmatched hit
-        else:
-            hit_true.append([-1])
-    
-    return reco_hits, hit_true
+            key = (reco_hits[i, 0], reco_hits[i, 1], reco_hits[i, 2])
+            matches = spatial_index.get(key, None)
+            if matches is None or matches.size == 0:
+                reco_hits[i, 5] = 2.0
+                ghost_mask[i] = True
+                matched_lists.append(np.empty(0, dtype=np.int32))
+                weight_lists.append(np.empty(0, dtype=np.float32))
+            else:
+                ghost_mask[i] = False
+                matched_lists.append(matches)
 
-def find_within_threshold(A, x, y, z):
+                # Compute per-link weights (fraction of energy)
+                energies = true_hits[matches, ENERGY].astype(np.float32, copy=False)
+                total = energies.sum()
+                if total > 0:
+                    weights = energies / total
+                else:
+                    weights = np.full_like(energies, 1.0 / len(energies))
+                weight_lists.append(weights)
+        else:
+            ghost_mask[i] = True
+            matched_lists.append(np.empty(0, dtype=np.int32))
+            weight_lists.append(np.empty(0, dtype=np.float32))
+
+    # Build CSR arrays
+    counts = np.fromiter((m.size for m in matched_lists), count=num_voxels, dtype=np.int32)
+    indptr = np.empty(num_voxels + 1, dtype=np.int32)
+    indptr[0] = 0
+    np.cumsum(counts, out=indptr[1:])
+
+    total = int(indptr[-1])
+    true_index = np.empty(total, dtype=np.int32)
+    link_weight = np.empty(total, dtype=np.float32)
+
+    offset = 0
+    for m, w in zip(matched_lists, weight_lists):
+        n = m.size
+        if n:
+            true_index[offset:offset+n] = m
+            link_weight[offset:offset+n] = w
+        offset += n
+
+    return reco_hits, true_index, indptr, ghost_mask, link_weight
+
+
+# -----------------------------
+# Helper function
+# -----------------------------
+def get_matched_true_hits(i, true_hits, true_index, indptr, link_weight=None):
     """
-    Finds hits within a given threshold distance.
+    Retrieve the true hits (and optional weights) linked to reco voxel i.
+    Returns:
+        hits: (K, 9) array of true hits (empty if none)
+        weights: (K,) array of weights, or None if link_weight not given
     """
-    mask = (A[:, X_POS] == x) & (A[:, Y_POS] == y) & (A[:, Z_POS] == z)
+    sl = slice(indptr[i], indptr[i+1])
+    if sl.start == sl.stop:
+        empty_hits = np.empty((0, true_hits.shape[1]), dtype=true_hits.dtype)
+        empty_w = np.empty((0,), dtype=np.float32) if link_weight is not None else None
+        return empty_hits, empty_w
+
+    hits = true_hits[true_index[sl]]
+    weights = link_weight[sl] if link_weight is not None else None
+    return hits, weights
+
+
+# -----------------------------
+# Labels with per-link weights
+# -----------------------------
+def process_labels_csr(true_index, indptr, ghost_mask, true_hits,
+                       out_lepton_pdg, is_cc, istau, link_weight=None):
+    """
+    Computes seg_labels with optional weighted contributions.
+
+    Returns:
+        seg_labels: (num_hits, 4) float32
+            [:,0] -> Ghost label (1 if ghost/unmatched, 0 otherwise)
+            [:,1] -> (muonic + electromagnetic) E_dep, minus primary-lepton E
+            [:,2] -> hadronic E_dep, minus primary-lepton E
+            [:,3] -> primary-lepton E_dep
+    """
+    num_hits = indptr.size - 1
+    seg_labels = np.zeros((num_hits, 4), dtype=np.float32)
+
+    no_true = (true_hits is None) or (true_hits.shape[0] == 0)
+
+    for i in range(num_hits):
+        if ghost_mask[i] or no_true:
+            seg_labels[i] = [1.0, 0.0, 0.0, 0.0]
+            continue
+
+        sl = slice(indptr[i], indptr[i+1])
+        if sl.start == sl.stop:
+            seg_labels[i] = [1.0, 0.0, 0.0, 0.0]
+            continue
+
+        matched = true_hits[true_index[sl]]
+        pdgs = matched[:, PDG].astype(np.int32, copy=False)
+        energies = matched[:, ENERGY].astype(np.float32, copy=False)
+
+        if link_weight is not None:
+            energies = energies * link_weight[sl]
+
+        mu_mask   = np.isin(pdgs, MUONIC_PDGS)
+        em_mask   = np.isin(pdgs, ELECTROMAGNETIC_PDGS)
+        muem_mask = mu_mask | em_mask
+        had_mask  = ~muem_mask
+
+        if is_cc:
+            primary_mask = (
+                (matched[:, TRACK_ID].astype(np.int32) == matched[:, PRIMARY_ID].astype(np.int32)) &
+                (matched[:, PARENT_ID].astype(np.int32) == 0) &
+                np.isin(pdgs, out_lepton_pdg)
+            )
+        else:
+            primary_mask = np.zeros_like(pdgs, dtype=bool)
+
+        muem_sum = energies[muem_mask].sum() if muem_mask.any() else 0.0
+        had_sum  = energies[had_mask].sum()  if had_mask.any()  else 0.0
+        prim_sum = energies[primary_mask].sum() if primary_mask.any() else 0.0
+
+        muem_primary = energies[muem_mask & primary_mask].sum() if (muem_mask & primary_mask).any() else 0.0
+        had_primary  = energies[had_mask  & primary_mask].sum() if (had_mask  & primary_mask).any() else 0.0
+
+        muem_sum -= muem_primary
+        had_sum  -= had_primary
+
+        seg_labels[i] = [0.0, muem_sum, had_sum, prim_sum]
+
+    return seg_labels
+
+
+def retrieve_hits(hits, x, y, z):
+    # Returns the indices of hits that exactly match the given (x, y, z) positions
+    mask = (hits[:, X_POS] == x) & (hits[:, Y_POS] == y) & (hits[:, Z_POS] == z)
     return np.where(mask)[0]
 
+    
 def get_tracks(tktracks):
     """
     Extracts track information including hit positions, centroid, and direction.
@@ -132,63 +297,6 @@ def get_tracks(tktracks):
         })
     return tracks
 
-def process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc):
-    """
-    Returns:
-        seg_labels: (num_hits, 4) array:
-            [:,0] -> Ghost label (1 if ghost, 0 otherwise)
-            [:,1] -> (muonic + electromagnetic) E_dep, with any primary-lepton E subtracted
-            [:,2] -> hadronic E_dep, with any primary-lepton E subtracted
-            [:,3] -> primary-lepton E_dep (energy from hits that satisfy primary-lepton criteria)
-    """
-    num_hits = len(reco_hits_true)
-    seg_labels = np.zeros((num_hits, 4), dtype=np.float32)
-
-    for i, reco_hit_true in enumerate(reco_hits_true):
-        # Ghost voxel
-        if reco_hit_true[0] == -1:
-            seg_labels[i] = [1.0, 0.0, 0.0, 0.0]
-            continue
-
-        try:
-            matched_hits = true_hits[reco_hit_true]
-        except Exception:
-            assert False, "No true information found for reco hits."
-            
-        pdgs = matched_hits[:, PDG]
-        energies = matched_hits[:, ENERGY]
-
-        # Base masks
-        mu_mask  = np.isin(pdgs, MUONIC_PDGS)
-        em_mask  = np.isin(pdgs, ELECTROMAGNETIC_PDGS)
-        muem_mask = mu_mask | em_mask
-        had_mask = ~(muem_mask)
-
-        # Primary-lepton mask (only if CC)
-        if is_cc:
-            primary_mask = (
-                (matched_hits[:, TRACK_ID] == matched_hits[:, PRIMARY_ID]) &
-                (matched_hits[:, PARENT_ID] == 0) &
-                np.isin(pdgs, out_lepton_pdg)
-            )
-        else:
-            primary_mask = np.zeros_like(pdgs, dtype=bool)
-
-        # Raw sums
-        muem_sum = energies[muem_mask].sum() if np.any(muem_mask) else 0.0
-        had_sum  = energies[had_mask].sum() if np.any(had_mask)  else 0.0
-        prim_sum = energies[primary_mask].sum() if np.any(primary_mask) else 0.0
-
-        # Subtract the primary-lepton energy from the matching buckets
-        muem_primary = energies[muem_mask & primary_mask].sum() if np.any(muem_mask & primary_mask) else 0.0
-        had_primary  = energies[had_mask  & primary_mask].sum() if np.any(had_mask  & primary_mask) else 0.0
-        muem_sum -= muem_primary
-        had_sum  -= had_primary
-
-        # [ghost_flag, mu+em (minus prim), had (minus prim), prim]
-        seg_labels[i] = [0.0, muem_sum, had_sum, prim_sum]
-    
-    return seg_labels
 
 def divide_list_into_chunks(input_list, num_chunks=1):
     """
@@ -203,7 +311,8 @@ def divide_list_into_chunks(input_list, num_chunks=1):
         start = end
     
     return chunks
-   
+
+
 def th2d_to_numpy(hist):
     root_array = hist.GetArray()
     n_bins_x = hist.GetNbinsX()
@@ -220,6 +329,22 @@ def th2d_to_numpy(hist):
     nonzero_coords_and_values = np.column_stack((nonzero_indices[0], nonzero_indices[1], nonzero_values))
 
     return nonzero_coords_and_values
+
+
+def divide_list_into_chunks(input_list, num_chunks=1):
+    """
+    Divides a list into approximately equal-sized chunks.
+    """
+    chunk_size, remainder = divmod(len(input_list), num_chunks)
+    chunks, start = [], 0
+    
+    for i in range(num_chunks):
+        end = start + chunk_size + (1 if i < remainder else 0)
+        chunks.append(input_list[start:end])
+        start = end
+    
+    return chunks
+
  
 def generate_events(number, chunks, disable):
     chunks = divide_list_into_chunks(reco_paths, num_chunks=chunks)
@@ -249,6 +374,7 @@ def generate_events(number, chunks, disable):
             charm = po_event.isCharmed()
             primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             is_cc = bool(po_event.isCC)
+            is_tau = bool(po_event.istau)
             e_vis = po_event.Evis
             sp_momentum = np.array([po_event.spx, po_event.spy, po_event.spz])
             vis_sp_momentum = np.array([po_event.vis_spx, po_event.vis_spy, po_event.vis_spz])
@@ -261,8 +387,12 @@ def generate_events(number, chunks, disable):
             out_lepton_pdg = out_lepton.m_pdg_id
             out_lepton_momentum = np.array([out_lepton.m_px, out_lepton.m_py, out_lepton.m_pz])
             out_lepton_energy = out_lepton.m_energy
-            tauvis_momentum = np.array([po_event.tauvis_px, po_event.tauvis_py, po_event.tauvis_pz])
-
+            tau_vis_momentum = np.array([po_event.tauvis_px, po_event.tauvis_py, po_event.tauvis_pz])
+            tau_decay_mode = int(po_event.tau_decaymode)  # =1 e, =2 mu, =3 1-prong, =4 rho =5 3-prong, =6 other
+            tau_decay_length = float(po_event.tauDecaylength())
+            tau_kink_angle = float(po_event.tauKinkAngle())
+            
+            '''
             # Extract views
             xz_view = tporeco_event.Get2DViewXPS()
             yz_view = tporeco_event.Get2DViewYPS()
@@ -278,6 +408,7 @@ def generate_events(number, chunks, disable):
             # Extract track data
             tk_tracks = get_tracks(tporeco_event.fTKTracks)
             ps_tracks = get_tracks(tporeco_event.fPSTracks)
+            '''
 
             # Extract calorimeter deposited energies
             rear_cal_energy = tporeco_event.rearCals.rearCalDeposit
@@ -301,13 +432,18 @@ def generate_events(number, chunks, disable):
 
             # Extract true and reconstructed hits
             true_hits = get_true_hits(tcal_event)
-            reco_hits, reco_hits_true = get_reco_hits(tporeco_event, tcal_event, true_hits)
-
-            if reco_hits.shape[0] < 5:
-                print("Skipping event {} with {} hits".format(event_id, reco_hits.shape[0]))
+            reco_hits, true_index, indptr, ghost_mask, link_weight = get_reco_hits_and_csr_map(
+                tporeco_event, tcal_event, true_hits
+            )
+            
+            if reco_hits.shape[0] - ghost_mask.sum() < 20:
+                print("Skipping event {} with {} non-ghost hits".format(event_id, reco_hits.shape[0]))
                 continue
 
-            seg_labels = process_labels(reco_hits_true, true_hits, out_lepton_pdg, is_cc)
+            seg_labels = process_labels_csr(
+                true_index, indptr, ghost_mask, true_hits,
+                out_lepton_pdg, is_cc, is_tau, link_weight=link_weight
+            )
             
             # Save event data
             np.savez_compressed(
@@ -315,6 +451,7 @@ def generate_events(number, chunks, disable):
                 run_number=run_number,
                 event_id=event_id,
                 is_cc=is_cc,
+                is_tau=is_tau,
                 charm=charm,
                 e_vis=e_vis,
                 sp_momentum=sp_momentum,
@@ -324,7 +461,10 @@ def generate_events(number, chunks, disable):
                 primary_vertex=primary_vertex,
                 true_hits=true_hits,
                 reco_hits=reco_hits,
-                reco_hits_true=np.array(reco_hits_true, dtype=object),
+                true_index=true_index,
+                indptr=indptr,
+                ghost_mask=ghost_mask,
+                link_weight=link_weight,
                 #xz_proj = xz_proj,
                 #yz_proj = yz_proj,
                 #xy_projs = np.array(xy_projs, dtype=object),
@@ -336,7 +476,10 @@ def generate_events(number, chunks, disable):
                 out_lepton_pdg=out_lepton_pdg,
                 out_lepton_momentum=out_lepton_momentum,
                 out_lepton_energy=out_lepton_energy,
-                tauvis_momentum=tauvis_momentum,
+                tau_vis_momentum=tau_vis_momentum,
+                tau_decay_mode=tau_decay_mode,
+                tau_decay_length=tau_decay_length,
+                tau_kink_angle=tau_kink_angle,
                 rear_cal_energy=rear_cal_energy,
                 rear_cal_modules=rear_cal_modules,
                 rear_hcal_energy=rear_hcal_energy,

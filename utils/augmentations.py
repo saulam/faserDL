@@ -31,86 +31,63 @@ def augment(
     modules, 
     feats, 
     labels, 
-    momentums, 
+    momenta, 
     global_feats, 
     primary_vertex,
     metadata,
-    transformations=None, 
     stage1 = False,
     aug_prob=1.0
 ):
     """
     Performs augmentations.
-    """
-    if transformations is None:
-        transformations = {}
-        
+    """        
     # Mirror
-    if 'mirror' in transformations:
-        flipped = transformations['mirror']
-        coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_mirror(
-            coords, modules, momentums, global_feats['rear_cal_modules'], 
-            primary_vertex, metadata, flipped,
-        )
-    else:
-        flipped = []
-        if np.random.random() < aug_prob:
-            coords, modules, momentums, global_feats['rear_cal_modules'], primary_vertex, flipped = mirror(
-                coords, modules, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['x', 'y'],
-            )
-        transformations['mirror'] = flipped                
+    if np.random.random() < aug_prob:
+        coords, modules, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = mirror(
+            coords, modules, momenta, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['x', 'y'],
+        )              
 
     # Rotation
-    if 'rotate' in transformations:
-        chosen_angles = transformations['rotate']
-        coords, momentums, global_feats['rear_cal_modules'], primary_vertex = apply_rotate_90(
-            coords, momentums, global_feats['rear_cal_modules'], 
-            primary_vertex, metadata, chosen_angles,
+    if np.random.random() < aug_prob:
+        coords, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = rotate_90(
+            coords, momenta, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
         )
-    else:
-        chosen_angles = {}
-        if np.random.random() < aug_prob:
-            coords, momentums, global_feats['rear_cal_modules'], primary_vertex, chosen_angles = rotate_90(
-                coords, momentums, global_feats['rear_cal_modules'], 
-                primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
-            )
-        transformations['rotate'] = chosen_angles
 
     # Translation
-    if 'translate' in transformations:
-        shifts = transformations['translate']
-        coords, modules, global_feats['rear_cal_modules'], primary_vertex = apply_translate(
+    if np.random.random() < aug_prob:
+        coords, modules, global_feats['rear_cal_modules'], primary_vertex, _ = translate(
             coords, modules, global_feats['rear_cal_modules'], 
-            primary_vertex, metadata, shifts,
+            primary_vertex, metadata, selected_axes=['x', 'y'],
         )
-    else:
-        shifts = {}
-        if np.random.random() < aug_prob:
-            coords, modules, global_feats['rear_cal_modules'], primary_vertex, shifts = translate(
-                coords, modules, global_feats['rear_cal_modules'], 
-                primary_vertex, metadata, selected_axes=['x', 'y'],
-            )
-        transformations['translate'] = shifts
 
     # Scaling
     if np.random.random() < aug_prob:
-        feats, momentums, global_feats, _ = scale_all_by_global_shift(
-            feats, momentums, global_feats, std_dev=0.1,
+        feats, momenta, global_feats, _ = scale_all_by_global_shift_lognormal(
+            feats, momenta, global_feats, log_sigma=0.1
         )
 
-    # Jitter
+    # Jitter per-hit multiplicative
     if np.random.random() < aug_prob:
-        feats = jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0)
+        feats = jitter_energy_multiplicative(
+            feats, log_sigma=0.12, clamp_min=0.0
+        )
 
-    # Dropping
+    # Jitter sqrt-law additive
+    if np.random.random() < aug_prob:
+        feats = jitter_energy_sqrtlaw(
+            feats, a=0.06, b=0.18, clamp_min=0.0
+        )
+
+    # Voxel dropping
     if np.random.random() < aug_prob:
         coords, modules, feats, labels = drop_hits(
             coords, modules, feats, labels, max_drop=0.05, min_hits=5,
         )
 
-    return coords, modules, feats, labels, momentums, global_feats, primary_vertex, transformations
-    
+    return coords, modules, feats, labels, momenta, global_feats, primary_vertex
+
 
 def mirror(
     coords,
@@ -477,6 +454,14 @@ def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
     return scaled_feats, scaled_momentums, scaled_global_feats, shift
 
 
+def scale_all_by_global_shift_lognormal(feats, momentums, global_feats, log_sigma=0.1):
+    # shift ~ LogNormal(mean=0, sigma=log_sigma) so E[shift]≈exp(0.5*log_sigma^2)
+    # If you want mean≈1 exactly, divide by that factor.
+    shift = np.exp(np.random.randn() * log_sigma)
+    shift /= np.exp(0.5 * log_sigma**2)   # center around 1.0
+    return feats * shift, [p * shift for p in momentums], {k: v * shift for k, v in global_feats.items()}, shift
+
+
 def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):
     """
     Additive Gaussian jitter to voxel energies.
@@ -491,6 +476,18 @@ def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):
     """
     noise = np.random.randn(*feats.shape) * sigma
     return (feats + noise).clip(min=clamp_min)
+
+
+def jitter_energy_multiplicative(feats, log_sigma=0.15, clamp_min=0.0):
+    mult = np.exp(np.random.randn(*feats.shape) * log_sigma)
+    mult /= np.exp(0.5 * log_sigma**2)   # mean≈1
+    return np.maximum(feats * mult, clamp_min)
+
+
+def jitter_energy_sqrtlaw(feats, a=0.1, b=0.2, clamp_min=0.0, eps=1e-6):
+    # sigma(feat) = sqrt(a^2 + b^2 * max(feat,0))
+    sigma = np.sqrt(a*a + b*b * np.clip(feats, 0, None))
+    return np.maximum(feats + np.random.randn(*feats.shape) * sigma, clamp_min)
 
 
 def smooth_labels(targets, smoothing: float, num_classes: int = None):

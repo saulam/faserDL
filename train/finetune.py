@@ -87,14 +87,9 @@ def main():
     else:
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
-        extra_dataset = None
-        if args.extra_dataset_path is not None:
-            args.dataset_path = args.extra_dataset_path
-            extra_dataset = SparseFASERCALMapDataset(args)
-
         print("- Dataset size: {} events".format(len(dataset)))
         train_loader, valid_loader, _ = split_dataset(
-            dataset, args, splits=[0.75, 0.05, 0.2], extra_dataset=extra_dataset
+            dataset, args, splits=[0.75, 0.05, 0.2],
         )
         metadata = dataset.metadata
         nb_batches_train = len(train_loader)

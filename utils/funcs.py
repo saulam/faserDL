@@ -9,10 +9,9 @@ Description:
 
 
 import copy
-import pickle as pkl
-import numpy as np
 import torch
 import MinkowskiEngine as ME
+from functools import partial
 from sklearn.model_selection import KFold
 from torch.utils.data import random_split, ConcatDataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
@@ -58,15 +57,8 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
     if args.train and args.augmentations_enabled and not args.stage1 and args.mixup_alpha > 0:
         train_set.calc_primary_vertices()
 
-    train_set.augmentations_enabled = args.augmentations_enabled
-
-    if extra_dataset is not None:
-        #if args.train and args.augmentations_enabled and not args.stage1:
-        #    extra_dataset.calc_primary_vertices()
-        extra_dataset.augmentations_enabled = args.augmentations_enabled
-        train_set = ConcatDataset([train_set, extra_dataset])
-    
-    collate_fn = collate_test if test else collate_sparse_minkowski
+    train_set.augmentations_enabled = args.augmentations_enabled   
+    collate_fn = partial(collate, test=test)
 
     return (
         create_loader(train_set, shuffle=True, drop_last=True, collate_fn=collate_fn, args=args),
@@ -77,7 +69,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
 
 def create_loader(ds, shuffle, drop_last, collate_fn=None, args=None):
     if collate_fn is None:
-        collate_fn = collate_sparse_minkowski
+        collate_fn = partial(collate, test=not args.train)
     persistent = args.num_workers > 0
     return DataLoader(
         ds,
@@ -91,76 +83,84 @@ def create_loader(ds, shuffle, drop_last, collate_fn=None, args=None):
     )
 
 
-def collate_test(batch):
-    coords_list, feats_list = [], []
+def collate(batch, test: bool = True):
+    """
+    Unified collate for 'train' and 'test'.
+    - mode='train': matches collate_train behavior (tensors via cat/stack).
+    - mode='test' : matches collate_test behavior (lists; some .numpy()/.item()).
+    """
+    mode = 'test' if test else 'train'
+    batch = [d for d in batch if len(d["coords"]) > 0]
 
-    batch = [d for d in batch if len(d['coords']) > 0]  # Filter out empty samples
-
-    for ev_idx, sample in enumerate(batch):
-        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        coords_list.append(coords)
-        feats_list.append(feats)
-
-    ret = {
-        'f': torch.cat(feats_list, dim=0),
-        'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
-        'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
-        'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
-        'c': coords_list,
-    }
-    
-    optional_keys = [
-        'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
-        'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'charm', 'e_vis', 'pt_miss', 
-        'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
-        'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir', 
-        'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
-    ]
-    
-    for key in optional_keys:
-        if key in batch[0]:
-            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'flavour_label', 'charm']
-                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'vis_sp_momentum_mag', 'out_lepton_momentum_mag', 'jet_momentum_mag']
-                        else [d[key] for d in batch])
-    
-    return ret
-
-
-def collate_sparse_minkowski(batch):
-    coords_list, feats_list = [], []
-
-    batch = [d for d in batch if len(d['coords']) > 0]  # Filter out empty samples
-
-    for ev_idx, sample in enumerate(batch):
-        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        coords_list.append(coords)
-        feats_list.append(feats)
+    coords_list = [d["coords"] for d in batch]
+    feats_list  = [d["feats"] for d in batch]
+    num_hits = torch.tensor([len(x) for x in feats_list], dtype=torch.long)
+    hit_event_id = torch.arange(len(feats_list), dtype=torch.long).repeat_interleave(num_hits)
 
     ret = {
-        'f': torch.cat(feats_list, dim=0),
-        'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
-        'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
-        'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
-        'c': coords_list,
+        "f": torch.cat(feats_list, dim=0),
+        "c": coords_list,
+        "hit_event_id": hit_event_id,
+        "f_glob": torch.stack([d["feats_global"] for d in batch]),
+        "faser_cal_modules": torch.stack([d["faser_cal_modules"] for d in batch]),
+        "rear_cal_modules": torch.stack([d["rear_cal_modules"] for d in batch]),
+        "rear_hcal_modules": torch.stack([d["rear_hcal_modules"] for d in batch]),
     }
-    
-    optional_keys = {
-        'primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm',
-        'e_vis', 'pt_miss', 'vis_sp_momentum', 'out_lepton_momentum',
-        'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
-        'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir', 
-        'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
+
+    if mode == "test":
+        optional_keys = [
+            "run_number", "event_id", "primary_vertex", "is_cc", "in_neutrino_pdg",
+            "in_neutrino_energy", "primlepton_labels", "seg_labels", "flavour_label",
+            "charm", "e_vis", "pt_miss",
+            "vis_sp_momentum", "vis_sp_momentum_mag", "vis_sp_momentum_dir",
+            "out_lepton_momentum", "out_lepton_momentum_mag", "out_lepton_momentum_dir",
+            "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
+        ]
+        to_numpy = {"primlepton_labels", "seg_labels", "flavour_label", "charm"}
+        to_item  = {
+            "e_vis", "pt_miss", "vis_sp_momentum_mag",
+            "out_lepton_momentum_mag", "jet_momentum_mag",
+        }
+
+        for key in optional_keys:
+            if key in batch[0]:
+                if key in to_numpy:
+                    ret[key] = [d[key].numpy() for d in batch]
+                elif key in to_item:
+                    ret[key] = [d[key].item() for d in batch]
+                else:
+                    ret[key] = [d[key] for d in batch]
+        return ret
+
+    # mode == "train"
+    opt_all = {
+        "hit_track_id", "hit_primary_id", "ghost_mask",
+        "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
+        "e_vis", "pt_miss", "vis_sp_momentum", "out_lepton_momentum",
+        "vis_sp_momentum_mag", "vis_sp_momentum_dir",
+        "out_lepton_momentum_mag", "out_lepton_momentum_dir",
+        "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
     }
-    
-    for key in optional_keys:
+    cat_keys = {
+        "hit_track_id", "hit_primary_id", "ghost_mask",
+        "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
+        "e_vis", "pt_miss", "vis_sp_momentum_mag",
+        "out_lepton_momentum_mag", "jet_momentum_mag",
+    }
+    stack_keys = {
+        "vis_sp_momentum", "out_lepton_momentum", "jet_momentum",
+        "vis_sp_momentum_dir", "out_lepton_momentum_dir", "jet_momentum_dir",
+    }
+
+    for key in opt_all:
         if key in batch[0]:
-            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'vis_sp_momentum_mag', 'out_lepton_momentum_mag', 'jet_momentum_mag']
-                        else torch.stack([d[key] for d in batch]) if key in ['vis_sp_momentum', 'out_lepton_momentum', 'jet_momentum', 'vis_sp_momentum_dir', 'out_lepton_momentum_dir', 'jet_momentum_dir']
-                        else [d[key] for d in batch])
-    
+            if key in cat_keys:
+                ret[key] = torch.cat([d[key] for d in batch])
+            elif key in stack_keys:
+                ret[key] = torch.stack([d[key] for d in batch])
+            else:
+                ret[key] = [d[key] for d in batch]
+
     return ret
 
 
@@ -181,6 +181,7 @@ def arrange_truth(data):
     output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}
     
     optional_keys = [
+        'hit_track_id', 'hit_primary_id', 'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
         'charm', 'e_vis', 'pt_miss', 

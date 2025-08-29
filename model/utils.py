@@ -347,20 +347,14 @@ class SharedLatentVoxelHead(nn.Module):
     """
     One projection -> H×(Kx*Ky*Kz) coeffs
     Expand once to V ∈ R^{P×H}
-    Then tiny 1x1 'convs' (linear) produce occ/cls/reg.
     """
     def __init__(self, in_dim, basis: SeparableDCT3D,
-                 H=16, out_ch_reg=1, out_ch_cls=4, norm_layer=nn.LayerNorm):
+                 H=16, norm_layer=nn.LayerNorm):
         super().__init__()
         self.basis = basis
         self.H = H
         self.norm = norm_layer(in_dim)
         self.proj = nn.Linear(in_dim, H * basis.K_total)
-
-        # 1x1 "convs" from latent H to outputs at each voxel
-        self.to_occ = nn.Linear(H, 1)
-        self.to_reg = nn.Linear(H, out_ch_reg)
-        self.to_cls = nn.Linear(H, out_ch_cls)
 
     def forward(self, token_emb):  # [N_tokens, D]
         x = self.norm(token_emb)
@@ -372,10 +366,7 @@ class SharedLatentVoxelHead(nn.Module):
 
         # per-voxel linear maps (vectorized)
         Vt = V.transpose(1, 2)                  # [N, P, H]
-        occ = self.to_occ(Vt).squeeze(-1)       # [N, P]
-        reg = self.to_reg(Vt)                   # [N, P, out_ch_reg]
-        cls = self.to_cls(Vt)                   # [N, P, out_ch_cls]
-        return occ, reg, cls
+        return Vt
 
 
 class CylindricalHeadNormalized(nn.Module):

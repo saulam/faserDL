@@ -11,12 +11,12 @@ function wait_for_jobs() {
 }
 
 # Loop
-for i in {0..158}; do
+for i in {0..157}; do
     # Wait until there are fewer than MAX_JOBS running
     wait_for_jobs
     
     # Start a new process in the background
-    python read_root.py --number $i --chunks 158 --disable &
+    python read_root.py --number $i --chunks 157 --disable &
 
 done
 

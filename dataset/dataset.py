@@ -32,7 +32,6 @@ class SparseFASERCALDataset(Dataset):
         self.preprocessing_output = args.preprocessing_output
         self.label_smoothing = args.label_smoothing
         self.mixup_alpha = args.mixup_alpha
-        self.crop_around_vertex = args.crop_around_vertex
         self.epoch = 0
 
         # Load metadata
@@ -237,25 +236,151 @@ class SparseFASERCALDataset(Dataset):
             x = self.robust_unstandardize(x, params=stats)
 
         return x
+    
+
+    def build_per_hit_ids_from_csr(
+        self,
+        true_track_id: np.ndarray,      # [T] int64
+        true_primary_id: np.ndarray,    # [T] int64
+        indptr: np.ndarray,             # [N+1] int64
+        true_index: np.ndarray,         # [E] int64
+        link_weight: np.ndarray,        # [E] float
+        ghost_mask: np.ndarray | None = None,  # [N] bool
+        train: bool = False,            # False: argmax; True: weighted sampling
+        weight_threshold: float = 0.0,
+    ):
+        """
+        Fully vectorized per-hit ID selection from CSR rows.
+        Returns:
+        hit_track_id   [N] int64  (=-1 if none)
+        hit_primary_id [N] int64  (=-1 if none)
+        active         [N] bool   (True if some edge selected)
+        chosen_true    [N] int64  chosen true index per hit (=-1 if none)
+        """
+
+        indptr = indptr.astype(np.int64, copy=False)
+        true_index = true_index.astype(np.int64, copy=False)
+        w = link_weight.astype(np.float64, copy=False)  # float64 for stable cumsum
+        t_tr = true_track_id.astype(np.int64, copy=False)
+        t_pr = true_primary_id.astype(np.int64, copy=False)
+
+        N = indptr.size - 1
+        deg = np.diff(indptr)                 # [N]
+        rows = np.arange(N, dtype=np.int64)
+        has_edges = deg > 0
+
+        # Map each edge -> its row (length E)
+        row_of_edge = np.repeat(rows, deg)
+
+        # Apply threshold (<= thr treated as zero for sampling / invalid for argmax)
+        if weight_threshold > 0.0:
+            w_valid = np.where(w > weight_threshold, w, 0.0)
+        else:
+            # assume non-negative weights; keep zeros
+            w_valid = np.where(w >= 0.0, w, 0.0)
+
+        # Zero-out all edges belonging to ghost rows (they will be ignored)
+        if ghost_mask is not None:
+            w_valid[ghost_mask[row_of_edge]] = 0.0
+
+        # Outputs (defaults)
+        hit_trk = np.full(N, -1, dtype=np.int64)
+        hit_pri = np.full(N, -1, dtype=np.int64)
+        active  = np.zeros(N, dtype=bool)
+        chosen_true = np.full(N, -1, dtype=np.int64)
+
+        if train:
+            # -------- Weighted sampling per row (O(E)) --------
+            # Global cumsum; sample target in [base, base+rowsum) for each row
+            cs = np.cumsum(w_valid)                             # [E]
+            cs_prev = np.concatenate(([0.0], cs[:-1]))          # [E]
+
+            s = indptr[:-1]                                     # starts
+            e = indptr[1:]                                      # ends
+            base = np.zeros(N, dtype=np.float64)
+            rowsum = np.zeros(N, dtype=np.float64)
+
+            # Only rows with edges contribute to base/rowsum
+            base[has_edges] = cs_prev[s[has_edges]]
+            rowsum[has_edges] = cs[e[has_edges] - 1] - base[has_edges]
+
+            # Active rows are those with positive total weight
+            positive = has_edges & (rowsum > 0)
+            if positive.any():
+                u = np.random.random(positive.sum()) * rowsum[positive]
+                targets = base[positive] + u                    # [R+]
+                # Pick first index where cs > target (rightmost cdf inverse)
+                edge_idx = np.searchsorted(cs, targets, side='right')  # [R+], in [0..E-1]
+
+                # Fill outputs for those rows
+                pos_rows = np.flatnonzero(positive)
+                t_idx = true_index[edge_idx]
+                hit_trk[pos_rows] = t_tr[t_idx]
+                hit_pri[pos_rows] = t_pr[t_idx]
+                active[pos_rows] = True
+                chosen_true[pos_rows] = t_idx
+
+            # Rows with rowsum==0 (all zeroed weights) remain -1/inactive
+
+        else:
+            # -------- Argmax per row (O(E log E) via single sort) --------
+            # Make invalid edges -inf so they lose the argmax
+            w_arg = w.copy()
+            # threshold
+            if weight_threshold > 0.0:
+                w_arg[w_arg <= weight_threshold] = -np.inf
+            # ghosts
+            if ghost_mask is not None:
+                w_arg[ghost_mask[row_of_edge]] = -np.inf
+
+            # Sort by (row, weight), take the last edge within each row
+            order = np.lexsort((w_arg, row_of_edge))            # by row, then weight asc
+            ends_in_order = np.cumsum(deg) - 1                  # position of last edge of each row in 'order'
+            rows_nonempty = np.flatnonzero(has_edges)
+            if rows_nonempty.size:
+                last_pos = ends_in_order[rows_nonempty]         # indices into 'order'
+                edge_max = order[last_pos]                      # edge indices chosen for those rows
+
+                # Exclude rows where all edges were invalid (-inf)
+                valid_rows_mask = ~np.isneginf(w_arg[edge_max])
+                if valid_rows_mask.any():
+                    sel_rows = rows_nonempty[valid_rows_mask]
+                    sel_edges = edge_max[valid_rows_mask]
+                    t_idx = true_index[sel_edges]
+                    hit_trk[sel_rows] = t_tr[t_idx]
+                    hit_pri[sel_rows] = t_pr[t_idx]
+                    active[sel_rows] = True
+                    chosen_true[sel_rows] = t_idx
+
+        return hit_trk, hit_pri, active, chosen_true
 
 
-    def _prepare_event(self, data, transformations=None):
+
+    def _prepare_event(self, data):
         """
         Loads and processes a single event up through augmentations.
         Returns a dict of intermediate arrays.
         """
         run_number = data['run_number'].item()
         event_id = data['event_id'].item()
-        reco_hits = data['reco_hits']
+        true_hits = data['true_hits']                   # [T]
+        true_track_id = true_hits[:, 0]                 # [T]
+        true_primary_id = true_hits[:, 2]               # [T]
+        reco_hits = data['reco_hits']                   # [N]
+        indptr = data['indptr']                         # [N+1] CSR row pointers for reco->true contributions
+        true_index = data['true_index']                 # [E] concatenated true-hit indices for each reco hit
+        link_weight = data['link_weight']               # [E] Per-edge weights
+        ghost_mask = data['ghost_mask']                 # [N] Ghost mask for reco hits
         primary_vertex = data['primary_vertex']
         is_cc = data['is_cc']
+        is_tau = data['is_tau']
         in_neutrino_pdg = data['in_neutrino_pdg']
         in_neutrino_energy = data['in_neutrino_energy']
         vis_sp_momentum = data['vis_sp_momentum']
         seg_labels_raw = data['seg_labels']
         out_lepton_momentum = data['out_lepton_momentum']
         jet_momentum = data['jet_momentum']
-        tauvis_momentum = data['tauvis_momentum']
+        tau_vis_momentum = data['tau_vis_momentum']
         charm = data['charm']
         global_feats = {
             'e_vis':             data['e_vis'],
@@ -267,26 +392,41 @@ class SparseFASERCALDataset(Dataset):
             'rear_cal_modules':  data['rear_cal_modules'],
             'rear_hcal_modules': data['rear_hcal_modules'],
         }
+        if is_tau:
+            assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"
+
+        hit_track_id, hit_primary_id = None, None
+        if self.stage1:
+            hit_track_id, hit_primary_id, _, _ = self.build_per_hit_ids_from_csr(
+                true_track_id=true_track_id,
+                true_primary_id=true_primary_id,
+                indptr=indptr,
+                true_index=true_index,
+                link_weight=link_weight,
+                ghost_mask=ghost_mask,
+                train=self.train,            # argmax if False, sampling if True
+                weight_threshold=0.05, 
+            )
+
         # initial transformations
         coords = reco_hits[:, :3]
         q = reco_hits[:, 4].reshape(-1, 1)
-        orig_coords = coords.copy()
         module_idx = np.searchsorted(self.metadata['z'][:, 0], coords[:, 2])
         modules = self.metadata['z'][module_idx, 1]
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
 
-        if is_cc and in_neutrino_pdg in [-16, 16]:  # nutau:
-            out_lepton_momentum = tauvis_momentum
+        if is_cc and is_tau:  # nutau
+            out_lepton_momentum = tau_vis_momentum
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
-            coords, modules, q, (seg_labels_raw,), \
+            coords, modules, q, (hit_track_id, hit_primary_id, ghost_mask), \
             (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
-            global_feats, _, transformations = augment(
-                coords, modules, q, (seg_labels_raw,),
+            global_feats, _ = augment(
+                coords, modules, q, (hit_track_id, hit_primary_id, ghost_mask), 
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
-                global_feats, primary_vertex, self.metadata, transformations, self.stage1
+                global_feats, primary_vertex, self.metadata, self.stage1
             )
             charm = smooth_labels(np.array([charm]), smoothing=self.label_smoothing)
             flavour_label = smooth_labels(
@@ -305,6 +445,9 @@ class SparseFASERCALDataset(Dataset):
         return {
             'run_number': run_number,
             'event_id': event_id,
+            'hit_track_id': hit_track_id,
+            'hit_primary_id': hit_primary_id,
+            'ghost_mask': ghost_mask,
             'coords': coords,
             'modules': modules,
             'q': q,
@@ -318,92 +461,10 @@ class SparseFASERCALDataset(Dataset):
             'vis_sp_momentum': vis_sp_momentum,
             'e_vis': global_feats['e_vis'],
             'primary_vertex': primary_vertex,
-            'transformations': transformations,
             'in_neutrino_pdg': in_neutrino_pdg,
             'in_neutrino_energy': in_neutrino_energy,
             'is_cc': is_cc,
         }
-
-
-    def _mixup(self, event1, event2, alpha=0.8):
-        """
-        Performs mixup of two prepared events with weight alpha, handling overlapping voxels.
-        Coordinates and module indices are concatenated; features and labels are mixed.
-        """
-        lam_mix = np.random.beta(alpha, alpha)
-        
-        # event1
-        coords1 = event1['coords']
-        modules1 = event1['modules']
-        q1_raw = event1['q']
-        seg1_raw = event1['seg_labels']
-        
-        # event2
-        coords2 = event2['coords']
-        modules2 = event2['modules']
-        q2_raw = event2['q']
-        seg2_raw = event2['seg_labels']
-
-        # weight features and labels: event1=lam_mix, event2=1-lam_mix
-        q1 = q1_raw * lam_mix
-        q2 = q2_raw * (1.0 - lam_mix)
-        seg1 = seg1_raw * lam_mix
-        seg2 = seg2_raw * (1.0 - lam_mix)
-
-        # concatenate all voxel-level arrays
-        coords = np.concatenate([coords1, coords2], axis=0)
-        modules = np.concatenate([modules1, modules2], axis=0)
-        q = np.concatenate([q1, q2], axis=0)
-        seg = np.concatenate([seg1, seg2], axis=0)
-        
-        # deduplicate overlapping voxels: aggregate q and seg
-        keys = np.concatenate([coords, modules.reshape(-1,1)], axis=1)
-        unique_keys, inv = np.unique(keys, axis=0, return_inverse=True)
-        new_coords = unique_keys[:, :3]
-        new_modules = unique_keys[:, 3].astype(int)
-        new_q = np.zeros((unique_keys.shape[0], q.shape[1]), dtype=q.dtype)
-        new_seg = np.zeros((unique_keys.shape[0], seg.shape[1]), dtype=seg.dtype)
-        for i in range(q.shape[1]):
-            new_q[:, i] = np.bincount(inv, weights=q[:, i], minlength=unique_keys.shape[0])
-        for j in range(seg.shape[1]):
-            new_seg[:, j] = np.bincount(inv, weights=seg[:, j], minlength=unique_keys.shape[0])
-        coords, modules, q, seg = new_coords, new_modules, new_q, new_seg
-
-        # mix global features
-        gf1, gf2 = event1['global_feats'], event2['global_feats']
-        mixed_gf = {}
-        for key in ['faser_cal_energy','rear_cal_energy','rear_hcal_energy','rear_mucal_energy']:
-            mixed_gf[key] = gf1[key]*lam_mix + gf2[key]*(1-lam_mix)
-        for key in ['faser_cal_modules','rear_cal_modules','rear_hcal_modules']:
-            mixed_gf[key] = gf1[key]*lam_mix + gf2[key]*(1-lam_mix)
-        
-        # mix scalars
-        mixed_vis_sp     = event1['vis_sp_momentum']     * lam_mix + event2['vis_sp_momentum']     * (1-lam_mix)
-        mixed_e_vis      = event1['e_vis']               * lam_mix + event2['e_vis']               * (1-lam_mix)
-        mixed_flavour    = event1['flavour_label']       * lam_mix + event2['flavour_label']       * (1-lam_mix)
-        mixed_charm      = event1['charm']               * lam_mix + event2['charm']               * (1-lam_mix)
-        mixed_vis_sp_mom = event1['vis_sp_momentum']     * lam_mix + event2['vis_sp_momentum']     * (1-lam_mix)
-        mixed_lep_mom    = event1['out_lepton_momentum'] * lam_mix + event2['out_lepton_momentum'] * (1-lam_mix)
-        mixed_jet        = event1['jet_momentum']        * lam_mix + event2['jet_momentum']        * (1-lam_mix)
-
-        # Filter out voxels outside the detector
-        coords, q, seg = self.within_limits(coords, feats=q, labels=seg, voxelised=True)
-        
-        mixed_event = {
-            'coords': coords,
-            'modules': modules,
-            'q': q,
-            'seg_labels': seg,
-            'global_feats': mixed_gf,
-            'flavour_label': mixed_flavour,
-            'vis_sp_momentum': mixed_vis_sp_mom,
-            'out_lepton_momentum': mixed_lep_mom,
-            'jet_momentum': mixed_jet,
-            'vis_sp_momentum': mixed_vis_sp,
-            'charm': mixed_charm,
-            'e_vis': mixed_e_vis,
-        }
-        return mixed_event
 
     
     def _finalise_event(self, event):
@@ -444,19 +505,11 @@ class SparseFASERCALDataset(Dataset):
         #out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output)
         #jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output)
 
-        if self.crop_around_vertex:
-            # Keep coordinates around the primary vertex module
-            primary_vertex_module = event['primary_vertex'][2] // self.num_modules
-            coords_module = event['coords'][:, 2] // self.num_modules
-            vertex_mask = (coords_module >= primary_vertex_module - 1) & (coords_module <= primary_vertex_module + 4)
-        else:
-            vertex_mask = np.ones(event['coords'].shape[0], dtype=bool)
-
         # Assemble output
         output = {
-            'coords': torch.from_numpy(event['coords'][vertex_mask]).float(),
-            'modules': torch.from_numpy(event['modules'][vertex_mask]).long(),
-            'feats': feats[vertex_mask].float(),
+            'coords': torch.from_numpy(event['coords']).float(),
+            'modules': torch.from_numpy(event['modules']).long(),
+            'feats': feats.float(),
             'feats_global': feats_global.float(),
             'faser_cal_modules': faser_mod.float(),
             'rear_cal_modules': rear_cal_mod.float(),
@@ -464,7 +517,12 @@ class SparseFASERCALDataset(Dataset):
             'flavour_label': torch.from_numpy(event['flavour_label']),
         }
         if self.stage1:
-            output['seg_labels'] = torch.from_numpy(event['seg_labels'][vertex_mask]).float()
+            output.update({
+                'hit_track_id': torch.from_numpy(event['hit_track_id']).long(),
+                'hit_primary_id': torch.from_numpy(event['hit_primary_id']).long(),
+                'ghost_mask': torch.from_numpy(event['ghost_mask']).bool(),
+            })
+            
         if not self.train or not self.stage1:
             output.update({
                 'charm': torch.from_numpy(np.atleast_1d(event['charm'])).float(),

@@ -14,6 +14,7 @@ import pytorch_lightning as pl
 import timm.optim.optim_factory as optim_factory
 from utils import (
     arrange_sparse_minkowski, arrange_truth, soft_focal_cross_entropy, soft_focal_bce_with_logits,
+    prototype_contrastive_loss_vectorized, 
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
 
@@ -37,13 +38,15 @@ class MAEPreTrainer(pl.LightningModule):
         self.label_smoothing = args.label_smoothing
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
+        self.log_sigma_trk = nn.Parameter(torch.zeros(()))
+        self.log_sigma_pri = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
-        self.log_sigma_cls = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
+            "trk": self.log_sigma_trk,
+            "pri": self.log_sigma_pri,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
-            "cls": self.log_sigma_cls,
         }
 
 
@@ -72,16 +75,62 @@ class MAEPreTrainer(pl.LightningModule):
 
     def _arrange_batch(self, batch):
         batch_input, *global_params = arrange_sparse_minkowski(batch, self.device)
-        seg_labels = arrange_truth(batch)['seg_labels']
-        return batch_input, *global_params, seg_labels
+        labels = arrange_truth(batch)
+        hit_track_id = labels['hit_track_id']
+        hit_primary_id = labels['hit_primary_id']
+        ghost_mask = labels['ghost_mask']
+        hit_event_id = labels['hit_event_id']
+
+        return batch_input, *global_params, (hit_track_id, hit_primary_id, ghost_mask, hit_event_id)
+    
+
+    def mask_and_align_voxels(
+        self,
+        enc_idx_targets,   # [N_tok, P]  raw voxel ids; -1 empty
+        ghost_mask
+    ):       # [N_hits] or None
+        """
+        Returns:
+        raw_idx     : [N_valid]     indices into the original x_sparse / labels tensors
+        tok_row     : [N_valid]     which token each voxel came from
+        sub_idx     : [N_valid]     which sub-voxel each voxel came from
+        """
+        valid = (enc_idx_targets >= 0) & (~ghost_mask[enc_idx_targets.clamp_min(0)])
+        tok_row, sub_idx = torch.nonzero(valid, as_tuple=True)      # each pair selects one voxel
+        raw_idx = enc_idx_targets[tok_row, sub_idx]                 # [N_valid]
+
+        return raw_idx, tok_row, sub_idx
+    
+
+    def metric_losses_masked_simple(
+        self,
+        z_track: torch.Tensor,           # [N, Dt]
+        z_primary: torch.Tensor,         # [N, Dp]
+        track_id: torch.Tensor,          # [N] int64 >=0
+        primary_id: torch.Tensor,        # [N] int64 >=0
+        event_id: torch.Tensor,          # [N] int64
+        num_neg: int = 16,
+        temperature: float = 0.07,
+        normalize: bool = True,
+    ):
+        """
+        Computes both losses (same-track, same-primary) in one call.
+        Assumes inputs are already masked/aligned (no ghosts/invisible hits).
+        """
+        loss_trk = prototype_contrastive_loss_vectorized(
+            z_track, track_id, event_id, num_neg=num_neg, temperature=temperature, normalize=normalize,
+        )
+        loss_pri = prototype_contrastive_loss_vectorized(
+            z_primary, primary_id, event_id, num_neg=num_neg, temperature=temperature, normalize=normalize,
+        )
+        return loss_trk, loss_pri
     
 
     def _occ_supervision_mask(
         self,
         idx_targets: torch.Tensor,          # [M, P], -1 => empty sub-voxel, >=0 => raw index of hit
         patch_shape: Tuple[int, int, int],  # (p_h, p_w, p_d)
-        targ_cls_soft: torch.Tensor,        # [N_hits, C] soft labels
-        ghost_class_idx: int = 0,           # order: [ghost, em, had, lep]
+        ghost_mask: torch.Tensor,
         dilate: int = 1,
     ):
         """
@@ -100,12 +149,11 @@ class MAEPreTrainer(pl.LightningModule):
         M, P   = idx_targets.shape
         p_h, p_w, p_d = patch_shape
 
-        # Positives = occupied and non-ghost (argmax)
+        # Positives = occupied and non-ghost
         is_occ = (idx_targets >= 0)
-        max_c  = torch.zeros_like(idx_targets, dtype=torch.long, device=device)
-        if is_occ.any():
-            max_c[is_occ] = targ_cls_soft[idx_targets[is_occ]].argmax(dim=-1)
-        pos_mask = is_occ & (max_c != ghost_class_idx)  # [M, P]
+        is_ghost  = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
+        is_ghost[is_occ]  = ghost_mask[idx_targets[is_occ]]
+        pos_mask = is_occ & ~is_ghost  # [M, P]
 
         # Border via dilation around positives
         occ = pos_mask.float().view(M, 1, p_h, p_w, p_d)
@@ -124,7 +172,7 @@ class MAEPreTrainer(pl.LightningModule):
         total_neg    = int(neg_counts_r.sum().item())
 
         # Global budget: proportional to positives
-        beta = getattr(self, "occ_empty_beta", 0.75)
+        beta = getattr(self, "occ_empty_beta", 0.5)
         target_total_negs = int(min(total_neg, round(beta * int(pos_counts.item()))))
         
         # Proportional quota per token (floored)
@@ -146,19 +194,47 @@ class MAEPreTrainer(pl.LightningModule):
         sup_targ = pos_mask.float()
 
         return sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask
+    
 
-   
-    def compute_losses(
+    def compute_encoder_losses(
+        self,
+        pred_track: torch.Tensor,
+        pred_primary: torch.Tensor,
+        enc_idx_targets: torch.Tensor,
+        hit_track_id: torch.Tensor,
+        hit_primary_id: torch.Tensor,
+        hit_event_id: torch.Tensor,
+        ghost_mask: torch.Tensor,
+    ):
+        raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(enc_idx_targets, ghost_mask)
+
+        # Gather embeddings and labels
+        z_track = pred_track[tok_row, sub_idx, :]                              # [N_valid, D]
+        z_primary = pred_primary[tok_row, sub_idx, :]                          # [N_valid, D]
+        y_track = hit_track_id[raw_idx]
+        y_primary = hit_primary_id[raw_idx]
+        hit_event_id = hit_event_id[raw_idx]
+
+        loss_trk, loss_pri = self.metric_losses_masked_simple(
+            z_track, z_primary, y_track, y_primary, hit_event_id, normalize=True,
+        )
+
+        part_losses_enc = {
+            'trk': loss_trk,
+            'pri': loss_pri,
+        }
+        return loss_trk, loss_pri, part_losses_enc
+    
+
+    def compute_decoder_losses(
         self,
         targ_reg: torch.Tensor,         # [N_hits, C_in]
-        targ_cls: torch.Tensor,         # [N_hits, C_out] (soft)
         pred_occ: torch.Tensor,         # [M, P]
         pred_reg: torch.Tensor,         # [M, P*C_in]
-        pred_cls: torch.Tensor,         # [M, P*C_out]
         idx_targets: torch.Tensor,      # [M, P]
+        ghost_mask: torch.Tensor,
     ):
         C_in       = self.model.in_chans
-        C_out      = self.model.out_chans
         p_h, p_w, p_d = self.model.patch_size.tolist()
         focal_gamma = getattr(self, "focal_gamma", 1.5)
         focal_alpha = getattr(self, "focal_alpha", None)
@@ -167,8 +243,7 @@ class MAEPreTrainer(pl.LightningModule):
         sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask = self._occ_supervision_mask(
             idx_targets,
             patch_shape=(p_h, p_w, p_d),
-            targ_cls_soft=targ_cls,
-            ghost_class_idx=getattr(self, "ghost_class_idx", 0),
+            ghost_mask=ghost_mask,
             dilate=getattr(self, "occ_dilate", 2),
         )
 
@@ -188,8 +263,7 @@ class MAEPreTrainer(pl.LightningModule):
         occ_pos_loss = occ_losses[(pos_mask | border_mask)[sup_mask]].mean()
         occ_neg_loss = occ_losses[sampled_neg_mask[sup_mask]].mean()
 
-        # REG/CLS only on positives and sampled negatives
-        ghost_idx = getattr(self, "ghost_class_idx", 0)
+        # REG only on positives and sampled negatives
         flat_idx_targets = idx_targets.view(-1)
         pos_idx = torch.where(pos_mask.view(-1))[0]
         neg_idx = torch.where(sampled_neg_mask.view(-1))[0]
@@ -199,23 +273,13 @@ class MAEPreTrainer(pl.LightningModule):
 
         # Predictions
         pred_reg_flat = pred_reg.view(-1, C_in)[all_idx]             # [N_all, C_in]
-        pred_cls_flat = pred_cls.view(-1, C_out)[all_idx]            # [N_all, C_out]
-
+        
         # Targets
         reg_empty = targ_reg.amin(dim=0)                             # [C_in]
         targ_reg_flat = reg_empty.unsqueeze(0).expand(N_all, -1).clone()
         if N_pos > 0:
             raw_pos = flat_idx_targets[pos_idx]
             targ_reg_flat[:N_pos] = targ_reg[raw_pos]
-
-        targ_cls_flat = pred_cls_flat.new_zeros(N_all, C_out)
-        targ_cls_flat[:, ghost_idx] = 1.0
-        if self.model.training and getattr(self, "label_smoothing", 0.0) > 0.0:
-            eps = self.label_smoothing
-            targ_cls_flat = targ_cls_flat * (1.0 - eps) + eps / targ_cls_flat.shape[-1]
-        if N_pos > 0:
-            raw_pos = flat_idx_targets[pos_idx]
-            targ_cls_flat[:N_pos] = targ_cls[raw_pos]
 
         # REG
         huber_delta = getattr(self, "huber_delta", 1.0)
@@ -227,45 +291,76 @@ class MAEPreTrainer(pl.LightningModule):
         reg_pos_loss = reg_row[:N_pos].mean()
         reg_neg_loss = reg_row[N_pos:].mean()
 
-        # CLS
-        cls_row = soft_focal_cross_entropy(
-            pred_cls_flat, targ_cls_flat, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
-        ) # [N_all]
-        loss_cls = cls_row.mean()
-        cls_pos_loss = cls_row[:N_pos].mean()
-        cls_neg_loss = cls_row[N_pos:].mean()
-
-        # Kendall aggregation
-        part_losses = {
+        part_losses_dec = {
             'occ': loss_occ, 'occ_pos': occ_pos_loss, 'occ_neg': occ_neg_loss,
             'reg': loss_reg, 'reg_pos': reg_pos_loss, 'reg_neg': reg_neg_loss,
-            'cls': loss_cls, 'cls_pos': cls_pos_loss, 'cls_neg': cls_neg_loss,
         }
+        return loss_occ, loss_reg, part_losses_dec
+    
+
+    def compute_losses(
+        self,
+        pred_track: torch.Tensor,       # encoder
+        pred_primary: torch.Tensor,     # encoder
+        pred_occ: torch.Tensor,         # decoder
+        pred_reg: torch.Tensor,         # decoder
+        targ_reg: torch.Tensor,         # [N_hits, C_in]
+        enc_idx_targets: torch.Tensor,  # encoder
+        hit_track_id: torch.Tensor,     # encoder
+        hit_primary_id: torch.Tensor,   # encoder
+        hit_event_id: torch.Tensor,     # encoder
+        idx_targets: torch.Tensor,      # decoder
+        ghost_mask: torch.Tensor,
+    ):
+        loss_trk, loss_pri, part_enc = self.compute_encoder_losses(
+            pred_track, pred_primary, enc_idx_targets, hit_track_id, hit_primary_id, hit_event_id, ghost_mask
+        )
+        loss_occ, loss_reg, part_dec = self.compute_decoder_losses(
+            targ_reg, pred_occ, pred_reg, idx_targets, ghost_mask
+        )
+
+        # Kendall aggregation
+        part_losses = {**part_enc, **part_dec}
+        def _weight(loss, attr):
+            ls = getattr(self, attr, None)
+            return weighted_loss(loss, ls) if ls is not None else loss
+
         total_loss = (
-            weighted_loss(loss_occ, self.log_sigma_occ) +
-            weighted_loss(loss_reg, self.log_sigma_reg) +
-            weighted_loss(loss_cls, self.log_sigma_cls)
+            _weight(loss_trk, "log_sigma_trk") +
+            _weight(loss_pri, "log_sigma_pri") +
+            _weight(loss_occ, "log_sigma_occ") +
+            _weight(loss_reg, "log_sigma_reg")
         )
 
         return total_loss, part_losses
 
-    
+
     def common_step(self, batch):
         batch_size = len(batch["c"])
-        batch_input, *batch_input_global, cls_labels = self._arrange_batch(batch)
+        batch_input, *batch_input_global, labels = self._arrange_batch(batch)
+        hit_track_id, hit_primary_id, ghost_mask, hit_event_id = labels
 
         # Forward pass
-        pred_occ, pred_reg, pred_cls, idx_targets, _, _ = self.forward(
+        pred_track, pred_primary, pred_occ, pred_reg, idx_targets, enc_idx_targets, _, _, = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
-            batch_input.F, cls_labels, pred_occ, pred_reg, pred_cls, idx_targets,
+            pred_track,
+            pred_primary,
+            pred_occ,
+            pred_reg,
+            batch_input.F,
+            enc_idx_targets,
+            hit_track_id,
+            hit_primary_id,
+            hit_event_id,
+            idx_targets,
+            ghost_mask,
         )
-  
-        lr = self.optimizers().param_groups[0]['lr']
-        
-        return loss, part_losses, batch_size, lr
 
+        lr = self.optimizers().param_groups[0]['lr']
+        return loss, part_losses, batch_size, lr
+   
 
     def training_step(self, batch, batch_idx):
         torch.cuda.empty_cache()
