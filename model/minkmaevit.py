@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import MinkowskiEngine as ME
 from functools import partial
-from torch.nn.utils.rnn import pad_sequence
 from MinkowskiEngine import MinkowskiConvolution
 from timm.models.vision_transformer import Block
 from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CrossAttention, SeparableDCT3D, SharedLatentVoxelHead
@@ -30,7 +29,7 @@ class MinkMAEViT(nn.Module):
         depth=24,
         inter_depth=2,
         num_heads=16,
-        num_modes=16,
+        num_modes=8,
         contrastive_embed_dim=64,
         decoder_embed_dim=192,
         decoder_depth=8,
@@ -152,10 +151,10 @@ class MinkMAEViT(nn.Module):
         )
 
         # Contrastive heads
-        def _choose_Kxyz(patch_size, alpha=0.5, max_per_axis=16):
+        def _choose_Kxyz(patch_size, alphas=(0.4, 0.4, 0.75), max_per_axis=16):
             ph, pw, pd = patch_size
             Ks = []
-            for dim in (ph, pw, pd):
+            for dim, alpha in zip((ph, pw, pd), alphas):
                 K = min(int(round(alpha * dim)), max_per_axis, dim)
                 if dim >= 2:
                     K = max(K, 2)  # at least 2 modes if dimension has >=2 voxels
@@ -541,6 +540,7 @@ def mae_vit_tiny(**kwargs):
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(16, 16, 4),
         depth=10, inter_depth=2, num_heads=12,
+        num_modes=8, contrastive_embed_dim=64,
         decoder_embed_dim=384, decoder_depth=6, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -552,6 +552,7 @@ def mae_vit_base(**kwargs):
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=10, inter_depth=2, num_heads=12,
+        num_modes=16, contrastive_embed_dim=64,
         decoder_embed_dim=528, decoder_depth=6, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -563,6 +564,7 @@ def mae_vit_large(**kwargs):
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=24, num_heads=16,
+        num_modes=32, contrastive_embed_dim=256,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -574,6 +576,7 @@ def mae_vit_huge(**kwargs):
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         eembed_dim=768, patch_size=(16, 16, 4),
         depth=32, num_heads=16,
+        num_modes=64, contrastive_embed_dim=512,
         decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
