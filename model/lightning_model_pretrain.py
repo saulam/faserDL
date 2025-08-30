@@ -14,7 +14,7 @@ import pytorch_lightning as pl
 import timm.optim.optim_factory as optim_factory
 from utils import (
     arrange_sparse_minkowski, arrange_truth, soft_focal_cross_entropy, soft_focal_bce_with_logits,
-    prototype_contrastive_loss_vectorized, 
+    prototype_contrastive_loss_vectorized,  ghost_pushaway_loss,
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
 
@@ -84,21 +84,14 @@ class MAEPreTrainer(pl.LightningModule):
         return batch_input, *global_params, (hit_track_id, hit_primary_id, ghost_mask, hit_event_id)
     
 
-    def mask_and_align_voxels(
-        self,
-        enc_idx_targets,   # [N_tok, P]  raw voxel ids; -1 empty
-        ghost_mask
-    ):       # [N_hits] or None
+    def mask_and_align_voxels(self, enc_idx_targets):
         """
-        Returns:
-        raw_idx     : [N_valid]     indices into the original x_sparse / labels tensors
-        tok_row     : [N_valid]     which token each voxel came from
-        sub_idx     : [N_valid]     which sub-voxel each voxel came from
+        enc_idx_targets: [N_tok, P] with -1 for empty slots.
+        Returns indices to slice your flat hit tensors; no ghost filtering here.
         """
-        valid = (enc_idx_targets >= 0) & (~ghost_mask[enc_idx_targets.clamp_min(0)])
-        tok_row, sub_idx = torch.nonzero(valid, as_tuple=True)      # each pair selects one voxel
-        raw_idx = enc_idx_targets[tok_row, sub_idx]                 # [N_valid]
-
+        valid = enc_idx_targets >= 0
+        tok_row, sub_idx = torch.nonzero(valid, as_tuple=True)   # where a voxel is present
+        raw_idx = enc_idx_targets[tok_row, sub_idx]              # [N_valid] indices into hit arrays
         return raw_idx, tok_row, sub_idx
     
 
@@ -109,22 +102,37 @@ class MAEPreTrainer(pl.LightningModule):
         track_id: torch.Tensor,          # [N] int64 >=0
         primary_id: torch.Tensor,        # [N] int64 >=0
         event_id: torch.Tensor,          # [N] int64
+        ghost_mask: torch.Tensor,        # [N] bool
         num_neg: int = 16,
         temperature: float = 0.07,
         normalize: bool = True,
+        pushaway_weight: float = 0.1,
     ):
         """
         Computes both losses (same-track, same-primary) in one call.
         Assumes inputs are already masked/aligned (no ghosts/invisible hits).
         """
         loss_trk = prototype_contrastive_loss_vectorized(
-            z_track, track_id, event_id, num_neg=num_neg, temperature=temperature, normalize=normalize,
+            z_track, track_id, event_id, num_neg=num_neg, 
+            temperature=temperature, normalize=normalize,
         )
         loss_pri = prototype_contrastive_loss_vectorized(
-            z_primary, primary_id, event_id, num_neg=num_neg, temperature=temperature, normalize=normalize,
+            z_primary, primary_id, event_id, num_neg=num_neg, 
+            temperature=temperature, normalize=normalize,
         )
+        ghost_loss_trk = ghost_pushaway_loss(
+            z_track, track_id, event_id, ghost_mask, num_neg=num_neg, 
+            temperature=temperature, normalize=normalize
+        )
+        ghost_loss_pri = ghost_pushaway_loss(
+            z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg, 
+            temperature=temperature, normalize=normalize
+        )
+        loss_trk = loss_trk + pushaway_weight * ghost_loss_trk
+        loss_pri = loss_pri + pushaway_weight * ghost_loss_pri
+
         return loss_trk, loss_pri
-    
+
 
     def _occ_supervision_mask(
         self,
@@ -206,17 +214,18 @@ class MAEPreTrainer(pl.LightningModule):
         hit_event_id: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
-        raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(enc_idx_targets, ghost_mask)
+        raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(enc_idx_targets)
 
         # Gather embeddings and labels
-        z_track = pred_track[tok_row, sub_idx, :]                              # [N_valid, D]
-        z_primary = pred_primary[tok_row, sub_idx, :]                          # [N_valid, D]
+        z_track = pred_track[tok_row, sub_idx, :]         # [N_valid, D]
+        z_primary = pred_primary[tok_row, sub_idx, :]     # [N_valid, D]
         y_track = hit_track_id[raw_idx]
         y_primary = hit_primary_id[raw_idx]
         hit_event_id = hit_event_id[raw_idx]
+        ghost_mask = ghost_mask[raw_idx]
 
         loss_trk, loss_pri = self.metric_losses_masked_simple(
-            z_track, z_primary, y_track, y_primary, hit_event_id, normalize=True,
+            z_track, z_primary, y_track, y_primary, hit_event_id, ghost_mask, normalize=True,
         )
 
         part_losses_enc = {
@@ -310,7 +319,7 @@ class MAEPreTrainer(pl.LightningModule):
         hit_primary_id: torch.Tensor,   # encoder
         hit_event_id: torch.Tensor,     # encoder
         idx_targets: torch.Tensor,      # decoder
-        ghost_mask: torch.Tensor,
+        ghost_mask: torch.Tensor,       # encoder
     ):
         loss_trk, loss_pri, part_enc = self.compute_encoder_losses(
             pred_track, pred_primary, enc_idx_targets, hit_track_id, hit_primary_id, hit_event_id, ghost_mask

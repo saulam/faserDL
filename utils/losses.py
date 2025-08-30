@@ -1066,13 +1066,21 @@ def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
     rank_sorted = pos - start_for_pos
     rank_in_event = torch.empty(G, dtype=torch.long, device=class_id.device)
     rank_in_event[ord_g] = rank_sorted
+
     eidx_for_pos = torch.arange(E, device=class_id.device).repeat_interleave(counts)
     eidx_for_group = torch.empty(G, dtype=torch.long, device=class_id.device)
     eidx_for_group[ord_g] = eidx_for_pos
+
     offset = torch.zeros(E, dtype=torch.long, device=class_id.device)
     if E > 1: offset[1:] = torch.cumsum(counts[:-1], dim=0)
-    return inv_group, {"ord_g": ord_g, "rank": rank_in_event, "eidx": eidx_for_group, "counts": counts, "offset": offset}
 
+    events_sorted = ge_sorted[starts]  # unique event ids in segment order
+
+    return inv_group, {
+        "ord_g": ord_g, "rank": rank_in_event, "eidx": eidx_for_group,
+        "counts": counts, "offset": offset, "events_sorted": events_sorted
+    }
+    
 
 def prototype_contrastive_loss_vectorized(
     z: torch.Tensor, class_id: torch.Tensor, event_id: torch.Tensor,
@@ -1137,3 +1145,79 @@ def prototype_contrastive_loss_vectorized(
     logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature
     targets = torch.zeros(M, dtype=torch.long, device=z.device)
     return F.cross_entropy(logits, targets, reduction="mean")
+
+
+def ghost_pushaway_loss(
+    z: torch.Tensor,                 # [N, D] masked embeddings (ghosts included)
+    class_id: torch.Tensor,          # [N] int64; real >=0, non-real (ghost/ignored) == -1
+    event_id: torch.Tensor,          # [N] int64
+    ghost_mask: torch.Tensor,        # [N] bool — TRUE = treat as ghost to push away
+    num_neg: int = 32,
+    temperature: float = 0.07,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Push embeddings with ghost_mask==True away from REAL prototypes (class_id>=0) in the same event.
+    Other -1 hits with ghost_mask==False are ignored here.
+    """
+    # Build real prototypes
+    real = class_id >= 0
+    if not torch.any(real):
+        return z.new_zeros(())
+    z_r = z[real]
+    eid_r = event_id[real].long()
+    cid_r = class_id[real].long()
+    if normalize: z_r = F.normalize(z_r, dim=-1)
+
+    inv_group, Pidx = _build_grouping(eid_r, cid_r)
+    G = int(Pidx["rank"].numel()); D = z.size(1)
+
+    P = z_r.new_zeros((G, D))
+    P.index_add_(0, inv_group, z_r)
+    cnt = torch.bincount(inv_group, minlength=G).clamp_min_(1).unsqueeze(1).to(P.dtype)
+    P = P / cnt
+    if normalize: P = F.normalize(P, dim=-1)
+
+    # Select ghosts to push
+    ghosts = ghost_mask.bool()
+    if not torch.any(ghosts):
+        return z.new_zeros(())
+
+    z_g = z[ghosts]
+    e_g = event_id[ghosts].long()
+    if normalize: z_g = F.normalize(z_g, dim=-1)
+
+    # keep only ghosts in events that have real prototypes
+    events_sorted = Pidx["events_sorted"]                 # [E_real], ascending
+    idx = torch.searchsorted(events_sorted, e_g)
+    valid_e = (idx < events_sorted.numel()) & (events_sorted[idx] == e_g)
+    if not torch.any(valid_e):
+        return z.new_zeros(())
+
+    z_g = z_g[valid_e]
+    eidx = idx[valid_e]
+    Ue = Pidx["counts"][eidx]                             # #prototypes in that event
+    off = Pidx["offset"][eidx]
+
+    # Sample up to num_neg prototypes per ghost within its event (with replacement)
+    K = num_neg
+    M = z_g.size(0)
+    if M == 0:
+        return z.new_zeros(())
+    ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
+    # cap columns to Ue (mask extras)
+    K_eff = torch.clamp(Ue, max=K)
+    rnd = torch.rand(M, K, device=z.device, dtype=ftype)
+    neg_local = torch.floor(rnd * K_eff.unsqueeze(1).to(ftype)).to(torch.long)  # [M,K] in [0..Ue-1]
+    base = off.unsqueeze(1) + neg_local
+    neg_group = Pidx["ord_g"][base]                     # [M,K]
+    P_negs = P[neg_group]                               # [M,K,D]
+
+    # mask unused columns where col >= K_eff
+    col = torch.arange(K, device=z.device).unsqueeze(0)
+    neg_valid = col < K_eff.unsqueeze(1)
+
+    # push-away: minimize similarity to prototypes (logsumexp over negatives)
+    neg_sim = torch.einsum('md,mkd->mk', z_g, P_negs) / temperature
+    neg_sim = neg_sim.masked_fill(~neg_valid, float('-inf'))
+    return torch.logsumexp(neg_sim, dim=1).mean()

@@ -405,7 +405,7 @@ class SparseFASERCALDataset(Dataset):
                 link_weight=link_weight,
                 ghost_mask=ghost_mask,
                 train=self.train,            # argmax if False, sampling if True
-                weight_threshold=0.05, 
+                weight_threshold=0.05,
             )
 
         # initial transformations

@@ -465,9 +465,9 @@ class SparseFASERCALDataset(Dataset):
         data = np.load(self.data_files[idx], allow_pickle=True)
 
         is_cc = data['is_cc'].item()
-        reco_hits_true = data['reco_hits_true']
         true_hits = data['true_hits']
         reco_hits = data['reco_hits']
+        true_index = data['true_index']
         faser_cal_energy = data['faser_cal_energy'].item()
         faser_cal_modules = data['faser_cal_modules']
         rear_cal_energy = data['rear_cal_energy'].item()
@@ -481,13 +481,10 @@ class SparseFASERCALDataset(Dataset):
         in_neutrino_energy = data['in_neutrino_energy'].item()
         out_lepton_energy = data['out_lepton_energy'].item()
         jet_momentum = data['jet_momentum']
-        tauvis_momentum = data['tauvis_momentum']
+        tau_vis_momentum = data['tau_vis_momentum']
 
         try:
-            pdg = np.unique(np.concatenate([
-                true_hits[reco_hit_true if isinstance(reco_hit_true, list) else reco_hit_true.astype(int)][:, 3]
-                for reco_hit, reco_hit_true in zip(reco_hits, reco_hits_true)
-            ]))
+            pdg = np.unique(true_hits[true_index][:, 3])
         except:
             assert False, idx
             
@@ -501,7 +498,7 @@ class SparseFASERCALDataset(Dataset):
         else:
             out_lepton_momentum = np.zeros(shape=(1, 3))
         if is_cc and in_neutrino_pdg in [-16, 16]:  # nutau
-            out_lepton_momentum = tauvis_momentum.reshape(1, 3)
+            out_lepton_momentum = tau_vis_momentum.reshape(1, 3)
 
         vis_sp_momentum = vis_sp_momentum.reshape(1, 3)
         jet_momentum = jet_momentum.reshape(1, 3)
@@ -711,7 +708,7 @@ metadata.update({
 metadata = {**metadata, **stats}  # for Python < 3.9 compatibility
 
 # save metadata
-with open("/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata_stats.pkl", "wb") as fd:
+with open("/scratch/salonso/sparse-nns/faser/events_new_v5.1b/metadata_stats.pkl", "wb") as fd:
     pk.dump(metadata, fd)
 
 print("Metadata saved.")
