@@ -245,7 +245,7 @@ class SparseFASERCALDataset(Dataset):
         indptr: np.ndarray,             # [N+1] int64
         true_index: np.ndarray,         # [E] int64
         link_weight: np.ndarray,        # [E] float
-        ghost_mask: np.ndarray | None = None,  # [N] bool
+        ghost_mask: np.ndarray,         # [N] bool
         train: bool = False,            # False: argmax; True: weighted sampling
         weight_threshold: float = 0.0,
     ):
@@ -558,7 +558,7 @@ class SparseFASERCALMapDataset(SparseFASERCALDataset, Dataset):
     def __init__(self, args):
         super().__init__(args)
         self.root = args.dataset_path
-        self.data_files = sorted(glob(f'{self.root}/*.npz'))
+        self.data_files = sorted(glob(f'{self.root}/*.npz'), key=lambda x: x.lower())
 
     def __len__(self):
         """Returns the total number of samples in the dataset."""

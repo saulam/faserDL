@@ -102,7 +102,6 @@ class MinkViT(vit.VisionTransformer):
             order   = torch.argsort(intra_m)      # stable intra order
             module_indices.append(flat_m[order])
         self.register_buffer('module_token_indices', torch.stack(module_indices, 0))  # [M, Lm]
-        print("Module token indices shape:", self.module_token_indices.shape)
 
         # Encoder: hierarchical ViT
         self.inter_depth = inter_depth
@@ -123,14 +122,20 @@ class MinkViT(vit.VisionTransformer):
             for i in range(self.inter_depth)
         ])
         self.inter_norm = norm_layer(embed_dim)
-        
-        # Cross attention and heads
+
+        # Intra-inter cross-attention
         self.cross_attn = CrossAttention(
             embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
         )
+
+        # Task specifics
         self.global_pool = global_pool
-        if self.global_pool:
-            del self.inter_norm  # remove the original inter norm
+        if not self.global_pool:
+            # Task cross-attention
+            self.task_cross_attn = CrossAttention(
+                embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
+            )
+            self.task_norm = norm_layer(embed_dim)
         self.head_channels = {
             "iscc": 1,
             "flavour": 3,
@@ -164,26 +169,20 @@ class MinkViT(vit.VisionTransformer):
             self.intra_pos_embed.weight.copy_(torch.from_numpy(enc_pos).float())
             self.intra_pos_embed.weight.requires_grad_(False)
 
+        self.apply(self._init_weights)
+
         # init task tokens
         nn.init.normal_(self.task_tokens, std=.02)
 
-        self.apply(self._init_weights)
-
-        def _init_cross_attn(m):
-            if isinstance(m, CrossAttention):
-                trunc_normal_(m.q.weight, std=0.02)
-                trunc_normal_(m.k.weight, std=0.02)
-                trunc_normal_(m.v.weight, std=0.02)
-                nn.init.zeros_(m.q.bias)
-                nn.init.zeros_(m.k.bias)
-                nn.init.zeros_(m.v.bias)
-                trunc_normal_(m.proj.weight, std=0.02)
-                nn.init.zeros_(m.proj.bias)
-                # tiny gate to start as near-identity residual
-                with torch.no_grad():
-                    m.gamma.fill_(1e-4)
-
-        self.apply(_init_cross_attn)
+        # init task cross-attention
+        if hasattr(self, "task_cross_attn"):
+            with torch.no_grad():
+                self.task_cross_attn.gamma.fill_(1e-4)
+                # mild downscale of output proj to make it even quieter at step 0
+                # without killing grads to q/k/v:
+                self.task_cross_attn.proj.weight.mul_(0.5)
+                if self.task_cross_attn.proj.bias is not None:
+                    self.task_cross_attn.proj.bias.mul_(0.5)
 
         # init heads
         for name, head in self.heads.items():
@@ -293,6 +292,7 @@ class MinkViT(vit.VisionTransformer):
 
         # retrieve CLS tokens
         cls_mod = x_intra[:, 0, :].reshape(B, M, C)        # [B, M, C]
+        tok_mod = x_intra[:, 1:, :].reshape(B, M, Lk, C)   # [B, M, Lk, C]
 
         # Inter-module transformer over CLS tokens
         g = self.global_feats_encoder(x_glob)                                  # [B, C]
@@ -301,13 +301,18 @@ class MinkViT(vit.VisionTransformer):
         x_inter = torch.cat([g_tok, cls_mod + mod_pos], dim=1)                 # [B, 1+M, C]
         for blk in self.inter_blocks:
             x_inter = blk(x_inter)
+        x_inter = self.inter_norm(x_inter)
+
+        # intra-inter cross-attention
+        x_enc = tok_mod + self.cross_attn(tok_mod.reshape(B, M*Lk, C), x_inter).reshape(B, M, Lk, C)
+        x_enc = x_enc.reshape(B, M*Lk, C) 
 
         if self.global_pool:
-            outcome = x_inter[:, 1:, :].mean(dim=1)
+            outcome = x_enc.mean(dim=1)
         else:
-            x_inter = self.inter_norm(x_inter)
+            x_enc = self.task_norm(x_enc)
             task_q  = self.task_tokens.expand(B, -1, -1)
-            outcome = task_q + self.cross_attn(task_q, x_inter)
+            outcome = task_q + self.task_cross_attn(task_q, x_enc)
 
         return outcome
     

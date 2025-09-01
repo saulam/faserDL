@@ -90,7 +90,7 @@ def main():
         dataset = SparseFASERCALMapDataset(args)
         print("- Dataset size: {} events".format(len(dataset)))
         train_loader, valid_loader, _ = split_dataset(
-            dataset, args, splits=[0.75, 0.05, 0.2],
+            dataset, args, splits=[0.85, 0.05, 0.1],
         )
         metadata = dataset.metadata
         nb_batches_train = len(train_loader)

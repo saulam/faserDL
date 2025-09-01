@@ -419,7 +419,7 @@ def drop_hits(
     if mask.sum() < min_hits:
         return coords, modules, feats, labels
 
-    return coords[mask], modules[mask], feats[mask], [lab[mask] for lab in labels]
+    return coords[mask], modules[mask], feats[mask], [lab[mask] if lab is not None else None for lab in labels]
 
 
 def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):

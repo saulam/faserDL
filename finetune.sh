@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1*"
-metadata_path="/scratch/salonso/sparse-nns/faser/dataset/metadata_stats.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_new_v5.1*"
+metadata_path="/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata_stats.pkl"
 shardshuffle=200
 shuffle=2000
 model="tiny"
@@ -34,7 +34,7 @@ save_top_k=1
 checkpoint_path="checkpoints_final"
 checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v2"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_clariden_0_5_v1/loss_val_total/last.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_clariden_0_5_v2/loss_val_total/last_323.ckpt"
 gpus=(1)
 
 python -m train.finetune \
