@@ -1085,64 +1085,110 @@ def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
 def prototype_contrastive_loss_vectorized(
     z: torch.Tensor, class_id: torch.Tensor, event_id: torch.Tensor,
     num_neg: int = 64, temperature: float = 0.07, normalize: bool = True,
+    semi_hard: bool = False, semi_hard_pool_mult: int = 4, semi_hard_margin: float = 0.05,
 ) -> torch.Tensor:
-    if z.numel() == 0: return z.new_zeros(())
+    if z.numel() == 0:
+        return z.new_zeros(())
+
     valid = class_id >= 0
-    if not torch.any(valid): return z.new_zeros(())
+    if not torch.any(valid):
+        return z.new_zeros(())
 
-    z = z[valid]; cid = class_id[valid].long(); eid = event_id[valid].long()
-    if normalize: z = F.normalize(z, dim=-1)
+    z   = z[valid]
+    cid = class_id[valid].long()
+    eid = event_id[valid].long()
+    if normalize:
+        z = F.normalize(z, dim=-1)
 
-    inv_group, Pidx = _build_grouping(eid, cid)              # [M], dict
+    # Groups & per-group sums / counts
+    inv_group, Pidx = _build_grouping(eid, cid)     # inv_group: [M]
     G = int(Pidx["rank"].numel())
     D = z.size(1)
 
-    # prototypes per (event, class)
-    P = z.new_zeros((G, D))
-    P.index_add_(0, inv_group, z)
-    cnt = torch.bincount(inv_group, minlength=G).clamp_min_(1).unsqueeze(1).to(P.dtype)
-    P = P / cnt
-    if normalize: P = F.normalize(P, dim=-1)
+    P_sum = z.new_zeros((G, D))
+    P_sum.index_add_(0, inv_group, z)               # sum per (event,class)
+    cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)   # [G] (int)
 
-    g = inv_group
-    local_pos = Pidx["rank"][g]
-    eidx = Pidx["eidx"][g]
-    Ue = Pidx["counts"][eidx]
-    off = Pidx["offset"][eidx]
+    # Per-hit metadata
+    g        = inv_group
+    local_pos= Pidx["rank"][g]
+    eidx     = Pidx["eidx"][g]
+    Ue       = Pidx["counts"][eidx]                 # classes per event (per hit)
+    off      = Pidx["offset"][eidx]
+    cls_cnt  = cnt_vec[g]                           # class size (per hit, int)
 
-    keep = Ue >= 2
-    if not torch.any(keep): return z.new_zeros(())
+    # Keep only hits with >=2 classes in event AND class size >=2
+    keep = (Ue >= 2) & (cls_cnt >= 2)
+    if not torch.any(keep):
+        return z.new_zeros(())
 
-    z = z[keep]; g = g[keep]; local_pos = local_pos[keep]; Ue = Ue[keep]; off = off[keep]
-    P_pos = P[g]
+    z        = z[keep]
+    g        = g[keep]
+    local_pos= local_pos[keep]
+    Ue       = Ue[keep]
+    off      = off[keep]
+    cls_cnt  = cls_cnt[keep]
 
-    # per-hit effective negatives (cap at Ue-1)
-    K = num_neg
-    K_eff = torch.clamp(Ue - 1, max=K)                    # [M’]
+    # Positive = leave-one-out prototype: (sum - z) / (cnt-1)
+    P_pos = (P_sum[g] - z) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)
+    if normalize:
+        P_pos = F.normalize(P_pos, dim=-1)
+
+    # Negatives = means of other classes in same event
+    P_mean = P_sum / cnt_vec.unsqueeze(1).to(P_sum.dtype)   # [G,D]
+    if normalize:
+        P_mean = F.normalize(P_mean, dim=-1)
+
+    # ---- negative sampling (candidate pool) ----
     M = z.size(0)
-    if M == 0: return z.new_zeros(())
+    # pool size: either num_neg or larger if semi-hard
+    K_final = num_neg
+    K_pool  = (num_neg * semi_hard_pool_mult) if semi_hard else num_neg
 
-    # sample local indices in [0..K_eff-1], then map to [0..Ue-1] skipping the positive
     ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
-    rnd = torch.rand(M, K, device=z.device, dtype=ftype)
-    # scale by K_eff (broadcast), floor, long
-    neg_raw = torch.floor(rnd * K_eff.unsqueeze(1).to(ftype)).to(torch.long)       # [M,K], each col < K_eff
-    neg_local = neg_raw + (neg_raw >= local_pos.unsqueeze(1)).to(torch.long)       # skip positive
+    K_eff = torch.clamp(Ue - 1, max=K_pool)               # per-row #available negatives
+    rnd = torch.rand(M, K_pool, device=z.device, dtype=ftype)
+    neg_raw = torch.floor(rnd * K_eff.unsqueeze(1).to(ftype)).to(torch.long)  # [M,K_pool] in [0..(Ue-2)]
+    # skip the positive class by "gap" after local_pos
+    neg_local = neg_raw + (neg_raw >= local_pos.unsqueeze(1)).to(torch.long)
+    base = off.unsqueeze(1) + neg_local
+    neg_group = Pidx["ord_g"][base]                      # [M,K_pool]
+    P_negs = P_mean[neg_group]                           # [M,K_pool,D]
 
-    # Map to global group ids via event-contiguous layout
-    base = off.unsqueeze(1) + neg_local                                            # [M,K]
-    neg_group = Pidx["ord_g"][base]
-    P_negs = P[neg_group]                                                          # [M,K,D]
+    # mask unused columns when Ue-1 < K_pool
+    col = torch.arange(K_pool, device=z.device).unsqueeze(0)
+    neg_valid = col < K_eff.unsqueeze(1)                 # [M,K_pool]
 
-    # Mask columns where col >= K_eff (unused slots)
-    col = torch.arange(K, device=z.device).unsqueeze(0)                            # [1,K]
-    neg_valid = col < K_eff.unsqueeze(1)                                           # [M,K]
+    # Similarities
+    pos_sim = (z * P_pos).sum(-1, keepdim=True)          # [M,1]
+    neg_sim_full = torch.einsum('md,mkd->mk', z, P_negs) # [M,K_pool]
+    neg_sim_full = neg_sim_full.masked_fill(~neg_valid, float('-inf'))
 
-    # logits
-    pos_sim = (z * P_pos).sum(-1, keepdim=True)                                    # [M,1]
-    neg_sim = torch.einsum('md,mkd->mk', z, P_negs)                                # [M,K]
-    neg_sim = neg_sim.masked_fill(~neg_valid, float('-inf'))
-    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature
+    # ---- semi-hard selection (top-K just below positive, within a margin) ----
+    if semi_hard:
+        # valid semi-hard = below positive but close: pos_sim - margin < neg_sim < pos_sim
+        sh_mask = (neg_sim_full < pos_sim) & (neg_sim_full > (pos_sim - semi_hard_margin))
+        # rank by similarity (hardest among semi-hard)
+        sh_scores = neg_sim_full.masked_fill(~sh_mask, float('-inf'))
+        sh_idx = torch.topk(sh_scores, k=K_final, dim=1).indices   # [M,K_final]
+        # Check how many valid we actually got; fallback if too few
+        got_mask = torch.gather(sh_mask, 1, sh_idx)                # [M,K_final]
+        enough = got_mask.sum(dim=1) >= K_final
+
+        # Fallback: purely hard (top by sim) among all valid if not enough semi-hard
+        fb_scores = neg_sim_full
+        fb_idx = torch.topk(fb_scores, k=K_final, dim=1).indices   # [M,K_final]
+
+        # choose row-wise
+        idx_sel = torch.where(enough.unsqueeze(1), sh_idx, fb_idx) # [M,K_final]
+        neg_sim = torch.gather(neg_sim_full, 1, idx_sel)           # [M,K_final]
+    else:
+        # vanilla: just take top-K hard negatives among valid
+        idx_sel = torch.topk(neg_sim_full, k=K_final, dim=1).indices
+        neg_sim = torch.gather(neg_sim_full, 1, idx_sel)
+
+    # Logits & loss
+    logits  = torch.cat([pos_sim, neg_sim], dim=1) / temperature  # [M,1+K_final]
     targets = torch.zeros(M, dtype=torch.long, device=z.device)
     return F.cross_entropy(logits, targets, reduction="mean")
 
@@ -1170,7 +1216,8 @@ def ghost_pushaway_loss(
     if normalize: z_r = F.normalize(z_r, dim=-1)
 
     inv_group, Pidx = _build_grouping(eid_r, cid_r)
-    G = int(Pidx["rank"].numel()); D = z.size(1)
+    G = int(Pidx["rank"].numel())
+    D = z.size(1)
 
     P = z_r.new_zeros((G, D))
     P.index_add_(0, inv_group, z_r)

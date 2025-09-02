@@ -123,19 +123,8 @@ class MinkViT(vit.VisionTransformer):
         ])
         self.inter_norm = norm_layer(embed_dim)
 
-        # Intra-inter cross-attention
-        self.cross_attn = CrossAttention(
-            embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
-        )
-
         # Task specifics
         self.global_pool = global_pool
-        if not self.global_pool:
-            # Task cross-attention
-            self.task_cross_attn = CrossAttention(
-                embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
-            )
-            self.task_norm = norm_layer(embed_dim)
         self.head_channels = {
             "iscc": 1,
             "flavour": 3,
@@ -144,7 +133,13 @@ class MinkViT(vit.VisionTransformer):
             "lep": 3,
         }
         self.num_tasks = len(self.head_channels)
-        self.task_tokens = nn.Parameter(torch.zeros(1, self.num_tasks, embed_dim))
+        if not self.global_pool:
+            # Task cross-attention
+            self.task_cross_attn = CrossAttention(
+                embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
+            )
+            self.task_norm = norm_layer(embed_dim)
+            self.task_tokens = nn.Parameter(torch.zeros(1, self.num_tasks, embed_dim))
         self.heads = nn.ModuleDict()
         for name in self.head_channels.keys():
             self.heads[name] = nn.Sequential(
@@ -172,7 +167,8 @@ class MinkViT(vit.VisionTransformer):
         self.apply(self._init_weights)
 
         # init task tokens
-        nn.init.normal_(self.task_tokens, std=.02)
+        if hasattr(self, "task_tokens"):
+            nn.init.normal_(self.task_tokens, std=.02)
 
         # init task cross-attention
         if hasattr(self, "task_cross_attn"):
@@ -303,16 +299,12 @@ class MinkViT(vit.VisionTransformer):
             x_inter = blk(x_inter)
         x_inter = self.inter_norm(x_inter)
 
-        # intra-inter cross-attention
-        x_enc = tok_mod + self.cross_attn(tok_mod.reshape(B, M*Lk, C), x_inter).reshape(B, M, Lk, C)
-        x_enc = x_enc.reshape(B, M*Lk, C) 
-
         if self.global_pool:
-            outcome = x_enc.mean(dim=1)
+            outcome = x_inter[:, 1:, :].mean(dim=1)
         else:
-            x_enc = self.task_norm(x_enc)
+            x_inter = self.task_norm(x_inter)
             task_q  = self.task_tokens.expand(B, -1, -1)
-            outcome = task_q + self.task_cross_attn(task_q, x_enc)
+            outcome = task_q + self.task_cross_attn(task_q, x_inter)
 
         return outcome
     

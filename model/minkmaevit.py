@@ -8,7 +8,6 @@ Description: PyTorch MAE-ViT model with MinkowskiEngine patching.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import MinkowskiEngine as ME
 from functools import partial
 from MinkowskiEngine import MinkowskiConvolution
@@ -25,7 +24,7 @@ class MinkMAEViT(nn.Module):
         img_size=(48, 48, 200),
         module_depth_voxels=20,
         embed_dim=384,
-        patch_size=(16, 16, 10),
+        patch_size=(16, 16, 4),
         depth=24,
         inter_depth=2,
         num_heads=16,
@@ -166,10 +165,11 @@ class MinkMAEViT(nn.Module):
         )
         H, E = num_modes, contrastive_embed_dim
         self.shared_voxel_head_enc = SharedLatentVoxelHead(
-            embed_dim, self.sep_basis, H=H*2, norm_layer=norm_layer
+            embed_dim, self.sep_basis, H=H*3, norm_layer=norm_layer
         )
-        self.track_head   = nn.Linear(H*2, E)
-        self.primary_head = nn.Linear(H*2, E)
+        self.track_head   = nn.Linear(H*3, E)
+        self.primary_head = nn.Linear(H*3, E)
+        self.pid_head     = nn.Linear(H*3, E)
 
         # MAE decoder
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
@@ -344,6 +344,11 @@ class MinkMAEViT(nn.Module):
 
     
     def forward_encoder(self, x_sparse, x_glob, mask_ratio):
+        """
+        x_sparse:                   sparse input
+        x_glob:       [B, C]        global context
+        mask_ratio:   float         masking ratio
+        """
         # patchify
         x_sparse = self.patch_embed(x_sparse)
         x, intra_idx, module_id = self.densify_patches(x_sparse)
@@ -376,6 +381,7 @@ class MinkMAEViT(nn.Module):
         for blk in self.inter_blocks:
             x_inter = blk(x_inter)
         x_inter = self.inter_norm(x_inter)
+        x_inter = x_inter[:, 1:, :]
 
         # cross-attention
         x_enc = tok_mod + self.cross_attn(tok_mod.reshape(B, M*Lk, C), x_inter).reshape(B, M, Lk, C)  
@@ -384,6 +390,7 @@ class MinkMAEViT(nn.Module):
         shared = self.shared_voxel_head_enc(x_enc.reshape(-1, C))
         pred_track   = self.track_head(shared)
         pred_primary = self.primary_head(shared)
+        pred_pid     = self.pid_head(shared)
 
         # auxiliaries
         patch_ids_all = self.module_token_indices.unsqueeze(0).expand(B, -1, -1)  # [B, M, Lm]
@@ -393,25 +400,26 @@ class MinkMAEViT(nn.Module):
         keep_patchid_flat = patch_ids_keep.reshape(-1)                            # [B*M*Lk]
 
         return (
-            pred_track, pred_primary,
-            x_enc, rand_mask, ids_restore,
+            pred_track, pred_primary, pred_pid,
+            tok_mod, x_inter, rand_mask, ids_restore,
             keep_b_flat, keep_patchid_flat,
         )
 
     
-    def forward_decoder(self, x_enc, rand_mask, ids_restore, idx_map):
+    def forward_decoder(self, tok_mod, x_inter, rand_mask, ids_restore, idx_map):
         """
         tok_mod:     [B, M, Lk, C]  encoder tokens per module
+        x_inter:     [B, M, C]      inter-module tokens
         rand_mask:   [B, M, Lm]     1=masked
         ids_restore: [B, M, Lm]     per-module restore to intra order
         idx_map:     [B, Np, P]     occupancy map from build_patch_occupancy_map
         """
-        B, M, Lk, C = x_enc.shape
+        B, M, Lk, C = tok_mod.shape
         Lm = rand_mask.shape[2]
         Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
 
         # project to decoder dim
-        x_dec = self.decoder_embed(x_enc)    # [B, M, Lk, Cdec]
+        x_dec = self.decoder_embed(tok_mod)    # [B, M, Lk, Cdec]
 
         # per-module restore with mask tokens
         num_mask = Lm - Lk
@@ -430,14 +438,17 @@ class MinkMAEViT(nn.Module):
         mod_pos = self.module_embed_dec(
             torch.arange(M, device=x_dec.device)
         ).unsqueeze(0).unsqueeze(2).expand(B, -1, Lm, -1)                                    # [B, M, Lm, Cdec]
-        x_full = x_full.view(B, M, Lm, Cdec) + pos_intra + mod_pos   
-        x_full = x_full.reshape(B*M, Lm, Cdec)
+        x_full = x_full.view(B, M, Lm, Cdec) + pos_intra + mod_pos
+
+        # add back CLS
+        cls_dec = self.decoder_embed(x_inter)                                                # [B, M, Cdec]
+        x_full = torch.cat([cls_dec.unsqueeze(2), x_full], dim=2).reshape(B*M, 1+Lm, Cdec)   # [B*M, 1+Lm, Cdec]
         
         # run transformer blocks
         for blk in self.decoder_blocks:
             x_full = blk(x_full)
         
-        x_tokens = x_full.reshape(B, M, Lm, Cdec)                                            # [B, M, Lm, Cdec]
+        x_tokens = x_full[:, 1:, :].reshape(B, M, Lm, Cdec)                                  # [B, M, Lm, Cdec]
         prediction_mask = rand_mask                                                          # [B, M, Lm] (bool)
         flat_out = x_tokens[prediction_mask]                                                 # [N_masked, Cdec]
 
@@ -473,14 +484,14 @@ class MinkMAEViT(nn.Module):
             Voxel predictions.
         """
         idx_map = self.build_patch_occupancy_map(x)
-        pred_track, pred_primary, x_enc, rand_mask, ids_restore, keep_b_flat, keep_patchid_flat = self.forward_encoder(x, x_glob, mask_ratio)
+        pred_track, pred_primary, pred_pid, tok_mod, x_inter, rand_mask, ids_restore, keep_b_flat, keep_patchid_flat = self.forward_encoder(x, x_glob, mask_ratio)
         pred_occ, pred_reg, idx_targets, row_event_ids, row_patch_ids = \
-            self.forward_decoder(x_enc, rand_mask, ids_restore, idx_map)
-        
+            self.forward_decoder(tok_mod, x_inter, rand_mask, ids_restore, idx_map)
+
         # Encoder mapping for labels
         enc_idx_targets = idx_map[keep_b_flat, keep_patchid_flat]  # [B*M*Lk, P]
 
-        return pred_track, pred_primary, pred_occ, pred_reg, idx_targets, enc_idx_targets, row_event_ids, row_patch_ids
+        return pred_track, pred_primary, pred_pid, pred_occ, pred_reg, idx_targets, enc_idx_targets, row_event_ids, row_patch_ids
 
         
     def replace_depthwise_with_channelwise(self):
@@ -551,9 +562,9 @@ def mae_vit_base(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
-        depth=10, inter_depth=2, num_heads=12,
+        depth=8, inter_depth=4, num_heads=12,
         num_modes=16, contrastive_embed_dim=64,
-        decoder_embed_dim=528, decoder_depth=6, decoder_num_heads=16,
+        decoder_embed_dim=384, decoder_depth=6, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model

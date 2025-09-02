@@ -134,7 +134,7 @@ def collate(batch, test: bool = True):
 
     # mode == "train"
     opt_all = {
-        "hit_track_id", "hit_primary_id", "ghost_mask",
+        "hit_track_id", "hit_primary_id", "hit_pdg", "ghost_mask",
         "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
         "e_vis", "pt_miss", "vis_sp_momentum", "out_lepton_momentum",
         "vis_sp_momentum_mag", "vis_sp_momentum_dir",
@@ -142,7 +142,7 @@ def collate(batch, test: bool = True):
         "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
     }
     cat_keys = {
-        "hit_track_id", "hit_primary_id", "ghost_mask",
+        "hit_track_id", "hit_primary_id", "hit_pdg", "ghost_mask",
         "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
         "e_vis", "pt_miss", "vis_sp_momentum_mag",
         "out_lepton_momentum_mag", "jet_momentum_mag",
@@ -181,7 +181,7 @@ def arrange_truth(data):
     output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}
     
     optional_keys = [
-        'hit_track_id', 'hit_primary_id', 'ghost_mask', 'hit_event_id',
+        'hit_track_id', 'hit_primary_id', 'hit_pdg', 'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
         'charm', 'e_vis', 'pt_miss', 

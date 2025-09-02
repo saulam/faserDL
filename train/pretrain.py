@@ -157,7 +157,7 @@ def main():
     # Lightning model
     lightning_model = MAEPreTrainer(
         model=model,
-        metadata=metadata,
+        dataset=dataset,
         args=args)
  
     # Initialise PyTorch Lightning trainer

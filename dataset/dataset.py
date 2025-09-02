@@ -14,6 +14,7 @@ import webdataset as wds
 from glob import glob
 from torch.utils.data import Dataset, IterableDataset
 from utils.augmentations import augment, smooth_labels
+from utils.pdg import cluster_labels_from_pdgs
 
 
 class SparseFASERCALDataset(Dataset):
@@ -242,6 +243,7 @@ class SparseFASERCALDataset(Dataset):
         self,
         true_track_id: np.ndarray,      # [T] int64
         true_primary_id: np.ndarray,    # [T] int64
+        true_pdg: np.ndarray,          # [T] int64
         indptr: np.ndarray,             # [N+1] int64
         true_index: np.ndarray,         # [E] int64
         link_weight: np.ndarray,        # [E] float
@@ -263,6 +265,7 @@ class SparseFASERCALDataset(Dataset):
         w = link_weight.astype(np.float64, copy=False)  # float64 for stable cumsum
         t_tr = true_track_id.astype(np.int64, copy=False)
         t_pr = true_primary_id.astype(np.int64, copy=False)
+        t_pdg = true_pdg.astype(np.int64, copy=False)
 
         N = indptr.size - 1
         deg = np.diff(indptr)                 # [N]
@@ -286,6 +289,7 @@ class SparseFASERCALDataset(Dataset):
         # Outputs (defaults)
         hit_trk = np.full(N, -1, dtype=np.int64)
         hit_pri = np.full(N, -1, dtype=np.int64)
+        hit_pdg = np.full(N, -1, dtype=np.int64)
         active  = np.zeros(N, dtype=bool)
         chosen_true = np.full(N, -1, dtype=np.int64)
 
@@ -317,6 +321,7 @@ class SparseFASERCALDataset(Dataset):
                 t_idx = true_index[edge_idx]
                 hit_trk[pos_rows] = t_tr[t_idx]
                 hit_pri[pos_rows] = t_pr[t_idx]
+                hit_pdg[pos_rows] = t_pdg[t_idx]
                 active[pos_rows] = True
                 chosen_true[pos_rows] = t_idx
 
@@ -349,10 +354,11 @@ class SparseFASERCALDataset(Dataset):
                     t_idx = true_index[sel_edges]
                     hit_trk[sel_rows] = t_tr[t_idx]
                     hit_pri[sel_rows] = t_pr[t_idx]
+                    hit_pdg[sel_rows] = t_pdg[t_idx]
                     active[sel_rows] = True
                     chosen_true[sel_rows] = t_idx
 
-        return hit_trk, hit_pri, active, chosen_true
+        return hit_trk, hit_pri, hit_pdg, active, chosen_true
 
 
 
@@ -366,6 +372,7 @@ class SparseFASERCALDataset(Dataset):
         true_hits = data['true_hits']                   # [T]
         true_track_id = true_hits[:, 0]                 # [T]
         true_primary_id = true_hits[:, 2]               # [T]
+        true_pdg = true_hits[:, 3]                      # [T]
         reco_hits = data['reco_hits']                   # [N]
         indptr = data['indptr']                         # [N+1] CSR row pointers for reco->true contributions
         true_index = data['true_index']                 # [E] concatenated true-hit indices for each reco hit
@@ -395,11 +402,12 @@ class SparseFASERCALDataset(Dataset):
         if is_tau:
             assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"
 
-        hit_track_id, hit_primary_id = None, None
+        hit_track_id, hit_primary_id, hit_pdg = None, None, None
         if self.stage1:
-            hit_track_id, hit_primary_id, _, _ = self.build_per_hit_ids_from_csr(
+            hit_track_id, hit_primary_id, hit_pdg, _, _ = self.build_per_hit_ids_from_csr(
                 true_track_id=true_track_id,
                 true_primary_id=true_primary_id,
+                true_pdg=true_pdg,
                 indptr=indptr,
                 true_index=true_index,
                 link_weight=link_weight,
@@ -407,6 +415,7 @@ class SparseFASERCALDataset(Dataset):
                 train=self.train,            # argmax if False, sampling if True
                 weight_threshold=0.05,
             )
+        hit_pdg = cluster_labels_from_pdgs(hit_pdg)
 
         # initial transformations
         coords = reco_hits[:, :3]
@@ -447,6 +456,7 @@ class SparseFASERCALDataset(Dataset):
             'event_id': event_id,
             'hit_track_id': hit_track_id,
             'hit_primary_id': hit_primary_id,
+            'hit_pdg': hit_pdg,
             'ghost_mask': ghost_mask,
             'coords': coords,
             'modules': modules,
@@ -520,6 +530,7 @@ class SparseFASERCALDataset(Dataset):
             output.update({
                 'hit_track_id': torch.from_numpy(event['hit_track_id']).long(),
                 'hit_primary_id': torch.from_numpy(event['hit_primary_id']).long(),
+                'hit_pdg': torch.from_numpy(event['hit_pdg']).long(),
                 'ghost_mask': torch.from_numpy(event['ghost_mask']).bool(),
             })
             
