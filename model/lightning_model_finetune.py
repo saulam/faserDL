@@ -29,12 +29,12 @@ class ViTFineTuner(pl.LightningModule):
             return d[key] if key in d else default
         
         # Loss functions
-        self.loss_iscc = nn.BCEWithLogitsLoss()
-        self.loss_flavour = nn.CrossEntropyLoss()
-        self.loss_charm = nn.BCEWithLogitsLoss()
+        self.loss_flavour = nn.CrossEntropyLoss(reduction='none')
+        self.loss_charm = nn.BCEWithLogitsLoss(reduction='none')
+        '''
         self.crit = KinematicsMultiTaskLoss(
-            s_vis_xyz=stats["vis"]["s_xyz"],  s_vis_mag=stats["vis"]["s_mag"],
-            s_lep_xyz=stats["lep"]["s_xyz"],  s_lep_mag=stats["lep"]["s_mag"],
+            s_vis_xyz=stats["vis"]["s_xyz"], s_vis_mag=stats["vis"]["s_mag"],
+            s_lep_xyz=stats["lep"]["s_xyz"], s_lep_mag=stats["lep"]["s_mag"],
             s_jet_xyz=get_or(stats.get("jet_loss_scales", {}), "s_xyz", stats["vis"]["s_xyz"]),
             s_jet_mag=get_or(stats.get("jet_loss_scales", {}), "s_mag", stats["vis"]["s_mag"]),
             tau_ptmiss_cc=stats.get("vis_tau_ptmiss_cc", stats["vis"]["tau_ptmiss"]),
@@ -47,25 +47,38 @@ class ViTFineTuner(pl.LightningModule):
             huber_delta=1.0,
             lam_mag=1.0, lam_dir=1.0
         )
+        '''
+        self.crit = KinematicsMultiTaskLoss(
+            stats=stats,
+            huber_delta=1.0, lam_dir_xy=1.0, lam_dir_3d=0.0,
+            lep_nc_zero_w=0.05, latent_prior_w=0.0,
+            enforce_nonneg_truth_pz=True, decouple_radial=False,
+        )
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
-        self.log_sigma_iscc = nn.Parameter(torch.zeros(()))
         self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
         self.log_sigma_charm = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep = nn.Parameter(torch.zeros(()))
-        self.log_sigma_ptmiss = nn.Parameter(torch.zeros(()))
-        self.log_sigma_evis = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis_geom = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis_pt = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_geom = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_pt = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep_geom = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep_pt = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep_mag = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
-            "is_cc":   self.log_sigma_iscc,
-            "flavour": self.log_sigma_flavour,
-            "charm":   self.log_sigma_charm,
-            "vis":     self.log_sigma_vis,
-            "lep":     self.log_sigma_lep,
-            "ptmiss":  self.log_sigma_ptmiss,
-            "evis":    self.log_sigma_evis,
-            "jet":     self.log_sigma_jet,
+            "flavour":     self.log_sigma_flavour,
+            "charm":       self.log_sigma_charm,
+            "vis_geom":    self.log_sigma_vis_geom,
+            "vis_pt":      self.log_sigma_vis_pt,
+            "vis_mag":     self.log_sigma_vis_mag,
+            "jet_geom":    self.log_sigma_jet_geom,
+            "jet_pt":      self.log_sigma_jet_pt,
+            "jet_mag":     self.log_sigma_jet_mag,
+            "lep_geom":    self.log_sigma_lep_geom,
+            "lep_pt":      self.log_sigma_lep_pt,
+            "lep_mag":     self.log_sigma_lep_mag,
         }
         
         self.warmup_steps = args.warmup_steps
@@ -142,73 +155,102 @@ class ViTFineTuner(pl.LightningModule):
 
     def compute_losses(self, batch_output, target):
         # ---- predicted outputs -----
-        out_iscc    = batch_output['out_iscc'].squeeze()
         out_flavour = batch_output['out_flavour']
         out_charm   = batch_output['out_charm'].squeeze()
         out_vis     = batch_output['out_vis']
-        out_lep     = batch_output['out_lep']
+        out_jet     = batch_output['out_jet']
 
         # ---- true outputs -----
-        targ_iscc                = target['is_cc']
-        targ_flavour             = target['flavour_label']
-        targ_charm               = target['charm']
-        targ_vis_sp_momentum     = target['vis_sp_momentum']
-        targ_lepton_momentum     = target['out_lepton_momentum']
+        targ_iscc            = target['is_cc']
+        targ_flavour         = target['flavour_label']
+        targ_charm           = target['charm']
+        targ_vis_sp_momentum = target['vis_sp_momentum']
+        targ_jet_momentum    = target['jet_momentum']
 
         outs = self.crit(
             p_vis_hat=out_vis["p_cart"],
-            p_lep_hat=out_lep["p_cart"],
+            p_jet_hat=out_jet["p_cart"],
             p_vis_true=targ_vis_sp_momentum,
-            p_lep_true=targ_lepton_momentum,
+            p_jet_true=targ_jet_momentum,
             is_cc=targ_iscc>0.5,
-            p_jet_true=targ_vis_sp_momentum - targ_lepton_momentum,  # if aux jet loss
-            p_jet_hat=None,                                          # derive from vis/lepton
             vis_latents=out_vis.get("latents"),
-            lep_latents=out_lep.get("latents"),
+            jet_latents=out_jet.get("latents"),
         )
 
-        # losses
-        m_cc         = (targ_iscc > 0.5).to(out_vis["p_cart"].dtype).view(-1)
-        loss_iscc    = self.loss_iscc(out_iscc, targ_iscc)
-        loss_flavour = self.loss_flavour(out_flavour[m_cc.bool()], targ_flavour[m_cc.bool()])
+        # ----- classification losses -----
+        loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm   = self.loss_charm(out_charm, targ_charm)
-        loss_vis     = outs["L_vis"]
-        loss_lep     = outs["L_lep_cc"] + outs["L_lep_zero"]
-        loss_ptmiss  = outs["L_ptmiss"]
-        loss_evis    = outs["L_evis"]
-        loss_jet     = outs["jet_aux_weight"] * outs["L_jet"]
+
+        # ----- regression per-sample tensors from the criterion -----
+        loss_vis_geom    = outs["loss_vis/geom"]
+        loss_vis_pt      = outs["loss_vis/pt"]
+        loss_vis_mag     = outs["loss_vis/mag"]
+        loss_jet_geom    = outs["loss_jet/geom"]
+        loss_jet_pt      = outs["loss_jet/pt"]
+        loss_jet_mag     = outs["loss_jet/mag"]
+        loss_lep_geom    = outs["loss_lep/geom"]
+        loss_lep_pt      = outs["loss_lep/pt"]
+        loss_lep_mag     = outs["loss_lep/mag"]
+        loss_lep_zero_nc = outs["loss_lep/zero_nc"]
+
+        def _safe_mean_mask(x, mask):
+            return (x[mask].mean() if mask.any() else torch.tensor(0.0, device=x.device))
+
+        # activity normalization (per batch)
+        cc_mask = (targ_iscc > 0.5)                 # bool [B]
+        nc_mask = ~cc_mask
+        cc_frac = cc_mask.float().mean().clamp_min(1e-6)
+        nc_frac = nc_mask.float().mean().clamp_min(1e-6)
+
+        # ----- Kendall-weighted total -----
+        total_loss = (
+            weighted_loss(loss_flavour,           self.log_sigma_flavour).mean() +
+            weighted_loss(loss_charm,             self.log_sigma_charm).mean() +
+            weighted_loss(loss_vis_geom,          self.log_sigma_vis_geom).mean() +
+            weighted_loss(loss_vis_pt,            self.log_sigma_vis_pt).mean() +
+            weighted_loss(loss_vis_mag,           self.log_sigma_vis_mag).mean() +
+            weighted_loss(loss_jet_geom,          self.log_sigma_jet_geom).mean() +
+            weighted_loss(loss_jet_pt,            self.log_sigma_jet_pt).mean() +
+            weighted_loss(loss_jet_mag,           self.log_sigma_jet_mag).mean() +
+            weighted_loss(loss_lep_geom[cc_mask], self.log_sigma_lep_geom).mean() +  # normalise masked tasks
+            weighted_loss(loss_lep_pt[cc_mask],   self.log_sigma_lep_pt).mean() +
+            weighted_loss(loss_lep_mag[cc_mask],  self.log_sigma_lep_mag).mean()
+        )
+
+        # add NC zero-attractor OUTSIDE Kendall (normalised by NC fraction)
+        #total_loss = total_loss + self.crit.lep_nc_zero_w * (loss_lep_zero_nc[nc_mask]).mean()
+
+        # (optional) tiny prior + clamp on sigmas each step
+        #reg = (
+        #    self.log_sigma_flavour**2 + self.log_sigma_charm**2 +
+        #    self.log_sigma_jet_geom**2 + self.log_sigma_jet_pt**2 + self.log_sigma_jet_mag**2 +
+        #    self.log_sigma_lep_geom**2 + self.log_sigma_lep_pt**2 + self.log_sigma_lep_mag**2
+        #    self.log_sigma_vis_geom**2 + self.log_sigma_vis_pt**2 + self.log_sigma_vis_mag**2 +
+        #)
+        #total_loss = total_loss + 1e-4 * reg
 
         part_losses = {
-            'is_cc': loss_iscc,
-            'flavour': loss_flavour,
-            'charm': loss_charm,
-            'vis_comp': outs["L_vis_comp"].mean(),
-            'vis_mag': outs["L_vis_mag"].mean(),
-            'vis_dir': outs["L_vis_dir"].mean(),
-            'vis': outs["L_vis"].mean(),
-            'lep_comp': outs["L_lep_comp"].mean(),
-            'lep_mag': outs["L_lep_mag"].mean(),
-            'lep_dir': outs["L_lep_dir"].mean(),
-            'lep_cc': (outs["L_lep_cc"][m_cc>0.5].mean() if (m_cc>0.5).any() else torch.tensor(0., device=self.device)),
-            'lep_zero': outs["L_lep_zero"].mean(),
-            'evis': outs["L_evis"].mean(),
-            'pt_miss': loss_ptmiss.mean(),
-            'jet_comp': outs["L_jet_comp"].mean(),
-            'jet_mag': outs["L_jet_mag"].mean(),
-            'jet_dir': outs["L_jet_dir"].mean(),
-            'jet': (outs["L_jet"][m_cc>0.5].mean() if (outs["jet_aux_weight"]>0 and (m_cc>0.5).any()) else torch.tensor(0., device=self.device)),            
-        }
-        total_loss = (
-            weighted_loss(loss_iscc,    self.log_sigma_iscc) +
-            weighted_loss(loss_flavour, self.log_sigma_flavour) +
-            weighted_loss(loss_charm,   self.log_sigma_charm) +
-            weighted_loss(loss_vis,     self.log_sigma_vis) +
-            weighted_loss(loss_lep,     self.log_sigma_lep) +
-            weighted_loss(loss_ptmiss,  self.log_sigma_ptmiss) +
-            weighted_loss(loss_evis,    self.log_sigma_evis) +
-            weighted_loss(loss_jet,     self.log_sigma_jet)
-        ).mean()
+            # classification
+            'loss_cls/flavour': loss_flavour.mean().detach().item(),
+            'loss_cls/charm':   loss_charm.mean().detach().item(),
 
+            # regression (unmasked/batch means)
+            'loss_vis/geom':    loss_vis_geom.mean().detach().item(),
+            'loss_vis/pt':      loss_vis_pt.mean().detach().item(),
+            'loss_vis/mag':     loss_vis_mag.mean().detach().item(),
+            'loss_jet/geom':    loss_jet_geom.mean().detach().item(),
+            'loss_jet/pt':      loss_jet_pt.mean().detach().item(),
+            'loss_jet/mag':     loss_jet_mag.mean().detach().item(),
+            'loss_lep/geom_cc': _safe_mean_mask(loss_lep_geom, cc_mask).detach().item(),
+            'loss_lep/pt_cc':   _safe_mean_mask(loss_lep_pt, cc_mask).detach().item(),
+            'loss_lep/mag_cc':  _safe_mean_mask(loss_lep_mag, cc_mask).detach().item(),
+            'loss_lep/zero_nc': _safe_mean_mask(loss_lep_zero_nc, nc_mask).detach().item(),
+
+            # batch mix
+            'mix/cc_frac':      cc_frac.detach().item(),
+            'mix/nc_frac':      nc_frac.detach().item(),
+        }
+        
         return total_loss, part_losses
 
     
@@ -246,9 +288,9 @@ class ViTFineTuner(pl.LightningModule):
         if torch.isnan(loss):
             return None
 
-        self.log(f"loss/train_total", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/train_{}".format(key), value.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("{}/train".format(key), value, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
         
         # log the actual sigmas (exp(-log_sigma))
@@ -264,9 +306,9 @@ class ViTFineTuner(pl.LightningModule):
 
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
-        self.log(f"loss/val_total", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(f"loss_total/val", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("loss/val_{}".format(key), value.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("{}/val".format(key), value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 
@@ -276,7 +318,9 @@ class ViTFineTuner(pl.LightningModule):
         param_groups = param_groups_lrd(
             self.model, 
             weight_decay=self.weight_decay,
-            layer_decay=self.layer_decay)
+            layer_decay=self.layer_decay,
+            no_weight_decay_list=self.model.no_weight_decay(),
+        )
 
         for param_group in param_groups:
             lr_scale = param_group.pop("lr_scale", 1.0)

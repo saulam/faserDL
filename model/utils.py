@@ -1,7 +1,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Attention, Block
+from timm.models.vision_transformer import Attention, Block, LayerScale
+from timm.models.layers import DropPath, Mlp
 from MinkowskiEngine import (
     SparseTensor,
     MinkowskiDepthwiseConvolution,
@@ -77,7 +78,7 @@ class BlockWithMask(Block):
         
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0., init_gamma=1e-4):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -88,7 +89,6 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.gamma = nn.Parameter(torch.ones(dim) * init_gamma)
 
     def forward(self, q_in, kv_in):  # q_in: [B, Nt, C], kv_in: [B, Nc, C]
         B, Nt, C = q_in.shape
@@ -100,8 +100,36 @@ class CrossAttention(nn.Module):
         attn = self.attn_drop(attn.softmax(dim=-1))
         x = (attn @ v).transpose(1, 2).reshape(B, Nt, C)           # [B, Nt, C]
         x = self.proj(x)
-        return self.proj_drop(x) * self.gamma
+        return self.proj_drop(x)
     
+
+class CrossAttnBlock(nn.Module):
+    def __init__(
+        self, dim, num_heads=8, mlp_ratio=4.0, qkv_bias=False, drop=0.,
+        attn_drop=0., init_values=None, drop_path=0.,
+        act_layer=nn.GELU, norm_layer=nn.LayerNorm
+    ):
+        super().__init__()
+        self.norm_q   = norm_layer(dim)   # for queries
+        self.norm_kv = norm_layer(dim)    # for keys/values
+        self.attn = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, 
+                                   attn_drop=attn_drop, proj_drop=drop)
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2   = norm_layer(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()        
+    
+    def forward(self, q, kv):
+        x = q
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm_q(q), self.norm_kv(kv))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        return x
+
+# x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=self.norm_kv(kv))))
+# x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
 
 def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     """
@@ -411,6 +439,38 @@ class CylindricalHeadNormalized(nn.Module):
             "pz": pz,
             "latents": latents
         }
+    
+
+class CylindricalHeadEta(nn.Module):
+    """
+    Predict [uT, eta, ax, ay] where:
+      pT = k_T * expm1(uT) >= 0,   eta is free (can clamp if you want >=0),
+      phi via normalized (ax, ay).
+    """
+    def __init__(self, k_T, mu_uT, sigma_uT, hidden=128):
+        super().__init__()
+        self.k_T, self.mu_uT, self.sigma_uT = float(k_T), float(mu_uT), float(max(sigma_uT,1e-8))
+        self.mlp = nn.Linear(hidden, 4)
+
+    def forward(self, x, eps=1e-8):
+        uT_raw, eta, ax, ay = self.mlp(x).unbind(-1)
+
+        # angle
+        norm = torch.sqrt(ax*ax + ay*ay + eps)
+        cos_phi, sin_phi = ax / norm, ay / norm
+
+        # pT via expm1 with location-scale
+        uT = self.mu_uT + self.sigma_uT * uT_raw
+        pT = self.k_T * torch.expm1(uT).clamp_min(0.0)
+        pz = pT * torch.sinh(eta)
+        px, py = pT * cos_phi, pT * sin_phi
+
+        p_cart = torch.stack([px, py, pz], dim=-1)
+        return {
+            "p_cart": p_cart,
+            "pT": pT, "eta": eta, "cos_phi": cos_phi, "sin_phi": sin_phi
+        }
+
     
     
 class MinkowskiLayerNorm(nn.Module):

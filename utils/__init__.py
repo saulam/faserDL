@@ -6,5 +6,6 @@ from .callbacks import *
 from .augmentations import *
 from .lr_decay import param_groups_lrd
 from .pdg import cluster_labels_from_pdgs
+from .logger import SplitTensorBoardLogger
 #from .plot import *
 

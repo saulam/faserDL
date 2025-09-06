@@ -239,14 +239,14 @@ def _select_cc_leptons(p_lep_true: np.ndarray, is_cc=None, eps=1e-12):
 @dataclass
 class VectorStatsLog1p:
     # log1p/expm1 parameters for pT and pz (both >=0)
-    k_T: float;   mu_uT: float; sigma_uT: float   # for uT = log1p(pT/k_T)
-    k_Z: float;   mu_uZ: float; sigma_uZ: float   # for uZ = log1p(pz/k_Z)
+    k_T: float;  mu_uT: float; sigma_uT: float   # for uT = log1p(pT/k_T)
+    k_Z: float;  mu_uZ: float; sigma_uZ: float   # for uZ = log1p(pz/k_Z)
     # robust loss scales
     s_xyz: Tuple[float, float, float]            # MADN per component (px,py,pz)
     s_mag: float                                 # MADN for ||p||
     # residual floors (for (true-reco)/max(true, tau))
-    tau_ptmiss: float
-    tau_evis: float
+    tau_pt: float
+    tau_mag: float
 
 def compute_vector_stats_from_cartesian(
     p_true: np.ndarray,
@@ -310,33 +310,30 @@ def compute_vector_stats_from_cartesian(
     s_mag = max(float(s_mag), 1e-8)
 
     # residual floors
-    tau_ptmiss = float(np.percentile(pT,  residual_floor_pct))
-    tau_evis   = float(np.percentile(mag, residual_floor_pct))
+    tau_pt  = float(np.percentile(pT,  residual_floor_pct))
+    tau_mag = float(np.percentile(mag, residual_floor_pct))
 
     return VectorStatsLog1p(
         k_T=k_T, mu_uT=mu_uT, sigma_uT=sigma_uT,
         k_Z=k_Z, mu_uZ=mu_uZ, sigma_uZ=sigma_uZ,
         s_xyz=s_xyz, s_mag=s_mag,
-        tau_ptmiss=tau_ptmiss, tau_evis=tau_evis,
+        tau_pt=tau_pt, tau_mag=tau_mag,
     )
 
 def compute_all_stats(
     p_vis_true: np.ndarray,
+    p_jet_true: np.ndarray,
     p_lep_true: np.ndarray,
-    p_jet_true: Optional[np.ndarray] = None,
     is_cc: Optional[np.ndarray] = None,
     use_robust: bool = True,
     residual_floor_pct: float = 5.0,
-    jet_scales_cc_only: bool = True,          # CC-only loss scales for jet (recommended)
-    compute_jet_inversion_stats: bool = False # set True only if planning to predict jet directly
 ) -> Dict[str, Dict]:
     """
     Returns a dict with:
       - 'vis': VectorStats as dict
       - 'lep': VectorStats as dict
-      - (optional) 'jet_loss_scales': {'s_xyz': (..), 's_mag': ..}
-      - (optional) 'jet': VectorStats as dict (if compute_jet_inversion_stats=True)
-      - (optional) class-specific vis floors: vis_tau_ptmiss_cc/nc, vis_tau_evis_cc/nc
+      - 'jet': VectorStats as dict
+      - (optional) class-specific vis floors: tau_pt_cc/nc, tau_mag_cc/nc
 
     Notes:
       * Output format/keys are intentionally unchanged.
@@ -344,9 +341,15 @@ def compute_all_stats(
     """
     out: Dict[str, Dict] = {}
 
-    # --- visible & lepton stats (always computed) ---
+    # --- visible, jet, and lepton stats (always computed) ---
     vis_stats = compute_vector_stats_from_cartesian(
         p_vis_true,
+        use_robust=use_robust,
+        residual_floor_pct=residual_floor_pct,
+        enforce_nonneg=False,
+    )
+    jet_stats = compute_vector_stats_from_cartesian(
+        p_jet_true,
         use_robust=use_robust,
         residual_floor_pct=residual_floor_pct,
         enforce_nonneg=True,
@@ -356,61 +359,61 @@ def compute_all_stats(
         p_lep_cc,
         use_robust=use_robust,
         residual_floor_pct=residual_floor_pct,
-        enforce_nonneg=True,
+        enforce_nonneg=False,
     )
     out["vis"] = asdict(vis_stats)
+    out["jet"] = asdict(jet_stats)
     out["lep"] = asdict(lep_stats)
 
-    # --- class-specific floors for vis (optional but useful) ---
-    if is_cc is not None:
-        mask = np.asarray(is_cc).astype(bool)
-        for tag, arr in (("cc", p_vis_true[mask]), ("nc", p_vis_true[~mask])):
-            if arr.shape[0] > 0:
-                px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
-                pT  = np.sqrt(px**2 + py**2)
+    # Helper to compute CC/NC residual floors for a given 3-vector array
+    def _class_floors(
+        arr: np.ndarray,
+        mask: np.ndarray,
+        pct: float,
+        fallback_tau_pt: float,
+        fallback_tau_mag: float,
+    ) -> Dict[str, float]:
+        res: Dict[str, float] = {}
+        for tag, sub in (("cc", arr[mask]), ("nc", arr[~mask])):
+            if sub.shape[0] > 0:
+                px, py, pz = sub[:, 0], sub[:, 1], sub[:, 2]
+                pT = np.sqrt(px**2 + py**2)
                 mag = np.sqrt(px**2 + py**2 + pz**2)
-                out[f"vis_tau_ptmiss_{tag}"] = float(np.percentile(pT,  residual_floor_pct))
-                out[f"vis_tau_evis_{tag}"]   = float(np.percentile(mag, residual_floor_pct))
+                res[f"tau_pt_{tag}"] = float(np.percentile(pT, pct))
+                res[f"tau_mag_{tag}"] = float(np.percentile(mag, pct))
             else:
-                # fallback to global floors
-                out[f"vis_tau_ptmiss_{tag}"] = out["vis"]["tau_ptmiss"]
-                out[f"vis_tau_evis_{tag}"]   = out["vis"]["tau_evis"]
+                # fallback to the group's global floors
+                res[f"tau_pt_{tag}"] = float(fallback_tau_pt)
+                res[f"tau_mag_{tag}"] = float(fallback_tau_mag)
+        return res
 
-    # --- jet-related stats (optional) ---
-    if p_jet_true is not None:
-        assert p_jet_true.shape == p_vis_true.shape, "p_jet_true must be (N,3) aligned with p_vis_true"
+    # --- class-specific floors for each group ---
+    if is_cc is not None:
+        mask = np.asarray(is_cc, dtype=bool)
 
-        # Loss scales for jet (used e.g. by auxiliary jet losses)
-        if jet_scales_cc_only:
-            if is_cc is None:
-                raise ValueError("is_cc mask is required when jet_scales_cc_only=True.")
-            mask = np.asarray(is_cc).astype(bool)
-            pJ = p_jet_true[mask]
-            if pJ.shape[0] == 0:
-                pJ = p_jet_true  # graceful fallback
-        else:
-            pJ = p_jet_true
+        # vis
+        vis_cls = _class_floors(
+            p_vis_true, mask, residual_floor_pct,
+            fallback_tau_pt=out["vis"]["tau_pt"],
+            fallback_tau_mag=out["vis"]["tau_mag"],
+        )
+        out["vis"].update(vis_cls)
 
-        if use_robust:
-            sJ_xyz = tuple(_madn(pJ, axis=0).astype(np.float64))
-            sJ_mag = float(_madn(np.linalg.norm(pJ, axis=1)))
-        else:
-            sJ_xyz = tuple((np.std(pJ, axis=0) + 1e-12).astype(np.float64))
-            sJ_mag = float(np.std(np.linalg.norm(pJ, axis=1)) + 1e-12)
+        # jet
+        jet_cls = _class_floors(
+            p_jet_true, mask, residual_floor_pct,
+            fallback_tau_pt=out["jet"]["tau_pt"],
+            fallback_tau_mag=out["jet"]["tau_mag"],
+        )
+        out["jet"].update(jet_cls)
 
-        sJ_xyz = tuple(max(float(v), 1e-8) for v in sJ_xyz)
-        sJ_mag = max(float(sJ_mag), 1e-8)
-        out["jet_loss_scales"] = {"s_xyz": sJ_xyz, "s_mag": sJ_mag}
-
-        # Optional inversion stats (only if you're directly predicting jet)
-        if compute_jet_inversion_stats:
-            jet_stats = compute_vector_stats_from_cartesian(
-                p_jet_true,
-                use_robust=use_robust,
-                residual_floor_pct=residual_floor_pct,
-                enforce_nonneg=False,
-            )
-            out["jet"] = asdict(jet_stats)
+        # lep (note: NC leptons may be absent; fallback handles it)
+        lep_cls = _class_floors(
+            p_lep_true, mask, residual_floor_pct,
+            fallback_tau_pt=out["lep"]["tau_pt"],
+            fallback_tau_mag=out["lep"]["tau_mag"],
+        )
+        out["lep"].update(lep_cls)
 
     return out
 
@@ -665,13 +668,11 @@ print("Done with concat")
 # -------------------------
 stats = compute_all_stats(
     p_vis_true=vis_sp_momentum,
-    p_lep_true=out_lepton_momentum,
     p_jet_true=jet_momentum,
+    p_lep_true=out_lepton_momentum,
     is_cc=is_cc,
     use_robust=True,
     residual_floor_pct=5.0,
-    jet_scales_cc_only=True,
-    compute_jet_inversion_stats=False  # flip to True only if you plan a direct jet head
 )
 
 # -------------------------

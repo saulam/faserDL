@@ -64,8 +64,8 @@ def augment(
 
     # Scaling
     if np.random.random() < aug_prob:
-        feats, momenta, global_feats, _ = scale_all_by_global_shift_lognormal(
-            feats, momenta, global_feats, log_sigma=0.1
+        feats, global_feats, _, _ = scale_all_by_global_shift_lognormal(
+            feats, global_feats, log_sigma=0.1
         )
 
     # Jitter per-hit multiplicative
@@ -454,12 +454,13 @@ def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
     return scaled_feats, scaled_momentums, scaled_global_feats, shift
 
 
-def scale_all_by_global_shift_lognormal(feats, momentums, global_feats, log_sigma=0.1):
+def scale_all_by_global_shift_lognormal(feats, global_feats, log_sigma=0.1, momenta=None):
     # shift ~ LogNormal(mean=0, sigma=log_sigma) so E[shift]≈exp(0.5*log_sigma^2)
     # If you want mean≈1 exactly, divide by that factor.
     shift = np.exp(np.random.randn() * log_sigma)
     shift /= np.exp(0.5 * log_sigma**2)   # center around 1.0
-    return feats * shift, [p * shift for p in momentums], {k: v * shift for k, v in global_feats.items()}, shift
+    momenta = [p * shift for p in momenta] if momenta is not None else None
+    return feats * shift, {k: v * shift for k, v in global_feats.items()}, momenta, shift
 
 
 def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):

@@ -22,7 +22,7 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
 
     num_intra_layers = len(model.blocks)
     num_inter_layers = len(model.inter_blocks)
-    num_layers = num_intra_layers + num_inter_layers + 2
+    num_layers = num_intra_layers + num_inter_layers + 1
 
     layer_scales = list(layer_decay ** (num_layers - i) for i in range(num_layers + 1))
 
@@ -69,18 +69,17 @@ def get_layer_id_for_vit(name, num_intra_layers, num_inter_layers):
     Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L33
     """
     if name.startswith('patch_embed') or name.startswith('module_cls_token') or \
-       name.startswith('intra_pos_embed') or name.startswith('module_embed_enc') or \
-       name.startswith('global_feats_encoder') or name.startswith('global_token_embed'):
+       name.startswith('intra_pos_embed') or name.startswith('module_embed_enc'):
         return 0
     elif name.startswith('blocks'):
         return int(name.split('.')[1]) + 1
     elif name.startswith('norm'):
         return num_intra_layers
+    elif name.startswith('global_feats_encoder') or name.startswith('global_token_embed'):
+        return num_intra_layers + 1
     elif name.startswith('inter_blocks'):
         return num_intra_layers + int(name.split('.')[1]) + 1
     elif name.startswith('inter_norm'):
         return num_intra_layers + num_inter_layers
-    elif name.startswith('cross_attn'):
-        return num_intra_layers + num_inter_layers + 1
     else:
-        return num_intra_layers + num_inter_layers + 2
+        return num_intra_layers + num_inter_layers + 1

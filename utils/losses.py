@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-
+'''
 class KinematicsMultiTaskLoss(nn.Module):
     """
     Multi-task regression loss for vis/lepton (and optional jet) with analysis-aligned residuals.
@@ -23,8 +23,6 @@ class KinematicsMultiTaskLoss(nn.Module):
       p_vis_true: (B,3) true visible momentum
       p_lep_true: (B,3) true lepton momentum
       is_cc:      (B,)  1 for CC, 0 for NC (bool or float)
-      p_jet_true: (B,3) optional true jet (if using aux jet loss); else None
-      p_jet_hat:  (B,3) optional predicted jet; if None, derived as p_vis_hat - p_lep_hat
       vis_latents, lep_latents: optional tensors from Option-A heads (e.g., [zT, zz]);
                                 if given, a tiny latent prior is applied.
 
@@ -44,9 +42,9 @@ class KinematicsMultiTaskLoss(nn.Module):
         # --- robust scales for LEP ---
         s_lep_xyz,                    # (3,)
         s_lep_mag,                    # float
-        # --- optional robust scales for JET (if aux jet loss enabled) ---
-        s_jet_xyz=None,               # (3,) or None -> fallback to s_vis_xyz
-        s_jet_mag=None,               # float or None -> fallback to s_vis_mag
+        # --- robust scales for JET ---
+        s_jet_xyz,                    # (3,) 
+        s_jet_mag,                    # float
         # --- residual floors (per-class) ---
         tau_ptmiss_cc=0.05, tau_ptmiss_nc=0.05,
         tau_evis_cc=0.05,   tau_evis_nc=0.05,
@@ -55,7 +53,7 @@ class KinematicsMultiTaskLoss(nn.Module):
         lam_mag=1.0, lam_dir=1.0,     # weights inside vector losses
         zero_attractor_w=0.1,
         jet_aux_w=0.0,                # set >0 to enable aux jet loss (CC-only)
-        latent_prior_w=0.0,           # tiny (e.g., 1e-3) if you pass latents
+        latent_prior_w=0.0,           # tiny (e.g., 1e-3) if passing latents
         enforce_nonneg_truth_pz=True, # enforce pz >= 0 for truth vectors (vis and lep)
     ):
         super().__init__()
@@ -116,11 +114,9 @@ class KinematicsMultiTaskLoss(nn.Module):
     # ---------- forward ----------
     def forward(
         self,
-        *,
         p_vis_hat, p_lep_hat,
         p_vis_true, p_lep_true,
         is_cc,
-        p_jet_true=None, p_jet_hat=None,
         vis_latents=None, lep_latents=None,
     ):
         device = p_vis_hat.device
@@ -128,22 +124,25 @@ class KinematicsMultiTaskLoss(nn.Module):
         eps = 1e-8
 
         if self.enforce_nonneg_truth_pz:
-            # enforce non-negative pz for truth vectors
             p_vis_true = p_vis_true.clone()
             p_lep_true = p_lep_true.clone()
             p_vis_true[..., 2] = p_vis_true[..., 2].clamp_min(0.0)
             p_lep_true[..., 2] = p_lep_true[..., 2].clamp_min(0.0)
 
-        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)                # (B,)
+        # calculate jet as (vis - lep)
+        p_jet_true = p_vis_true - p_lep_true
+        p_jet_hat = p_vis_hat - p_lep_hat
+
+        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)      # (B,)
         m_nc = 1.0 - m_cc
+        cc_mask = m_cc > 0.5
 
         # ----- Visible vector losses -----
         L_vis_comp = self._component_loss(p_vis_hat, p_vis_true, self.s_vis_xyz)
         L_vis_mag  = self._magnitude_loss(p_vis_hat, p_vis_true, self.s_vis_mag)
         L_vis_dir  = self._cosine_dir_loss(p_vis_hat, p_vis_true)
-        L_vis = L_vis_comp + self.lam_mag * L_vis_mag + self.lam_dir * L_vis_dir
+        L_vis      = L_vis_comp + self.lam_mag * L_vis_mag + self.lam_dir * L_vis_dir
 
-        # optional latent prior (tiny)
         if vis_latents is not None and self.latent_prior_w > 0.0:
             L_vis = L_vis + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
 
@@ -166,43 +165,250 @@ class KinematicsMultiTaskLoss(nn.Module):
         e_true  = p_vis_true.norm(dim=-1)
         e_hat   = p_vis_hat.norm(dim=-1)
 
-        # per-sample floors
         tau_pt = (self.tau_ptmiss_cc * m_cc + self.tau_ptmiss_nc * m_nc).to(device)
         tau_ev = (self.tau_evis_cc   * m_cc + self.tau_evis_nc   * m_nc).to(device)
 
         L_ptmiss = self._residual_scalar_loss(pt_true, pt_hat, tau_pt)
         L_evis   = self._residual_scalar_loss(e_true,  e_hat,  tau_ev)
 
-        # ----- Optional jet aux loss (CC-only) -----
-        if self.jet_aux_w > 0.0 and (p_jet_true is not None):
-            if p_jet_hat is None:
-                p_jet_hat = p_vis_hat - p_lep_hat
+        # ----- Jet aux loss (define safe zeros first) -----
+        L_jet_comp = torch.zeros(B, device=device)
+        L_jet_mag  = torch.zeros(B, device=device)
+        L_jet_dir  = torch.zeros(B, device=device)
+        L_jet      = torch.zeros(B, device=device)
+
+        if self.jet_aux_w > 0.0:
             L_jet_comp = self._component_loss(p_jet_hat, p_jet_true, self.s_jet_xyz)
             L_jet_mag  = self._magnitude_loss(p_jet_hat, p_jet_true, self.s_jet_mag)
             L_jet_dir  = self._cosine_dir_loss(p_jet_hat, p_jet_true)
-            L_jet = (L_jet_comp + self.lam_mag * L_jet_mag + self.lam_dir * L_jet_dir) * m_cc
-        else:
-            L_jet = torch.zeros(B, device=device)
+            L_jet      = (L_jet_comp + self.lam_mag * L_jet_mag + self.lam_dir * L_jet_dir) * m_cc
 
-        out = {
-            "L_vis_comp": L_vis_comp,
-            "L_vis_mag": L_vis_mag,
-            "L_vis_dir": L_vis_dir,
-            "L_vis": L_vis,
-            "L_lep_comp": L_lep_comp,
-            "L_lep_mag": L_lep_mag,
-            "L_lep_dir": L_lep_dir,
-            "L_lep_cc": L_lep_cc,
-            "L_lep_zero": L_lep_zero,
-            "L_ptmiss": L_ptmiss,
-            "L_evis": L_evis,
-            "jet_aux_weight": self.jet_aux_w,
-            "L_jet_comp": L_jet_comp,
-            "L_jet_mag": L_jet_mag,
-            "L_jet_dir": L_jet_dir,
-            "L_jet": L_jet,
+        # ---------- per-sample outputs for total loss ----------
+        per_sample = {
+            "loss_vis":   L_vis,                            # (B,)
+            "loss_lep":   L_lep_cc + L_lep_zero,            # (B,)
+            "loss_ptmiss":L_ptmiss,                         # (B,)
+            "loss_evis":  L_evis,                           # (B,)
+            "loss_jet":   L_jet,                            # (B,)
         }
-        return out
+
+        # ---------- ready-to-log means ----------
+        def _safe_mean(x):
+            # supports zero-length selections
+            return (x.mean() if x.numel() > 0 else torch.tensor(0.0, device=device))
+
+        logs = {
+            'loss_reg_vis/vis_comp': L_vis_comp.mean(),
+            'loss_reg_vis/vis_mag':  L_vis_mag.mean(),
+            'loss_reg_vis/vis_dir':  L_vis_dir.mean(),
+            'loss_reg_vis/vis':      L_vis.mean(),
+            'loss_reg_vis/evis':     L_evis.mean(),
+            'loss_reg_vis/pt_miss':  L_ptmiss.mean(),
+            'loss_reg_lep/lep_comp': L_lep_comp.mean(),
+            'loss_reg_lep/lep_mag':  L_lep_mag.mean(),
+            'loss_reg_lep/lep_dir':  L_lep_dir.mean(),
+            'loss_reg_lep/lep_cc':   _safe_mean(L_lep_cc[cc_mask]),
+            'loss_reg_lep/lep_zero': L_lep_zero.mean(),
+            'loss_reg_jet/jet_comp': L_jet_comp.mean(),
+            'loss_reg_jet/jet_mag':  L_jet_mag.mean(),
+            'loss_reg_jet/jet_dir':  L_jet_dir.mean(),
+            'loss_reg_jet/jet':      (_safe_mean(L_jet[cc_mask]) if self.jet_aux_w > 0.0 else torch.tensor(0.0, device=device)),
+        }
+
+        return {"per_sample": per_sample, "logs": logs}
+'''
+
+class KinematicsMultiTaskLoss(nn.Module):
+    """
+    Predict (p_vis, p_jet). Derive p_lep = p_vis - p_jet.
+
+    forward() inputs:
+      p_vis_hat:  (B,3) predicted visible momentum
+      p_jet_hat:  (B,3) predicted jet momentum
+      p_vis_true: (B,3) true visible momentum
+      p_jet_true: (B,3) true jet momentum  (provided)
+      is_cc:      (B,)  ground-truth CC mask in {0,1}
+      is_cc_hat:  (B,)  predicted CC prob in [0,1] (already sigmoid’d)
+      vis_latents, jet_latents: optional latents for tiny priors
+
+    Design:
+      - Magnitudes supervised via relative residuals.
+      - XY-direction loss added (plus optional 3D direction).
+      - Lepton vector supervision is CC-only. Optional NC zero-attractor on raw lep.
+    """
+
+    def __init__(
+        self,
+        *,
+        stats,
+        # -------- weights / knobs --------
+        huber_delta=1.0,
+        lam_dir_xy=1.0,               # weight for XY cosine loss
+        lam_dir_3d=0.0,               # weight for 3D cosine loss (default off)
+        lep_nc_zero_w=0.05,           # small NC zero-attractor on raw lep
+        latent_prior_w=0.0,           # tiny N(0,1) prior on provided latents
+        enforce_nonneg_truth_pz=True, # clamp truth pz>=0 before deriving p_lep_true
+        decouple_radial=False,        # remove radial component from component loss
+    ):
+        super().__init__()
+
+        # scales
+        self.register_buffer("s_vis_xyz", torch.tensor(stats["vis"]["s_xyz"], dtype=torch.float32).view(1,3))
+        self.register_buffer("s_jet_xyz", torch.tensor(stats["jet"]["s_xyz"], dtype=torch.float32).view(1,3))
+        self.register_buffer("s_lep_xyz", torch.tensor(stats["lep"]["s_xyz"], dtype=torch.float32).view(1,3))
+
+        # per-output floors
+        self.tau_pt_vis   = float(stats["vis"]["tau_pt"])
+        self.tau_mag_vis  = float(stats["vis"]["tau_mag"])
+        self.tau_pt_jet   = float(stats["jet"]["tau_pt"])
+        self.tau_mag_jet  = float(stats["jet"]["tau_mag"])
+        self.tau_pt_lep   = float(stats["lep"]["tau_pt"])
+        self.tau_mag_lep  = float(stats["lep"]["tau_mag"])
+
+        # knobs
+        self.huber_delta = float(huber_delta)
+        self.lam_dir_xy  = float(lam_dir_xy)
+        self.lam_dir_3d  = float(lam_dir_3d)
+
+        self.lep_nc_zero_w = float(lep_nc_zero_w)
+        self.latent_prior_w = float(latent_prior_w)
+        self.enforce_nonneg_truth_pz = bool(enforce_nonneg_truth_pz)
+        self.decouple_radial = bool(decouple_radial)
+
+    # ---------- primitives ----------
+    @staticmethod
+    def _huber(x, delta):
+        ax = x.abs()
+        quad = torch.clamp(ax, max=delta)
+        lin = ax - quad
+        return 0.5 * quad**2 + delta * lin
+
+    @staticmethod
+    def _cosine_dir_3d(p_hat, p_true, eps=1e-8):
+        num = (p_hat * p_true).sum(-1)
+        den = p_hat.norm(dim=-1) * p_true.norm(dim=-1)
+        return 1.0 - num / (den + eps)
+
+    @staticmethod
+    def _cosine_dir_xy(p_hat, p_true, eps=1e-8):
+        v_hat  = p_hat[..., :2]
+        v_true = p_true[..., :2]
+        num = (v_hat * v_true).sum(-1)
+        den = v_hat.norm(dim=-1) * v_true.norm(dim=-1)
+        return 1.0 - num / (den + eps)
+
+    def _component_loss(self, p_hat, p_true, s_xyz, eps=1e-8):
+        """
+        If decouple_radial=True, remove the radial component so this term is
+        purely angular in the native Cartesian basis (per-axis scaled).
+        """
+        e = p_hat - p_true
+        if self.decouple_radial:
+            tnorm2 = (p_true * p_true).sum(-1, keepdim=True).clamp_min(eps)
+            e_rad = ((e * p_true).sum(-1, keepdim=True) / tnorm2) * p_true
+            e = e - e_rad
+        z = e / s_xyz
+        return self._huber(z, self.huber_delta).sum(-1)
+
+    def _relative_residual_loss(self, p_true, p_hat, tau, kind="mag"):
+        """
+        Relative residual Huber on a scalar derived from vectors p_true/p_hat:
+          kind="mag":  uses ||p||
+          kind="pt":   uses ||p_xy||
+        Norms are computed internally.
+        """
+        if kind == "mag":
+            x_true = p_true.norm(dim=-1)
+            x_hat  = p_hat.norm(dim=-1)
+        elif kind == "pt":
+            x_true = p_true[..., :2].norm(dim=-1)
+            x_hat  = p_hat[..., :2].norm(dim=-1)
+        else:
+            raise ValueError(f"Unknown kind='{kind}'")
+        denom = torch.maximum(x_true, torch.as_tensor(tau, dtype=x_true.dtype, device=x_true.device))
+        r = (x_true - x_hat) / denom
+        return self._huber(r, self.huber_delta)
+
+    # ---------- forward ----------
+    def forward(
+        self,
+        *,
+        p_vis_hat, p_jet_hat,
+        p_vis_true, p_jet_true,
+        is_cc, vis_latents=None, jet_latents=None,
+    ):
+        device = p_vis_hat.device
+
+        # ----- truths -----
+        if self.enforce_nonneg_truth_pz:
+            p_vis_true = p_vis_true.clone(); p_vis_true[...,2] = p_vis_true[...,2].clamp_min(0.0)
+            p_jet_true = p_jet_true.clone(); p_jet_true[...,2] = p_jet_true[...,2].clamp_min(0.0)
+        p_lep_true = p_vis_true - p_jet_true
+
+        # ----- predictions -----
+        p_lep_hat = p_vis_hat - p_jet_hat
+
+        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)      # (B,)
+        m_nc = 1.0 - m_cc
+
+        # ----- vector losses -----
+        # VIS
+        L_vis_comp  = self._component_loss(p_vis_hat, p_vis_true, self.s_vis_xyz)
+        L_vis_dirxy = self._cosine_dir_xy(p_vis_hat, p_vis_true)
+        L_vis_geom = L_vis_comp + self.lam_dir_xy * L_vis_dirxy
+        if self.lam_dir_3d != 0.0:
+            L_vis_geom = L_vis_geom + self.lam_dir_3d * self._cosine_dir_3d(p_vis_hat, p_vis_true)
+        if vis_latents is not None and self.latent_prior_w > 0.0:
+            L_vis_geom = L_vis_geom + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
+        L_vis_pt   = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_pt_vis, kind="pt")
+        L_vis_mag  = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_mag_vis, kind="mag")
+
+        # JET
+        L_jet_comp  = self._component_loss(p_jet_hat, p_jet_true, self.s_jet_xyz)
+        L_jet_dirxy = self._cosine_dir_xy(p_jet_hat, p_jet_true)
+        L_jet_geom = L_jet_comp + self.lam_dir_xy * L_jet_dirxy
+        if self.lam_dir_3d != 0.0:
+            L_jet_geom = L_jet_geom + self.lam_dir_3d * self._cosine_dir_3d(p_jet_hat, p_jet_true)
+        if jet_latents is not None and self.latent_prior_w > 0.0:
+            L_jet_geom = L_jet_geom + self.latent_prior_w * (jet_latents.pow(2).sum(-1))
+        L_jet_pt   = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_pt_jet, kind="pt")
+        L_jet_mag  = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_mag_jet, kind="mag")
+
+        # LEPTON (CC-only; use gated prediction).
+        L_lep_comp  = self._component_loss(p_lep_hat, p_lep_true, self.s_lep_xyz)
+        L_lep_dirxy = self._cosine_dir_xy(p_lep_hat, p_lep_true)
+        L_lep_geom = L_lep_comp + self.lam_dir_xy * L_lep_dirxy
+        if self.lam_dir_3d != 0.0:
+            L_lep_geom = L_lep_geom + (self.lam_dir_3d * self._cosine_dir_3d(p_lep_hat, p_lep_true))
+        L_lep_geom = L_lep_geom * m_cc
+        L_lep_pt   = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_pt_lep, kind="pt") * m_cc
+        L_lep_mag  = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_mag_lep, kind="mag") * m_cc
+
+        # NC zero-attractor (small) on RAW lepton
+        if self.lep_nc_zero_w > 0.0:
+            z_nc = (p_lep_hat / self.s_lep_xyz) * m_nc.view(-1,1)
+            L_lep_zero_nc = self._huber(z_nc, self.huber_delta).sum(-1)
+        else:
+            L_lep_zero_nc = torch.zeros_like(m_cc)
+
+        losses = {
+            # vis
+            'loss_vis/geom': L_vis_geom,
+            'loss_vis/pt':   L_vis_pt,
+            'loss_vis/mag':  L_vis_mag,
+            # jet
+            'loss_jet/geom': L_jet_geom,
+            'loss_jet/pt':   L_jet_pt,
+            'loss_jet/mag':  L_jet_mag,
+            # lep (CC-only)
+            'loss_lep/geom': L_lep_geom,
+            'loss_lep/pt':   L_lep_pt,
+            'loss_lep/mag':  L_lep_mag,
+            # NC prior
+            'loss_lep/zero_nc': L_lep_zero_nc,
+        }
+
+        return losses
 
 
 class MAPE(torch.nn.Module):
@@ -1117,8 +1323,8 @@ def prototype_contrastive_loss_vectorized(
     off      = Pidx["offset"][eidx]
     cls_cnt  = cnt_vec[g]                           # class size (per hit, int)
 
-    # Keep only hits with >=2 classes in event AND class size >=2
-    keep = (Ue >= 2) & (cls_cnt >= 2)
+    # Keep only hits with >=2 classes in event AND class size >=5
+    keep = (Ue >= 2) & (cls_cnt >= 5)
     if not torch.any(keep):
         return z.new_zeros(())
 

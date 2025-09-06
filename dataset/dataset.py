@@ -128,7 +128,7 @@ class SparseFASERCALDataset(Dataset):
             if pdg in [-12, 12]: return 0  # CC nue
             if pdg in [-14, 14]: return 1  # CC numu
             if pdg in [-16, 16]: return 2  # CC nutau
-        return 0  # NC (not used)
+        return 3  # NC
 
 
     def decompose_momentum(self, momentum):
@@ -243,7 +243,7 @@ class SparseFASERCALDataset(Dataset):
         self,
         true_track_id: np.ndarray,      # [T] int64
         true_primary_id: np.ndarray,    # [T] int64
-        true_pdg: np.ndarray,          # [T] int64
+        true_pdg: np.ndarray,           # [T] int64
         indptr: np.ndarray,             # [N+1] int64
         true_index: np.ndarray,         # [E] int64
         link_weight: np.ndarray,        # [E] float
@@ -256,6 +256,7 @@ class SparseFASERCALDataset(Dataset):
         Returns:
         hit_track_id   [N] int64  (=-1 if none)
         hit_primary_id [N] int64  (=-1 if none)
+        hit_pdg        [N] int64  (=-1 if none)
         active         [N] bool   (True if some edge selected)
         chosen_true    [N] int64  chosen true index per hit (=-1 if none)
         """
@@ -415,7 +416,7 @@ class SparseFASERCALDataset(Dataset):
                 train=self.train,            # argmax if False, sampling if True
                 weight_threshold=0.05,
             )
-        hit_pdg = cluster_labels_from_pdgs(hit_pdg)
+            hit_pdg = cluster_labels_from_pdgs(hit_pdg)
 
         # initial transformations
         coords = reco_hits[:, :3]
@@ -441,9 +442,8 @@ class SparseFASERCALDataset(Dataset):
             flavour_label = smooth_labels(
                 np.array([self.pdg2label(in_neutrino_pdg, is_cc)]),
                 smoothing=self.label_smoothing,
-                num_classes=3
+                num_classes=4
             )
-            is_cc = smooth_labels(np.array([float(is_cc)]), smoothing=self.label_smoothing)
             seg_labels = self.normalise_seg_labels(seg_labels_raw, smoothing=self.label_smoothing)
         else:
             flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])

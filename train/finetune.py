@@ -11,10 +11,10 @@ import os
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
-from utils import ini_argparse, split_dataset, create_loader
+from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
 from dataset import *
 from model import *
-from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 
 
@@ -127,8 +127,8 @@ def main():
 
     # define the list of losses to monitor
     monitor_losses = [
-        "loss/val_total",
-        "loss/val_flavour",
+        "loss_total/val",
+        #"loss/val_flavour",
         #"loss/val_charm",
         #"loss/val_vis_sp_momentum_mag",
         #"loss/val_vis_sp_momentum_dir",
@@ -152,7 +152,7 @@ def main():
                     save_top_k=args.save_top_k,
                     monitor=loss,
                     mode="min",
-                    save_last=(loss == "loss/val_total"),
+                    save_last=True,
                 )
             )
         progress_bar = CustomProgressBar()
@@ -161,7 +161,14 @@ def main():
 
     # Rest of callbacks
     logger    = CSVLogger(save_dir=f"{args.save_dir}/logs", name=f"{args.name}")
-    tb_logger = TensorBoardLogger(save_dir=f"{args.save_dir}/tb_logs", name=f"{args.name}")
+    tb_logger = SplitTensorBoardLogger(   
+        save_dir=f"{args.save_dir}/tb_logs",
+        name=f"{args.name}",
+        other_target="train",
+        strip_suffix=True,
+        val_suffix = "_epoch",
+    )
+    
     callbacks = make_callbacks()
     logger.log_hyperparams(vars(args))
     tb_logger.log_hyperparams(vars(args))

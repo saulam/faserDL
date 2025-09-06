@@ -14,7 +14,7 @@ from functools import partial
 from timm.models.layers import trunc_normal_
 from MinkowskiEngine import MinkowskiConvolution
 from timm.models.vision_transformer import Block
-from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CrossAttention, CylindricalHeadNormalized
+from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CrossAttnBlock, CylindricalHeadNormalized
 
 
 class MinkViT(vit.VisionTransformer):
@@ -121,25 +121,24 @@ class MinkViT(vit.VisionTransformer):
             )
             for i in range(self.inter_depth)
         ])
-        self.inter_norm = norm_layer(embed_dim)
 
         # Task specifics
         self.global_pool = global_pool
         self.head_channels = {
-            "iscc": 1,
-            "flavour": 3,
+            "flavour": 4,
             "charm": 1,
             "vis": 3,
-            "lep": 3,
+            "jet": 3,
         }
         self.num_tasks = len(self.head_channels)
         if not self.global_pool:
-            # Task cross-attention
-            self.task_cross_attn = CrossAttention(
-                embed_dim, num_heads=num_heads, qkv_bias=True, attn_drop=attn_drop_rate, proj_drop=drop_rate
-            )
-            self.task_norm = norm_layer(embed_dim)
+            # Task tokens and cross-attention
             self.task_tokens = nn.Parameter(torch.zeros(1, self.num_tasks, embed_dim))
+            self.task_cross_attn = CrossAttnBlock(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                drop_path=0., norm_layer=norm_layer, init_values=2e-5,
+            )
         self.heads = nn.ModuleDict()
         for name in self.head_channels.keys():
             self.heads[name] = nn.Sequential(
@@ -170,16 +169,6 @@ class MinkViT(vit.VisionTransformer):
         if hasattr(self, "task_tokens"):
             nn.init.normal_(self.task_tokens, std=.02)
 
-        # init task cross-attention
-        if hasattr(self, "task_cross_attn"):
-            with torch.no_grad():
-                self.task_cross_attn.gamma.fill_(1e-4)
-                # mild downscale of output proj to make it even quieter at step 0
-                # without killing grads to q/k/v:
-                self.task_cross_attn.proj.weight.mul_(0.5)
-                if self.task_cross_attn.proj.bias is not None:
-                    self.task_cross_attn.proj.bias.mul_(0.5)
-
         # init heads
         for name, head in self.heads.items():
             lin = head[2]
@@ -204,6 +193,16 @@ class MinkViT(vit.VisionTransformer):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    
+    def no_weight_decay(self):
+        return {
+            'module_cls_token',
+            'global_token_embed',
+            'task_tokens',
+            'module_embed_enc.weight',
+            'patch_embed.bias',
+        }
             
 
     def make_head_from_stats(self, stats_entry, hidden=128):
@@ -220,8 +219,8 @@ class MinkViT(vit.VisionTransformer):
             sigma_uZ=stats_entry["sigma_uZ"],
             hidden=hidden,
         )
-    
-    
+
+
     def densify_patches(self, x_sparse):
         coords = x_sparse.C.long()  # [N,4]
         feats  = x_sparse.F
@@ -288,7 +287,6 @@ class MinkViT(vit.VisionTransformer):
 
         # retrieve CLS tokens
         cls_mod = x_intra[:, 0, :].reshape(B, M, C)        # [B, M, C]
-        tok_mod = x_intra[:, 1:, :].reshape(B, M, Lk, C)   # [B, M, Lk, C]
 
         # Inter-module transformer over CLS tokens
         g = self.global_feats_encoder(x_glob)                                  # [B, C]
@@ -297,14 +295,13 @@ class MinkViT(vit.VisionTransformer):
         x_inter = torch.cat([g_tok, cls_mod + mod_pos], dim=1)                 # [B, 1+M, C]
         for blk in self.inter_blocks:
             x_inter = blk(x_inter)
-        x_inter = self.inter_norm(x_inter)
 
+        # Task-specific heads
         if self.global_pool:
             outcome = x_inter[:, 1:, :].mean(dim=1)
         else:
-            x_inter = self.task_norm(x_inter)
             task_q  = self.task_tokens.expand(B, -1, -1)
-            outcome = task_q + self.task_cross_attn(task_q, x_inter)
+            outcome = self.task_cross_attn(task_q, x_inter)
 
         return outcome
     
@@ -393,8 +390,8 @@ def vit_tiny(**kwargs):
 def vit_base(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=768, patch_size=(48, 48, 2),
-        depth=12, num_heads=12,
+        embed_dim=768, patch_size=(16, 16, 4),
+        depth=8, inter_depth=4, num_heads=12,
         mlp_ratio=4.0, qkv_bias=True, global_pool=False,
         block_fn=Block,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)

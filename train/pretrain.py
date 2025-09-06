@@ -11,11 +11,10 @@ import os
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
-from utils import ini_argparse, split_dataset, create_loader
+from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
 from dataset import *
 from model import *
 from pytorch_lightning.loggers import CSVLogger
-from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
 
 
@@ -125,10 +124,16 @@ def main():
 
     # Define logger and checkpoint
     logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
-    tb_logger = TensorBoardLogger(save_dir=args.save_dir + "/tb_logs", name=args.name)
+    tb_logger = SplitTensorBoardLogger(   
+        save_dir=f"{args.save_dir}/tb_logs",
+        name=f"{args.name}",
+        other_target="train",
+        strip_suffix=True,
+        val_suffix = "_epoch",
+    )
     callbacks = []
     monitored_losses = [
-            'loss/val_total',
+            'loss_total/val',
     ]
     for loss_name in monitored_losses:
         checkpoint = ModelCheckpoint(
@@ -177,11 +182,12 @@ def main():
     )
 
     # Train and validate the model
+    ckpt_path = args.load_checkpoint if args.load_checkpoint and os.path.exists(args.load_checkpoint) else None
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=valid_loader,
-        ckpt_path=args.load_checkpoint if args.load_checkpoint else None,
+        ckpt_path=ckpt_path,
     )
 
 

@@ -146,9 +146,9 @@ class MAEPreTrainer(pl.LightningModule):
         loss_pid_all = loss_pid + pushaway_weight * loss_pid_ghost
 
         part_losses_enc = {
-            'trk': loss_trk, 'trk_ghost': loss_trk_ghost,
-            'pri': loss_pri, 'pri_ghost': loss_pri_ghost,
-            'pid': loss_pid, 'pid_ghost': loss_pid_ghost,
+            'trk/pos': loss_trk, 'trk/ghost': loss_trk_ghost,
+            'pri/pos': loss_pri, 'pri/ghost': loss_pri_ghost,
+            'pid/pos': loss_pid, 'pid/ghost': loss_pid_ghost,
         }
 
         return loss_trk_all, loss_pri_all, loss_pid_all, part_losses_enc
@@ -282,9 +282,6 @@ class MAEPreTrainer(pl.LightningModule):
             sup_targ = sup_targ * (1.0 - eps) + 0.5 * eps
         occ_logits_sup = pred_occ[sup_mask]
         occ_targ_sup   = sup_targ[sup_mask]
-        #occ_losses = F.binary_cross_entropy_with_logits(
-        #    occ_logits_sup, occ_targ_sup, reduction='none'
-        #)  # [N_sup]
         occ_losses = soft_focal_bce_with_logits(
             occ_logits_sup, occ_targ_sup, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
         )  # [N_sup]
@@ -352,8 +349,8 @@ class MAEPreTrainer(pl.LightningModule):
         reg_neg_loss = reg_row[N_pos:].mean()
 
         part_losses_dec = {
-            'occ': loss_occ, 'occ_pos': occ_pos_loss, 'occ_neg': occ_neg_loss,
-            'reg': loss_reg, 'reg_pos': reg_pos_loss, 'reg_neg': reg_neg_loss,
+            'occ/total': loss_occ, 'occ/pos': occ_pos_loss, 'occ/neg': occ_neg_loss,
+            'reg/total': loss_reg, 'reg/pos': reg_pos_loss, 'reg/neg': reg_neg_loss,
         }
         return loss_occ, loss_reg, part_losses_dec
     
@@ -433,7 +430,7 @@ class MAEPreTrainer(pl.LightningModule):
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(
-            f"loss/train_total",
+            f"loss_total/train",
             loss.item(), 
             batch_size=batch_size, 
             on_step=True, 
@@ -443,7 +440,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         for key, value in part_losses.items():
             self.log(
-                "loss/train_{}".format(key),
+                "{}/train".format(key),
                 value.item(), 
                 batch_size=batch_size, 
                 on_step=True, 
@@ -475,7 +472,7 @@ class MAEPreTrainer(pl.LightningModule):
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(
-            f"loss/val_total",
+            f"loss_total/val",
             loss.item(),
             batch_size=batch_size,
             on_step=False,
@@ -485,7 +482,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         for key, value in part_losses.items():
             self.log(
-                "loss/val_{}".format(key),
+                "{}/val".format(key),
                 value.item(),
                 batch_size=batch_size,
                 on_step=False,
@@ -500,7 +497,7 @@ class MAEPreTrainer(pl.LightningModule):
     def configure_optimizers(self):
         """Configure and initialize the optimizer and learning rate scheduler."""
         param_groups = optim_factory.param_groups_weight_decay(
-            self.model, self.weight_decay,
+            self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
             'params': list(self._uncertainty_params.values()),
