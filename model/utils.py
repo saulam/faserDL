@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import warnings
 from timm.models.vision_transformer import Attention, Block, LayerScale
 from timm.models.layers import DropPath, Mlp
 from MinkowskiEngine import (
@@ -13,44 +14,61 @@ from MinkowskiEngine import (
 )
 
 
+HAS_SDPA = hasattr(F, "scaled_dot_product_attention")
+
+def _attn_classic(q, k, v, mask, drop_p, training, is_causal):
+    # q:[B,H,Q,D], k/v:[B,H,K,D]; mask: bool keep or additive float broadcastable to [B,1,Q,K]
+    scale = 1.0 / math.sqrt(q.size(-1))
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if mask is not None:
+        if mask.dtype == torch.bool:
+            scores = scores.masked_fill(~mask, float("-1e9"))
+        else:
+            scores = scores + mask
+    attn = torch.softmax(scores, dim=-1)
+    if training and drop_p > 0.0:
+        attn = F.dropout(attn, p=drop_p)
+    return torch.matmul(attn, v)
+
+
+def _attn_sdpa(q, k, v, mask, drop_p, training, is_causal):
+    # Prefer Flash, never mem-efficient; allow math fallback
+    try:
+        with torch.backends.cuda.sdp_kernel(enable_flash=True,
+                                            enable_mem_efficient=False,
+                                            enable_math=True):
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=(drop_p if training else 0.0),
+                is_causal=is_causal
+            )
+    except Exception as e:
+        raise e
+
+
+_ATTENTION_IMPL = _attn_classic if (not HAS_SDPA) else _attn_sdpa
+_warned = False
+
+
 def sdpa_safe(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, training=False):
     """
     q,k,v: [B,H,Q,D], [B,H,K,D], [B,H,K,D]
-    attn_mask:  None OR broadcastable to [B,1,Q,K]
-           - bool: True = keep
-           - float: additive (0 keep, -inf block)
+    attn_mask: None OR bool keep mask OR additive float mask, broadcastable to [B,1,Q,K]
     """
+    global _ATTENTION_IMPL, _warned
     try:
-        try:
-            ctx = torch.backends.cuda.sdp_kernel(enable_flash=True,
-                                                 enable_mem_efficient=False,
-                                                 enable_math=True)
-        except AttributeError:  # older torch
-            print("Failing... Classic")
-            class _DummyCtx:
-                def __enter__(self): return None
-                def __exit__(self, *a): return False
-            ctx = _DummyCtx()
-
-        with ctx:
-            return F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask,
-                dropout_p=(dropout_p if training else 0.0),
-                is_causal=is_causal
-            )
-    except RuntimeError:
-        print("Numeraical issue in SDPA; falling back to classic attention")
-        # Fallback: classic attention (numerically stable)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(~attn_mask, float("-inf"))
-            else:
-                scores = scores + attn_mask
-        attn = torch.softmax(scores, dim=-1)
-        if training and dropout_p > 0:
-            attn = F.dropout(attn, p=dropout_p)
-        return torch.matmul(attn, v)
+        return _ATTENTION_IMPL(q, k, v, attn_mask, dropout_p, training, is_causal)
+    except Exception as e:
+        # Switch permanently to the classic path (warn once)
+        if _ATTENTION_IMPL is _attn_sdpa:
+            if not _warned:
+                warnings.warn(f"SDPA failed ({type(e).__name__}: {e}); "
+                              f"switching to classic attention for the rest of this run.")
+                _warned = True
+            _ATTENTION_IMPL = _attn_classic
+            return _ATTENTION_IMPL(q, k, v, attn_mask, dropout_p, training, is_causal)
+        raise
     
 
 def _to_sdpa_block_mask(mask, B, Q, K, device):
@@ -485,7 +503,7 @@ class CylindricalHeadNormalized(nn.Module):
 class CylindricalHeadEta(nn.Module):
     """
     Predict [uT, eta, ax, ay] where:
-      pT = k_T * expm1(uT) >= 0,   eta is free (can clamp if you want >=0),
+      pT = k_T * expm1(uT) >= 0,   eta is free (can clamp >=0),
       phi via normalized (ax, ay).
     """
     def __init__(self, k_T, mu_uT, sigma_uT, hidden=128):

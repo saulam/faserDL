@@ -19,7 +19,6 @@ from utils import (
 )
 
 
-
 class MAEPreTrainer(pl.LightningModule):
     def __init__(self, model, dataset, args):
         super(MAEPreTrainer, self).__init__()
