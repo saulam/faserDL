@@ -18,7 +18,7 @@ from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
 
 
-torch.set_float32_matmul_precision("medium")
+torch.set_float32_matmul_precision("high")
 pl_major = int(pl.__version__.split(".")[0])
 MODEL_FACTORIES = {
     'tiny':  mae_vit_tiny,
@@ -150,7 +150,7 @@ def main():
     callbacks.append(progress_bar)
     if args.early_stop_patience > 0:
         early_stop_callback = EarlyStopping(
-            monitor='loss/val_total',
+            monitor='loss_total/val',
             patience=args.early_stop_patience,
             verbose=True,
             mode='min' 
@@ -174,6 +174,7 @@ def main():
         accelerator="gpu",
         devices=nb_gpus,
         precision="bf16-mixed" if pl_major >= 2 else 32,
+        #precision="32-true",
         strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,

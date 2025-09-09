@@ -293,3 +293,15 @@ class CombinedScheduler(_LRScheduler):
         if self.scheduler2:
             self.scheduler2.load_state_dict(state_dict['scheduler2'])
 
+
+def load_mae_encoder(mae_ckpt, model_vit):
+    sd = mae_ckpt["model"] if "model" in mae_ckpt else mae_ckpt
+    # Keep only encoder keys that exist in the fine-tune model
+    vit_sd = model_vit.state_dict()
+    keep = {k: v for k, v in sd.items() if k in vit_sd and v.shape == vit_sd[k].shape}
+    missing = [k for k in vit_sd.keys() if k not in keep]
+    dropped = [k for k in sd.keys() if k not in keep]
+    msg = model_vit.load_state_dict(keep, strict=False)
+    print("Loaded:", len(keep), " | Missing in ckpt:", len(missing), " | Dropped from ckpt:", len(dropped))
+    print("Load msg:", msg)
+

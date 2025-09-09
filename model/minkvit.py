@@ -14,7 +14,7 @@ from functools import partial
 from timm.models.layers import trunc_normal_
 from MinkowskiEngine import MinkowskiConvolution
 from timm.models.vision_transformer import Block
-from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CrossAttnBlock, CylindricalHeadNormalized
+from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CrossAttention, CylindricalHeadNormalized
 
 
 class MinkViT(vit.VisionTransformer):
@@ -57,7 +57,7 @@ class MinkViT(vit.VisionTransformer):
             * self.grid_size[2]
         )
         self.patch_voxels = p_h * p_w * p_d
-        self.register_buffer('patch_size', torch.tensor(patch_size))
+        self.register_buffer('patch_size', torch.tensor(patch_size, dtype=torch.long))
 
         # module slicing along Z
         assert module_depth_voxels % p_d == 0, "module_depth_voxels must be divisible by patch depth"
@@ -133,12 +133,13 @@ class MinkViT(vit.VisionTransformer):
         self.num_tasks = len(self.head_channels)
         if not self.global_pool:
             # Task tokens and cross-attention
+            self.inter_norm = norm_layer(embed_dim)
             self.task_tokens = nn.Parameter(torch.zeros(1, self.num_tasks, embed_dim))
-            self.task_cross_attn = CrossAttnBlock(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=0., norm_layer=norm_layer, init_values=2e-5,
+            self.task_cross_attn = CrossAttention(
+                dim=embed_dim, num_heads=num_heads, qkv_bias=True,
+                attn_drop=attn_drop_rate,
             )
+            self.gamma = nn.Parameter(torch.ones(1) * 1e-4) # scaling after cross-attention
         self.heads = nn.ModuleDict()
         for name in self.head_channels.keys():
             self.heads[name] = nn.Sequential(
@@ -267,18 +268,18 @@ class MinkViT(vit.VisionTransformer):
     def forward_features(self, x_sparse, x_glob):
         # patchify
         x_sparse = self.patch_embed(x_sparse)
-        x, intra_idx, module_id = self.densify_patches(x_sparse)
+        x, intra_idx, _ = self.densify_patches(x_sparse)
 
         # add positional embeddings
-        x = x + self.intra_pos_embed(intra_idx) + self.module_embed_enc(module_id)
+        x = x + self.intra_pos_embed(intra_idx)
 
         # group to modules
         x_mod = self._group_tokens_by_module(x)
-        B, M, Lk, C = x_mod.shape
+        B, M, Lm, C = x_mod.shape
 
         # Intra-module transformer with per-module CLS
         cls = self.module_cls_token.expand(B*M, 1, C)
-        x_intra = x_mod.reshape(B*M, Lk, C)
+        x_intra = x_mod.reshape(B*M, Lm, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
         x_intra = self.pos_drop(x_intra)
         for blk in self.blocks:
@@ -286,13 +287,14 @@ class MinkViT(vit.VisionTransformer):
         x_intra = self.norm(x_intra)
 
         # retrieve CLS tokens
-        cls_mod = x_intra[:, 0, :].reshape(B, M, C)        # [B, M, C]
+        cls_mod = x_intra[:, 0, :].reshape(B, M, C)                            # [B, M, C]
 
         # Inter-module transformer over CLS tokens
         g = self.global_feats_encoder(x_glob)                                  # [B, C]
         g_tok = g.unsqueeze(1) + self.global_token_embed                       # [B, 1, C]
         mod_pos = self.module_embed_enc.weight.unsqueeze(0).expand(B, -1, -1)
         x_inter = torch.cat([g_tok, cls_mod + mod_pos], dim=1)                 # [B, 1+M, C]
+        x_inter = self.pos_drop(x_inter)
         for blk in self.inter_blocks:
             x_inter = blk(x_inter)
 
@@ -301,7 +303,8 @@ class MinkViT(vit.VisionTransformer):
             outcome = x_inter[:, 1:, :].mean(dim=1)
         else:
             task_q  = self.task_tokens.expand(B, -1, -1)
-            outcome = self.task_cross_attn(task_q, x_inter)
+            x_inter = self.inter_norm(x_inter)
+            outcome = task_q + self.task_cross_attn(task_q, x_inter) * self.gamma
 
         return outcome
     
@@ -392,7 +395,7 @@ def vit_base(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=8, inter_depth=4, num_heads=12,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=Block,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model

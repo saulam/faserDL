@@ -11,8 +11,7 @@ import torch.nn as nn
 import MinkowskiEngine as ME
 from functools import partial
 from MinkowskiEngine import MinkowskiConvolution
-from timm.models.vision_transformer import Block
-from .utils import get_3d_sincos_pos_embed, GlobalFeatureEncoderSimple, CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead
+from .utils import get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead
         
 
 class MinkMAEViT(nn.Module):
@@ -25,14 +24,15 @@ class MinkMAEViT(nn.Module):
         module_depth_voxels=20,
         embed_dim=384,
         patch_size=(16, 16, 4),
-        depth=24,
-        inter_depth=4,
-        cross_depth=2,
+        depth=8,
+        num_global_tokens=2,
+        latent_tokens=32,
+        io_depth=4,
+        io_decode_depth=4,
         num_heads=16,
         num_modes=8,
         contrastive_embed_dim=64,
         decoder_embed_dim=192,
-        decoder_depth=8,
         decoder_num_heads=16,
         mlp_ratio=4.0,
         drop_rate=0.,
@@ -40,7 +40,6 @@ class MinkMAEViT(nn.Module):
         drop_path_rate=0.,
         drop_rate_dec=0.,
         attn_drop_rate_dec=0.,
-        drop_path_rate_dec=0.,
         norm_layer=nn.LayerNorm,
     ):
         """
@@ -114,17 +113,14 @@ class MinkMAEViT(nn.Module):
 
         # Encoder: hierarchical ViT
         self.intra_depth = depth
-        self.inter_depth = inter_depth
-        self.cross_depth = cross_depth
         self.module_cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))        # per-module CLS (shared weights)
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)  # fixed sin-cos per-module
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)         # learned module index for intra-attn
-        self.module_embed_cross = nn.Embedding(self.num_modules, embed_dim)       # learned module index for cross-attn
 
         # Intra-module transformer blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.intra_depth)]
         self.blocks = nn.ModuleList([
-            Block(
+            BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[i], norm_layer=norm_layer
@@ -133,30 +129,46 @@ class MinkMAEViT(nn.Module):
         ])
         self.norm = norm_layer(embed_dim)
 
-        # Inter-module transformer over M CLS tokens
-        self.global_token_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Perceiver-IO bottleneck (encoder side)
+        self.num_global_tokens = num_global_tokens
         self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.inter_depth)]
-        self.inter_blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=dpr[i], norm_layer=norm_layer
-            )
-            for i in range(self.inter_depth)
-        ])
-        self.inter_norm = norm_layer(embed_dim)
-
-        # Intra-inter cross-attention
-        self.cross_attn = nn.ModuleList([
+        self.global_mem = nn.Parameter(torch.zeros(1, self.num_global_tokens, embed_dim))
+        self.latent_tokens = latent_tokens
+        self.latents = nn.Parameter(torch.zeros(1, latent_tokens, embed_dim))
+        self.latent_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=0., norm_layer=norm_layer
-            ) for _ in range(self.cross_depth)
+            )
+            for _ in range(io_depth)
+        ])
+        self.latent_self_blocks = nn.ModuleList([
+            BlockWithMask(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                drop_path=0., norm_layer=norm_layer
+            )
+            for _ in range(io_depth)
+        ])
+        self.latent_norm = norm_layer(embed_dim)
+
+        # Perceiver-IO decoder (queries -> latents)
+        self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim) # frozen sin-cos
+        self.latents_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
+        self.module_embed_dec = nn.Embedding(self.num_modules, decoder_embed_dim)
+        self.keep_query_token = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+        self.mask_query_token = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+        self.decode_xattn_blocks = nn.ModuleList([
+            CrossAttnBlock(
+                dim=decoder_embed_dim, num_heads=decoder_num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, drop=drop_rate_dec, attn_drop=attn_drop_rate_dec,
+                drop_path=0., norm_layer=norm_layer
+            )
+            for _ in range(io_decode_depth)
         ])
 
-        # Contrastive heads
+        # separable basis
         def _choose_Kxyz(patch_size, alphas=(0.4, 0.4, 0.75), max_per_axis=16):
             ph, pw, pd = patch_size
             Ks = []
@@ -170,27 +182,15 @@ class MinkMAEViT(nn.Module):
             self.patch_size.tolist(),
             Kxyz=_choose_Kxyz(self.patch_size.tolist())
         )
+
+        # Contrastive heads
         H, E = num_modes, contrastive_embed_dim
-        self.shared_voxel_head_enc = SharedLatentVoxelHead(
-            embed_dim, self.sep_basis, H=H*3, norm_layer=norm_layer
+        self.shared_voxel_head_con = SharedLatentVoxelHead(
+            decoder_embed_dim, self.sep_basis, H=H*3, norm_layer=norm_layer
         )
         self.track_head   = nn.Linear(H*3, E)
         self.primary_head = nn.Linear(H*3, E)
         self.pid_head     = nn.Linear(H*3, E)
-
-        # MAE decoder
-        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim)  # frozen sin-cos
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate_dec, decoder_depth)]
-        self.decoder_blocks = nn.ModuleList([
-            Block(
-                dim=decoder_embed_dim, num_heads=decoder_num_heads, mlp_ratio=mlp_ratio,
-                qkv_bias=True, drop=drop_rate_dec, attn_drop=attn_drop_rate_dec,
-                drop_path=dpr[i], norm_layer=norm_layer
-            )
-            for i in range(decoder_depth)
-        ])
 
         # Reconstruction heads        
         self.shared_voxel_head_dec = SharedLatentVoxelHead(
@@ -223,13 +223,14 @@ class MinkMAEViT(nn.Module):
             self.decoder_intra_pos_embed.weight.requires_grad_(False)
 
         # init tokens
-        nn.init.normal_(self.module_cls_token, std=.02)
-        nn.init.normal_(self.global_token_embed, std=.02)
-        nn.init.normal_(self.mask_token, std=.02)
-
         with torch.no_grad():
+            nn.init.normal_(self.global_mem, std=.02)
+            nn.init.normal_(self.latents, std=.02)
+            nn.init.normal_(self.module_cls_token, std=.02)
+            nn.init.normal_(self.keep_query_token, std=0.02)
+            nn.init.normal_(self.mask_query_token, std=0.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
-            self.module_embed_cross.weight.data.copy_(self.module_embed_enc.weight.data)  # start aligned
+            nn.init.normal_(self.module_embed_dec.weight, std=0.02)
 
         self.apply(self._init_weights)
 
@@ -253,10 +254,12 @@ class MinkMAEViT(nn.Module):
     def no_weight_decay(self):
         return {
             'module_cls_token',
-            'global_token_embed',
-            'mask_token',
             'module_embed_enc.weight',
-            'module_embed_cross.weight',
+            'module_embed_dec.weight',
+            'global_mem',
+            'latents',
+            'keep_query_token',
+            'mask_query_token',
             'patch_embed.bias',
         }
 
@@ -282,10 +285,12 @@ class MinkMAEViT(nn.Module):
         dense = feats.new_zeros(B, Np, C)
         dense[batch_ids, patch_ids, :] = feats
 
+        attn_mask = torch.zeros(B, Np, dtype=torch.bool, device=feats.device)
+        attn_mask[batch_ids, patch_ids] = True
         intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
         module_id = self.module_id_template.unsqueeze(0).expand(B, -1)
 
-        return dense, intra_idx, module_id
+        return dense, attn_mask, intra_idx, module_id
 
 
     def build_patch_occupancy_map(self, x):
@@ -319,45 +324,67 @@ class MinkMAEViT(nn.Module):
         return idx_map
     
 
-    def _group_tokens_by_module(self, x):
+    def _group_tokens_by_module(self, x, attn_mask):
         """
         x: [B, Np, C] dense tokens
+        attn_mask: [B, Np]  (bool)
         returns:
             x_mod: [B, M, Lm, C] re-ordered by module then intra-order
+            attn_mask_mod: [B, M, Lm] (bool)
         """
         B, Np, C = x.shape
         M, Lm = self.num_modules, self.num_intra_positions
         idx = self.module_token_indices.unsqueeze(0).expand(B, -1, -1)  # [B, M, Lm]
-        x_flat = torch.gather(
-            x, 1,
-            idx.reshape(B, M*Lm).unsqueeze(-1).expand(-1, -1, C)
-        )  # [B, M*Lm, C]
-        return x_flat.view(B, M, Lm, C)
-    
+        flat_idx = idx.reshape(B, M * Lm)
 
-    def _module_random_masking(self, x_mod, mask_ratio):
+        x_mod = torch.gather(x, 1, flat_idx.unsqueeze(-1).expand(-1, -1, C)).contiguous()  # [B, M*Lm, C]
+        attn_mask_mod = torch.gather(attn_mask, 1, flat_idx).contiguous()                  # [B, M*Lm]
+        return x_mod.view(B, M, Lm, C), attn_mask_mod.view(B, M, Lm)
+
+
+    def _module_random_masking(self, x, attn_mask, mask_ratio):
         """
-        x_mod: [B, M, Lm, C]
+        x: [B, M, Lm, C]
+        attn_mask: [B, M, Lm]
         returns:
-            x_keep: [B, M, Lk, C] (Lk is per-module, same across modules by floor)
-            rand_mask: [B, M, Lm] (1=masked)
-            ids_restore: [B, M, Lm] to recover original intra order
+            x_keep: [B, M, Lk, C]
+            attn_mask_keep: [B, M, Lk]
+            rand_mask: [B, M, Lm]  True = masked (in original order)
+            ids_restore: [B, M, Lm]  (identity; unused by the rest of the model)
+            ids_keep: [B, M, Lk]
         """
-        B, M, Lm, C = x_mod.shape
-        Lk = max(1, int(Lm * (1 - mask_ratio)))  # keep at least 1
-        device = x_mod.device
-        noise = torch.rand(B, M, Lm, device=device) 
-        ids_shuffle = torch.argsort(noise, dim=-1)         # [B, M, Lm]
-        ids_restore = torch.argsort(ids_shuffle, dim=-1)   # [B, M, Lm]
-        ids_keep = ids_shuffle[..., :Lk]                   # [B, M, Lk]
-        x_keep = torch.gather(
-            x_mod, 2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, C)
-        )  # [B, M, Lk, C]
-        rand_mask = torch.ones(B, M, Lm, device=device)
-        rand_mask[..., :Lk] = 0
-        rand_mask = torch.gather(rand_mask, 2, ids_restore)
+        B, M, Lm, C = x.shape
+        Lk = max(1, int(Lm * (1.0 - mask_ratio)))
+        device = x.device
 
-        return x_keep, rand_mask.bool(), ids_restore, ids_keep
+        # Sample scores and push invalids to +inf so they won't be selected unless forced
+        scores = torch.rand(B, M, Lm, device=device)
+        scores = scores.masked_fill(~attn_mask, float('inf'))
+
+        # Take k smallest (valid first) (cheaper than sorting the whole axis)
+        keep_scores, ids_keep = torch.topk(scores, k=Lk, dim=-1, largest=False, sorted=False)  # [B, M, Lk]
+
+        # Gather kept tokens and their mask
+        x_keep = torch.gather(x, 2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, C))              # [B, M, Lk, C]
+        attn_mask_keep = torch.gather(attn_mask, 2, ids_keep)                                  # [B, M, Lk]
+
+        # Build rand_mask in original order: start all True (masked), then unmask kept ids
+        rand_mask = torch.ones(B, M, Lm, dtype=torch.bool, device=device)
+        rand_mask.scatter_(2, ids_keep, False)                                                 # kept -> not masked
+
+        # ids_restore is not used downstream
+        ids_restore = torch.arange(Lm, device=device).view(1, 1, Lm).expand(B, M, Lm)
+
+        return x_keep, attn_mask_keep, rand_mask, ids_restore, ids_keep
+
+
+    def compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
+        # b_ids must be nondecreasing (true for torch.nonzero over [B, ...]).
+        if N == 0:
+            return b_ids
+        _, counts = torch.unique_consecutive(b_ids, return_counts=True)  # [G]
+        starts = torch.cumsum(counts, dim=0) - counts                    # [G]
+        return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
 
     
     def forward_encoder(self, x_sparse, x_glob, mask_ratio):
@@ -368,150 +395,171 @@ class MinkMAEViT(nn.Module):
         """
         # patchify
         x_sparse = self.patch_embed(x_sparse)
-        x, intra_idx, _ = self.densify_patches(x_sparse)
+        x, attn_mask, intra_idx, _ = self.densify_patches(x_sparse)
 
         # add positional embeddings
         x = x + self.intra_pos_embed(intra_idx)
 
         # group to modules and mask
-        x_mod = self._group_tokens_by_module(x)
-        x_keep, rand_mask, ids_restore, ids_keep = self._module_random_masking(x_mod, mask_ratio)
+        x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
+        x_keep, attn_mask_keep, rand_mask, _, ids_keep = self._module_random_masking(x_mod, attn_mask_mod, mask_ratio)
         B, M, Lk, C = x_keep.shape
 
         # Intra-module transformer with per-module CLS
         cls = self.module_cls_token.expand(B*M, 1, C)
         x_intra = x_keep.reshape(B*M, Lk, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
+        attn_mask_intra = torch.cat([torch.ones(B*M, 1, dtype=torch.bool, device=x.device), attn_mask_keep.reshape(B*M, Lk)], dim=1)
         for blk in self.blocks:
-            x_intra = blk(x_intra)
+            x_intra = blk(x_intra, attn_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
-        # split CLS and tokens
-        cls_mod = x_intra[:, 0, :].reshape(B, M, C)        # [B, M, C]
+        # discard intra-module CLS and add module embedding
         tok_mod = x_intra[:, 1:, :].reshape(B, M, Lk, C)   # [B, M, Lk, C]
-
-        # Inter-module transformer over CLS tokens
-        g = self.global_feats_encoder(x_glob)                                  # [B, C]
-        g_tok = g.unsqueeze(1) + self.global_token_embed                       # [B, 1, C]
-        mod_pos = self.module_embed_enc.weight.unsqueeze(0).expand(B, -1, -1)
-        x_inter = torch.cat([g_tok, cls_mod + mod_pos], dim=1)                 # [B, 1+M, C]
-        for blk in self.inter_blocks:
-            x_inter = blk(x_inter)
-        x_inter = self.inter_norm(x_inter)
-        x_inter = x_inter[:, 1:, :]
-
-        # cross-attention
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
-        memb = self.module_embed_cross(mod_ids)                      # [M, C]
-        q = tok_mod + memb.view(1, M, 1, -1)                         # add module embedding to queries
-        x_enc = q.reshape(B, M*Lk, C)
-        for blk in self.cross_attn:
-            x_enc = blk(x_enc, x_inter)
-        x_enc = x_enc.reshape(B, M, Lk, C)
+        tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
 
-        # outs     
-        shared       = self.shared_voxel_head_enc(x_enc.reshape(-1, C))
-        pred_track   = self.track_head(shared)
-        pred_primary = self.primary_head(shared)
-        pred_pid     = self.pid_head(shared)
+        # global input
+        g_enc   = self.global_feats_encoder(x_glob)                  # [B, C]
+        g_tokens = g_enc.unsqueeze(1) + self.global_mem              # [B, G, C]
+        g_tokens = g_tokens.to(tok_mod.dtype)
 
-        # auxiliaries
-        patch_ids_all = self.module_token_indices.unsqueeze(0).expand(B, -1, -1)  # [B, M, Lm]
-        patch_ids_keep = torch.gather(patch_ids_all, 2, ids_keep)                 # [B, M, Lk]
-        keep_b = torch.arange(B, device=x_enc.device).view(B, 1, 1).expand(B, M, Lk)
-        keep_b_flat       = keep_b.reshape(-1)                                    # [B*M*Lk]
-        keep_patchid_flat = patch_ids_keep.reshape(-1)                            # [B*M*Lk]
+        # Perceiver-IO encoder: latents attend to all kept tokens
+        kv_tokens = tok_mod.reshape(B, M*Lk, C)                       # [B, Nk, C]
+        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)           # [B, Nk+G, C]
+        kv_keep  = attn_mask_keep.reshape(B, M*Lk)                    # [B, Nk]
+        kv_keep   = torch.cat([kv_keep, torch.ones(
+            kv_keep.size(0), self.num_global_tokens, 
+            dtype=torch.bool, device=kv_keep.device)], dim=1)         # [B, Nk+G]
+        lat = self.latents.expand(B, -1, -1)                          # [B, K, C]
+        for xa, sa in zip(self.latent_xattn_blocks, self.latent_self_blocks):
+            lat = xa(lat, kv_tokens, attn_mask=kv_keep)               # cross: lat <- tokens
+            lat = sa(lat, attn_mask=None)                             # self-attn over latents
+        lat = self.latent_norm(lat)                                   # [B, K, C]
+
+        return (
+            lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
+        )
+        
+
+    def forward_contrastive(self, latents, attn_mask_keep, ids_keep, idx_map):
+        """
+        latents:        [B, K, Cenc]
+        attn_mask_keep: [B, M, Lk]
+        ids_keep:       [B, M, Lk] 
+        idx_map:        [B, Np, P]
+        """
+        B, K, Cenc = latents.shape
+        Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
+        
+        # masked REAL positions
+        keep_mask = attn_mask_keep                                         # [B, M, Lk], True=keep
+        counts = keep_mask.view(B, -1).sum(-1)                             # [B]
+        max_n = int(counts.max().item())
+        
+        # flatten selected (b,m,l)
+        b_ids, m_ids, lk_ids = torch.nonzero(keep_mask, as_tuple=True)     # [Nk]
+        l_intra = ids_keep[b_ids, m_ids, lk_ids]                           # [Nk]
+        Nk = b_ids.numel()
+
+        # build queries for all selected positions
+        q = ( self.decoder_intra_pos_embed(l_intra) +
+              self.module_embed_dec(m_ids) +
+              self.keep_query_token )                                      # [Nk, Cdec]
+
+        # pack by batch into [B, max_n, Cdec] using one-hot cumsum trick
+        within = self.compute_within_ranks(b_ids, Nk)
+        Q = latents.new_zeros(B, max_n, Cdec)                              # padded queries
+        Q[b_ids, within] = q                                               # place queries by (b, rank)
+
+        # decode with latents
+        KV = self.latents_to_dec(latents)                                  # [B, K, Cdec]
+        X  = Q
+        for blk in self.decode_xattn_blocks:
+            X = blk(X, KV, attn_mask=None)
+        out_flat = X[b_ids, within]                                        # [Nk, Cdec]
+
+        # heads
+        shared = self.shared_voxel_head_con(out_flat)                      # [Nk, P, H*3]
+        pred_track   = self.track_head(shared)                             # [Nk, P, E]
+        pred_primary = self.primary_head(shared)                           # [Nk, P, E]
+        pred_pid     = self.pid_head(shared)                               # [Nk, P, E]
+
+        # targets
+        patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
+        idx_targets_kept = idx_map[b_ids, patch_ids]                       # [Nk, P]
+
+        return pred_track, pred_primary, pred_pid, idx_targets_kept
+
+
+    def forward_reconstruction(self, latents, rand_mask, attn_mask_mod, idx_map):
+        """
+        latents:       [B, K, Cenc]
+        rand_mask:     [B, M, Lm]
+        attn_mask_mod: [B, M, Lm]
+        idx_map:       [B, Np, P]
+        """
+        B, K, Cenc = latents.shape
+        Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
+
+        # masked REAL positions
+        prediction_mask = rand_mask & attn_mask_mod                          # [B, M, Lm]
+        counts = prediction_mask.view(B, -1).sum(-1)                         # [B]
+        max_n = int(counts.max().item())
+
+        # flatten selected (b,m,l)
+        b_ids, m_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)  # [Nm]
+        Nm = b_ids.numel()
+
+        # build queries for all selected positions
+        q = ( self.decoder_intra_pos_embed(l_ids) +
+            self.module_embed_dec(m_ids) +
+            self.mask_query_token )                                          # [Nm, Cdec]
+
+        # pack by batch into [B, max_n, Cdec] using one-hot cumsum trick
+        within = self.compute_within_ranks(b_ids, Nm)
+        Q = latents.new_zeros(B, max_n, Cdec)                                # padded queries
+        Q[b_ids, within] = q                                                 # place queries by (b, rank)
+
+        # decode with latents
+        KV = self.latents_to_dec(latents)                                    # [B, K, Cdec]
+        X  = Q
+        for blk in self.decode_xattn_blocks:
+            X = blk(X, KV, attn_mask=None)
+        out_flat = X[b_ids, within]                                          # [Nm, Cdec]
+
+        # heads
+        shared = self.shared_voxel_head_dec(out_flat)                        # [Nm, P, H]
+        pred_occ = self.occ_head(shared).squeeze(-1)                         # [Nm, P]
+        pred_reg = self.reg_head(shared)                                     # [Nm, P, in_chans]
+
+        # targets
+        patch_ids = self.module_token_indices[m_ids, l_ids]                  # [Nm]
+        idx_targets = idx_map[b_ids, patch_ids]                              # [Nm, P]
+
+        return pred_occ, pred_reg, idx_targets, b_ids, patch_ids
+
+
+    def forward(self, x, x_glob, mask_ratio=0.75):
+        idx_map = self.build_patch_occupancy_map(x)
+
+        # Encoder
+        lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \
+            self.forward_encoder(x, x_glob, mask_ratio)
+
+        # Contrastive path
+        pred_track, pred_primary, pred_pid, enc_idx_targets = \
+            self.forward_contrastive(lat, attn_mask_keep, ids_keep, idx_map)
+        
+        # Reconstruction path
+        pred_occ, pred_reg, idx_targets, row_event_ids, row_patch_ids = \
+            self.forward_reconstruction(lat, rand_mask, attn_mask_mod, idx_map)
 
         return (
             pred_track, pred_primary, pred_pid,
-            tok_mod, x_inter, rand_mask, ids_restore,
-            keep_b_flat, keep_patchid_flat,
+            pred_occ, pred_reg, idx_targets, enc_idx_targets,
+            row_event_ids, row_patch_ids
         )
-
-    
-    def forward_decoder(self, tok_mod, x_inter, rand_mask, ids_restore, idx_map):
-        """
-        tok_mod:     [B, M, Lk, C]  encoder tokens per module
-        x_inter:     [B, M, C]      inter-module tokens
-        rand_mask:   [B, M, Lm]     1=masked
-        ids_restore: [B, M, Lm]     per-module restore to intra order
-        idx_map:     [B, Np, P]     occupancy map from build_patch_occupancy_map
-        """
-        B, M, Lk, C = tok_mod.shape
-        Lm = rand_mask.shape[2]
-        Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
-
-        # project to decoder dim
-        x_dec = self.decoder_embed(tok_mod)    # [B, M, Lk, Cdec]
-
-        # per-module restore with mask tokens
-        num_mask = Lm - Lk
-        mask_tok = self.mask_token.expand(B*M, num_mask, Cdec)           # [B*M, num_mask, Cdec]
-        keep = x_dec.reshape(B*M, Lk, Cdec)
-        x_full = torch.cat([keep, mask_tok], dim=1)                      # [B*M, Lm, Cdec]
-        x_full = torch.gather(
-            x_full, 1,
-            ids_restore.reshape(B*M, Lm).unsqueeze(-1).expand(-1, -1, Cdec)
-        )                                                                # [B*M, Lm, Cdec]
-
-        # add decoder intra-pos embeddings
-        intra_positions = torch.arange(Lm, device=x_dec.device)
-        pos_intra = self.decoder_intra_pos_embed(intra_positions).unsqueeze(0).unsqueeze(0)  # [1, 1, Lm, Cdec]
-        pos_intra = pos_intra.expand(B, M, -1, -1)                                           # [B, M, Lm, Cdec]
-        x_full = x_full.view(B, M, Lm, Cdec) + pos_intra
-
-        # add back CLS
-        cls_dec = self.decoder_embed(x_inter)                                                # [B, M, Cdec]
-        x_full = torch.cat([cls_dec.unsqueeze(2), x_full], dim=2).reshape(B*M, 1+Lm, Cdec)   # [B*M, 1+Lm, Cdec]
-        
-        # run transformer blocks
-        for blk in self.decoder_blocks:
-            x_full = blk(x_full)
-        
-        x_tokens = x_full[:, 1:, :].reshape(B, M, Lm, Cdec)                                  # [B, M, Lm, Cdec]
-        prediction_mask = rand_mask                                                          # [B, M, Lm] (bool)
-        flat_out = x_tokens[prediction_mask]                                                 # [N_masked, Cdec]
-
-        # outs
-        shared = self.shared_voxel_head_dec(flat_out)
-        pred_occ = self.occ_head(shared).squeeze(-1)
-        pred_reg = self.reg_head(shared)
-
-        # map (b, m, l) -> global patch id -> targets
-        bm_l = torch.nonzero(prediction_mask, as_tuple=False)                                # [N_masked, 3] (b,m,l)
-        b_ids  = bm_l[:, 0]
-        m_ids  = bm_l[:, 1]
-        l_ids  = bm_l[:, 2]
-
-        # module_token_indices: [M, Lm] -> global flat patch id
-        patch_ids = self.module_token_indices[m_ids, l_ids]                                  # [N_masked]
-        idx_targets = idx_map[b_ids, patch_ids]
-
-        return pred_occ, pred_reg, idx_targets, b_ids, patch_ids
-        
-
-    def forward(self, x, x_glob, mask_ratio=0.75):
-        """
-        Forward pass through the encoder-decoder network.
-
-        Args:
-            x: Input sparse tensor.
-            x_glob: Global feature tensors.
-            cls_labels: Labels for classification task.
-            mask_ratio: mask probability.
-
-        Returns:
-            Voxel predictions.
-        """
-        idx_map = self.build_patch_occupancy_map(x)
-        pred_track, pred_primary, pred_pid, tok_mod, x_inter, rand_mask, ids_restore, keep_b_flat, keep_patchid_flat = self.forward_encoder(x, x_glob, mask_ratio)
-        pred_occ, pred_reg, idx_targets, row_event_ids, row_patch_ids = \
-            self.forward_decoder(tok_mod, x_inter, rand_mask, ids_restore, idx_map)
-
-        # Encoder mapping for labels
-        enc_idx_targets = idx_map[keep_b_flat, keep_patchid_flat]  # [B*M*Lk, P]
-
-        return pred_track, pred_primary, pred_pid, pred_occ, pred_reg, idx_targets, enc_idx_targets, row_event_ids, row_patch_ids
 
         
     def replace_depthwise_with_channelwise(self):
@@ -564,15 +612,139 @@ class MinkMAEViT(nn.Module):
         for comp in components[:-1]:
             parent = getattr(parent, comp)
         return parent, components[-1]
+    
+
+    def print_param_report(self):
+        """
+        Prints parameter counts by component:
+        - patch_embed
+        - intra_vit (pos-emb, module token/emb, blocks, norm)
+        - perceiver_encoder (global encoder, global_mem, latents, cross/self blocks, norm)
+        - perceiver_decoder (dec pos-emb, module emb, query tokens, cross blocks)
+        - heads_contrastive
+        - heads_reconstruction
+        - TOTAL
+        """
+        import torch
+        import torch.nn as nn
+
+        def _iter_params(obj):
+            """Yield parameters from nn.Modules, nn.Parameters, and containers (list/tuple/dict/ModuleList/etc.)."""
+            if obj is None:
+                return
+            if isinstance(obj, nn.Parameter):
+                # Yield the loose parameter itself
+                yield obj
+                return
+            if isinstance(obj, nn.Module):
+                # Yield all parameters from the module
+                for p in obj.parameters(recurse=True):
+                    yield p
+                return
+            # Handle common containers
+            if isinstance(obj, (list, tuple, set)):
+                for o in obj:
+                    yield from _iter_params(o)
+                return
+            if isinstance(obj, dict):
+                for o in obj.values():
+                    yield from _iter_params(o)
+                return
+            # Torch container types
+            if isinstance(obj, (nn.ModuleList, nn.Sequential, nn.ParameterList)):
+                for o in obj:
+                    yield from _iter_params(o)
+                return
+            # Ignore everything else (buffers / plain tensors that aren't parameters)
+
+        def _count(objs):
+            # Collect and de-duplicate by id in case something shows up twice in a group
+            ps = list(_iter_params(objs))
+            seen = set()
+            uniq = []
+            for p in ps:
+                pid = id(p)
+                if pid not in seen:
+                    seen.add(pid)
+                    uniq.append(p)
+            total = sum(p.numel() for p in uniq)
+            train = sum(p.numel() for p in uniq if p.requires_grad)
+            return total, train
+
+        # Build groups with hasattr/getattr guards so finetune variants don't break
+        groups = {}
+
+        if hasattr(self, "patch_embed"):
+            groups["patch_embed"] = [self.patch_embed]
+        else:
+            groups["patch_embed"] = []
+
+        intra_list = []
+        if hasattr(self, "intra_pos_embed"):   intra_list.append(self.intra_pos_embed)
+        if hasattr(self, "module_cls_token"):  intra_list.append(self.module_cls_token)
+        if hasattr(self, "module_embed_enc"):  intra_list.append(self.module_embed_enc)
+        if hasattr(self, "norm"):              intra_list.append(self.norm)
+        if hasattr(self, "blocks"):            intra_list.extend(list(self.blocks))
+        groups["intra_vit"] = intra_list
+
+        enc_list = []
+        if hasattr(self, "global_feats_encoder"): enc_list.append(self.global_feats_encoder)
+        if hasattr(self, "global_mem"):           enc_list.append(self.global_mem)
+        if hasattr(self, "latents"):              enc_list.append(self.latents)
+        if hasattr(self, "latent_norm"):          enc_list.append(self.latent_norm)
+        if hasattr(self, "latent_xattn_blocks"):  enc_list.extend(list(self.latent_xattn_blocks))
+        if hasattr(self, "latent_self_blocks"):   enc_list.extend(list(self.latent_self_blocks))
+        groups["perceiver_encoder"] = enc_list
+
+        dec_list = []
+        if hasattr(self, "decoder_intra_pos_embed"): dec_list.append(self.decoder_intra_pos_embed)
+        if hasattr(self, "latents_to_dec"):          dec_list.append(self.latents_to_dec)
+        if hasattr(self, "module_embed_dec"):        dec_list.append(self.module_embed_dec)
+        if hasattr(self, "mask_query_token"):        dec_list.append(self.mask_query_token)
+        if hasattr(self, "decode_xattn_blocks"):     dec_list.extend(list(self.decode_xattn_blocks))
+        groups["perceiver_decoder"] = dec_list
+
+        heads_con = []
+        if hasattr(self, "shared_voxel_head_con"): heads_con.append(self.shared_voxel_head_con)
+        if hasattr(self, "track_head"):            heads_con.append(self.track_head)
+        if hasattr(self, "primary_head"):          heads_con.append(self.primary_head)
+        if hasattr(self, "pid_head"):              heads_con.append(self.pid_head)
+        groups["heads_contrastive"] = [m for m in heads_con if m is not None]
+
+        heads_rec = []
+        if hasattr(self, "shared_voxel_head_dec"): heads_rec.append(self.shared_voxel_head_dec)
+        if hasattr(self, "occ_head"):              heads_rec.append(self.occ_head)
+        if hasattr(self, "reg_head"):              heads_rec.append(self.reg_head)
+        groups["heads_reconstruction"] = [m for m in heads_rec if m is not None]
+
+        if getattr(self, "classifier", None) is not None:
+            groups["classifier"] = [self.classifier]
+
+        grand_total = grand_train = 0
+        print("=== Parameter report ===")
+        for name, objs in groups.items():
+            tot, trn = _count(objs)
+            grand_total += tot
+            grand_train += trn
+            print(f"{name:24s} total={tot/1e6:8.3f}M  trainable={trn/1e6:8.3f}M")
+
+        # Full model sanity check
+        tot_all = sum(p.numel() for p in self.parameters())
+        trn_all = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print("-" * 64)
+        print(f"{'ALL (sanity)':24s} total={tot_all/1e6:8.3f}M  trainable={trn_all/1e6:8.3f}M")
+        print(f"{'SUM(groups)':24s} total={grand_total/1e6:8.3f}M  trainable={grand_train/1e6:8.3f}M")
+
 
 
 def mae_vit_tiny(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(16, 16, 4),
-        depth=10, inter_depth=2, cross_depth=1, num_heads=12,
-        num_modes=8, contrastive_embed_dim=64,
-        decoder_embed_dim=384, decoder_depth=6, decoder_num_heads=12,
+        depth=2, num_heads=12, num_global_tokens=2,
+        latent_tokens=8, io_depth=2, io_decode_depth=2,
+        num_modes=8, contrastive_embed_dim=32,
+        decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model
@@ -582,9 +754,10 @@ def mae_vit_base(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
-        depth=8, inter_depth=4, cross_depth=2, num_heads=12,
+        depth=4, num_heads=12, num_global_tokens=2,
+        latent_tokens=16, io_depth=4, io_decode_depth=4,
         num_modes=16, contrastive_embed_dim=64,
-        decoder_embed_dim=384, decoder_depth=6, decoder_num_heads=12,
+        decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model
@@ -594,9 +767,10 @@ def mae_vit_large(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
-        depth=24, inter_depth=8, cross_depth=4, num_heads=16,
-        num_modes=32, contrastive_embed_dim=256,
-        decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
+        depth=8, num_heads=12, num_global_tokens=2,
+        latent_tokens=32, io_depth=8, io_decode_depth=8,
+        num_modes=32, contrastive_embed_dim=64,
+        decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model
@@ -606,9 +780,10 @@ def mae_vit_huge(**kwargs):
     model = MinkMAEViT(
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
-        depth=32, inter_depth=16, cross_depth=8, num_heads=16,
-        num_modes=64, contrastive_embed_dim=512,
-        decoder_embed_dim=528, decoder_depth=8, decoder_num_heads=16,
+        depth=16, num_heads=12, num_global_tokens=4,
+        latent_tokens=64, io_depth=16, io_decode_depth=16,
+        num_modes=64, contrastive_embed_dim=128,
+        decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model

@@ -87,14 +87,14 @@ class MAEPreTrainer(pl.LightningModule):
         return batch_input, *global_params, (hit_track_id, hit_primary_id, hit_pdg, ghost_mask, hit_event_id)
 
 
-    def mask_and_align_voxels(self, enc_idx_targets):
+    def mask_and_align_voxels(self, idx_targets):
         """
-        enc_idx_targets: [N_tok, P] with -1 for empty slots.
+        idx_targets: [N_tok, P] with -1 for empty slots.
         Returns indices to slice your flat hit tensors; no ghost filtering here.
         """
-        valid = enc_idx_targets >= 0
+        valid = idx_targets >= 0
         tok_row, sub_idx = torch.nonzero(valid, as_tuple=True)   # where a voxel is present
-        raw_idx = enc_idx_targets[tok_row, sub_idx]              # [N_valid] indices into hit arrays
+        raw_idx = idx_targets[tok_row, sub_idx]                  # [N_valid] indices into hit arrays
         return raw_idx, tok_row, sub_idx
     
 

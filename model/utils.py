@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 from timm.models.vision_transformer import Attention, Block, LayerScale
 from timm.models.layers import DropPath, Mlp
 from MinkowskiEngine import (
@@ -10,31 +12,71 @@ from MinkowskiEngine import (
     MinkowskiGELU,
 )
 
+
+def sdpa_safe(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, training=False):
+    """
+    q,k,v: [B,H,Q,D], [B,H,K,D], [B,H,K,D]
+    attn_mask:  None OR broadcastable to [B,1,Q,K]
+           - bool: True = keep
+           - float: additive (0 keep, -inf block)
+    """
+    try:
+        try:
+            ctx = torch.backends.cuda.sdp_kernel(enable_flash=True,
+                                                 enable_mem_efficient=False,
+                                                 enable_math=True)
+        except AttributeError:  # older torch
+            print("Failing... Classic")
+            class _DummyCtx:
+                def __enter__(self): return None
+                def __exit__(self, *a): return False
+            ctx = _DummyCtx()
+
+        with ctx:
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask,
+                dropout_p=(dropout_p if training else 0.0),
+                is_causal=is_causal
+            )
+    except RuntimeError:
+        print("Numeraical issue in SDPA; falling back to classic attention")
+        # Fallback: classic attention (numerically stable)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                scores = scores.masked_fill(~attn_mask, float("-inf"))
+            else:
+                scores = scores + attn_mask
+        attn = torch.softmax(scores, dim=-1)
+        if training and dropout_p > 0:
+            attn = F.dropout(attn, p=dropout_p)
+        return torch.matmul(attn, v)
+    
+
+def _to_sdpa_block_mask(mask, B, Q, K, device):
+    if mask is None:
+        return None
+    if mask.ndim == 2 and mask.shape == (B, K):   # key padding on KV
+        return (mask).view(B, 1, 1, K).to(device=device)
+    if mask.ndim == 3 and mask.shape == (B, Q, K):
+        return (mask).view(B, 1, Q, K).to(device=device)
+    raise ValueError(f"Bad mask shape {tuple(mask.shape)}")
+
+
 # NOTE: patch works for timm version 0.6.13
 class MaskableAttention(Attention):
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None):  # x: [B, N, C]
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
-        if attn_mask is not None:
-            # if key padding mask (B, N) → expand to (B, 1, 1, N)
-            if attn_mask.ndim == 2:
-                mask = attn_mask[:, None, None, :].to(torch.bool)
-            # if full mask (B, N, N) → expand to (B, 1, N, N)
-            else:
-                mask = attn_mask[:, None, :, :].to(torch.bool)
-            attn = attn.masked_fill(~mask, float("-1e9"))
-        
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        qkv = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        q, k, v = qkv.unbind(0)  # [B,H,N,hdim]
+        block = _to_sdpa_block_mask(attn_mask, B, Q=N, K=N, device=x.device)
+        p = self.attn_drop.p if self.training and self.attn_drop.p > 0 else 0.0
+        out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            raise RuntimeError("NaN/Inf in SDPA output (self-attn)")
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)  # fp32
+        return self.proj_drop(out)
 
 
 class BlockWithMask(Block):
@@ -75,33 +117,34 @@ class BlockWithMask(Block):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
-        
+
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0.):
         super().__init__()
+        assert dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v = nn.Linear(dim, dim, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.head_dim = dim // num_heads
+        self.q  = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop_p = float(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, q_in, kv_in):  # q_in: [B, Nt, C], kv_in: [B, Nc, C]
-        B, Nt, C = q_in.shape
-        _, Nc, _ = kv_in.shape
-        q = self.q(q_in).reshape(B, Nt, self.num_heads, C // self.num_heads).transpose(1, 2)
-        k = self.k(kv_in).reshape(B, Nc, self.num_heads, C // self.num_heads).transpose(1, 2)
-        v = self.v(kv_in).reshape(B, Nc, self.num_heads, C // self.num_heads).transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * self.scale              # [B, h, Nt, Nc]
-        attn = self.attn_drop(attn.softmax(dim=-1))
-        x = (attn @ v).transpose(1, 2).reshape(B, Nt, C)           # [B, Nt, C]
-        x = self.proj(x)
-        return self.proj_drop(x)
-    
+    def forward(self, q_in, kv_in, attn_mask=None):  # q_in:[B,Nq,C], kv_in:[B,Nk,C]
+        B, Nq, C = q_in.shape
+        Nk = kv_in.shape[1]
+        H  = self.num_heads
+        q = self.q(q_in).view(B, Nq, H, C // H).transpose(1, 2).contiguous()              # [B, H, Nq, hdim]
+        kv = self.kv(kv_in).view(B, Nk, 2, H, C // H).permute(2, 0, 3, 1, 4).contiguous() # [2, B, H, Nk, hdim]
+        k, v = kv.unbind(0)       # [B, H, Nk, hdim]
+        block = _to_sdpa_block_mask(attn_mask, B, Q=Nq, K=Nk, device=q_in.device)
+        p = self.attn_drop_p if (self.training and self.attn_drop_p > 0) else 0.0
+        out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
+        out = out.transpose(1, 2).reshape(B, Nq, C)
+        out = self.proj(out)
+        return self.proj_drop(out)
+
 
 class CrossAttnBlock(nn.Module):
     def __init__(
@@ -122,14 +165,12 @@ class CrossAttnBlock(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()        
     
-    def forward(self, q, kv):
+    def forward(self, q, kv, attn_mask=None):
         x = q
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm_q(q), self.norm_kv(kv))))
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm_q(q), self.norm_kv(kv), attn_mask=attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
-# x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=self.norm_kv(kv))))
-# x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
 
 def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     """
