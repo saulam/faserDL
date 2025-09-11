@@ -1,8 +1,8 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 import warnings
 from timm.models.vision_transformer import Attention, Block, LayerScale
 from timm.models.layers import DropPath, Mlp
@@ -16,15 +16,13 @@ from MinkowskiEngine import (
 
 HAS_SDPA = hasattr(F, "scaled_dot_product_attention")
 
+
 def _attn_classic(q, k, v, mask, drop_p, training, is_causal):
     # q:[B,H,Q,D], k/v:[B,H,K,D]; mask: bool keep or additive float broadcastable to [B,1,Q,K]
     scale = 1.0 / math.sqrt(q.size(-1))
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
     if mask is not None:
-        if mask.dtype == torch.bool:
-            scores = scores.masked_fill(~mask, float("-1e9"))
-        else:
-            scores = scores + mask
+        scores = scores + mask
     attn = torch.softmax(scores, dim=-1)
     if training and drop_p > 0.0:
         attn = F.dropout(attn, p=drop_p)
@@ -71,14 +69,19 @@ def sdpa_safe(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, training=
         raise
     
 
-def _to_sdpa_block_mask(mask, B, Q, K, device):
+def _to_sdpa_mask(mask, B, Q, K, device, dtype):
     if mask is None:
         return None
     if mask.ndim == 2 and mask.shape == (B, K):   # key padding on KV
-        return (mask).view(B, 1, 1, K).to(device=device)
-    if mask.ndim == 3 and mask.shape == (B, Q, K):
-        return (mask).view(B, 1, Q, K).to(device=device)
-    raise ValueError(f"Bad mask shape {tuple(mask.shape)}")
+        m = mask.view(B, 1, 1, K).to(device=device)
+    elif mask.ndim == 3 and mask.shape == (B, Q, K):
+        m = mask.view(B, 1, Q, K).to(device=device)
+    else:
+        raise ValueError(f"Bad mask shape {tuple(mask.shape)}")
+    if mask.dtype == torch.bool:
+        NEG = -1e4 if dtype in (torch.float16, torch.bfloat16) else -1e9
+        m = torch.where(m, 0.0, NEG)
+    return m
 
 
 # NOTE: patch works for timm version 0.6.13
@@ -87,7 +90,7 @@ class MaskableAttention(Attention):
         B, N, C = x.shape
         qkv = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
         q, k, v = qkv.unbind(0)  # [B,H,N,hdim]
-        block = _to_sdpa_block_mask(attn_mask, B, Q=N, K=N, device=x.device)
+        block = _to_sdpa_mask(attn_mask, B, Q=N, K=N, device=x.device, dtype=x.dtype)
         p = self.attn_drop.p if self.training and self.attn_drop.p > 0 else 0.0
         out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
         if torch.isnan(out).any() or torch.isinf(out).any():
@@ -156,7 +159,7 @@ class CrossAttention(nn.Module):
         q = self.q(q_in).view(B, Nq, H, C // H).transpose(1, 2).contiguous()              # [B, H, Nq, hdim]
         kv = self.kv(kv_in).view(B, Nk, 2, H, C // H).permute(2, 0, 3, 1, 4).contiguous() # [2, B, H, Nk, hdim]
         k, v = kv.unbind(0)       # [B, H, Nk, hdim]
-        block = _to_sdpa_block_mask(attn_mask, B, Q=Nq, K=Nk, device=q_in.device)
+        block = _to_sdpa_mask(attn_mask, B, Q=Nq, K=Nk, device=q_in.device, dtype=q_in.dtype)
         p = self.attn_drop_p if (self.training and self.attn_drop_p > 0) else 0.0
         out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
         out = out.transpose(1, 2).reshape(B, Nq, C)

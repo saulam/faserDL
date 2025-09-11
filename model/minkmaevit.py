@@ -6,6 +6,7 @@ Date: 07.25
 Description: PyTorch MAE-ViT model with MinkowskiEngine patching.
 """
 
+import math
 import torch
 import torch.nn as nn
 import MinkowskiEngine as ME
@@ -25,7 +26,7 @@ class MinkMAEViT(nn.Module):
         embed_dim=384,
         patch_size=(16, 16, 4),
         depth=8,
-        num_global_tokens=2,
+        num_global_tokens=1,
         latent_tokens=32,
         io_depth=4,
         io_decode_depth=4,
@@ -131,10 +132,13 @@ class MinkMAEViT(nn.Module):
 
         # Perceiver-IO bottleneck (encoder side)
         self.num_global_tokens = num_global_tokens
-        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
+        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim, dropout=drop_rate)
         self.global_mem = nn.Parameter(torch.zeros(1, self.num_global_tokens, embed_dim))
+        assert latent_tokens >= self.num_modules, \
+            f"latent_tokens ({latent_tokens}) must be >= num_modules ({self.num_modules})"
         self.latent_tokens = latent_tokens
-        self.latents = nn.Parameter(torch.zeros(1, latent_tokens, embed_dim))
+        self.latent_free_tokens = max(latent_tokens - self.num_modules, 0)
+        self.latents_free = nn.Parameter(torch.zeros(1, self.latent_free_tokens, embed_dim))
         self.latent_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -225,7 +229,7 @@ class MinkMAEViT(nn.Module):
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.global_mem, std=.02)
-            nn.init.normal_(self.latents, std=.02)
+            nn.init.normal_(self.latents_free, std=.02)
             nn.init.normal_(self.module_cls_token, std=.02)
             nn.init.normal_(self.keep_query_token, std=0.02)
             nn.init.normal_(self.mask_query_token, std=0.02)
@@ -257,7 +261,7 @@ class MinkMAEViT(nn.Module):
             'module_embed_enc.weight',
             'module_embed_dec.weight',
             'global_mem',
-            'latents',
+            'latents_free',
             'keep_query_token',
             'mask_query_token',
             'patch_embed.bias',
@@ -342,43 +346,198 @@ class MinkMAEViT(nn.Module):
         return x_mod.view(B, M, Lm, C), attn_mask_mod.view(B, M, Lm)
 
 
-    def _module_random_masking(self, x, attn_mask, mask_ratio):
+    def _module_random_masking(self, x, attn_mask, mask_ratio, enforce_both=True):
         """
-        x: [B, M, Lm, C]
-        attn_mask: [B, M, Lm]
-        returns:
-            x_keep: [B, M, Lk, C]
-            attn_mask_keep: [B, M, Lk]
-            rand_mask: [B, M, Lm]  True = masked (in original order)
-            ids_restore: [B, M, Lm]  (identity; unused by the rest of the model)
-            ids_keep: [B, M, Lk]
+        Occupancy-aware masking with fixed shapes and no wasted compute.
+
+        Args:
+            x:          [B, M, Lm, C]   tokens per module
+            attn_mask:  [B, M, Lm]      True = real token, False = pad/invalid
+            mask_ratio: float           desired mask ratio over *real* tokens
+            enforce_both (bool): if True, for modules with v>=2, keep at least 1 and mask at least 1
+
+        Returns:
+            x_keep:       [B, M, Lk, C]      gathered tokens (padded with dummies)
+            attn_keep:    [B, M, Lk]         True for real-kept tokens; False = pad/dummy
+            rand_mask:    [B, M, Lm]         True for masked real tokens; False elsewhere
+            ids_keep_all: [B, M, Lk]         intra indices selected per module (order ~random)
+            keep:         [B, M]             #real kept per module (for logging/metrics)
         """
         B, M, Lm, C = x.shape
-        Lk = max(1, int(Lm * (1.0 - mask_ratio)))
         device = x.device
+        valid = attn_mask  # [B,M,Lm], bool
 
-        # Sample scores and push invalids to +inf so they won't be selected unless forced
-        scores = torch.rand(B, M, Lm, device=device)
-        scores = scores.masked_fill(~attn_mask, float('inf'))
+        # fixed gather width (static shape)
+        Lk = max(1, int(math.ceil(Lm * (1.0 - mask_ratio))))  # keep constant for efficiency
 
-        # Take k smallest (valid first) (cheaper than sorting the whole axis)
-        keep_scores, ids_keep = torch.topk(scores, k=Lk, dim=-1, largest=False, sorted=False)  # [B, M, Lk]
+        # per-module real kept (unbiased stochastic rounding of v*(1-r))
+        v = valid.sum(dim=-1)                                   # [B,M], long
+        keep_f = v.float() * (1.0 - mask_ratio)                 # [B,M]
+        keep   = keep_f.floor().long()
+        frac   = keep_f - keep.float()
+        keep   = keep + (torch.rand_like(frac) < frac).long()   # unbiased
 
-        # Gather kept tokens and their mask
-        x_keep = torch.gather(x, 2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, C))              # [B, M, Lk, C]
-        attn_mask_keep = torch.gather(attn_mask, 2, ids_keep)                                  # [B, M, Lk]
+        if enforce_both:
+            # v==0 -> keep=0; v==1 -> keep=1; v>=2 -> clamp to [1, v-1]
+            keep = torch.where(v == 0, torch.zeros_like(keep), keep)
+            keep = torch.where(v == 1, torch.ones_like(keep), keep)
+            keep_capped = torch.minimum(keep.clamp_min(1), v - 1)
+            keep = torch.where(v >= 2, keep_capped, keep)
+        else:
+            keep = keep.clamp_min(0)
+            keep = torch.minimum(keep, v)
 
-        # Build rand_mask in original order: start all True (masked), then unmask kept ids
-        rand_mask = torch.ones(B, M, Lm, dtype=torch.bool, device=device)
-        rand_mask.scatter_(2, ids_keep, False)                                                 # kept -> not masked
+        # sample Lk candidate positions among valids (invalids set to +inf)
+        noise = torch.rand(B, M, Lm, device=device).masked_fill(~valid, float('inf'))
+        ids_keep_all = torch.topk(noise, k=Lk, dim=-1, largest=False, sorted=False).indices  # [B,M,Lk]
 
-        # ids_restore is not used downstream
-        ids_restore = torch.arange(Lm, device=device).view(1, 1, Lm).expand(B, M, Lm)
+        # flags telling which gathered slots are real vs invalid
+        real_flags = torch.gather(valid, 2, ids_keep_all)                 # [B,M,Lk], bool
 
-        return x_keep, attn_mask_keep, rand_mask, ids_restore, ids_keep
+        # among gathered real slots, mark only the first 'keep' as actually kept
+        real_cum = real_flags.int().cumsum(dim=-1)                        # [B,M,Lk]
+        keep_real_mask = real_flags & (real_cum <= keep.unsqueeze(-1))    # [B,M,Lk], bool
+
+        # gather tokens (padding stays; masked out by attn_keep downstream)
+        x_keep = torch.gather(x, 2, ids_keep_all.unsqueeze(-1).expand(-1, -1, -1, C))  # [B,M,Lk,C]
+
+        # build rand_mask over original intra space: real & not kept -> True
+        kept_full = torch.zeros_like(valid)                                # [B,M,Lm], bool
+        kept_full.scatter_(2, ids_keep_all, keep_real_mask)                # mark real-kept only
+        rand_mask = valid & (~kept_full)                                   # True = masked real, False else
+
+        # attn_keep is exactly which gathered slots are real-kept
+        return x_keep, keep_real_mask, rand_mask, ids_keep_all, keep
+    
+
+    def _pack_tokens(self, kv, attn_mask):
+        """
+        kv:             [B, M, L, C]
+        attn_mask:      [B, M, L]
+        returns:
+            kv_tokens:  [B, N_max, C] (packed real tokens, padded per batch)
+            kv_mask:    [B, N_max]
+        """
+        B, M, L, C = kv.shape
+        device = kv.device
+
+        b_ids, m_ids, lk_ids = torch.nonzero(attn_mask, as_tuple=True)  # [Nk]
+        N = b_ids.numel()
+
+        # per-batch ranks to map ragged -> padded
+        _, counts = torch.unique_consecutive(b_ids, return_counts=True)
+        N_max = int(counts.max().item())
+        starts = torch.cumsum(counts, dim=0) - counts
+        within = torch.arange(N, device=device) - torch.repeat_interleave(starts, counts)
+
+        kv_tokens = kv.new_zeros(B, N_max, C)
+        kv_mask   = torch.zeros(B, N_max, dtype=torch.bool, device=device)
+        kv_tokens[b_ids, within] = kv[b_ids, m_ids, lk_ids, :]   # pack only real kept
+        kv_mask[b_ids, within]   = True
+        return kv_tokens, kv_mask
+    
+
+    def _prepare_kv_tokens(
+        self,
+        kv,
+        attn_mask,
+        pack: bool = True,
+        adaptive: bool = True,
+        abs_threshold: int = 64,
+        ratio_threshold: float = 1.5
+    ):
+        """
+        Either reshape (fast) or pack (slow, but memory efficient) the kv tokens for Perceiver cross-attn.
+
+        kv:              [B, M, L, C]
+        attn_mask:       [B, M, L]
+        pack:            if False -> always reshape; if True -> pack (optionally adaptive)
+        adaptive:        if True, only pack when it clearly shrinks KV (see thresholds)
+        abs_threshold:   pack if N_fixed - N_real_max >= this
+        ratio_threshold: pack if N_fixed / N_real_max >= this
+
+        returns:
+            kv_tokens: [B, N(_max), C]
+            kv_mask:   [B, N(_max)]
+        """
+        B, M, L, C = kv.shape
+
+        if not pack:
+            return kv.reshape(B, M * L, C), attn_mask.reshape(B, M * L)
+
+        if adaptive:
+            N_fixed = M * L
+            N_real_max = attn_mask.reshape(B, -1).sum(dim=-1).max()
+            # avoid div-by-zero if a degenerate empty batch appears
+            ratio = N_fixed / max(int(N_real_max.item()), 1)
+            if (N_fixed - int(N_real_max.item()) < abs_threshold) and (ratio < ratio_threshold):
+                # not worth packing -> take the simple fast path
+                return kv.reshape(B, N_fixed, C), attn_mask.reshape(B, N_fixed)
+
+        # pack only real tokens
+        return self._pack_tokens(kv, attn_mask)
+
+    
+    def _prepare_queries_and_mask(
+        self,
+        cls_mod: torch.Tensor,      # [B, M, C]  per-module CLS
+        kv_keep: torch.Tensor,      # [B, Nk]    bool, real K/V positions
+        *,
+        adaptive: bool = True,
+        alpha: float = 1.0,         # free queries ~ alpha * sqrt(#KV)
+        min_free: int = 2,          # minimum number of free queries when adaptive
+        jitter: int = 1,            # ± jitter on active free queries when training
+    ):
+        """
+        Returns:
+        queries      [B, Q, C]   (Q = M + K_free)
+        q_mask       [B, Q]      bool, which queries are active
+        pair_mask    [B, Q, Nk]  bool, (active query) AND (real KV)
+        """
+        B, M, C = cls_mod.shape
+        device  = cls_mod.device
+        Q_total = self.latent_tokens
+
+        # Anchored CLS queries
+        mod_ids   = torch.arange(M, device=device)
+        q_anchor  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, C)  # [B,M,C]
+
+        # Free queries (K_free)
+        if self.latent_free_tokens > 0:
+            q_free = self.latents_free.expand(B, self.latent_free_tokens, -1)  # [B, K_free, C]
+            queries = torch.cat([q_anchor, q_free], dim=1)    # [B,Q_total,C]
+        else:
+            queries = q_anchor                                 # [B,M,C]
+
+        # Query mask
+        q_mask = torch.zeros(B, Q_total, dtype=torch.bool, device=device)
+        q_mask[:, :M] = True  # anchors always active
+
+        if self.latent_free_tokens > 0:
+            if adaptive:
+                # how many free queries to activate per event (0..K_free)
+                v_b = kv_keep.sum(dim=1).float()                  # [B]
+                k_b = (alpha * v_b.sqrt()).round().clamp_(min_free, self.latent_free_tokens).long()
+                if self.training and jitter > 0:
+                    k_b = (k_b + torch.randint(-jitter, jitter + 1, k_b.shape, device=device)).clamp_(max(min_free-1, 0), self.latent_free_tokens)
+
+                num = int(k_b.max().item())
+                if num > 0:
+                    # sample which free slots to activate (ensures tail slots get trained over time)
+                    idx  = torch.rand(B, self.latent_free_tokens, device=device).topk(num, dim=1, largest=False, sorted=False).indices  # [B,num]
+                    take = (torch.arange(num, device=device).unsqueeze(0) < k_b.unsqueeze(1))                           # [B,num]
+                    r, c = take.nonzero(as_tuple=True)
+                    q_mask[r, M + idx[r, c]] = True
+            else:
+                q_mask[:, :] = True
+
+        # Single pair mask for CrossAttnBlock
+        pair_mask = q_mask.unsqueeze(-1) & kv_keep.unsqueeze(1)  # [B, Q, Nk]
+
+        return queries, q_mask, pair_mask
 
 
-    def compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
+    def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
         # b_ids must be nondecreasing (true for torch.nonzero over [B, ...]).
         if N == 0:
             return b_ids
@@ -402,47 +561,54 @@ class MinkMAEViT(nn.Module):
 
         # group to modules and mask
         x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
-        x_keep, attn_mask_keep, rand_mask, _, ids_keep = self._module_random_masking(x_mod, attn_mask_mod, mask_ratio)
+        x_keep, attn_mask_keep, rand_mask, ids_keep, _ = self._module_random_masking(x_mod, attn_mask_mod, mask_ratio)
         B, M, Lk, C = x_keep.shape
 
         # Intra-module transformer with per-module CLS
         cls = self.module_cls_token.expand(B*M, 1, C)
         x_intra = x_keep.reshape(B*M, Lk, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
-        attn_mask_intra = torch.cat([torch.ones(B*M, 1, dtype=torch.bool, device=x.device), attn_mask_keep.reshape(B*M, Lk)], dim=1)
+        attn_mask_intra = torch.cat([torch.ones(B*M, 1, dtype=torch.bool, device=x_intra.device), attn_mask_keep.reshape(B*M, Lk)], dim=1)
         for blk in self.blocks:
             x_intra = blk(x_intra, attn_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
         # discard intra-module CLS and add module embedding
-        tok_mod = x_intra[:, 1:, :].reshape(B, M, Lk, C)   # [B, M, Lk, C]
+        cls_mod = x_intra[:, 0, :].view(B, M, C)                               # [B, M, C]
+        tok_mod = x_intra[:, 1:, :].reshape(B, M, Lk, C)                       # [B, M, Lk, C]
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
 
         # global input
-        g_enc   = self.global_feats_encoder(x_glob)                  # [B, C]
-        g_tokens = g_enc.unsqueeze(1) + self.global_mem              # [B, G, C]
+        g_enc   = self.global_feats_encoder(x_glob)                            # [B, C]
+        g_tokens = g_enc.unsqueeze(1) + self.global_mem                        # [B, G, C]
         g_tokens = g_tokens.to(tok_mod.dtype)
 
         # Perceiver-IO encoder: latents attend to all kept tokens
-        kv_tokens = tok_mod.reshape(B, M*Lk, C)                       # [B, Nk, C]
-        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)           # [B, Nk+G, C]
-        kv_keep  = attn_mask_keep.reshape(B, M*Lk)                    # [B, Nk]
+        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_keep)  # [B, Nk(_max), C], [B, Nk(_max)]
+
+        # append global tokens to kv
+        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                    # [B, Nk(_max)+G, C]
         kv_keep   = torch.cat([kv_keep, torch.ones(
             kv_keep.size(0), self.num_global_tokens, 
-            dtype=torch.bool, device=kv_keep.device)], dim=1)         # [B, Nk+G]
-        lat = self.latents.expand(B, -1, -1)                          # [B, K, C]
+            dtype=torch.bool, device=kv_keep.device)], dim=1)                  # [B, Nk(_max)+G]
+        
+        # prepare queries and masks
+        queries, q_mask, pair_mask = self._prepare_queries_and_mask(
+            cls_mod, kv_keep, adaptive=False,
+        )
+        lat = queries                                                          # [B, Q, C]
         for xa, sa in zip(self.latent_xattn_blocks, self.latent_self_blocks):
-            lat = xa(lat, kv_tokens, attn_mask=kv_keep)               # cross: lat <- tokens
-            lat = sa(lat, attn_mask=None)                             # self-attn over latents
-        lat = self.latent_norm(lat)                                   # [B, K, C]
+            lat = xa(lat, kv_tokens, attn_mask=pair_mask)                      # cross: lat <- tokens
+            lat = sa(lat, attn_mask=q_mask)                                    # self-attn over latents
+        lat = self.latent_norm(lat)                                            # [B, Q, C]
 
         return (
-            lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
+            lat, q_mask, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
         )
         
 
-    def forward_contrastive(self, latents, attn_mask_keep, ids_keep, idx_map):
+    def forward_contrastive(self, latents, latent_mask, attn_mask_keep, ids_keep, idx_map):
         """
         latents:        [B, K, Cenc]
         attn_mask_keep: [B, M, Lk]
@@ -468,15 +634,16 @@ class MinkMAEViT(nn.Module):
               self.keep_query_token )                                      # [Nk, Cdec]
 
         # pack by batch into [B, max_n, Cdec] using one-hot cumsum trick
-        within = self.compute_within_ranks(b_ids, Nk)
+        within = self._compute_within_ranks(b_ids, Nk)
         Q = latents.new_zeros(B, max_n, Cdec)                              # padded queries
         Q[b_ids, within] = q                                               # place queries by (b, rank)
 
         # decode with latents
         KV = self.latents_to_dec(latents)                                  # [B, K, Cdec]
+        kv_mask = latent_mask
         X  = Q
         for blk in self.decode_xattn_blocks:
-            X = blk(X, KV, attn_mask=None)
+            X = blk(X, KV, attn_mask=kv_mask)
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
         # heads
@@ -492,7 +659,7 @@ class MinkMAEViT(nn.Module):
         return pred_track, pred_primary, pred_pid, idx_targets_kept
 
 
-    def forward_reconstruction(self, latents, rand_mask, attn_mask_mod, idx_map):
+    def forward_reconstruction(self, latents, latent_mask, rand_mask, attn_mask_mod, idx_map):
         """
         latents:       [B, K, Cenc]
         rand_mask:     [B, M, Lm]
@@ -517,15 +684,16 @@ class MinkMAEViT(nn.Module):
             self.mask_query_token )                                          # [Nm, Cdec]
 
         # pack by batch into [B, max_n, Cdec] using one-hot cumsum trick
-        within = self.compute_within_ranks(b_ids, Nm)
+        within = self._compute_within_ranks(b_ids, Nm)
         Q = latents.new_zeros(B, max_n, Cdec)                                # padded queries
         Q[b_ids, within] = q                                                 # place queries by (b, rank)
 
         # decode with latents
         KV = self.latents_to_dec(latents)                                    # [B, K, Cdec]
+        kv_mask = latent_mask
         X  = Q
         for blk in self.decode_xattn_blocks:
-            X = blk(X, KV, attn_mask=None)
+            X = blk(X, KV, attn_mask=kv_mask)
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
         # heads
@@ -544,16 +712,16 @@ class MinkMAEViT(nn.Module):
         idx_map = self.build_patch_occupancy_map(x)
 
         # Encoder
-        lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \
+        lat, latent_mask, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \
             self.forward_encoder(x, x_glob, mask_ratio)
 
         # Contrastive path
         pred_track, pred_primary, pred_pid, enc_idx_targets = \
-            self.forward_contrastive(lat, attn_mask_keep, ids_keep, idx_map)
+            self.forward_contrastive(lat, latent_mask, attn_mask_keep, ids_keep, idx_map)
         
         # Reconstruction path
         pred_occ, pred_reg, idx_targets, row_event_ids, row_patch_ids = \
-            self.forward_reconstruction(lat, rand_mask, attn_mask_mod, idx_map)
+            self.forward_reconstruction(lat, latent_mask, rand_mask, attn_mask_mod, idx_map)
 
         return (
             pred_track, pred_primary, pred_pid,
@@ -625,8 +793,6 @@ class MinkMAEViT(nn.Module):
         - heads_reconstruction
         - TOTAL
         """
-        import torch
-        import torch.nn as nn
 
         def _iter_params(obj):
             """Yield parameters from nn.Modules, nn.Parameters, and containers (list/tuple/dict/ModuleList/etc.)."""
@@ -755,7 +921,7 @@ def mae_vit_base(**kwargs):
         in_chans=1, out_chans=4, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=2,
-        latent_tokens=16, io_depth=4, io_decode_depth=4,
+        latent_tokens=32, io_depth=4, io_decode_depth=4,
         num_modes=16, contrastive_embed_dim=64,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),

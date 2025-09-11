@@ -21,8 +21,9 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
     param_groups = {}
 
     num_intra_layers = len(model.blocks)
-    num_inter_layers = len(model.inter_blocks)
-    num_layers = num_intra_layers + num_inter_layers + 1
+    num_xattn_layers = len(model.latent_xattn_blocks)
+    num_self_layers  = len(model.latent_self_blocks)
+    num_layers = num_intra_layers + num_xattn_layers + num_self_layers + 1
 
     layer_scales = list(layer_decay ** (num_layers - i) for i in range(num_layers + 1))
 
@@ -38,7 +39,7 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
             g_decay = "decay"
             this_decay = weight_decay
             
-        layer_id = get_layer_id_for_vit(n, num_intra_layers, num_inter_layers)
+        layer_id = get_layer_id_for_vit(n, num_intra_layers, num_xattn_layers, num_self_layers)
         group_name = "layer_%d_%s" % (layer_id, g_decay)
 
         if group_name not in param_group_names:
@@ -63,23 +64,26 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
     return list(param_groups.values())
 
 
-def get_layer_id_for_vit(name, num_intra_layers, num_inter_layers):
+def get_layer_id_for_vit(name, num_intra_layers, num_xattn_layers, num_self_layers):
     """
     Assign a parameter with its layer id
     Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L33
     """
     if name.startswith('patch_embed') or name.startswith('module_cls_token') or \
-       name.startswith('intra_pos_embed') or name.startswith('module_embed_enc'):
+       name.startswith('intra_pos_embed'):
         return 0
     elif name.startswith('blocks'):
         return int(name.split('.')[1]) + 1
     elif name.startswith('norm'):
         return num_intra_layers
-    elif name.startswith('global_feats_encoder') or name.startswith('global_token_embed'):
+    elif name.startswith('module_embed_enc') or name.startswith('global_feats_encoder') or \
+        name.startswith('global_mem') or name.startswith('latents'):
         return num_intra_layers + 1
-    elif name.startswith('inter_blocks'):
-        return num_intra_layers + int(name.split('.')[1]) + 1
-    elif name.startswith('inter_norm'):
-        return num_intra_layers + num_inter_layers
+    elif name.startswith('latent_xattn_blocks'):
+        return num_intra_layers + int(name.split('.')[1]) * 2 + 1
+    elif name.startswith('latent_self_blocks'):
+        return num_intra_layers + int(name.split('.')[1]) * 2 + 2
+    elif name.startswith('latent_norm'):
+        return num_intra_layers + num_xattn_layers + num_self_layers
     else:
-        return num_intra_layers + num_inter_layers + 1
+        return num_intra_layers + num_xattn_layers + num_self_layers + 1

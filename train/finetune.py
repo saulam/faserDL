@@ -11,7 +11,7 @@ import os
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
-from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
+from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger, load_mae_encoder
 from dataset import *
 from model import *
 from pytorch_lightning.loggers import CSVLogger
@@ -118,12 +118,15 @@ def main():
     )
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
+    load_mae_encoder(model, checkpoint)
+    '''
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
     filtered = {k: v for k, v in state_dict.items() if k in model.state_dict()}
     mismatched = model.load_state_dict(filtered, strict=False)
     print("missing keys:", mismatched.missing_keys)
     print("unexpected keys:", mismatched.unexpected_keys)
     print("Weights transferred succesfully")
+    '''
 
     # define the list of losses to monitor
     monitor_losses = [

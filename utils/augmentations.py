@@ -62,6 +62,12 @@ def augment(
             primary_vertex, metadata, selected_axes=['x', 'y'],
         )
 
+    # Global features multiplicative jitter
+    if np.random.random() < aug_prob:
+        global_feats = module_multiplicative_jitter(
+            global_feats, log_sigma=dict(faser=0.1, rear_cal=0.1, rear_hcal=0.1, rear_mucal=0.1),
+        )
+
     # Scaling
     if np.random.random() < aug_prob:
         feats, global_feats, _, _ = scale_all_by_global_shift_lognormal(
@@ -543,3 +549,42 @@ def smooth_labels(targets, smoothing: float, num_classes: int = None):
         raise ValueError(f"Unsupported target shape {targets.shape}, must be 1-D or 2-D.")
 
 
+def _sync_totals_from_modules(global_feats, eps=1e-9):
+    """Make totals equal the sum of their module arrays (when present)."""
+    if 'faser_cal_modules' in global_feats:
+        s = float(np.clip(np.sum(global_feats['faser_cal_modules']), 0.0, None))
+        global_feats['faser_cal_energy'] = max(s, eps)
+    if 'rear_cal_modules' in global_feats:
+        s = float(np.clip(np.sum(global_feats['rear_cal_modules'] / 1000.), 0.0, None))   # correction to GeV
+        global_feats['rear_cal_energy'] = max(s, eps)
+    if 'rear_hcal_modules' in global_feats:
+        s = float(np.clip(np.sum(global_feats['rear_hcal_modules']) / 1000., 0.0, None))  # correction to GeV
+        global_feats['rear_hcal_energy'] = max(s, eps)
+    # mucal has no module map; ensure strictly positive:
+    if 'rear_mucal_energy' in global_feats:
+        global_feats['rear_mucal_energy'] = max(float(global_feats['rear_mucal_energy']), eps)
+    return global_feats
+
+
+def module_multiplicative_jitter(global_feats, log_sigma=dict(faser=0.1, rear_cal=0.1, rear_hcal=0.1, rear_mucal=0.1)):
+    """
+    Independent per-cell multiplicative jitter (mean≈1), then sync totals.
+    """
+    gf = global_feats
+    def _per_cell(a, s):
+        mult = np.exp(np.random.randn(*a.shape) * s) / np.exp(0.5 * s * s)
+        return np.maximum(a * mult, 0.0)
+
+    if 'faser_cal_modules' in gf:
+        gf['faser_cal_modules'] = _per_cell(np.asarray(gf['faser_cal_modules'], dtype=float),
+                                            log_sigma.get('faser', 0.1))
+    if 'rear_cal_modules' in gf:
+        gf['rear_cal_modules'] = _per_cell(np.asarray(gf['rear_cal_modules'], dtype=float),
+                                           log_sigma.get('rear_cal', 0.1))
+    if 'rear_hcal_modules' in gf:
+        gf['rear_hcal_modules'] = _per_cell(np.asarray(gf['rear_hcal_modules'], dtype=float),
+                                            log_sigma.get('rear_hcal', 0.1))
+    if 'rear_mucal_energy' in gf:
+        gf['rear_mucal_energy'] = _per_cell(np.asarray(gf['rear_mucal_energy'], dtype=float),
+                                            log_sigma.get('rear_mucal', 0.1))
+    return _sync_totals_from_modules(gf)
