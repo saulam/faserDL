@@ -28,13 +28,13 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v18"
+name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v20"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v18"
+checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v20"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_clariden_0_5_v5/loss_total_val/epoch=81-step=29602.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v13/loss_total_val/epoch=105-step=19186.ckpt"
 gpus=(1)
 
 python -m train.finetune \

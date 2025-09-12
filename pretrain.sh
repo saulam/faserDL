@@ -34,7 +34,7 @@ checkpoint_path="checkpoints_final"
 checkpoint_name="pretrain_v5.1b_dlnu_log_base_v13"
 early_stop_patience=200
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
-gpus=(0 1)
+gpus=(0)
 
 python -m train.pretrain \
     --train \

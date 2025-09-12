@@ -254,7 +254,6 @@ class MinkMAEViT(nn.Module):
             'latents_free',
             'query_tokens.con',
             'query_tokens.rec',
-            'mask_query_token',
             'patch_embed.bias',
         }
 
@@ -490,14 +489,14 @@ class MinkMAEViT(nn.Module):
 
         # Anchored CLS queries
         mod_ids   = torch.arange(M, device=device)
-        q_anchor  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, C)  # [B,M,C]
+        q_anchor  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, C)     # [B, M, C]
 
         # Free queries (K_free)
         if self.latent_free_tokens > 0:
             q_free = self.latents_free.expand(B, self.latent_free_tokens, -1)  # [B, K_free, C]
-            queries = torch.cat([q_anchor, q_free], dim=1)    # [B,Q_total,C]
+            queries = torch.cat([q_anchor, q_free], dim=1)                     # [B, Q_total, C]
         else:
-            queries = q_anchor                                 # [B,M,C]
+            queries = q_anchor                                                 # [B, M, C]
 
         # Query mask
         q_mask = torch.zeros(B, Q_total, dtype=torch.bool, device=device)
@@ -901,7 +900,7 @@ def mae_vit_tiny(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(16, 16, 4),
         depth=2, num_heads=12, num_global_tokens=1,
-        latent_tokens=8, io_depth=2, io_decode_depth=2,
+        latent_tokens=16, io_depth=2, io_decode_depth=2,
         num_modes=16, contrastive_embed_dim=16,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),

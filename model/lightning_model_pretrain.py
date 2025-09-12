@@ -13,8 +13,8 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import timm.optim.optim_factory as optim_factory
 from utils import (
-    arrange_sparse_minkowski, arrange_truth, soft_focal_cross_entropy, soft_focal_bce_with_logits,
-    prototype_contrastive_loss_vectorized,  ghost_pushaway_loss,
+    arrange_sparse_minkowski, arrange_truth, soft_focal_bce_with_logits,
+    prototype_contrastive_loss,  ghost_pushaway_loss,
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
 
@@ -110,21 +110,21 @@ class MAEPreTrainer(pl.LightningModule):
         num_neg: int = 16,
         temperature: float = 0.07,
         normalize: bool = True,
-        pushaway_weight: float = 0.15,
+        pushaway_weight: float = 0.1,
     ):
         """
         Computes both losses (same-track, same-primary, same-pid) in one call.
         Assumes inputs are already masked/aligned (no ghosts/invisible hits).
         """
-        loss_trk = prototype_contrastive_loss_vectorized(
+        loss_trk = prototype_contrastive_loss(
             z_track, track_id, event_id, num_neg=num_neg, 
             temperature=temperature, normalize=normalize,
         )
-        loss_pri = prototype_contrastive_loss_vectorized(
+        loss_pri = prototype_contrastive_loss(
             z_primary, primary_id, event_id, num_neg=num_neg, 
             temperature=temperature, normalize=normalize,
         )
-        loss_pid = prototype_contrastive_loss_vectorized(
+        loss_pid = prototype_contrastive_loss(
             z_pid, pid_id, event_id, num_neg=num_neg,
             temperature=temperature, normalize=normalize,
         )

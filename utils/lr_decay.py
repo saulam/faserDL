@@ -77,7 +77,7 @@ def get_layer_id_for_vit(name, num_intra_layers, num_xattn_layers, num_self_laye
     elif name.startswith('norm'):
         return num_intra_layers
     elif name.startswith('module_embed_enc') or name.startswith('global_feats_encoder') or \
-        name.startswith('global_mem') or name.startswith('latents'):
+        name.startswith('global_mem') or name.startswith('latents_free'):
         return num_intra_layers + 1
     elif name.startswith('latent_xattn_blocks'):
         return num_intra_layers + int(name.split('.')[1]) * 2 + 1

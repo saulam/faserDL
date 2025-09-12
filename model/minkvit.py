@@ -13,7 +13,10 @@ import timm.models.vision_transformer as vit
 from functools import partial
 from timm.models.layers import trunc_normal_
 from MinkowskiEngine import MinkowskiConvolution
-from .utils import get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, CrossAttnBlock, CrossAttention, CylindricalHeadNormalized
+from .utils import (
+    get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
+    CrossAttnBlock, CrossAttention, CylindricalHeadNormalized
+)
 
 
 class MinkViT(vit.VisionTransformer):
@@ -26,7 +29,7 @@ class MinkViT(vit.VisionTransformer):
         D=3,
         img_size=(48, 48, 200),
         module_depth_voxels=20,
-        num_global_tokens=2,
+        num_global_tokens=1,
         latent_tokens=32,
         io_depth=4,
         global_pool=False,
@@ -119,10 +122,13 @@ class MinkViT(vit.VisionTransformer):
 
         # Perceiver-IO bottleneck
         self.num_global_tokens = num_global_tokens
-        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim)
+        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim, dropout=drop_rate)
         self.global_mem = nn.Parameter(torch.zeros(1, self.num_global_tokens, embed_dim))
+        assert latent_tokens >= self.num_modules, \
+            f"latent_tokens ({latent_tokens}) must be >= num_modules ({self.num_modules})"
         self.latent_tokens = latent_tokens
-        self.latents = nn.Parameter(torch.zeros(1, latent_tokens, embed_dim))
+        self.latent_free_tokens = max(latent_tokens - self.num_modules, 0)
+        self.latents_free = nn.Parameter(torch.zeros(1, self.latent_free_tokens, embed_dim))
         self.latent_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -183,11 +189,16 @@ class MinkViT(vit.VisionTransformer):
             self.intra_pos_embed.weight.copy_(torch.from_numpy(enc_pos).float())
             self.intra_pos_embed.weight.requires_grad_(False)
 
-        self.apply(self._init_weights)
+        # init tokens
+        with torch.no_grad():
+            nn.init.normal_(self.global_mem, std=.02)
+            nn.init.normal_(self.latents_free, std=.02)
+            nn.init.normal_(self.module_cls_token, std=.02)
+            nn.init.normal_(self.module_embed_enc.weight, std=0.02)
+            if not self.global_pool:
+                nn.init.normal_(self.task_tokens, std=.02)
 
-        # init task tokens
-        if hasattr(self, "task_tokens"):
-            nn.init.normal_(self.task_tokens, std=.02)
+        self.apply(self._init_weights)
 
         # init heads
         for name, head in self.heads.items():
@@ -220,7 +231,7 @@ class MinkViT(vit.VisionTransformer):
             'module_cls_token',
             'module_embed_enc.weight',
             'global_mem',
-            'latents',
+            'latent_free',
             'task_tokens',
             'patch_embed.bias',
         }
@@ -266,9 +277,8 @@ class MinkViT(vit.VisionTransformer):
         attn_mask = torch.zeros(B, Np, dtype=torch.bool, device=feats.device)
         attn_mask[batch_ids, patch_ids] = True
         intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
-        module_id = self.module_id_template.unsqueeze(0).expand(B, -1)
 
-        return dense, attn_mask, intra_idx, module_id
+        return dense, attn_mask, intra_idx
     
 
     def _group_tokens_by_module(self, x, attn_mask):
@@ -287,12 +297,139 @@ class MinkViT(vit.VisionTransformer):
         x_mod = torch.gather(x, 1, flat_idx.unsqueeze(-1).expand(-1, -1, C)).contiguous()  # [B, M*Lm, C]
         attn_mask_mod = torch.gather(attn_mask, 1, flat_idx).contiguous()                  # [B, M*Lm]
         return x_mod.view(B, M, Lm, C), attn_mask_mod.view(B, M, Lm)
+
+
+    def _pack_tokens(self, kv, attn_mask):
+        """
+        kv:             [B, M, L, C]
+        attn_mask:      [B, M, L]
+        returns:
+            kv_tokens:  [B, N_max, C] (packed real tokens, padded per batch)
+            kv_mask:    [B, N_max]
+        """
+        B, M, L, C = kv.shape
+        device = kv.device
+
+        b_ids, m_ids, lk_ids = torch.nonzero(attn_mask, as_tuple=True)  # [Nk]
+        N = b_ids.numel()
+
+        # per-batch ranks to map ragged -> padded
+        _, counts = torch.unique_consecutive(b_ids, return_counts=True)
+        N_max = int(counts.max().item())
+        starts = torch.cumsum(counts, dim=0) - counts
+        within = torch.arange(N, device=device) - torch.repeat_interleave(starts, counts)
+
+        kv_tokens = kv.new_zeros(B, N_max, C)
+        kv_mask   = torch.zeros(B, N_max, dtype=torch.bool, device=device)
+        kv_tokens[b_ids, within] = kv[b_ids, m_ids, lk_ids, :]   # pack only real kept
+        kv_mask[b_ids, within]   = True
+        return kv_tokens, kv_mask
+    
+
+    def _prepare_kv_tokens(
+        self,
+        kv,
+        attn_mask,
+        pack: bool = True,
+        adaptive: bool = True,
+        abs_threshold: int = 64,
+        ratio_threshold: float = 1.5
+    ):
+        """
+        Either reshape (fast) or pack (slow, but memory efficient) the kv tokens for Perceiver cross-attn.
+
+        kv:              [B, M, L, C]
+        attn_mask:       [B, M, L]
+        pack:            if False -> always reshape; if True -> pack (optionally adaptive)
+        adaptive:        if True, only pack when it clearly shrinks KV (see thresholds)
+        abs_threshold:   pack if N_fixed - N_real_max >= this
+        ratio_threshold: pack if N_fixed / N_real_max >= this
+
+        returns:
+            kv_tokens: [B, N(_max), C]
+            kv_mask:   [B, N(_max)]
+        """
+        B, M, L, C = kv.shape
+
+        if not pack:
+            return kv.reshape(B, M * L, C), attn_mask.reshape(B, M * L)
+
+        if adaptive:
+            N_fixed = M * L
+            N_real_max = attn_mask.reshape(B, -1).sum(dim=-1).max()
+            # avoid div-by-zero if a degenerate empty batch appears
+            ratio = N_fixed / max(int(N_real_max.item()), 1)
+            if (N_fixed - int(N_real_max.item()) < abs_threshold) and (ratio < ratio_threshold):
+                # not worth packing -> take the simple fast path
+                return kv.reshape(B, N_fixed, C), attn_mask.reshape(B, N_fixed)
+
+        # pack only real tokens
+        return self._pack_tokens(kv, attn_mask)
+    
+
+    def _prepare_queries_and_mask(
+        self,
+        cls_mod: torch.Tensor,      # [B, M, C]  per-module CLS
+        kv_keep: torch.Tensor,      # [B, N]    bool, real K/V positions
+        *,
+        adaptive: bool = True,
+        alpha: float = 1.0,         # free queries ~ alpha * sqrt(#KV)
+        min_free: int = 2,          # minimum number of free queries when adaptive
+        jitter: int = 1,            # ± jitter on active free queries when training
+    ):
+        """
+        Returns:
+        queries      [B, Q, C]   (Q = M + K_free)
+        q_mask       [B, Q]      bool, which queries are active
+        pair_mask    [B, Q, N]   bool, (active query) AND (real KV)
+        """
+        B, M, C = cls_mod.shape
+        device  = cls_mod.device
+        Q_total = self.latent_tokens
+
+        # Anchored CLS queries
+        mod_ids   = torch.arange(M, device=device)
+        q_anchor  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, C)     # [B, M, C]
+
+        # Free queries (K_free)
+        if self.latent_free_tokens > 0:
+            q_free = self.latents_free.expand(B, self.latent_free_tokens, -1)  # [B, K_free, C]
+            queries = torch.cat([q_anchor, q_free], dim=1)                     # [B, Q_total, C]
+        else:
+            queries = q_anchor                                                 # [B, M, C]
+
+        # Query mask
+        q_mask = torch.zeros(B, Q_total, dtype=torch.bool, device=device)
+        q_mask[:, :M] = True  # anchors always active
+
+        if self.latent_free_tokens > 0:
+            if adaptive:
+                # how many free queries to activate per event (0..K_free)
+                v_b = kv_keep.sum(dim=1).float()                  # [B]
+                k_b = (alpha * v_b.sqrt()).round().clamp_(min_free, self.latent_free_tokens).long()
+                if self.training and jitter > 0:
+                    k_b = (k_b + torch.randint(-jitter, jitter + 1, k_b.shape, device=device)).clamp_(min_free, self.latent_free_tokens)
+
+                num = int(k_b.max().item())
+                if num > 0:
+                    # sample which free slots to activate (ensures tail slots get trained over time)
+                    idx  = torch.rand(B, self.latent_free_tokens, device=device).topk(num, dim=1, largest=False, sorted=False).indices  # [B,num]
+                    take = (torch.arange(num, device=device).unsqueeze(0) < k_b.unsqueeze(1))                           # [B,num]
+                    r, c = take.nonzero(as_tuple=True)
+                    q_mask[r, M + idx[r, c]] = True
+            else:
+                q_mask[:, :] = True
+
+        # Single pair mask for CrossAttnBlock
+        pair_mask = q_mask.unsqueeze(-1) & kv_keep.unsqueeze(1)  # [B, Q, N]
+
+        return queries, q_mask, pair_mask
     
 
     def forward_features(self, x_sparse, x_glob):
         # patchify
         x_sparse = self.patch_embed(x_sparse)
-        x, attn_mask, intra_idx, _ = self.densify_patches(x_sparse)
+        x, attn_mask, intra_idx = self.densify_patches(x_sparse)
 
         # add positional embeddings
         x = x + self.intra_pos_embed(intra_idx)
@@ -312,6 +449,7 @@ class MinkViT(vit.VisionTransformer):
         x_intra = self.norm(x_intra)
 
         # discard intra-module CLS and add module embedding
+        cls_mod = x_intra[:, 0, :].view(B, M, C)                      # [B, M, C]
         tok_mod = x_intra[:, 1:, :].reshape(B, M, L, C)               # [B, M, L, C]
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
@@ -322,16 +460,22 @@ class MinkViT(vit.VisionTransformer):
         g_tokens = g_tokens.to(tok_mod.dtype)
 
         # Perceiver-IO encoder: latents attend to all kept tokens
-        kv_tokens = tok_mod.reshape(B, M*L, C)                        # [B, N, C]
-        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)           # [B, N+G, C]
-        kv_keep  = attn_mask_mod.reshape(B, M*L)                      # [B, N]
+        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_mod)  # [B, N(_max), C], [B, N(_max)]
+
+        # append global tokens to kv
+        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                   # [B, N(_max)+G, C]
         kv_keep  = torch.cat([kv_keep, torch.ones(
             kv_keep.size(0), self.num_global_tokens, 
-            dtype=torch.bool, device=kv_keep.device)], dim=1)         # [B, N+G]
-        lat = self.latents.expand(B, -1, -1)                          # [B, K, C]
+            dtype=torch.bool, device=kv_keep.device)], dim=1)                 # [B, N(_max)+G]
+        
+        # prepare queries and masks
+        queries, q_mask, pair_mask = self._prepare_queries_and_mask(
+            cls_mod, kv_keep, adaptive=False,
+        )
+        lat = queries
         for xa, sa in zip(self.latent_xattn_blocks, self.latent_self_blocks):
-            lat = xa(lat, kv_tokens, attn_mask=kv_keep)               # cross: lat <- tokens
-            lat = sa(lat, attn_mask=None)                             # self-attn over latents
+            lat = xa(lat, kv_tokens, attn_mask=pair_mask)                     # cross: lat <- tokens
+            lat = sa(lat, attn_mask=q_mask)                                   # self-attn over latents
 
         # Task-specific heads
         if self.global_pool:
@@ -418,8 +562,8 @@ def vit_tiny(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(16, 16, 4),
-        depth=2, num_heads=12, num_global_tokens=2,
-        latent_tokens=8, io_depth=2,
+        depth=2, num_heads=12, num_global_tokens=1,
+        latent_tokens=16, io_depth=2,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -430,9 +574,9 @@ def vit_base(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
-        depth=4, num_heads=12, num_global_tokens=2,
-        latent_tokens=16, io_depth=4,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=False,
+        depth=4, num_heads=12, num_global_tokens=1,
+        latent_tokens=32, io_depth=4,
+        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
