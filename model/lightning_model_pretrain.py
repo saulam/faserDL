@@ -110,7 +110,7 @@ class MAEPreTrainer(pl.LightningModule):
         num_neg: int = 16,
         temperature: float = 0.07,
         normalize: bool = True,
-        pushaway_weight: float = 0.05,
+        pushaway_weight: float = 0.15,
     ):
         """
         Computes both losses (same-track, same-primary, same-pid) in one call.
@@ -244,11 +244,11 @@ class MAEPreTrainer(pl.LightningModule):
         y_track = hit_track_id[raw_idx]
         y_primary = hit_primary_id[raw_idx]
         y_pid = hit_pdg[raw_idx]
-        hit_event_id = hit_event_id[raw_idx]
-        ghost_mask = ghost_mask[raw_idx]
+        evt = hit_event_id[raw_idx]
+        ghost = ghost_mask[raw_idx]
 
         loss_trk, loss_pri, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
-            z_track, z_primary, z_pid, y_track, y_primary, y_pid, hit_event_id, ghost_mask, normalize=True,
+            z_track, z_primary, z_pid, y_track, y_primary, y_pid, evt, ghost, normalize=True,
         )
 
         return loss_trk, loss_pri, loss_pid, part_losses_enc

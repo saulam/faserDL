@@ -402,10 +402,10 @@ class GlobalFeatureEncoder(nn.Module):
     
 
 class SeparableDCT3D(nn.Module):
-    def __init__(self, patch_size, Kxyz):
+    def __init__(self, patch_size, alphas=(0.4, 0.4, 0.75), max_per_axis=16):
         super().__init__()
         p_h, p_w, p_d = patch_size
-        Kx, Ky, Kz = Kxyz
+        Kx, Ky, Kz = self._choose_Kxyz(patch_size, alphas, max_per_axis)
         def dct_1d(L, K, device=None, dtype=None):
             x = torch.arange(L, dtype=torch.float32, device=device).unsqueeze(1)  # [L,1]
             k = torch.arange(K, dtype=torch.float32, device=device).unsqueeze(0)  # [1,K]
@@ -421,6 +421,16 @@ class SeparableDCT3D(nn.Module):
         self.Kx, self.Ky, self.Kz = Kx, Ky, Kz
         self.P = p_h * p_w * p_d
         self.patch_size = (p_h, p_w, p_d)
+
+    def _choose_Kxyz(self, patch_size, alphas, max_per_axis):
+        ph, pw, pd = patch_size
+        Ks = []
+        for dim, alpha in zip((ph, pw, pd), alphas):
+            K = min(int(round(alpha * dim)), max_per_axis, dim)
+            if dim >= 2:
+                K = max(K, 2)  # at least 2 modes if dimension has >=2 voxels
+            Ks.append(K)
+        return tuple(Ks)
 
     @property
     def K_total(self):

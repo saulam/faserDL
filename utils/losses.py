@@ -1314,6 +1314,8 @@ def prototype_contrastive_loss_vectorized(
     P_sum = z.new_zeros((G, D))
     P_sum.index_add_(0, inv_group, z)               # sum per (event,class)
     cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)   # [G] (int)
+    P_sum = P_sum.detach()
+    cnt_vec = cnt_vec.detach()
 
     # Per-hit metadata
     g        = inv_group
@@ -1323,8 +1325,8 @@ def prototype_contrastive_loss_vectorized(
     off      = Pidx["offset"][eidx]
     cls_cnt  = cnt_vec[g]                           # class size (per hit, int)
 
-    # Keep only hits with >=2 classes in event AND class size >=5
-    keep = (Ue >= 2) & (cls_cnt >= 5)
+    # Keep only hits with >=2 classes in event AND class size >=4
+    keep = (Ue >= 2) & (cls_cnt >= 4)
     if not torch.any(keep):
         return z.new_zeros(())
 
@@ -1336,7 +1338,7 @@ def prototype_contrastive_loss_vectorized(
     cls_cnt  = cls_cnt[keep]
 
     # Positive = leave-one-out prototype: (sum - z) / (cnt-1)
-    P_pos = (P_sum[g] - z) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)
+    P_pos = (P_sum[g] - z.detach()) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)
     if normalize:
         P_pos = F.normalize(P_pos, dim=-1)
 
@@ -1430,6 +1432,7 @@ def ghost_pushaway_loss(
     cnt = torch.bincount(inv_group, minlength=G).clamp_min_(1).unsqueeze(1).to(P.dtype)
     P = P / cnt
     if normalize: P = F.normalize(P, dim=-1)
+    P = P.detach()  # no gradients to prototypes
 
     # Select ghosts to push
     ghosts = ghost_mask.bool()
