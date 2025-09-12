@@ -1314,8 +1314,6 @@ def prototype_contrastive_loss_vectorized(
     P_sum = z.new_zeros((G, D))
     P_sum.index_add_(0, inv_group, z)               # sum per (event,class)
     cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)   # [G] (int)
-    P_sum = P_sum.detach()
-    cnt_vec = cnt_vec.detach()
 
     # Per-hit metadata
     g        = inv_group
@@ -1338,12 +1336,12 @@ def prototype_contrastive_loss_vectorized(
     cls_cnt  = cls_cnt[keep]
 
     # Positive = leave-one-out prototype: (sum - z) / (cnt-1)
-    P_pos = (P_sum[g] - z.detach()) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)
+    P_pos = (P_sum[g] - z) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)
     if normalize:
         P_pos = F.normalize(P_pos, dim=-1)
 
     # Negatives = means of other classes in same event
-    P_mean = P_sum / cnt_vec.unsqueeze(1).to(P_sum.dtype)   # [G,D]
+    P_mean = P_sum.detach() / cnt_vec.detach().unsqueeze(1).to(P_sum.dtype)  # detach to avoid gradients
     if normalize:
         P_mean = F.normalize(P_mean, dim=-1)
 

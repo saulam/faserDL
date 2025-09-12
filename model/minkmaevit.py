@@ -274,7 +274,7 @@ class MinkMAEViT(nn.Module):
         d = coords[:, 3] // self.patch_size[2]
 
         patch_ids = (h * (G_w * G_d)) + (w * G_d) + d
-        batch_ids = coords[:, 0]
+        batch_ids = coords[:, 0].long()
         
         # scatter into dense tensor
         dense = feats.new_zeros(B, Np, C)
@@ -295,7 +295,7 @@ class MinkMAEViT(nn.Module):
         coords     = x.C
         device     = coords.device
         event_ids  = coords[:, 0].long()
-        x_, y_, z_ = coords[:, 1:].unbind(-1)
+        x_, y_, z_ = coords[:, 1:].long().unbind(-1)
     
         p_h, p_w, p_d  = self.patch_size.tolist()
         G_h, G_w, G_d  = self.grid_size
