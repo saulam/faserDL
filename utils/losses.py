@@ -1420,88 +1420,92 @@ def ghost_pushaway_loss(
     temperature: float = 0.07,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """
-    Push embeddings with ghost_mask==True away from REAL per-(event,class) prototypes in the same event.
-    Negatives are event-local class prototypes (means). We cap negatives per row and mask extras.
-    """
-    # build real prototypes (no grad for stability)
+    # build real prototypes (fixed for stability)
     real = class_id >= 0
     if not torch.any(real):
         return z.new_zeros(())
 
-    z_r, eid_r, cid_r = z[real], event_id[real].long(), class_id[real].long()
-    inv_group, Pidx = _build_grouping(eid_r, cid_r)             # inv_group: [Nr]
+    z_r   = z[real]
+    eid_r = event_id[real].long()
+    cid_r = class_id[real].long()
+
+    inv_group, Pidx = _build_grouping(eid_r, cid_r)     # inv_group: [Nr]
     G, D = int(Pidx["rank"].numel()), z.size(1)
 
+    # check inv_group bounds on CPU to catch issues early
+    ig = inv_group.detach().cpu()
+    if ig.numel() == 0 or ig.min().item() < 0 or ig.max().item() >= G:
+        # invalid grouping
+        assert False, "invalid grouping in ghost_pushaway_loss"
+
     with torch.no_grad():
-        if normalize:
-            z_r = F.normalize(z_r, dim=-1)
         P = z_r.new_zeros((G, D))
-        P.index_add_(0, inv_group, z_r)                         # sum per (event,class)
+        zr = F.normalize(z_r, dim=-1) if normalize else z_r
+        zr = zr.to(z_r.dtype) 
+        P.index_add_(0, inv_group, zr)                   # sum per (event,class)
         cnt = torch.bincount(inv_group, minlength=G).clamp_min_(1).to(P.dtype).unsqueeze(1)
-        P = P / cnt                                             # mean prototype
+        P = P / cnt
         if normalize:
             P = F.normalize(P, dim=-1)
 
-    # select ghosts that belong to events with real prototypes
+    # pick ghosts that belong to events with real prototypes
     ghosts = ghost_mask.bool()
     if not torch.any(ghosts):
         return z.new_zeros(())
 
-    z_g, e_g = z[ghosts], event_id[ghosts].long()
+    z_g = z[ghosts]
+    e_g = event_id[ghosts].long()
     if normalize:
         z_g = F.normalize(z_g, dim=-1)
 
-    events_sorted = Pidx["events_sorted"]                       # [E_real], ascending
+    events_sorted = Pidx["events_sorted"]               # [E], ascending
     idx = torch.searchsorted(events_sorted, e_g)
     have_real = (idx < events_sorted.numel()) & (events_sorted[idx] == e_g)
     if not torch.any(have_real):
         return z.new_zeros(())
 
-    z_g  = z_g[have_real]
-    eidx = idx[have_real]                                       # event index per ghost
-    Ue   = Pidx["counts"][eidx]                                 # #prototypes in that event (>=1)
-    off  = Pidx["offset"][eidx]                                 # start offset in ord_g
+    z_g  = z_g[have_real]                               # [M,D]
+    eidx = idx[have_real].to(z.device)                  # [M] (0..E-1)
     M    = z_g.size(0)
 
-    # cap & mask setup
-    max_Ue = int(Ue.max().item())
-    if max_Ue <= 0:
+    # per-event subset (vectorised)
+    counts  = Pidx["counts"].to(z.device)               # [E]
+    offsets = Pidx["offset"].to(z.device)               # [E]
+    ord_g   = Pidx["ord_g"].to(z.device)                # [sum(counts)]
+
+    Umax = int(counts.max().item())
+    if Umax == 0:
         return z.new_zeros(())
 
-    K_pool = min(int(num_neg), max_Ue)                          # cap per row
-    if K_pool <= 0:
+    K = min(int(num_neg), Umax)
+    if K == 0:
         return z.new_zeros(())
 
-    # Build safe per-row local indices [0..Ue_i-1], clamped so indexing is ALWAYS valid
-    col = torch.arange(max_Ue, device=z.device)                 # [max_Ue]
-    local_full = torch.minimum(
-        col.unsqueeze(0).expand(M, max_Ue),                     # [M, max_Ue]
-        (Ue - 1).unsqueeze(1)                                   # [M, 1]
-    )
-    base = off.unsqueeze(1) + local_full                        # [M, max_Ue] valid indices
-    neg_group_full = Pidx["ord_g"][base]                        # [M, max_Ue]
-    P_negs_full = P[neg_group_full]                             # [M, max_Ue, D]
+    col = torch.arange(Umax, device=z.device)           # [Umax]
+    valid_ev = col.unsqueeze(0) < counts.unsqueeze(1)   # [E, Umax]
 
-    # Validity mask per row/column
-    neg_valid = col.unsqueeze(0) < Ue.unsqueeze(1)              # [M, max_Ue]
-
-    # similarities to all event prototypes
-    neg_sim_full = torch.einsum('md,mkd->mk', z_g, P_negs_full) # [M, max_Ue]
-
-    # select up to K_pool uniformly w/o replacement (Gumbel top-k over valid cols)
+    # Uniform w/o replacement via masked top-k over random scores
     work_dtype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
-    u = torch.rand(M, max_Ue, device=z.device, dtype=work_dtype).clamp_(1e-6, 1 - 1e-6)
-    gumbel = -torch.log(-torch.log(u))
-    gumbel = gumbel.masked_fill(~neg_valid, float('-inf'))
-    sel_idx = torch.topk(gumbel, k=K_pool, dim=1).indices       # [M, K_pool]
+    scores = torch.rand(counts.numel(), Umax, device=z.device, dtype=work_dtype)
+    scores = scores.masked_fill(~valid_ev, float('-inf'))
+    sel_local = torch.topk(scores, k=K, dim=1).indices   # [E, K]
 
-    sel_valid = torch.gather(neg_valid, 1, sel_idx)             # [M, K_pool]
-    neg_sim   = torch.gather(neg_sim_full, 1, sel_idx)          # [M, K_pool]
-    neg_sim   = neg_sim.masked_fill(~sel_valid, float('-inf'))
+    # CLAMP local indices so base indexing is ALWAYS in-range
+    sel_local_safe = torch.minimum(sel_local, (counts - 1).unsqueeze(1))   # [E,K]
+    base = offsets.unsqueeze(1) + sel_local_safe                           # [E,K]
+    sel_groups = ord_g.index_select(0, base.reshape(-1)).reshape(-1, K)    # [E,K]
 
-    # log-mean-exp over selected negatives (temperature-scaled)
-    logits = neg_sim / temperature
-    lse = torch.logsumexp(logits, dim=1)                        # [M]
-    k_eff = sel_valid.sum(dim=1).clamp_min(1).to(logits.dtype)  # per-row selected count
+    # Gather prototypes and validity, then broadcast to ghosts
+    P_sel   = P.index_select(0, sel_groups.reshape(-1)).reshape(-1, K, D)  # [E,K,D]
+    sel_val = torch.gather(valid_ev, 1, sel_local).to(torch.bool)          # [E,K]
+
+    Pg       = P_sel.index_select(0, eidx)                                 # [M,K,D]
+    valid_g  = sel_val.index_select(0, eidx)                               # [M,K]
+
+    # similarities & log-mean-exp push-away
+    sims = torch.einsum('md,mkd->mk', z_g, Pg) / temperature               # [M,K]
+    sims = sims.masked_fill(~valid_g, float('-inf'))
+
+    lse   = torch.logsumexp(sims, dim=1)                                   # [M]
+    k_eff = valid_g.sum(dim=1).clamp_min(1).to(lse.dtype)
     return (lse - torch.log(k_eff)).mean()
