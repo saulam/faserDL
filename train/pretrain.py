@@ -81,9 +81,9 @@ def main():
         )
         train_loader = create_loader(train_set, shuffle=False, drop_last=True, args=args)
         valid_loader = create_loader(val_set, shuffle=False, drop_last=True, args=args)
-        metadata = train_set.metadata
         nb_batches_train = len(train_set) // args.batch_size
         nb_batches_val = len(val_set) // args.batch_size
+        dataset = train_set
     else:
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
@@ -91,7 +91,6 @@ def main():
         train_loader, valid_loader, _ = split_dataset(
             dataset, args, splits=[0.85, 0.05, 0.1],
         )
-        metadata = dataset.metadata
         nb_batches_train = len(train_loader)
         nb_batches_val = len(valid_loader)
 
@@ -167,14 +166,13 @@ def main():
  
     # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(
-        limit_train_batches=nb_batches_train//denom,
-        limit_val_batches=nb_batches_val//denom,
+        limit_train_batches=nb_batches_train//nb_gpus if args.web_dataset_path else None,
+        limit_val_batches=nb_batches_val//nb_gpus if args.web_dataset_path else None,
         max_epochs=args.epochs,
         callbacks=callbacks,
         accelerator="gpu",
         devices=nb_gpus,
         precision="bf16-mixed" if pl_major >= 2 else 32,
-        #precision="32-true",
         strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,

@@ -1435,8 +1435,7 @@ def ghost_pushaway_loss(
     # check inv_group bounds on CPU to catch issues early
     ig = inv_group.detach().cpu()
     if ig.numel() == 0 or ig.min().item() < 0 or ig.max().item() >= G:
-        # invalid grouping
-        assert False, "invalid grouping in ghost_pushaway_loss"
+        raise AssertionError("invalid grouping in ghost_pushaway_loss")
 
     with torch.no_grad():
         P = z_r.new_zeros((G, D))
@@ -1459,8 +1458,16 @@ def ghost_pushaway_loss(
         z_g = F.normalize(z_g, dim=-1)
 
     events_sorted = Pidx["events_sorted"]               # [E], ascending
-    idx = torch.searchsorted(events_sorted, e_g)
-    have_real = (idx < events_sorted.numel()) & (events_sorted[idx] == e_g)
+    E = events_sorted.numel()
+    if E == 0:
+        return z.new_zeros(())
+    
+    idx = torch.searchsorted(events_sorted, e_g)        # [Ng]
+    in_range = idx < E
+    # clamp to avoid OOB; only compared where in_range is True
+    idx_clamped = idx.clamp_max(E - 1)
+    matches = (events_sorted[idx_clamped] == e_g)
+    have_real = in_range & matches
     if not torch.any(have_real):
         return z.new_zeros(())
 
@@ -1505,7 +1512,6 @@ def ghost_pushaway_loss(
     # similarities & log-mean-exp push-away
     sims = torch.einsum('md,mkd->mk', z_g, Pg) / temperature               # [M,K]
     sims = sims.masked_fill(~valid_g, float('-inf'))
-
     lse   = torch.logsumexp(sims, dim=1)                                   # [M]
     k_eff = valid_g.sum(dim=1).clamp_min(1).to(lse.dtype)
     return (lse - torch.log(k_eff)).mean()
