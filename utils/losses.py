@@ -7,10 +7,408 @@ Description:
     Custom loss functions.
 """
 
-
+from typing import Optional, Sequence, Union
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+'''
+class KinematicsMultiTaskLoss(nn.Module):
+    """
+    Multi-task regression loss for vis/lepton (and optional jet) with analysis-aligned residuals.
+
+    Inputs to forward():
+      p_vis_hat:  (B,3) predicted visible momentum (Cartesian)
+      p_lep_hat:  (B,3) predicted lepton momentum (Cartesian)
+      p_vis_true: (B,3) true visible momentum
+      p_lep_true: (B,3) true lepton momentum
+      is_cc:      (B,)  1 for CC, 0 for NC (bool or float)
+      vis_latents, lep_latents: optional tensors from Option-A heads (e.g., [zT, zz]);
+                                if given, a tiny latent prior is applied.
+
+    Configure with:
+      - Scales s_*_* (MADN) for component and magnitude losses (register_buffer’d)
+      - tau_ptmiss_cc/nc, tau_evis_cc/nc (per-class denominator floors)
+      - Weights: zero_attractor_w, jet_aux_w, latent_prior_w, lam_mag, lam_dir
+      - use_uncertainty: learn Kendall–Gal weights over [vis, lep, ptmiss, evis, jet]
+      - enforce_nonneg_truth_pz: enforce pz >= 0 for truth vectors (vis and lep)
+    """
+    def __init__(
+        self,
+        *,
+        # --- robust scales for VIS ---
+        s_vis_xyz,                    # (3,) tuple/list: MADN per component for vis
+        s_vis_mag,                    # float: MADN of ||p_vis||
+        # --- robust scales for LEP ---
+        s_lep_xyz,                    # (3,)
+        s_lep_mag,                    # float
+        # --- robust scales for JET ---
+        s_jet_xyz,                    # (3,) 
+        s_jet_mag,                    # float
+        # --- residual floors (per-class) ---
+        tau_ptmiss_cc=0.05, tau_ptmiss_nc=0.05,
+        tau_evis_cc=0.05,   tau_evis_nc=0.05,
+        # --- weights / knobs ---
+        huber_delta=1.0,
+        lam_mag=1.0, lam_dir=1.0,     # weights inside vector losses
+        zero_attractor_w=0.1,
+        jet_aux_w=0.0,                # set >0 to enable aux jet loss (CC-only)
+        latent_prior_w=0.0,           # tiny (e.g., 1e-3) if passing latents
+        enforce_nonneg_truth_pz=True, # enforce pz >= 0 for truth vectors (vis and lep)
+    ):
+        super().__init__()
+        # register robust scales
+        self.register_buffer("s_vis_xyz", torch.tensor(s_vis_xyz, dtype=torch.float32).view(1,3))
+        self.register_buffer("s_lep_xyz", torch.tensor(s_lep_xyz, dtype=torch.float32).view(1,3))
+        self.s_vis_mag = float(s_vis_mag)
+        self.s_lep_mag = float(s_lep_mag)
+
+        if s_jet_xyz is None: s_jet_xyz = s_vis_xyz
+        if s_jet_mag is None: s_jet_mag = s_vis_mag
+        self.register_buffer("s_jet_xyz", torch.tensor(s_jet_xyz, dtype=torch.float32).view(1,3))
+        self.s_jet_mag = float(s_jet_mag)
+
+        # residual floors
+        self.tau_ptmiss_cc = float(tau_ptmiss_cc)
+        self.tau_ptmiss_nc = float(tau_ptmiss_nc)
+        self.tau_evis_cc   = float(tau_evis_cc)
+        self.tau_evis_nc   = float(tau_evis_nc)
+
+        # knobs
+        self.huber_delta = float(huber_delta)
+        self.lam_mag = float(lam_mag)
+        self.lam_dir = float(lam_dir)
+        self.zero_attractor_w = float(zero_attractor_w)
+        self.jet_aux_w = float(jet_aux_w)
+        self.latent_prior_w = float(latent_prior_w)
+        self.enforce_nonneg_truth_pz = bool(enforce_nonneg_truth_pz)
+
+    # ---------- primitives ----------
+    @staticmethod
+    def _huber(x, delta):
+        ax = x.abs()
+        quad = torch.clamp(ax, max=delta)
+        lin = ax - quad
+        return 0.5 * quad**2 + delta * lin
+
+    @staticmethod
+    def _cosine_dir_loss(p_hat, p_true, eps=1e-8):
+        num = (p_hat * p_true).sum(-1)
+        den = p_hat.norm(dim=-1) * p_true.norm(dim=-1)
+        return 1.0 - num / (den + eps)
+
+    def _component_loss(self, p_hat, p_true, s_xyz):
+        z = (p_hat - p_true) / s_xyz
+        return self._huber(z, self.huber_delta).sum(-1)
+
+    def _magnitude_loss(self, p_hat, p_true, s_mag):
+        z = (p_hat.norm(dim=-1) - p_true.norm(dim=-1)) / s_mag
+        return self._huber(z, self.huber_delta)
+
+    def _residual_scalar_loss(self, x_true, x_hat, tau):
+        # tau can be scalar or (B,)
+        denom = torch.maximum(x_true, tau)
+        r = (x_true - x_hat) / denom
+        return self._huber(r, self.huber_delta)
+
+    # ---------- forward ----------
+    def forward(
+        self,
+        p_vis_hat, p_lep_hat,
+        p_vis_true, p_lep_true,
+        is_cc,
+        vis_latents=None, lep_latents=None,
+    ):
+        device = p_vis_hat.device
+        B = p_vis_hat.shape[0]
+        eps = 1e-8
+
+        if self.enforce_nonneg_truth_pz:
+            p_vis_true = p_vis_true.clone()
+            p_lep_true = p_lep_true.clone()
+            p_vis_true[..., 2] = p_vis_true[..., 2].clamp_min(0.0)
+            p_lep_true[..., 2] = p_lep_true[..., 2].clamp_min(0.0)
+
+        # calculate jet as (vis - lep)
+        p_jet_true = p_vis_true - p_lep_true
+        p_jet_hat = p_vis_hat - p_lep_hat
+
+        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)      # (B,)
+        m_nc = 1.0 - m_cc
+        cc_mask = m_cc > 0.5
+
+        # ----- Visible vector losses -----
+        L_vis_comp = self._component_loss(p_vis_hat, p_vis_true, self.s_vis_xyz)
+        L_vis_mag  = self._magnitude_loss(p_vis_hat, p_vis_true, self.s_vis_mag)
+        L_vis_dir  = self._cosine_dir_loss(p_vis_hat, p_vis_true)
+        L_vis      = L_vis_comp + self.lam_mag * L_vis_mag + self.lam_dir * L_vis_dir
+
+        if vis_latents is not None and self.latent_prior_w > 0.0:
+            L_vis = L_vis + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
+
+        # ----- Lepton vector losses (CC-supervised) -----
+        L_lep_comp = self._component_loss(p_lep_hat, p_lep_true, self.s_lep_xyz)
+        L_lep_mag  = self._magnitude_loss(p_lep_hat, p_lep_true, self.s_lep_mag)
+        L_lep_dir  = self._cosine_dir_loss(p_lep_hat, p_lep_true)
+        L_lep_cc   = (L_lep_comp + self.lam_mag * L_lep_mag + self.lam_dir * L_lep_dir) * m_cc
+
+        # zero-attractor on NC
+        z_nc = (p_lep_hat / self.s_lep_xyz) * m_nc.view(-1,1)
+        L_lep_zero = self._huber(z_nc, self.huber_delta).sum(-1) * self.zero_attractor_w
+
+        if lep_latents is not None and self.latent_prior_w > 0.0:
+            L_lep_cc = L_lep_cc + self.latent_prior_w * (lep_latents.pow(2).sum(-1)) * m_cc
+
+        # ----- Residual scalars from visible only -----
+        pt_true = torch.sqrt(p_vis_true[...,0]**2 + p_vis_true[...,1]**2 + eps)
+        pt_hat  = torch.sqrt(p_vis_hat[...,0]**2  + p_vis_hat[...,1]**2  + eps)
+        e_true  = p_vis_true.norm(dim=-1)
+        e_hat   = p_vis_hat.norm(dim=-1)
+
+        tau_pt = (self.tau_ptmiss_cc * m_cc + self.tau_ptmiss_nc * m_nc).to(device)
+        tau_ev = (self.tau_evis_cc   * m_cc + self.tau_evis_nc   * m_nc).to(device)
+
+        L_ptmiss = self._residual_scalar_loss(pt_true, pt_hat, tau_pt)
+        L_evis   = self._residual_scalar_loss(e_true,  e_hat,  tau_ev)
+
+        # ----- Jet aux loss (define safe zeros first) -----
+        L_jet_comp = torch.zeros(B, device=device)
+        L_jet_mag  = torch.zeros(B, device=device)
+        L_jet_dir  = torch.zeros(B, device=device)
+        L_jet      = torch.zeros(B, device=device)
+
+        if self.jet_aux_w > 0.0:
+            L_jet_comp = self._component_loss(p_jet_hat, p_jet_true, self.s_jet_xyz)
+            L_jet_mag  = self._magnitude_loss(p_jet_hat, p_jet_true, self.s_jet_mag)
+            L_jet_dir  = self._cosine_dir_loss(p_jet_hat, p_jet_true)
+            L_jet      = (L_jet_comp + self.lam_mag * L_jet_mag + self.lam_dir * L_jet_dir) * m_cc
+
+        # ---------- per-sample outputs for total loss ----------
+        per_sample = {
+            "loss_vis":   L_vis,                            # (B,)
+            "loss_lep":   L_lep_cc + L_lep_zero,            # (B,)
+            "loss_ptmiss":L_ptmiss,                         # (B,)
+            "loss_evis":  L_evis,                           # (B,)
+            "loss_jet":   L_jet,                            # (B,)
+        }
+
+        # ---------- ready-to-log means ----------
+        def _safe_mean(x):
+            # supports zero-length selections
+            return (x.mean() if x.numel() > 0 else torch.tensor(0.0, device=device))
+
+        logs = {
+            'loss_reg_vis/vis_comp': L_vis_comp.mean(),
+            'loss_reg_vis/vis_mag':  L_vis_mag.mean(),
+            'loss_reg_vis/vis_dir':  L_vis_dir.mean(),
+            'loss_reg_vis/vis':      L_vis.mean(),
+            'loss_reg_vis/evis':     L_evis.mean(),
+            'loss_reg_vis/pt_miss':  L_ptmiss.mean(),
+            'loss_reg_lep/lep_comp': L_lep_comp.mean(),
+            'loss_reg_lep/lep_mag':  L_lep_mag.mean(),
+            'loss_reg_lep/lep_dir':  L_lep_dir.mean(),
+            'loss_reg_lep/lep_cc':   _safe_mean(L_lep_cc[cc_mask]),
+            'loss_reg_lep/lep_zero': L_lep_zero.mean(),
+            'loss_reg_jet/jet_comp': L_jet_comp.mean(),
+            'loss_reg_jet/jet_mag':  L_jet_mag.mean(),
+            'loss_reg_jet/jet_dir':  L_jet_dir.mean(),
+            'loss_reg_jet/jet':      (_safe_mean(L_jet[cc_mask]) if self.jet_aux_w > 0.0 else torch.tensor(0.0, device=device)),
+        }
+
+        return {"per_sample": per_sample, "logs": logs}
+'''
+
+class KinematicsMultiTaskLoss(nn.Module):
+    """
+    Predict (p_vis, p_jet). Derive p_lep = p_vis - p_jet.
+
+    forward() inputs:
+      p_vis_hat:  (B,3) predicted visible momentum
+      p_jet_hat:  (B,3) predicted jet momentum
+      p_vis_true: (B,3) true visible momentum
+      p_jet_true: (B,3) true jet momentum  (provided)
+      is_cc:      (B,)  ground-truth CC mask in {0,1}
+      is_cc_hat:  (B,)  predicted CC prob in [0,1] (already sigmoid’d)
+      vis_latents, jet_latents: optional latents for tiny priors
+
+    Design:
+      - Magnitudes supervised via relative residuals.
+      - XY-direction loss added (plus optional 3D direction).
+      - Lepton vector supervision is CC-only. Optional NC zero-attractor on raw lep.
+    """
+
+    def __init__(
+        self,
+        *,
+        stats,
+        # -------- weights / knobs --------
+        huber_delta=1.0,
+        lam_dir_xy=1.0,               # weight for XY cosine loss
+        lam_dir_3d=0.0,               # weight for 3D cosine loss (default off)
+        lep_nc_zero_w=0.05,           # small NC zero-attractor on raw lep
+        latent_prior_w=0.0,           # tiny N(0,1) prior on provided latents
+        enforce_nonneg_truth_pz=True, # clamp truth pz>=0 before deriving p_lep_true
+        decouple_radial=False,        # remove radial component from component loss
+    ):
+        super().__init__()
+
+        # scales
+        self.register_buffer("s_vis_xyz", torch.tensor(stats["vis"]["s_xyz"], dtype=torch.float32).view(1,3))
+        self.register_buffer("s_jet_xyz", torch.tensor(stats["jet"]["s_xyz"], dtype=torch.float32).view(1,3))
+        self.register_buffer("s_lep_xyz", torch.tensor(stats["lep"]["s_xyz"], dtype=torch.float32).view(1,3))
+
+        # per-output floors
+        self.tau_pt_vis   = float(stats["vis"]["tau_pt"])
+        self.tau_mag_vis  = float(stats["vis"]["tau_mag"])
+        self.tau_pt_jet   = float(stats["jet"]["tau_pt"])
+        self.tau_mag_jet  = float(stats["jet"]["tau_mag"])
+        self.tau_pt_lep   = float(stats["lep"]["tau_pt"])
+        self.tau_mag_lep  = float(stats["lep"]["tau_mag"])
+
+        # knobs
+        self.huber_delta = float(huber_delta)
+        self.lam_dir_xy  = float(lam_dir_xy)
+        self.lam_dir_3d  = float(lam_dir_3d)
+
+        self.lep_nc_zero_w = float(lep_nc_zero_w)
+        self.latent_prior_w = float(latent_prior_w)
+        self.enforce_nonneg_truth_pz = bool(enforce_nonneg_truth_pz)
+        self.decouple_radial = bool(decouple_radial)
+
+    # ---------- primitives ----------
+    @staticmethod
+    def _huber(x, delta):
+        ax = x.abs()
+        quad = torch.clamp(ax, max=delta)
+        lin = ax - quad
+        return 0.5 * quad**2 + delta * lin
+
+    @staticmethod
+    def _cosine_dir_3d(p_hat, p_true, eps=1e-8):
+        num = (p_hat * p_true).sum(-1)
+        den = p_hat.norm(dim=-1) * p_true.norm(dim=-1)
+        return 1.0 - num / (den + eps)
+
+    @staticmethod
+    def _cosine_dir_xy(p_hat, p_true, eps=1e-8):
+        v_hat  = p_hat[..., :2]
+        v_true = p_true[..., :2]
+        num = (v_hat * v_true).sum(-1)
+        den = v_hat.norm(dim=-1) * v_true.norm(dim=-1)
+        return 1.0 - num / (den + eps)
+
+    def _component_loss(self, p_hat, p_true, s_xyz, eps=1e-8):
+        """
+        If decouple_radial=True, remove the radial component so this term is
+        purely angular in the native Cartesian basis (per-axis scaled).
+        """
+        e = p_hat - p_true
+        if self.decouple_radial:
+            tnorm2 = (p_true * p_true).sum(-1, keepdim=True).clamp_min(eps)
+            e_rad = ((e * p_true).sum(-1, keepdim=True) / tnorm2) * p_true
+            e = e - e_rad
+        z = e / s_xyz
+        return self._huber(z, self.huber_delta).sum(-1)
+
+    def _relative_residual_loss(self, p_true, p_hat, tau, kind="mag"):
+        """
+        Relative residual Huber on a scalar derived from vectors p_true/p_hat:
+          kind="mag":  uses ||p||
+          kind="pt":   uses ||p_xy||
+        Norms are computed internally.
+        """
+        if kind == "mag":
+            x_true = p_true.norm(dim=-1)
+            x_hat  = p_hat.norm(dim=-1)
+        elif kind == "pt":
+            x_true = p_true[..., :2].norm(dim=-1)
+            x_hat  = p_hat[..., :2].norm(dim=-1)
+        else:
+            raise ValueError(f"Unknown kind='{kind}'")
+        denom = torch.maximum(x_true, torch.as_tensor(tau, dtype=x_true.dtype, device=x_true.device))
+        r = (x_true - x_hat) / denom
+        return self._huber(r, self.huber_delta)
+
+    # ---------- forward ----------
+    def forward(
+        self,
+        *,
+        p_vis_hat, p_jet_hat,
+        p_vis_true, p_jet_true,
+        is_cc, vis_latents=None, jet_latents=None,
+    ):
+        device = p_vis_hat.device
+
+        # ----- truths -----
+        if self.enforce_nonneg_truth_pz:
+            p_vis_true = p_vis_true.clone(); p_vis_true[...,2] = p_vis_true[...,2].clamp_min(0.0)
+            p_jet_true = p_jet_true.clone(); p_jet_true[...,2] = p_jet_true[...,2].clamp_min(0.0)
+        p_lep_true = p_vis_true - p_jet_true
+
+        # ----- predictions -----
+        p_lep_hat = p_vis_hat - p_jet_hat
+
+        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)      # (B,)
+        m_nc = 1.0 - m_cc
+
+        # ----- vector losses -----
+        # VIS
+        L_vis_comp  = self._component_loss(p_vis_hat, p_vis_true, self.s_vis_xyz)
+        L_vis_dirxy = self._cosine_dir_xy(p_vis_hat, p_vis_true)
+        L_vis_geom = L_vis_comp + self.lam_dir_xy * L_vis_dirxy
+        if self.lam_dir_3d != 0.0:
+            L_vis_geom = L_vis_geom + self.lam_dir_3d * self._cosine_dir_3d(p_vis_hat, p_vis_true)
+        if vis_latents is not None and self.latent_prior_w > 0.0:
+            L_vis_geom = L_vis_geom + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
+        L_vis_pt   = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_pt_vis, kind="pt")
+        L_vis_mag  = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_mag_vis, kind="mag")
+
+        # JET
+        L_jet_comp  = self._component_loss(p_jet_hat, p_jet_true, self.s_jet_xyz)
+        L_jet_dirxy = self._cosine_dir_xy(p_jet_hat, p_jet_true)
+        L_jet_geom = L_jet_comp + self.lam_dir_xy * L_jet_dirxy
+        if self.lam_dir_3d != 0.0:
+            L_jet_geom = L_jet_geom + self.lam_dir_3d * self._cosine_dir_3d(p_jet_hat, p_jet_true)
+        if jet_latents is not None and self.latent_prior_w > 0.0:
+            L_jet_geom = L_jet_geom + self.latent_prior_w * (jet_latents.pow(2).sum(-1))
+        L_jet_pt   = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_pt_jet, kind="pt")
+        L_jet_mag  = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_mag_jet, kind="mag")
+
+        # LEPTON (CC-only; use gated prediction).
+        L_lep_comp  = self._component_loss(p_lep_hat, p_lep_true, self.s_lep_xyz)
+        L_lep_dirxy = self._cosine_dir_xy(p_lep_hat, p_lep_true)
+        L_lep_geom = L_lep_comp + self.lam_dir_xy * L_lep_dirxy
+        if self.lam_dir_3d != 0.0:
+            L_lep_geom = L_lep_geom + (self.lam_dir_3d * self._cosine_dir_3d(p_lep_hat, p_lep_true))
+        L_lep_geom = L_lep_geom * m_cc
+        L_lep_pt   = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_pt_lep, kind="pt") * m_cc
+        L_lep_mag  = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_mag_lep, kind="mag") * m_cc
+
+        # NC zero-attractor (small) on RAW lepton
+        if self.lep_nc_zero_w > 0.0:
+            z_nc = (p_lep_hat / self.s_lep_xyz) * m_nc.view(-1,1)
+            L_lep_zero_nc = self._huber(z_nc, self.huber_delta).sum(-1)
+        else:
+            L_lep_zero_nc = torch.zeros_like(m_cc)
+
+        losses = {
+            # vis
+            'loss_vis/geom': L_vis_geom,
+            'loss_vis/pt':   L_vis_pt,
+            'loss_vis/mag':  L_vis_mag,
+            # jet
+            'loss_jet/geom': L_jet_geom,
+            'loss_jet/pt':   L_jet_pt,
+            'loss_jet/mag':  L_jet_mag,
+            # lep (CC-only)
+            'loss_lep/geom': L_lep_geom,
+            'loss_lep/pt':   L_lep_pt,
+            'loss_lep/mag':  L_lep_mag,
+            # NC prior
+            'loss_lep/zero_nc': L_lep_zero_nc,
+        }
+
+        return losses
 
 
 class MAPE(torch.nn.Module):
@@ -27,13 +425,18 @@ class MAPE(torch.nn.Module):
         epsilon (float): Small value to prevent division by zero. Default is 1e-8.
         reduction (str): Specifies the reduction method ('mean' or 'sum'). Default is 'mean'.
         preprocessing (str): Type of preprocessing applied ('sqrt', 'log', or None).
+        standardize (str): Type of standarisation applied ('z-score', 'unit-var', 'norm').
     """
 
-    def __init__(self, eps=1e-8, reduction='mean', preprocessing=None):
+    def __init__(
+            self,
+            eps=1e-8,
+            reduction='mean',
+        ):
         super(MAPE, self).__init__()
         self.eps = eps
         self.reduction = reduction
-        self.preprocessing = preprocessing
+
 
     def forward(self, pred, target):
         """
@@ -45,14 +448,7 @@ class MAPE(torch.nn.Module):
 
         Returns:
             torch.Tensor: Computed MAPE loss, considering only target values > 0.
-        """
-        if self.preprocessing == "sqrt":
-            pred = pred ** 2
-            target = target ** 2
-        elif self.preprocessing == "log":
-            pred = torch.expm1(pred)
-            target = torch.expm1(target)
-            
+        """ 
         # Calculate percentage error where the target is greater than 0
         mask = target > 0
         percentage_error = torch.abs((pred - target) / (target + self.eps))
@@ -436,6 +832,79 @@ def sigmoid_focal_loss_star(
     return loss
 
 
+def soft_focal_bce_with_logits(
+    logits: torch.Tensor, 
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
+    reduction: str = "mean",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Focal binary cross-entropy (sigmoid) that supports SOFT targets.
+      For each logit x and target t in [0,1], with p = sigmoid(x).
+    """
+    target = target.to(dtype=logits.dtype)
+
+    # Stable logs: log(sigmoid(x)) and log(1 - sigmoid(x))
+    log_p   = F.logsigmoid(logits)      # = -softplus(-x)
+    log_1mp = F.logsigmoid(-logits)     # = -softplus(x)
+    p       = torch.sigmoid(logits)
+
+    mod_pos = (1.0 - p).clamp_min(eps).pow(gamma)
+    mod_neg = p.clamp_min(eps).pow(gamma)
+
+    if alpha is None:
+        alpha_pos = alpha_neg = 1.0
+    else:
+        if not torch.is_tensor(alpha):
+            alpha = logits.new_tensor(alpha, dtype=logits.dtype)
+        if alpha.numel() == 1:
+            alpha_pos = alpha
+            alpha_neg = 1.0 - alpha
+        elif alpha.numel() == 2:
+            alpha_pos, alpha_neg = alpha.reshape(-1)
+        else:
+            raise ValueError("alpha must be None, a scalar, or a length-2 sequence/tensor")
+
+    loss_pos = -target * mod_pos * log_p * alpha_pos
+    loss_neg = -(1.0 - target) * mod_neg * log_1mp * alpha_neg
+    loss = loss_pos + loss_neg
+    if reduction == "mean": return loss.mean()
+    if reduction == "sum":  return loss.sum()
+    return loss
+
+
+
+def soft_focal_cross_entropy(
+    logits: torch.Tensor,              # [N, C]
+    target: torch.Tensor,              # [N, C] (soft labels; rows sum≈1)
+    gamma: float = 2.0,
+    alpha: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
+    reduction: str = "mean",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Focal cross-entropy that supports SOFT targets.
+      loss_i = - sum_c t_ic * (1 - p_ic)^gamma * log p_ic * alpha_c
+    """
+    logp = F.log_softmax(logits, dim=-1)
+    p    = logp.exp()
+
+    mod  = (1.0 - p).clamp_min(eps).pow(gamma)             # [N, C]
+    loss = -target * mod * logp                            # [N, C]
+
+    if alpha is not None:
+        if not torch.is_tensor(alpha):
+            alpha = logits.new_tensor(alpha, dtype=loss.dtype)
+        loss = loss * alpha.view(1, -1)                    # broadcast [1, C]
+
+    loss = loss.sum(dim=-1)                                # [N]
+    if reduction == "mean": return loss.mean()
+    if reduction == "sum":  return loss.sum()
+    return loss
+
+
 def dice_score(inputs: torch.Tensor,
                targets: torch.Tensor,
                smooth_num: float = 0,
@@ -781,3 +1250,268 @@ def generate_positive_and_negative_masks(labels1: torch.Tensor, labels2: torch.T
 
     return positive_mask, negative_mask
 
+
+@torch.no_grad()
+def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
+    cid = class_id.to(torch.int64); eid = event_id.to(torch.int64)
+    key = (eid << 32) | cid
+    uniq_key, inv_group = torch.unique(key, return_inverse=True)   # groups G
+    G = uniq_key.numel()
+    group_eid = (uniq_key >> 32)
+    ord_g = torch.argsort(group_eid)
+    ge_sorted = group_eid[ord_g]
+
+    first = torch.ones_like(ge_sorted, dtype=torch.bool)
+    first[1:] = ge_sorted[1:] != ge_sorted[:-1]
+    starts = torch.nonzero(first, as_tuple=False).squeeze(1)
+    counts = torch.diff(torch.cat([starts, ge_sorted.new_tensor([ge_sorted.numel()])]))
+    E = starts.numel()
+
+    pos = torch.arange(G, device=class_id.device)
+    start_for_pos = starts.repeat_interleave(counts)
+    rank_sorted = pos - start_for_pos
+    rank_in_event = torch.empty(G, dtype=torch.long, device=class_id.device)
+    rank_in_event[ord_g] = rank_sorted
+
+    eidx_for_pos = torch.arange(E, device=class_id.device).repeat_interleave(counts)
+    eidx_for_group = torch.empty(G, dtype=torch.long, device=class_id.device)
+    eidx_for_group[ord_g] = eidx_for_pos
+
+    offset = torch.zeros(E, dtype=torch.long, device=class_id.device)
+    if E > 1: offset[1:] = torch.cumsum(counts[:-1], dim=0)
+
+    events_sorted = ge_sorted[starts]  # unique event ids in segment order
+
+    return inv_group, {
+        "ord_g": ord_g, "rank": rank_in_event, "eidx": eidx_for_group,
+        "counts": counts, "offset": offset, "events_sorted": events_sorted
+    }
+    
+
+def prototype_contrastive_loss(
+    z: torch.Tensor,
+    class_id: torch.Tensor,
+    event_id: torch.Tensor,
+    num_neg: int = 64,
+    temperature: float = 0.07,
+    normalize: bool = True,
+    pool_mult: int = 4,
+    semi_hard: bool = False,
+    semi_hard_margin: float = 0.05,
+) -> torch.Tensor:
+    """
+    Leave-one-out prototype contrastive loss.
+    Positives: class prototype excluding the anchor.
+    Negatives: other class prototypes within the same event.
+    """
+
+    if z.numel() == 0:
+        return z.new_zeros(())
+
+    # filter valid hits
+    valid = class_id >= 0
+    if not torch.any(valid):
+        return z.new_zeros(())
+
+    z   = z[valid]
+    cid = class_id[valid].long()
+    eid = event_id[valid].long()
+    if normalize:
+        z = F.normalize(z, dim=-1)
+
+    # group by (event, class)
+    inv_group, Pidx = _build_grouping(eid, cid)              # inv_group: [M]
+    G, D = int(Pidx["rank"].numel()), z.size(1)
+
+    P_sum = z.new_zeros((G, D))
+    P_sum.index_add_(0, inv_group, z)                        # sum per (event,class)
+    cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)
+
+    # Per-hit metadata
+    g          = inv_group
+    local_pos  = Pidx["rank"][g]                             # position within event's classes
+    eidx       = Pidx["eidx"][g]                             # event index per hit
+    Ue         = Pidx["counts"][eidx]                        # #classes in event (per hit)
+    off        = Pidx["offset"][eidx]                        # start offset in ord_g (per hit)
+    cls_cnt    = cnt_vec[g]                                  # class size (per hit)
+
+    # keep: need >=2 classes in event & class size >=2 (for leave-one-out)
+    keep = (Ue >= 2) & (cls_cnt >= 2)
+    if not torch.any(keep):
+        return z.new_zeros(())
+
+    z, g, local_pos, Ue, off, cls_cnt = (
+        z[keep], g[keep], local_pos[keep], Ue[keep], off[keep], cls_cnt[keep]
+    )
+
+    # prototypes
+    P_pos = (P_sum[g] - z) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)  # leave-one-out
+    if normalize:
+        P_pos = F.normalize(P_pos, dim=-1)
+
+    P_mean = (P_sum / cnt_vec.unsqueeze(1).to(P_sum.dtype)).detach() # other-class means (no grad)
+    if normalize:
+        P_mean = F.normalize(P_mean, dim=-1)
+
+    # negative candidate pool (K_pool scalar)
+    M = z.size(0)
+    max_avail = int((Ue - 1).max().item())                   # max negatives available in any row
+    if max_avail <= 0:
+        return z.new_zeros(())
+
+    K_pool  = min(max_avail, int(num_neg * pool_mult))       # scalar
+    K_final = min(num_neg, K_pool)                            # scalar used by topk
+    if K_final <= 0:
+        return z.new_zeros(())
+
+    # Per-row available negatives (clamped by global pool size)
+    K_eff = torch.clamp(Ue - 1, max=K_pool)                  # [M]
+
+    # Sample candidate indices uniformly with replacement per row
+    ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
+    rnd = torch.rand(M, K_pool, device=z.device, dtype=ftype)
+    neg_raw = torch.floor(rnd * K_eff.unsqueeze(1).to(ftype)).to(torch.long)  # [M,K_pool] in [0..K_eff-1]
+
+    # Skip the positive class index by inserting a gap at local_pos
+    neg_local = neg_raw + (neg_raw >= local_pos.unsqueeze(1)).to(torch.long)  # [M,K_pool]
+
+    # Map local class indices to global (event,class) group ids
+    base = off.unsqueeze(1) + neg_local                                        # [M,K_pool]
+    neg_group = Pidx["ord_g"][base]                                            # [M,K_pool]
+    P_negs = P_mean[neg_group]                                                 # [M,K_pool,D]
+
+    # Mask columns beyond what's available in each row
+    col = torch.arange(K_pool, device=z.device).unsqueeze(0)                   # [1,K_pool]
+    neg_valid = col < K_eff.unsqueeze(1)                                       # [M,K_pool]
+
+    # similarities
+    pos_sim = (z * P_pos).sum(-1, keepdim=True)                                # [M,1]
+    neg_sim_full = torch.einsum('md,mkd->mk', z, P_negs)                       # [M,K_pool]
+    neg_sim_full = neg_sim_full.masked_fill(~neg_valid, float('-inf'))
+
+    # pick negatives (semi-hard or hard)
+    if semi_hard:
+        # within margin below positive
+        sh_mask   = (neg_sim_full < pos_sim) & (neg_sim_full > (pos_sim - semi_hard_margin))
+        sh_scores = neg_sim_full.masked_fill(~sh_mask, float('-inf'))
+        sh_vals, sh_idx = torch.topk(sh_scores, k=K_final, dim=1)
+        rows_enough = torch.isfinite(sh_vals).sum(dim=1) == K_final
+
+        # fallback: hardest among all valid
+        fb_idx = torch.topk(neg_sim_full, k=K_final, dim=1).indices
+        idx_sel = torch.where(rows_enough.unsqueeze(1), sh_idx, fb_idx)
+    else:
+        idx_sel = torch.topk(neg_sim_full, k=K_final, dim=1).indices
+
+    neg_sim = torch.gather(neg_sim_full, 1, idx_sel)                            # [M,K_final]
+
+    # logits & loss
+    logits  = torch.cat([pos_sim, neg_sim], dim=1) / temperature               # [M,1+K_final]
+    targets = torch.zeros(M, dtype=torch.long, device=z.device)
+    return F.cross_entropy(logits, targets, reduction="mean")
+
+
+def ghost_pushaway_loss(
+    z: torch.Tensor,
+    class_id: torch.Tensor,
+    event_id: torch.Tensor,
+    ghost_mask: torch.Tensor,
+    num_neg: int = 32,
+    temperature: float = 0.07,
+    normalize: bool = True,
+) -> torch.Tensor:
+    # build real prototypes (fixed for stability)
+    real = class_id >= 0
+    if not torch.any(real):
+        return z.new_zeros(())
+
+    z_r   = z[real]
+    eid_r = event_id[real].long()
+    cid_r = class_id[real].long()
+
+    inv_group, Pidx = _build_grouping(eid_r, cid_r)     # inv_group: [Nr]
+    G, D = int(Pidx["rank"].numel()), z.size(1)
+
+    # check inv_group bounds on CPU to catch issues early
+    ig = inv_group.detach().cpu()
+    if ig.numel() == 0 or ig.min().item() < 0 or ig.max().item() >= G:
+        raise AssertionError("invalid grouping in ghost_pushaway_loss")
+
+    with torch.no_grad():
+        P = z_r.new_zeros((G, D))
+        zr = F.normalize(z_r, dim=-1) if normalize else z_r
+        zr = zr.to(z_r.dtype) 
+        P.index_add_(0, inv_group, zr)                   # sum per (event,class)
+        cnt = torch.bincount(inv_group, minlength=G).clamp_min_(1).to(P.dtype).unsqueeze(1)
+        P = P / cnt
+        if normalize:
+            P = F.normalize(P, dim=-1)
+
+    # pick ghosts that belong to events with real prototypes
+    ghosts = ghost_mask.bool()
+    if not torch.any(ghosts):
+        return z.new_zeros(())
+
+    z_g = z[ghosts]
+    e_g = event_id[ghosts].long()
+    if normalize:
+        z_g = F.normalize(z_g, dim=-1)
+
+    events_sorted = Pidx["events_sorted"]               # [E], ascending
+    E = events_sorted.numel()
+    if E == 0:
+        return z.new_zeros(())
+    
+    idx = torch.searchsorted(events_sorted, e_g)        # [Ng]
+    in_range = idx < E
+    # clamp to avoid OOB; only compared where in_range is True
+    idx_clamped = idx.clamp_max(E - 1)
+    matches = (events_sorted[idx_clamped] == e_g)
+    have_real = in_range & matches
+    if not torch.any(have_real):
+        return z.new_zeros(())
+
+    z_g  = z_g[have_real]                               # [M,D]
+    eidx = idx[have_real].to(z.device)                  # [M] (0..E-1)
+    M    = z_g.size(0)
+
+    # per-event subset (vectorised)
+    counts  = Pidx["counts"].to(z.device)               # [E]
+    offsets = Pidx["offset"].to(z.device)               # [E]
+    ord_g   = Pidx["ord_g"].to(z.device)                # [sum(counts)]
+
+    Umax = int(counts.max().item())
+    if Umax == 0:
+        return z.new_zeros(())
+
+    K = min(int(num_neg), Umax)
+    if K == 0:
+        return z.new_zeros(())
+
+    col = torch.arange(Umax, device=z.device)           # [Umax]
+    valid_ev = col.unsqueeze(0) < counts.unsqueeze(1)   # [E, Umax]
+
+    # Uniform w/o replacement via masked top-k over random scores
+    work_dtype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
+    scores = torch.rand(counts.numel(), Umax, device=z.device, dtype=work_dtype)
+    scores = scores.masked_fill(~valid_ev, float('-inf'))
+    sel_local = torch.topk(scores, k=K, dim=1).indices   # [E, K]
+
+    # CLAMP local indices so base indexing is ALWAYS in-range
+    sel_local_safe = torch.minimum(sel_local, (counts - 1).unsqueeze(1))   # [E,K]
+    base = offsets.unsqueeze(1) + sel_local_safe                           # [E,K]
+    sel_groups = ord_g.index_select(0, base.reshape(-1)).reshape(-1, K)    # [E,K]
+
+    # Gather prototypes and validity, then broadcast to ghosts
+    P_sel   = P.index_select(0, sel_groups.reshape(-1)).reshape(-1, K, D)  # [E,K,D]
+    sel_val = torch.gather(valid_ev, 1, sel_local).to(torch.bool)          # [E,K]
+
+    Pg       = P_sel.index_select(0, eidx)                                 # [M,K,D]
+    valid_g  = sel_val.index_select(0, eidx)                               # [M,K]
+
+    # similarities & log-mean-exp push-away
+    sims = torch.einsum('md,mkd->mk', z_g, Pg) / temperature               # [M,K]
+    sims = sims.masked_fill(~valid_g, float('-inf'))
+    lse   = torch.logsumexp(sims, dim=1)                                   # [M]
+    k_eff = valid_g.sum(dim=1).clamp_min(1).to(lse.dtype)
+    return (lse - torch.log(k_eff)).mean()

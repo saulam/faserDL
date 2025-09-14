@@ -124,10 +124,14 @@ class SparseFASERCALDataset(Dataset):
         rear_hcal_energy = data['rear_hcal_energy'].item()
         rear_hcal_modules = data['rear_hcal_modules']#.sum()
         rear_mucal_energy = data['rear_mucal_energy'].item()
+        vis_sp_momentum = data['vis_sp_momentum']
         out_lepton_momentum = data['out_lepton_momentum']
+        in_neutrino_pdg = data['in_neutrino_pdg'].item()
         in_neutrino_energy = data['in_neutrino_energy'].item()
         out_lepton_energy = data['out_lepton_energy'].item()
         jet_momentum = data['jet_momentum']
+        tauvis_momentum = data['tauvis_momentum']
+
         try:
             pdg = np.unique(np.concatenate([true_hits[reco_hit_true if isinstance(reco_hit_true, list) else reco_hit_true.astype(int)][:, 3] for reco_hit, reco_hit_true in zip(reco_hits, reco_hits_true)]))
         except:
@@ -138,16 +142,22 @@ class SparseFASERCALDataset(Dataset):
         z = np.unique(np.stack((data['reco_hits'][:, 2], data['reco_hits'][:, 3]), axis=1), axis=0)
         q = data['reco_hits'][:, 4].round().astype(int)
         e_vis = np.array([e_vis])
+        pt_miss = np.array([pt_miss])
         if is_cc:
             e_vis_cc = e_vis
             e_vis_nc = np.array([])
-            pt_miss = np.array([])
+            pt_miss_cc = pt_miss
+            pt_miss_nc = np.array([])
             out_lepton_momentum = out_lepton_momentum.reshape(1, 3)
         else:
             e_vis_cc = np.array([])
             e_vis_nc = e_vis
-            pt_miss = np.array([pt_miss])
-            out_lepton_momentum = np.array([]).reshape(0, 3)
+            pt_miss_cc = np.array([])
+            pt_miss_nc = pt_miss
+            out_lepton_momentum = np.zeros(shape=(1, 3))
+        if is_cc and in_neutrino_pdg in [-16, 16]:  # nutau
+            out_lepton_momentum = tauvis_momentum.reshape(1, 3)
+        vis_sp_momentum = vis_sp_momentum.reshape(1, 3)
         jet_momentum = jet_momentum.reshape(1, 3)
 
         module_hits = np.bincount(reco_hits[:, 3].astype(int))
@@ -166,7 +176,8 @@ class SparseFASERCALDataset(Dataset):
 
         return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
                 "e_vis": e_vis, "e_vis_cc": e_vis_cc, "e_vis_nc": e_vis_nc, 
-                "pt_miss": pt_miss,
+                "pt_miss": pt_miss, "pt_miss_cc": pt_miss_cc, "pt_miss_nc": pt_miss_nc,
+                "vis_sp_momentum": vis_sp_momentum,
                 "out_lepton_momentum": out_lepton_momentum,
                 "jet_momentum": jet_momentum,
                 "faser_cal_energy": faser_cal_energy,
@@ -194,6 +205,9 @@ def collate(batch):
     e_vis_cc = np.concatenate([x['e_vis_cc'] for x in batch])
     e_vis_nc = np.concatenate([x['e_vis_nc'] for x in batch])
     pt_miss = np.concatenate([x['pt_miss'] for x in batch])
+    pt_miss_cc = np.concatenate([x['pt_miss_cc'] for x in batch])
+    pt_miss_nc = np.concatenate([x['pt_miss_nc'] for x in batch])
+    vis_sp_momentum = np.concatenate([x['vis_sp_momentum'] for x in batch])
     out_lepton_momentum = np.concatenate([x['out_lepton_momentum'] for x in batch])
     jet_momentum = np.concatenate([x['jet_momentum'] for x in batch])
     faser_cal_energy = np.concatenate([x['faser_cal_energy'] for x in batch])
@@ -211,7 +225,8 @@ def collate(batch):
     
     return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
             "e_vis": e_vis, "e_vis_cc": e_vis_cc, "e_vis_nc": e_vis_nc,
-            "pt_miss": pt_miss,
+            "pt_miss": pt_miss, "pt_miss_cc": pt_miss_cc, "pt_miss_nc": pt_miss_nc,
+            "vis_sp_momentum": vis_sp_momentum,
             "out_lepton_momentum": out_lepton_momentum,
             "jet_momentum": jet_momentum,
             "faser_cal_energy": faser_cal_energy,
@@ -238,6 +253,9 @@ e_vis = []
 e_vis_cc = []
 e_vis_nc = []
 pt_miss = []
+pt_miss_cc = []
+pt_miss_nc = []
+vis_sp_momentum = []
 out_lepton_momentum = []
 jet_momentum = []
 faser_cal_energy = []
@@ -263,6 +281,9 @@ for i, batch in t:
     e_vis_cc.append(batch["e_vis_cc"])
     e_vis_nc.append(batch["e_vis_nc"])
     pt_miss.append(batch["pt_miss"])
+    pt_miss_cc.append(batch["pt_miss_cc"])
+    pt_miss_nc.append(batch["pt_miss_nc"])
+    vis_sp_momentum.append(batch["vis_sp_momentum"])
     out_lepton_momentum.append(batch["out_lepton_momentum"])
     jet_momentum.append(batch["jet_momentum"])
     faser_cal_energy.append(batch["faser_cal_energy"])
@@ -287,10 +308,17 @@ e_vis = np.concatenate(e_vis)
 e_vis_cc = np.concatenate(e_vis_cc)
 e_vis_nc = np.concatenate(e_vis_nc)
 pt_miss = np.concatenate(pt_miss)
+pt_miss_cc = np.concatenate(pt_miss_cc)
+pt_miss_nc = np.concatenate(pt_miss_nc)
+vis_sp_momentum = np.concatenate(vis_sp_momentum)
+vis_sp_momentum_magnitude = np.linalg.norm(vis_sp_momentum, axis=1)
+vis_sp_momentum_magnitude = vis_sp_momentum_magnitude[vis_sp_momentum_magnitude != 0]
 out_lepton_momentum = np.concatenate(out_lepton_momentum)
 out_lepton_momentum_magnitude = np.linalg.norm(out_lepton_momentum, axis=1)
+out_lepton_momentum_magnitude = out_lepton_momentum_magnitude[out_lepton_momentum_magnitude != 0]
 jet_momentum = np.concatenate(jet_momentum)
 jet_momentum_magnitude = np.linalg.norm(jet_momentum, axis=1)
+jet_momentum_magnitude = jet_momentum_magnitude[jet_momentum_magnitude != 0]
 faser_cal_energy = np.concatenate(faser_cal_energy)
 faser_cal_modules = np.concatenate(faser_cal_modules)
 rear_cal_energy = np.concatenate(rear_cal_energy)
@@ -305,35 +333,40 @@ event_hits = np.concatenate(event_hits)
 
 print("Done with concat")
 
-def get_dict(x):
-    return {'mean': x.mean(),
-            'median': np.median(x),
-            'std': x.std(),
-            'min': x.min(),
-            'max': x.max()}
+def get_dict(x, axis=None):
+    return {
+        'mean':   x.mean(axis=axis),
+        'median': np.median(x, axis=axis),
+        'std':    x.std(axis=axis),
+        'min':    x.min(axis=axis),
+        'max':    x.max(axis=axis),
+    }
 
 # assemble base metadata
-base_keys = ['e_vis', 'e_vis_cc', 'e_vis_nc', 'pt_miss',
-             'out_lepton_momentum_magnitude', 'jet_momentum_magnitude', 
+base_keys = ['e_vis', 'e_vis_cc', 'e_vis_nc', 'pt_miss', 'pt_miss_cc', 'pt_miss_nc',
+             'vis_sp_momentum', 'vis_sp_momentum_magnitude',
+             'out_lepton_momentum', 'out_lepton_momentum_magnitude',
+             'jet_momentum', 'jet_momentum_magnitude',
              'in_neutrino_energy', 'out_lepton_energy',
              'faser_cal_energy', 'faser_cal_modules',
              'rear_cal_energy', 'rear_cal_modules',
              'rear_hcal_energy', 'rear_hcal_modules',
              'rear_mucal_energy', 'module_hits', 'event_hits',
             ]
+vector_keys = {'vis_sp_momentum', 'out_lepton_momentum', 'jet_momentum'}
 
 metadata = {}
 for key in base_keys:
     arr = locals()[key]
-    metadata[key] = get_dict(arr)
-    metadata[f"{key}_log1p"] = get_dict(np.log1p(arr))
-    metadata[f"{key}_sqrt"] = get_dict(np.sqrt(arr))
+    axis = 0 if key in vector_keys else None
+    metadata[key] = get_dict(arr, axis=axis)
+    metadata[f"{key}_log1p"] = get_dict(np.log1p(arr), axis=axis)
+    metadata[f"{key}_sqrt"]  = get_dict(np.sqrt(arr), axis=axis)
 
-# … inside your script, after “Done with loader” …
 # q_counter has been built via q_counter.update(batch["q"])
 total_hits = sum(q_counter.values())
 
-# 1) compute raw-q stats
+# compute raw-q stats
 q_mean = sum(val * cnt for val, cnt in q_counter.items()) / total_hits
 q2_mean = sum((val**2) * cnt for val, cnt in q_counter.items()) / total_hits
 q_std = np.sqrt(q2_mean - q_mean**2)
@@ -349,7 +382,7 @@ for val in sorted(q_counter):
 q_min = min(q_counter)
 q_max = max(q_counter)
 
-# 2) compute log1p-q stats
+# compute log1p-q stats
 #    E[log1p(q)], E[(log1p(q))^2], etc.
 q_lp_mean = sum(np.log1p(val)    * cnt for val, cnt in q_counter.items()) / total_hits
 q_lp2_mean= sum((np.log1p(val)**2)* cnt for val, cnt in q_counter.items()) / total_hits
@@ -358,7 +391,7 @@ q_lp_median = np.log1p(q_median)
 q_lp_min    = np.log1p(q_min)
 q_lp_max    = np.log1p(q_max)
 
-# 3) compute sqrt-q stats
+# compute sqrt-q stats
 #    E[sqrt(q)], E[(sqrt(q))^2], etc.
 q_s_mean = sum(np.sqrt(val)    * cnt for val, cnt in q_counter.items()) / total_hits
 q_s2_mean= sum((np.sqrt(val)**2)* cnt for val, cnt in q_counter.items()) / total_hits
@@ -367,7 +400,7 @@ q_s_median = np.sqrt(q_median)
 q_s_min    = np.sqrt(q_min)
 q_s_max    = np.sqrt(q_max)
 
-# 4) inject into your metadata dict
+# inject into metadata dict
 metadata['q'] = {
     'mean':   q_mean,
     'median': q_median,
@@ -399,7 +432,7 @@ metadata.update({'x': x, 'y': y, 'z': z,
 
 # save metadata
 import pickle as pk
-with open("/scratch2/salonso/faser/events_v5.1b/metadata.pkl", "wb") as fd:
+with open("/scratch/salonso/sparse-nns/faser/events_v5.1b/metadata.pkl", "wb") as fd:
     pk.dump(metadata, fd)
 
-print("Metadata with log1p and sqrt statistics saved.")
+print("Metadata saved.")

@@ -1,465 +1,388 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-# URL: https://github.com/facebookresearch/ConvNeXt-V2/blob/main/models/utils.py
-
-import numpy.random as random
-
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
-from torch.cuda.amp import autocast
-from timm.models.layers import trunc_normal_, DropPath
+import warnings
+from timm.models.vision_transformer import Attention, Block, LayerScale
+from timm.models.layers import DropPath, Mlp
 from MinkowskiEngine import (
     SparseTensor,
-    MinkowskiConvolution,
     MinkowskiDepthwiseConvolution,
     MinkowskiLinear,
     MinkowskiGELU,
-    MinkowskiGlobalAvgPooling,
 )
 
 
-def _init_weights(m):
-    """Custom weight initialization for various layers."""
-    if isinstance(m, MinkowskiConvolution):
-        trunc_normal_(m.kernel, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, MinkowskiDepthwiseConvolution):
-        trunc_normal_(m.kernel)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, MinkowskiLinear):
-        trunc_normal_(m.linear.weight)
-        if m.linear.bias is not None:
-            nn.init.constant_(m.linear.bias, 0)
-    elif isinstance(m, nn.Linear):
-        trunc_normal_(m.weight, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Embedding):
-        nn.init.trunc_normal_(m.weight, std=0.02)
-    elif isinstance(m, nn.LayerNorm):
-        nn.init.constant_(m.bias, 0)
-        nn.init.constant_(m.weight, 1.0)
-    elif isinstance(m, nn.Conv2d):
-        w = m.weight.data
-        trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
-        nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Conv3d):
-        w = m.weight.data
-        trunc_normal_(w.view([w.shape[0], -1]), std=0.02)
-        nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.ConvTranspose3d):
-        w = m.weight.data
-        trunc_normal_(w.view(w.shape[0], -1))
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.LSTM):
-        for name, param in m.named_parameters():
-            if 'weight_ih' in name:
-                init.xavier_uniform_(param.data)
-            elif 'weight_hh' in name:
-                init.orthogonal_(param.data)
-            elif 'bias' in name:
-                param.data.fill_(0)
-                hidden_size = m.hidden_size
-                param.data[hidden_size:2*hidden_size].fill_(1)
+HAS_SDPA = hasattr(F, "scaled_dot_product_attention")
+
+
+def _attn_classic(q, k, v, mask, drop_p, training, is_causal):
+    # q:[B,H,Q,D], k/v:[B,H,K,D]; mask: bool keep or additive float broadcastable to [B,1,Q,K]
+    scale = 1.0 / math.sqrt(q.size(-1))
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if mask is not None:
+        scores = scores + mask
+    attn = torch.softmax(scores, dim=-1)
+    if training and drop_p > 0.0:
+        attn = F.dropout(attn, p=drop_p)
+    return torch.matmul(attn, v)
+
+
+def _attn_sdpa(q, k, v, mask, drop_p, training, is_causal):
+    # Prefer Flash, never mem-efficient; allow math fallback
+    try:
+        with torch.backends.cuda.sdp_kernel(enable_flash=True,
+                                            enable_mem_efficient=False,
+                                            enable_math=True):
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=(drop_p if training else 0.0),
+                is_causal=is_causal
+            )
+    except Exception as e:
+        raise e
+
+
+_ATTENTION_IMPL = _attn_classic if (not HAS_SDPA) else _attn_sdpa
+_warned = False
+
+
+def sdpa_safe(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, training=False):
+    """
+    q,k,v: [B,H,Q,D], [B,H,K,D], [B,H,K,D]
+    attn_mask: None OR bool keep mask OR additive float mask, broadcastable to [B,1,Q,K]
+    """
+    global _ATTENTION_IMPL, _warned
+    try:
+        return _ATTENTION_IMPL(q, k, v, attn_mask, dropout_p, training, is_causal)
+    except Exception as e:
+        # Switch permanently to the classic path (warn once)
+        if _ATTENTION_IMPL is _attn_sdpa:
+            if not _warned:
+                warnings.warn(f"SDPA failed ({type(e).__name__}: {e}); "
+                              f"switching to classic attention for the rest of this run.")
+                _warned = True
+            _ATTENTION_IMPL = _attn_classic
+            return _ATTENTION_IMPL(q, k, v, attn_mask, dropout_p, training, is_causal)
+        raise
+    
+
+def _to_sdpa_mask(mask, B, Q, K, device, dtype):
+    if mask is None:
+        return None
+    if mask.ndim == 2 and mask.shape == (B, K):   # key padding on KV
+        m = mask.view(B, 1, 1, K).to(device=device)
+    elif mask.ndim == 3 and mask.shape == (B, Q, K):
+        m = mask.view(B, 1, Q, K).to(device=device)
     else:
-        for attr in ('mask_voxel_emb', 'mask_mod_emb', 'empty_mod_emb',
-                     'cls_mod', 'cls_evt'):
-            if hasattr(m, attr):
-                init.normal_(getattr(m, attr), std=0.02)
+        raise ValueError(f"Bad mask shape {tuple(mask.shape)}")
+    if mask.dtype == torch.bool:
+        NEG = -1e4 if dtype in (torch.float16, torch.bfloat16) else -1e9
+        m = torch.where(m, 0.0, NEG)
+    return m
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=200):
-        super().__init__()
-
-        # Precompute [max_len × d_model] sinusoidal table once
-        pe = torch.zeros(max_len, d_model).float()
-        pe.requires_grad = False
-
-        position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = (
-            torch.arange(0, d_model, 2).float() *
-            -(math.log(10000.0) / d_model)
-        ).exp()
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        pe = pe.unsqueeze(0)   # shape = [1, max_len, d_model]
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        return self.pe[:, : x.size(1)]
+# NOTE: patch works for timm version 0.6.13
+class MaskableAttention(Attention):
+    def forward(self, x, attn_mask=None):  # x: [B, N, C]
+        B, N, C = x.shape
+        qkv = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        q, k, v = qkv.unbind(0)  # [B,H,N,hdim]
+        block = _to_sdpa_mask(attn_mask, B, Q=N, K=N, device=x.device, dtype=x.dtype)
+        p = self.attn_drop.p if self.training and self.attn_drop.p > 0 else 0.0
+        out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            raise RuntimeError("NaN/Inf in SDPA output (self-attn)")
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)  # fp32
+        return self.proj_drop(out)
 
 
-class PositionalEncoding3D(nn.Module):
-    """
-    3D sinusoidal positional encoding.
+class BlockWithMask(Block):
+    def __init__(
+            self,
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            drop=0.,
+            attn_drop=0.,
+            init_values=None,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm
+    ):
+        super().__init__(
+            dim,
+            num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            drop=drop,
+            attn_drop=attn_drop,
+            init_values=init_values,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+        )
+        self.attn = MaskableAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
 
-    Args:
-        L (int): Number of frequency bands per axis. Produces 2*L features per axis, total out_dim = 6 * L.
-    """
-    def __init__(self, L: int):
-        super(PositionalEncoding3D, self).__init__()
-        self.L = L
-        freqs = 2. ** torch.arange(L).float() * torch.pi
-        self.register_buffer('freqs', freqs)
-
-    @property
-    def out_dim(self) -> int:
-        """Total output dimension of the encoding (6 * L)."""
-        return 6 * self.L
-
-    def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        x, y, z = coords.unbind(-1)
-        xp = x.unsqueeze(-1) * self.freqs
-        yp = y.unsqueeze(-1) * self.freqs
-        zp = z.unsqueeze(-1) * self.freqs
-
-        # Compute sin/cos for each
-        sin_x, cos_x = torch.sin(xp), torch.cos(xp)
-        sin_y, cos_y = torch.sin(yp), torch.cos(yp)
-        sin_z, cos_z = torch.sin(zp), torch.cos(zp)
-
-        # Concatenate along feature dimension
-        pos_enc = torch.cat([sin_x, cos_x, sin_y, cos_y, sin_z, cos_z], dim=-1)
-        return pos_enc
-
-
-class TransposeUpsampleDecoder(nn.Module):
-    def __init__(self, input_dim, hidden_channels=16):
-        super().__init__()
-        
-        self.init_dims = (6, 6, 5)
-        self.hidden = hidden_channels
-        self.fc = nn.Linear(input_dim,
-                            hidden_channels * self.init_dims[0] * self.init_dims[1] * self.init_dims[2])
-        self.deconv1 = nn.ConvTranspose3d(hidden_channels,
-                                          hidden_channels,
-                                          kernel_size=(4, 4, 2),
-                                          stride=(4, 4, 2))
-        self.deconv2 = nn.ConvTranspose3d(hidden_channels,
-                                          hidden_channels,
-                                          kernel_size=(2, 2, 2),
-                                          stride=(2, 2, 2))
-        self.conv_out = nn.Conv3d(hidden_channels, 1, kernel_size=3, padding=1)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        B = x.size(0)
-        x = self.fc(x)                                 # [B, hidden*6*6*5]
-        x = x.view(B, self.hidden, *self.init_dims)    # [B, hidden, 6, 6, 5}
-        x = self.act(self.deconv1(x))                  # [B, hidden, 24, 24, 10]
-        x = self.act(self.deconv2(x))                  # [B, hidden, 48, 48, 20]
-        x = self.conv_out(x)                           # [B, 1, 48, 48, 20]
+    def forward(self, x, attn_mask=None):
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
 
-class Upsample3DDecoder(nn.Module):
-    def __init__(self,
-                 latent_dim: int,
-                 decoder_dim: int = 64,
-                 depth: int = 1,
-                 init_size=(6,6,5),
-                 patch_size=(8,8,4)
-                ):
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0., proj_drop=0.):
         super().__init__()
-        H0, W0, D0 = init_size
-        ph, pw, pd = patch_size
-        pv = ph * pw * pd
+        assert dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q  = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop_p = float(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        self.proj = nn.Linear(latent_dim, decoder_dim * H0 * W0 * D0)
-        self.blocks = nn.Sequential(*[
-            BlockDense(decoder_dim)
-            for _ in range(depth)
-        ])
-        self.pred = nn.Conv3d(decoder_dim, pv, kernel_size=1)
-        self.init_size = init_size
-        self.patch_size = patch_size
+    def forward(self, q_in, kv_in, attn_mask=None):  # q_in:[B,Nq,C], kv_in:[B,Nk,C]
+        B, Nq, C = q_in.shape
+        Nk = kv_in.shape[1]
+        H  = self.num_heads
+        q = self.q(q_in).view(B, Nq, H, C // H).transpose(1, 2).contiguous()              # [B, H, Nq, hdim]
+        kv = self.kv(kv_in).view(B, Nk, 2, H, C // H).permute(2, 0, 3, 1, 4).contiguous() # [2, B, H, Nk, hdim]
+        k, v = kv.unbind(0)       # [B, H, Nk, hdim]
+        block = _to_sdpa_mask(attn_mask, B, Q=Nq, K=Nk, device=q_in.device, dtype=q_in.dtype)
+        p = self.attn_drop_p if (self.training and self.attn_drop_p > 0) else 0.0
+        out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
+        out = out.transpose(1, 2).reshape(B, Nq, C)
+        out = self.proj(out)
+        return self.proj_drop(out)
 
-    def forward(self, z):
-        """
-        z: [M_masked, latent_dim]
-        returns: [M_masked, 1, 48, 48, 20]
-        """
-        M = z.size(0)
-        H0, W0, D0 = self.init_size
-        ph, pw, pd = self.patch_size
 
-        x = self.proj(z)                                # [B, dec*H0*W0*D0]
-        x = x.view(M, -1, H0, W0, D0)                   # [B, dec, 6, 6, 5]
-        x = self.blocks(x)                              # [B, dec, 6, 6, 5]
-        x = self.pred(x)                                # [B, ph*pw*pd, 6, 6, 5]
-        x = x.permute(0, 2, 3, 4, 1)                    # [B, 6, 6, 5, pv]
-        x = x.view(M, H0, W0, D0, ph, pw, pd)
-        x = x.permute(0, 4, 1, 5, 2, 6, 3)              # [B, ph, 6, pw, 6, pd, 5]
-        x = x.contiguous().view(M, 1,
-                                ph*H0,
-                                pw*W0,
-                                pd*D0)                  # [B, 1, 48, 48, 20]
+class CrossAttnBlock(nn.Module):
+    def __init__(
+        self, dim, num_heads=8, mlp_ratio=4.0, qkv_bias=False, drop=0.,
+        attn_drop=0., init_values=None, drop_path=0.,
+        act_layer=nn.GELU, norm_layer=nn.LayerNorm
+    ):
+        super().__init__()
+        self.norm_q   = norm_layer(dim)   # for queries
+        self.norm_kv = norm_layer(dim)    # for keys/values
+        self.attn = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, 
+                                   attn_drop=attn_drop, proj_drop=drop)
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2   = norm_layer(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()        
+    
+    def forward(self, q, kv, attn_mask=None):
+        x = q
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm_q(q), self.norm_kv(kv), attn_mask=attn_mask)))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
 
-class MultiTaskUpsample3DDecoder(nn.Module):
-    def __init__(self,
-                 latent_dim: int,
-                 decoder_dim: int = 64,
-                 depth: int = 1,
-                 init_size=(6,6,5),
-                 patch_size=(8,8,4),
-                ):
-        super().__init__()
-        H0, W0, D0 = init_size
-        ph, pw, pd = patch_size
-        pv = ph * pw * pd  # Channels needed for voxel shuffling
-        self.num_seg_classes = 3
+def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
+    """
+    grid_size: int (for cubic grid) or tuple of ints (H, W, D)
+    returns:
+      pos_embed: [H*W*D, embed_dim] or [cls_tokens+H*W*D, embed_dim] if cls_tokens > 0
+    """
+    if isinstance(grid_size, int):
+        H = W = D = grid_size
+    else:
+        H, W, D = grid_size
 
-        # --- Shared Backbone ---
-        self.proj = nn.Linear(latent_dim, decoder_dim * H0 * W0 * D0)
-        self.blocks = nn.Sequential(*[
-            BlockDense(decoder_dim)
-            for _ in range(depth)
-        ])
-        
-        # --- Four Separate Prediction Heads ---
-        # Head 1: Voxel occupancy (binary classification)
-        self.pred_occupancy = nn.Conv3d(decoder_dim, pv, kernel_size=1)
-        
-        # Head 2: Voxel charge (regression)
-        self.pred_charge = nn.Conv3d(decoder_dim, pv, kernel_size=1)
+    h = np.arange(H, dtype=np.float32)
+    w = np.arange(W, dtype=np.float32)
+    d = np.arange(D, dtype=np.float32)
+    grid_h, grid_w, grid_d = np.meshgrid(h, w, d, indexing='ij')
+    grid = np.stack([grid_h, grid_w, grid_d], axis=0)
+    grid = grid.reshape(3, 1, H, W, D).reshape(3, -1)
 
-        # Head 3: Primary lepton (binary classification)
-        self.pred_lepton = nn.Conv3d(decoder_dim, pv, kernel_size=1)
+    pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token:
+        # prepend a zero-vector for class tokens
+        cls = np.zeros((1, embed_dim), dtype=np.float32)
+        pos_embed = np.vstack((cls, pos_embed))
+    return pos_embed
 
-        # Head 4: Electromagnetic/hadronic/ghost (multi-class classification)
-        self.pred_particle_type = nn.Conv3d(decoder_dim, self.num_seg_classes * pv, kernel_size=1)
 
-        self.init_size = init_size
-        self.patch_size = patch_size
-        self.decoder_dim = decoder_dim
+def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
+    """
+    grid: np.ndarray of shape (3, N)
+    returns: (N, embed_dim)
+    """
+    assert embed_dim % 3 == 0, "embed_dim must be divisible by 3"
+    dim_each = embed_dim // 3
+    # each dim_each must be even so that it can be split sin/cos
+    assert dim_each % 2 == 0, "embed_dim/3 must be even"
 
-    def forward(self, z):
+    emb_h = get_1d_sincos_pos_embed_from_grid(dim_each, grid[0])  # (N, dim_each)
+    emb_w = get_1d_sincos_pos_embed_from_grid(dim_each, grid[1])  # (N, dim_each)
+    emb_d = get_1d_sincos_pos_embed_from_grid(dim_each, grid[2])  # (N, dim_each)
+    
+    return np.concatenate([emb_h, emb_w, emb_d], axis=1)  # (N, 3*dim_each = embed_dim)
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: must be even
+    pos: 1D array of positions, shape (N,)
+    returns: (N, embed_dim)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.
+    omega = 1. / (10000 ** omega)              # (dim/2,)
+
+    pos = pos.reshape(-1)                      # (N,)
+    angles = np.einsum('n,d->nd', pos, omega)  # (N, dim/2)
+
+    emb_sin = np.sin(angles)                   # (N, dim/2)
+    emb_cos = np.cos(angles)                   # (N, dim/2)
+    return np.concatenate([emb_sin, emb_cos], axis=1)
+
+
+class GlobalFeatureEncoderSimple(nn.Module):
+    """
+    Flattens, concatenates, and projects the input features to a specified
+    embedding dimension.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        dropout: float = 0.1,
+        hidden: bool = False,
+        norm_layer: nn.Module = None,
+    ):
         """
-        z: [M_masked, latent_dim]
-        returns: dict with four tensors
+        Args:
+            embed_dim (int): The target embedding dimension of the output token,
+                             which should match the ViT's embedding dimension.
         """
-        M = z.size(0)
-        H0, W0, D0 = self.init_size
-        ph, pw, pd = self.patch_size
-
-        # Shared backbone
-        x_shared = self.proj(z)                                            # [M, C_in*H0*W0*D0]
-        x_shared = x_shared.view(M, self.decoder_dim, H0, W0, D0)          # [M, C_in, H0, W0, D0]
-        x_shared = self.blocks(x_shared)                                   # [M, C_in, H0, W0, D0]
-
-        # Process all heads in parallel
-        x_occ = self.pred_occupancy(x_shared)                              # [M, C_out, H0, W0, D0]
-        x_chg = self.pred_charge(x_shared)                                 # [M, C_out, H0, W0, D0]
-        x_lep = self.pred_lepton(x_shared)                                 # [M, C_out, H0, W0, D0]
-        x_part = self.pred_particle_type(x_shared)                         # [M, C_out, H0, W0, D0]
-
-        # Utility function for unpatching
-        def unpatch(tensor, channels_per_voxel=1):
-            out = tensor.permute(0, 2, 3, 4, 1)                            # [M, H0, W0, D0, C_out]
-            out = out.view(M, H0, W0, D0, ph, pw, pd, channels_per_voxel)  # [M, H0, W0, D0, ph, pw, pd, C_voxel]
-            out = out.permute(0, 7, 4, 1, 5, 2, 6, 3)                      # [M, C_voxel, ph, H0, pw, W0, pd, D0]
-            final_shape = (M, channels_per_voxel, ph*H0, pw*W0, pd*D0)     # [M, C_voxel, ph*H0, pw*W0, pd*D0]
-            return out.contiguous().view(final_shape)                      # [M, C_voxel, 48, 48, 20]
-
-        # Head's output
-        occ_logits = unpatch(x_occ, channels_per_voxel=1)
-        pred_charge = unpatch(x_chg, channels_per_voxel=1)
-        lepton_logits = unpatch(x_lep, channels_per_voxel=1)
-        particle_type_logits = unpatch(x_part, channels_per_voxel=self.num_seg_classes)
-
-        return {
-            "occupancy_logits": occ_logits,         # Shape: [M, 1, 48, 48, 20]
-            "pred_charge": pred_charge,             # Shape: [M, 1, 48, 48, 20]
-            "primlepton_logits": lepton_logits,     # Shape: [M, 1, 48, 48, 20]
-            "seg_logits": particle_type_logits      # Shape: [M, 3, 48, 48, 20]
-        }
-        
-
-class ScaledFourierPosEmb3D(nn.Module):
-    def __init__(self, num_features, d_model, init_scale=5):
         super().__init__()
-        self.B = nn.Parameter(torch.randn(num_features, 3) * init_scale)
-        self.alpha = nn.Parameter(torch.tensor(0.1))
-        self.proj = nn.Linear(2 * num_features, d_model)
-
-    def forward(self, coords):
-        proj_feats = coords @ self.B.t()
-        pe = torch.cat([proj_feats.sin(), proj_feats.cos()], dim=-1)
-        pe = self.alpha * pe
-        return self.proj(pe)
+        self.embed_dim = embed_dim
         
+        # fasercal (10) + ecal (5*5) + hcal (9) + scalars (5)
+        global_feature_dim = 10 + 25 + 9 + 5
 
-class RelPosSelfAttention(nn.Module):
-    def __init__(self, d_model, nhead, num_dims, num_special_tokens=1):
-        super().__init__()
-        self.bias_alpha = nn.Parameter(torch.zeros(1))
-        self.bias_mlp = nn.Sequential(
-            nn.Linear(num_dims + 1 if num_dims > 1 else num_dims, nhead * 4),
-            nn.GELU(),
-            nn.Linear(nhead * 4, nhead)
-        )
-        self.nhead = nhead
-        self.scale = (d_model // nhead) ** -0.5
-        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
-        self.out = nn.Linear(d_model, d_model)
-        self.num_special_tokens = num_special_tokens
+        layers = []
+        if hidden:
+            layers += [
+                nn.Linear(global_feature_dim, embed_dim * 4),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim * 4, embed_dim),
+            ]
+        else:
+            layers += [
+                nn.Linear(global_feature_dim, embed_dim),
+                nn.Dropout(dropout),
+            ]
 
-    def forward(self, x, coords, key_padding_mask=None):
-        B, N, _ = x.size()
-        qkv = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
-        c = coords
+        if norm_layer is not None:
+            layers.append(norm_layer(embed_dim))
 
-        # relative positional bias
-        ci = c.unsqueeze(2)  # [B,N,1,C]
-        cj = c.unsqueeze(1)  # [B,1,N,C]
-        dpos = ci - cj       # [B,N,N,C]
-        if dpos.size(-1) > 1:
-            dist = torch.norm(dpos, dim=-1, keepdim=True)  # [B,N,N,1]
-            dpos = torch.cat([dpos, dist], dim=-1)         # [B,N,N,C+1]
-        bias = self.bias_mlp(dpos).permute(0, 3, 1, 2)     # [B,heads,N,N]
-        
-        # zero out bias for special tokens
-        ns = self.num_special_tokens
-        if ns > 0:
-            bias[:, :, :ns, :] = 0
-            bias[:, :, :, :ns] = 0
+        self.projector = nn.Sequential(*layers)
 
-        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
-        logits = dots + self.bias_alpha * bias
-        if key_padding_mask is not None:
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            logits = logits.masked_fill(mask, float('-inf'))
-
-        attn = torch.softmax(logits, dim=-1)
-        out = torch.einsum('bhij,bhjd->bhid', attn, v)
-        out = out.transpose(1, 2).reshape(B, N, -1)
-        return self.out(out), attn
-
-
-class RelPosEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, num_special_tokens=1, num_dims=1, dropout=0.1):
-        super().__init__()
-        self.self_attn = RelPosSelfAttention(d_model, nhead, num_dims, num_special_tokens)
-        self.linear1 = nn.Linear(d_model, d_model * 4)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_model * 4, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.act = nn.GELU()
-
-    def forward(self, src, coords, key_padding_mask=None):
-        attn_out, _ = self.self_attn(src, coords, key_padding_mask)
-        src = src + self.dropout(attn_out)
-        src = self.norm1(src)
-        ffn = self.linear2(self.dropout(self.act(self.linear1(src))))
-        src = src + self.dropout(ffn)
-        return self.norm2(src)
-
-
-class RelPosTransformer(nn.Module):
-    """
-    A stack of K RelPosEncoderLayer modules, each performing
-    relative‐positional self‐attention + MLP. 
-
-    Args:
-      d_model (int): hidden dimension of each layer
-      nhead (int): number of attention heads 
-      num_special_tokens (int): how many “CLS‐like” tokens to zero out in bias
-      depth (int): number of layers (K)
-      dropout (float): dropout rate inside each RelPosEncoderLayer
-    """
-    def __init__(self, d_model: int, nhead: int, num_special_tokens: int = 1, num_layers: int = 6, 
-                 num_dims: int = 3, dropout: float = 0.1):
-        super().__init__()
-        assert d_model % nhead==0, "d_model not divisible by number of heads"
-        self.layers = nn.ModuleList([
-            RelPosEncoderLayer(d_model=d_model, 
-                               nhead=nhead, 
-                               num_special_tokens=num_special_tokens,
-                               num_dims=num_dims,
-                               dropout=dropout)
-            for _ in range(num_layers)
-        ])
-        self.num_layers = num_layers
-
-    def forward(self, x: torch.Tensor, coords: torch.Tensor, key_padding_mask: torch.Tensor = None) -> torch.Tensor:
-        B, N_total, d = x.size()
-        for layer in self.layers:
-            x = layer(x, coords, key_padding_mask)
-        return x
-
-
-class GlobalFeatureEncoder(nn.Module):
-    """
-    Encodes global detector information (Rear ECal, Rear HCal, scalars)
-    into a single embedding for use as a [GLOBAL] token.
-
-    Args:
-        ecal_hidden_dim (int): Channels for the ECal Conv2D.
-        hcal_hidden_dim (int): Hidden size per direction for HCal BiLSTM.
-        scalar_hidden_dim (int): Hidden size for MuTag projection.
-        d_model (int): Final embedding dimension (transformer hidden size).
-    """
-    def __init__(self,
-                 d_model: int = 512,
-                 dropout: float = 0.1,
-                ):
-        super().__init__()
-
-        # ECal conv encoder
-        self.ecal_encoder = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=d_model, kernel_size=3),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d(1),  # (batch, ecal_hidden_dim, 1, 1)
-            nn.Flatten()              # (batch, ecal_hidden_dim)
-        )
-        
-        # HCal lstm encoder
-        self.hcal_lstm = nn.LSTM(
-            input_size=1,
-            hidden_size=d_model,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-
-        # Scalars: single scalar → project → mu_hidden_dim
-        self.scalars_proj = nn.Linear(5, d_model)
-        
-        # Fuse all three → project to d_model
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self,
-                x_glob) -> torch.Tensor:
+    def forward(self, x_glob) -> torch.Tensor:
         """
         Args (list):
             [
+             fcal: Tensor of shape (batch, 10),
              ecal: Tensor of shape (batch, 5, 5),
              hcal: Tensor of shape (batch, 9),
              scalars: Tensor of shape (batch, 5),
             ]
 
         Returns:
-            Tensor of shape (batch, d_model): the [GLOBAL] embedding
+            Tensor of shape (batch, embed_dim): the [GLOBAL] embedding
         """
-        ecal, hcal, scalars_in = x_glob
+        fcal, ecal, hcal, scalars = x_glob
+        batch_size = fcal.shape[0]
+        ecal_flat = ecal.view(batch_size, -1)
+        combined_globals = torch.cat([fcal, ecal_flat, hcal, scalars], dim=1)
+        global_token = self.projector(combined_globals)        
+        return global_token
+
+        
+class GlobalFeatureEncoder(nn.Module):
+    """
+    Encodes global detector information (FASERCal, Rear ECal, Rear HCal, scalars)
+    into a single embedding for use as a [GLOBAL] token.
+
+    Args:
+        embed_dim (int): hidden size.
+        dropout (float): dropout probability.
+    """
+    def __init__(self,
+                 embed_dim: int = 384,
+                 dropout: float = 0.1,
+                ):
+        super().__init__()
+
+        # ECal conv encoder
+        self.ecal_encoder = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=embed_dim, kernel_size=3),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),  # (batch, ecal_hidden_dim, 1, 1)
+            nn.Flatten()              # (batch, ecal_hidden_dim)
+        )
+
+        # FASERCal lstm encoder
+        self.fcal_lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=embed_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        # HCal lstm encoder
+        self.hcal_lstm = nn.LSTM(
+            input_size=1,
+            hidden_size=embed_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True
+        )
+
+        # Scalars: single scalar → project → mu_hidden_dim
+        self.scalars_proj = nn.Linear(5, embed_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x_glob) -> torch.Tensor:
+        """
+        Args (list):
+            [
+             fcal: Tensor of shape (batch, 10),
+             ecal: Tensor of shape (batch, 5, 5),
+             hcal: Tensor of shape (batch, 9),
+             scalars: Tensor of shape (batch, 5),
+            ]
+
+        Returns:
+            Tensor of shape (batch, embed_dim): the [GLOBAL] embedding
+        """
+        fcal, ecal, hcal, scalars_in = x_glob
+
+        # FASERCal path
+        x_fcal = fcal.unsqueeze(-1)
+        outputs, (h_n, _) = self.fcal_lstm(x_fcal)
+        fcal_feat = h_n[-2] + h_n[-1]
         
         # ECal path
         x_ecal = ecal.unsqueeze(1)
@@ -473,59 +396,173 @@ class GlobalFeatureEncoder(nn.Module):
         # Scalars path
         scalars_feat = self.scalars_proj(scalars_in)
         
-        # Fuse and project
-        global_embed = ecal_feat + hcal_feat + scalars_feat
+        # Combine
+        global_embed = fcal_feat + ecal_feat + hcal_feat + scalars_feat
         return self.dropout(global_embed)
+    
+
+class SeparableDCT3D(nn.Module):
+    def __init__(self, patch_size, alphas=(0.4, 0.4, 0.75), max_per_axis=16):
+        super().__init__()
+        p_h, p_w, p_d = patch_size
+        Kx, Ky, Kz = self._choose_Kxyz(patch_size, alphas, max_per_axis)
+        def dct_1d(L, K, device=None, dtype=None):
+            x = torch.arange(L, dtype=torch.float32, device=device).unsqueeze(1)  # [L,1]
+            k = torch.arange(K, dtype=torch.float32, device=device).unsqueeze(0)  # [1,K]
+            M = torch.cos(torch.pi * (x + 0.5) * k / L)
+            M[:, 0] /= torch.sqrt(torch.tensor(L, dtype=M.dtype, device=M.device))
+            if K > 1:
+                scale = torch.sqrt(torch.tensor(2.0 / L, dtype=M.dtype, device=M.device))
+                M[:, 1:] *= scale
+            return M
+        self.register_buffer('Bx', dct_1d(p_h, Kx))  # [p_h, Kx]
+        self.register_buffer('By', dct_1d(p_w, Ky))  # [p_w, Ky]
+        self.register_buffer('Bz', dct_1d(p_d, Kz))  # [p_d, Kz]
+        self.Kx, self.Ky, self.Kz = Kx, Ky, Kz
+        self.P = p_h * p_w * p_d
+        self.patch_size = (p_h, p_w, p_d)
+
+    def _choose_Kxyz(self, patch_size, alphas, max_per_axis):
+        ph, pw, pd = patch_size
+        Ks = []
+        for dim, alpha in zip((ph, pw, pd), alphas):
+            K = min(int(round(alpha * dim)), max_per_axis, dim)
+            if dim >= 2:
+                K = max(K, 2)  # at least 2 modes if dimension has >=2 voxels
+            Ks.append(K)
+        return tuple(Ks)
+
+    @property
+    def K_total(self):
+        return self.Kx * self.Ky * self.Kz
+
+    def expand(self, coeff):  # coeff: [N, H, Kx, Ky, Kz]
+        t = torch.einsum('nhkyz,ik->nhiyz', coeff, self.Bx)  # [N,H,p_h,Ky,Kz]
+        t = torch.einsum('nhiyz,jy->nhijz', t, self.By)      # [N,H,p_h,p_w,Kz]
+        t = torch.einsum('nhijz,kz->nhijk', t, self.Bz)      # [N,H,p_h,p_w,p_d]
+        return t.reshape(t.size(0), t.size(1), -1)           # [N,H,P]
 
 
-class MinkowskiSE(nn.Module):
-    def __init__(self, channels, glob_dim, reduction=16):
-        """
-        Squeeze-and-excitation block which combines voxel with global features
-        Args:
-            channels (int): The number of channels in the voxel features.
-            glob_dim (int): The dimension of the global feature vector.
-            reduction (int): Reduction ratio in the SE module.
-        """
-        super(MinkowskiSE, self).__init__()
-        self.glob_transform = nn.Linear(glob_dim, channels)
-        # The SE MLP: takes concatenated pooled branch features and transformed global features.
-        self.fc = nn.Sequential(
-            nn.Linear(2 * channels, channels // reduction, bias=True),
-            nn.GELU(),
-            nn.Linear(channels // reduction, channels, bias=True),
-            nn.Sigmoid()
-        )
-        self.global_pool = MinkowskiGlobalAvgPooling()
+class SharedLatentVoxelHead(nn.Module):
+    """
+    One projection -> H×(Kx*Ky*Kz) coeffs
+    Expand once to V ∈ R^{P×H}
+    """
+    def __init__(self, in_dim, basis: SeparableDCT3D,
+                 H=16, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.basis = basis
+        self.H = H
+        self.norm = norm_layer(in_dim)
+        self.proj = nn.Linear(in_dim, H * basis.K_total)
 
-    def forward(self, voxel_feature, global_feature, global_weight):
-        """
-        Args:
-            voxel_feature (ME.SparseTensor): Voxel pecific features.
-            global_feature (torch.Tensor): Dense tensor from global features, shape [B, glob_dim].
-        Returns:
-            (ME.SparseTensor): SE-modulated features.
-        """
-        # Pool voxel features to get per-sample statistics.
-        pooled = self.global_pool(voxel_feature)  # [B, channels]
-        pooled_dense = pooled.F  # [B, channels]
-        global_transformed = self.glob_transform(global_feature)  # [B, channels]
-        global_transformed = global_weight * global_transformed
-        combined = torch.cat([pooled_dense, global_transformed], dim=1)  # [B, 2 * channels]
-        
-        # Compute the channel scaling factors.
-        scaling = self.fc(combined)  # [B, channels] with values in (0,1)
-        batch_indices = voxel_feature.C[:, 0].long()  # shape [N_voxels]
-        scaling_expanded = scaling[batch_indices]  # [N_voxels, channels]
-        new_features = voxel_feature.F * scaling_expanded
-        
+    def forward(self, token_emb):  # [N_tokens, D]
+        x = self.norm(token_emb)
+        coef = self.proj(x)                     # [N, H*Ktot]
+        N = coef.size(0)
+        coef = coef.view(N, self.H,
+                         self.basis.Kx, self.basis.Ky, self.basis.Kz)
+        V = self.basis.expand(coef)             # [N, H, P]
+
+        # per-voxel linear maps (vectorized)
+        Vt = V.transpose(1, 2)                  # [N, P, H]
+        return Vt
+
+
+class CylindricalHeadNormalized(nn.Module):
+    """
+    pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)   (>=0)
+    pz:  uZ = mu_uZ + sigma_uZ*zz,  pz = k_Z * expm1(uZ)   (>=0)
+    phi: via normalised (cos_phi, sin_phi)
+    """
+    def __init__(self, k_T, mu_uT, sigma_uT, k_Z, mu_uZ, sigma_uZ, hidden=128):
+        super().__init__()
+        self.k_T, self.mu_uT, self.sigma_uT = float(k_T), float(mu_uT), float(max(sigma_uT,1e-8))
+        self.k_Z, self.mu_uZ, self.sigma_uZ = float(k_Z), float(mu_uZ), float(max(sigma_uZ,1e-8))
+        self.mlp = nn.Linear(hidden, 4)
+
+    def forward(self, x, eps=1e-8):
+        zT, a, b, zz = self.mlp(x).unbind(-1)
+
+        # angle
+        norm = torch.sqrt(a*a + b*b + eps)
+        cos_phi = a / norm
+        sin_phi = b / norm
+
+        # pT via log1p/expm1
+        uT = self.mu_uT + self.sigma_uT * zT
+        pT = self.k_T * torch.expm1(uT)
+        pT = torch.clamp(pT, min=0.0)
+
+        # pz via log1p/expm1
+        uZ = self.mu_uZ + self.sigma_uZ * zz
+        pz = self.k_Z * torch.expm1(uZ)
+        pz = torch.clamp(pz, min=0.0)
+
+        px, py = pT * cos_phi, pT * sin_phi
+        p_cart = torch.stack([px, py, pz], dim=-1)
+        latents = torch.stack([zT, zz], dim=-1)
+
+        return {
+            "p_cart": p_cart,   # (B,3)
+            "pT": pT,
+            "cos_phi": cos_phi,
+            "sin_phi": sin_phi,
+            "pz": pz,
+            "latents": latents
+        }
+    
+
+class CylindricalHeadEta(nn.Module):
+    """
+    Predict [uT, eta, ax, ay] where:
+      pT = k_T * expm1(uT) >= 0,   eta is free (can clamp >=0),
+      phi via normalized (ax, ay).
+    """
+    def __init__(self, k_T, mu_uT, sigma_uT, hidden=128):
+        super().__init__()
+        self.k_T, self.mu_uT, self.sigma_uT = float(k_T), float(mu_uT), float(max(sigma_uT,1e-8))
+        self.mlp = nn.Linear(hidden, 4)
+
+    def forward(self, x, eps=1e-8):
+        uT_raw, eta, ax, ay = self.mlp(x).unbind(-1)
+
+        # angle
+        norm = torch.sqrt(ax*ax + ay*ay + eps)
+        cos_phi, sin_phi = ax / norm, ay / norm
+
+        # pT via expm1 with location-scale
+        uT = self.mu_uT + self.sigma_uT * uT_raw
+        pT = self.k_T * torch.expm1(uT).clamp_min(0.0)
+        pz = pT * torch.sinh(eta)
+        px, py = pT * cos_phi, pT * sin_phi
+
+        p_cart = torch.stack([px, py, pz], dim=-1)
+        return {
+            "p_cart": p_cart,
+            "pT": pT, "eta": eta, "cos_phi": cos_phi, "sin_phi": sin_phi
+        }
+
+    
+    
+class MinkowskiLayerNorm(nn.Module):
+    """ Channel-wise layer normalization for sparse tensors.
+    """
+    def __init__(
+        self,
+        normalized_shape,
+        eps=1e-6,
+    ):
+        super(MinkowskiLayerNorm, self).__init__()
+        self.ln = nn.LayerNorm(normalized_shape, eps=eps)
+    def forward(self, input):
+        output = self.ln(input.F)
         return SparseTensor(
-            new_features, 
-            coordinate_manager=voxel_feature.coordinate_manager,
-            coordinate_map_key=voxel_feature.coordinate_map_key,
-        )
+            output,
+            coordinate_map_key=input.coordinate_map_key,
+            coordinate_manager=input.coordinate_manager)
 
-        
+
 class BlockDense(nn.Module):
     """ Dense ConvNeXtV2 Block.
     
@@ -533,9 +570,9 @@ class BlockDense(nn.Module):
         dim (int): Number of input channels.
         drop_path (float): Stochastic depth rate. Default: 0.0
     """
-    def __init__(self, dim, drop_path=0.):
+    def __init__(self, dim, kernel_size=7, padding=3, drop_path=0.):
         super().__init__()
-        self.dwconv = nn.Conv3d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.dwconv = nn.Conv3d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim)
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, 4 * dim)
         self.act = nn.GELU()
@@ -563,7 +600,7 @@ class BlockDense(nn.Module):
         return x
         
 
-class Block(nn.Module):
+class BlockSparse(nn.Module):
     """ Sparse ConvNeXtV2 Block. 
 
     Args:
@@ -705,4 +742,4 @@ class GRN(nn.Module):
         Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
-
+        

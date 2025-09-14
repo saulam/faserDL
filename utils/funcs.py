@@ -9,165 +9,158 @@ Description:
 
 
 import copy
-import pickle as pkl
-import numpy as np
 import torch
 import MinkowskiEngine as ME
+from functools import partial
 from sklearn.model_selection import KFold
-from torch.utils.data import random_split, Subset, DataLoader
+from torch.utils.data import random_split, ConcatDataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
 
-def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
+def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, extra_dataset=None):
     """
     Splits the dataset into training, validation, and test sets based on the given splits.
 
     Parameters:
         dataset (torch.utils.data.Dataset): The dataset to split.
-        args (Namespace): Arguments containing batch_size, num_workers, and optionally sets_path and dataset_path.
+        args (Namespace): Arguments containing batch_size, num_workers.
         splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
         seed (int): Seed for reproducibility. Default is 7.
         test (bool): Whether to use collate_test or collate_sparse_minkowski. Default is False.
+        extra_dataset (torch.utils.data.Dataset or None): Extra dataset to append to the training loader. Default is None.
 
     Returns:
         tuple: DataLoader objects for training, validation, and test sets.
     """
+    assert sum(splits) == 1, "The splits should sum up to 1."
 
-    if args.sets_path is not None:
-        with open(args.sets_path, "rb") as fd:
-            sets = pkl.load(fd)
-        
-        def update_path(files):
-            return np.char.replace(files, "path", args.dataset_path, count=1)
+    fulllen = len(dataset)
+    train_len = int(fulllen * splits[0])
+    val_len = int(fulllen * splits[1])
+    test_len = fulllen - train_len - val_len  # Remaining length for the test set
 
-        train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
-        train_set.data_files = update_path(sets["train_files"])
-        val_set.data_files = update_path(sets["valid_files"])
-        test_set.data_files = update_path(sets["test_files"])
-        print("Loaded saved splits!")
-    else:
-        assert sum(splits) == 1, "The splits should sum up to 1."
+    # Split the dataset
+    train_split, val_split, test_split = random_split(
+        dataset, 
+        [train_len, val_len, test_len], 
+        generator=torch.Generator().manual_seed(seed)
+    )
 
-        fulllen = len(dataset)
-        train_len = int(fulllen * splits[0])
-        val_len = int(fulllen * splits[1])
-        test_len = fulllen - train_len - val_len  # Remaining length for the test set
+    def extract_files(indices):
+        return [dataset.data_files[i] for i in indices]
 
-        # Split the dataset
-        train_split, val_split, test_split = random_split(
-            dataset, 
-            [train_len, val_len, test_len], 
-            generator=torch.Generator().manual_seed(seed)
-        )
+    train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
+    train_set.data_files = extract_files(train_split.indices)
+    val_set.data_files = extract_files(val_split.indices)
+    test_set.data_files = extract_files(test_split.indices)
 
-        def extract_files(indices):
-            return [dataset.data_files[i] for i in indices]
+    if args.train and args.augmentations_enabled and not args.stage1 and args.mixup_alpha > 0:
+        train_set.calc_primary_vertices()
 
-        train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
-        train_set.data_files = extract_files(train_split.indices)
-        val_set.data_files = extract_files(val_split.indices)
-        test_set.data_files = extract_files(test_split.indices)
-    
-    train_set.augmentations_enabled = args.augmentations_enabled
-    collate_fn = collate_test if test else collate_sparse_minkowski
-    persistent = args.num_workers > 0
-
-    def create_loader(ds, shuffle):
-        return DataLoader(
-            ds,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            shuffle=shuffle,
-            pin_memory=True,
-            persistent_workers=persistent,
-            collate_fn=collate_fn
-        )
+    train_set.augmentations_enabled = args.augmentations_enabled   
+    collate_fn = partial(collate, test=test)
 
     return (
-        create_loader(train_set, shuffle=True),
-        create_loader(val_set, shuffle=False),
-        create_loader(test_set, shuffle=False),
+        create_loader(train_set, shuffle=True, drop_last=True, collate_fn=collate_fn, args=args),
+        create_loader(val_set, shuffle=False, drop_last=True, collate_fn=collate_fn, args=args),
+        create_loader(test_set, shuffle=False, drop_last=False, collate_fn=collate_fn, args=args),
     )
 
 
-def collate_test(batch):
-    coords_list, feats_list = [], []
-    module_to_event, module_pos = [], []
-
-    for ev_idx, sample in enumerate(batch):
-        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        for m in torch.unique(mods):
-            mask = (mods == m)
-            coords_list.append(coords[mask])
-            feats_list.append(feats[mask])
-            module_to_event.append(ev_idx)
-            module_pos.append(int(m))
-
-    ret = {
-        'f': torch.cat(feats_list, dim=0),
-        'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'module_hits': torch.stack([d['module_hits'] for d in batch]),
-        'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
-        'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
-        'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
-        'c': coords_list,
-        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
-        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
-    }
-    
-    optional_keys = [
-        'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg', 
-        'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
-        'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
-    ]
-    
-    for key in optional_keys:
-        if key in batch[0]:
-            ret[key] = ([d[key].numpy() for d in batch] if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm']
-                        else [d[key].item() for d in batch] if key in ['e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
-                        else [d[key] for d in batch])
-    
-    return ret
+def create_loader(ds, shuffle, drop_last, collate_fn=None, args=None):
+    if collate_fn is None:
+        collate_fn = partial(collate, test=not args.train)
+    persistent = args.num_workers > 0
+    return DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=shuffle,
+        pin_memory=True,
+        persistent_workers=persistent,
+        collate_fn=collate_fn,
+        drop_last=drop_last,
+    )
 
 
-def collate_sparse_minkowski(batch):
-    coords_list, feats_list = [], []
-    module_to_event, module_pos = [], []
+def collate(batch, test: bool = True):
+    """
+    Unified collate for 'train' and 'test'.
+    - mode='train': matches collate_train behavior (tensors via cat/stack).
+    - mode='test' : matches collate_test behavior (lists; some .numpy()/.item()).
+    """
+    mode = 'test' if test else 'train'
+    batch = [d for d in batch if len(d["coords"]) > 0]
 
-    for ev_idx, sample in enumerate(batch):
-        coords, mods, feats = sample['coords'], sample['modules'], sample['feats']
-        for m in torch.unique(mods):
-            mask = (mods == m)
-            coords_list.append(coords[mask])
-            feats_list.append(feats[mask])
-            module_to_event.append(ev_idx)
-            module_pos.append(int(m))
+    coords_list = [d["coords"] for d in batch]
+    feats_list  = [d["feats"] for d in batch]
+    num_hits = torch.tensor([len(x) for x in feats_list], dtype=torch.long)
+    hit_event_id = torch.arange(len(feats_list), dtype=torch.long).repeat_interleave(num_hits)
 
     ret = {
-        'f': torch.cat(feats_list, dim=0),
-        'f_glob': torch.stack([d['feats_global'] for d in batch]),
-        'module_hits': torch.stack([d['module_hits'] for d in batch]),
-        'faser_cal_modules': torch.stack([d['faser_cal_modules'] for d in batch]),
-        'rear_cal_modules': torch.stack([d['rear_cal_modules'] for d in batch]),
-        'rear_hcal_modules': torch.stack([d['rear_hcal_modules'] for d in batch]),
-        'c': coords_list,
-        'module_to_event': torch.tensor(module_to_event, dtype=torch.long),
-        'module_pos':      torch.tensor(module_pos,      dtype=torch.long),
+        "f": torch.cat(feats_list, dim=0),
+        "c": coords_list,
+        "hit_event_id": hit_event_id,
+        "f_glob": torch.stack([d["feats_global"] for d in batch]),
+        "faser_cal_modules": torch.stack([d["faser_cal_modules"] for d in batch]),
+        "rear_cal_modules": torch.stack([d["rear_cal_modules"] for d in batch]),
+        "rear_hcal_modules": torch.stack([d["rear_hcal_modules"] for d in batch]),
     }
-    
-    optional_keys = {
-        'primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm',
-        'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
-        'jet_momentum_mag', 'jet_momentum_dir',
+
+    if mode == "test":
+        optional_keys = [
+            "run_number", "event_id", "primary_vertex", "is_cc", "in_neutrino_pdg",
+            "in_neutrino_energy", "primlepton_labels", "seg_labels", "flavour_label",
+            "charm", "e_vis", "pt_miss",
+            "vis_sp_momentum", "vis_sp_momentum_mag", "vis_sp_momentum_dir",
+            "out_lepton_momentum", "out_lepton_momentum_mag", "out_lepton_momentum_dir",
+            "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
+        ]
+        to_numpy = {"primlepton_labels", "seg_labels", "flavour_label", "charm"}
+        to_item  = {
+            "e_vis", "pt_miss", "vis_sp_momentum_mag",
+            "out_lepton_momentum_mag", "jet_momentum_mag",
+        }
+
+        for key in optional_keys:
+            if key in batch[0]:
+                if key in to_numpy:
+                    ret[key] = [d[key].numpy() for d in batch]
+                elif key in to_item:
+                    ret[key] = [d[key].item() for d in batch]
+                else:
+                    ret[key] = [d[key] for d in batch]
+        return ret
+
+    # mode == "train"
+    opt_all = {
+        "hit_track_id", "hit_primary_id", "hit_pdg", "ghost_mask",
+        "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
+        "e_vis", "pt_miss", "vis_sp_momentum", "out_lepton_momentum",
+        "vis_sp_momentum_mag", "vis_sp_momentum_dir",
+        "out_lepton_momentum_mag", "out_lepton_momentum_dir",
+        "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
     }
-    
-    for key in optional_keys:
+    cat_keys = {
+        "hit_track_id", "hit_primary_id", "hit_pdg", "ghost_mask",
+        "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
+        "e_vis", "pt_miss", "vis_sp_momentum_mag",
+        "out_lepton_momentum_mag", "jet_momentum_mag",
+    }
+    stack_keys = {
+        "vis_sp_momentum", "out_lepton_momentum", "jet_momentum",
+        "vis_sp_momentum_dir", "out_lepton_momentum_dir", "jet_momentum_dir",
+    }
+
+    for key in opt_all:
         if key in batch[0]:
-            ret[key] = (torch.cat([d[key] for d in batch]) if key in ['primlepton_labels', 'seg_labels', 'is_cc', 'flavour_label', 'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag', 'jet_momentum_mag']
-                        else torch.stack([d[key] for d in batch]) if key in ['out_lepton_momentum_dir', 'jet_momentum_dir']
-                        else [d[key] for d in batch])
-    
+            if key in cat_keys:
+                ret[key] = torch.cat([d[key] for d in batch])
+            elif key in stack_keys:
+                ret[key] = torch.stack([d[key] for d in batch])
+            else:
+                ret[key] = [d[key] for d in batch]
+
     return ret
 
 
@@ -177,22 +170,24 @@ def arrange_sparse_minkowski(data, device):
         coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
         device=device
     )
-    module_hits = data['module_hits']
     faser_cal = data['faser_cal_modules']
     rear_cal = data['rear_cal_modules']
     rear_hcal = data['rear_hcal_modules']
     tensor_global = data['f_glob']
 
-    return tensor, module_hits, faser_cal, rear_cal, rear_hcal, tensor_global
+    return tensor, faser_cal, rear_cal, rear_hcal, tensor_global
 
 def arrange_truth(data):
     output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}
     
     optional_keys = [
+        'hit_track_id', 'hit_primary_id', 'hit_pdg', 'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'charm', 'e_vis', 'pt_miss', 'out_lepton_momentum_mag',
-        'out_lepton_momentum_dir', 'jet_momentum_mag', 'jet_momentum_dir'
+        'charm', 'e_vis', 'pt_miss', 
+        'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
+        'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
+        'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
     ]
     
     for key in optional_keys:
@@ -201,34 +196,16 @@ def arrange_truth(data):
     
     return output
 
-def argsort_coords(coordinates):
-    # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
-    # Multiply coordinates by powers of a large number to encode them uniquely into one tensor
-    max_val = coordinates.max() + 1
-    multipliers = torch.tensor([max_val**i for i in reversed(range(coordinates.shape[1]))], device=coordinates.device)
 
-    # Create a single sortable tensor
-    encoded_coords = (coordinates * multipliers).sum(dim=1)
+def weighted_loss(L, s):
+    """
+    Calculates the uncertainty-weighted loss for any task.
+    L: The raw loss for the task (e.g., MSE, BCE, CrossEntropy).
+    s: The learnable log-variance parameter for the task.
 
-    # Sort based on the encoded coordinates
-    sorted_indices = torch.argsort(encoded_coords)
-
-    return sorted_indices
-
-def argsort_sparse_tensor(tensor):
-    # Assume coordinates are integers. Create a large enough multiplier to uniquely represent each dimension.
-    # Multiply coordinates by powers of a large number to encode them uniquely into one tensor
-    max_val = tensor.coordinates.max() + 1
-    multipliers = torch.tensor([max_val**i for i in reversed(range(tensor.coordinates.shape[1]))], device=tensor.coordinates.device)
-    
-    # Create a single sortable tensor
-    #encoded_coords = torch.matmul(tensor.coordinates.float(), multipliers.float())
-    encoded_coords = (tensor.coordinates * multipliers).sum(dim=1)
-
-    # Sort based on the encoded coordinates
-    sorted_indices = torch.argsort(encoded_coords)
-    
-    return sorted_indices
+    https://arxiv.org/pdf/1705.07115
+    """
+    return torch.exp(-s) * L + 0.5 * s
 
 
 class CustomLambdaLR(LambdaLR):
@@ -317,23 +294,16 @@ class CombinedScheduler(_LRScheduler):
             self.scheduler2.load_state_dict(state_dict['scheduler2'])
 
 
-def transfer_weights(model_seg, model_enc):
-    """
-    Load weights from segmentation model to encoder model
-    """
-    model_enc.stem.load_state_dict(model_seg.stem.state_dict())
-    model_enc.global_feats_encoder.load_state_dict(model_seg.global_feats_encoder.state_dict())
-    N_bb = len(model_enc.shared_encoders)
-    for i in range(N_bb):
-        model_enc.shared_encoders[i].load_state_dict(model_seg.encoder_layers[i].state_dict())
-        model_enc.shared_se_layers[i].load_state_dict(model_seg.se_layers[i].state_dict())
-        if i < N_bb - 1:
-            model_enc.shared_downsamples[i].load_state_dict(model_seg.downsample_layers[i].state_dict())
-
-    last = N_bb  # index in model_seg: encoder_layers[last], se_layers[last], downsample_layers[last]
-    for name, branch in model_enc.branches.items():
-        # branch is an nn.ModuleDict, so indexing by string
-        branch["downsample"].load_state_dict(model_seg.downsample_layers[last - 1].state_dict())
-        branch["encoder"].load_state_dict(model_seg.encoder_layers[last].state_dict())
-        branch["se"].load_state_dict(model_seg.se_layers[last].state_dict())
+def load_mae_encoder(model_vit, mae_ckpt):
+    sd = {key.replace("model.", ""): value for key, value in mae_ckpt['state_dict'].items()}
+    # Keep only encoder keys that exist in the fine-tune model
+    vit_sd = model_vit.state_dict()
+    #keep = {k: v for k, v in sd.items() if k in vit_sd and v.shape == vit_sd[k].shape}
+    #missing = [k for k in vit_sd.keys() if k not in keep]
+    #dropped = [k for k in sd.keys() if k not in keep]
+    msg = model_vit.load_state_dict(sd, strict=False)
+    #print("Loaded:", len(keep))
+    #print("Missing in ckpt:", len(missing))
+    #print("Dropped from ckpt:", len(dropped))
+    print("Load msg:", msg)
 

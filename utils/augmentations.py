@@ -7,396 +7,584 @@ Description:
     Auxiliary functions for data augmentations.
 """
 
-
-import torch
 import numpy as np
-from scipy.spatial.transform import Rotation as R
-from utils import ini_argparse, random_rotation_saul
 
 
-# for indexing in add_noise_global_params()
-REAR_CAL_ENERGY_IDX = 0
-REAR_HCAL_ENERGY_IDX = 1
-REAR_MUCAL_ENERGY_IDX = 2
-FASER_CAL_ENERGY_IDX = 3
+ROTATIONS = {
+    'x': {0: np.eye(3),
+         90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
+         180: np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),
+         270: np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])},
+    'y': {0: np.eye(3),
+          90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
+          180: np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
+          270: np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])},
+    'z': {0: np.eye(3),
+          90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
+          180: np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
+          270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
+}
 
-REAR_HCAL_START = 4
-REAR_HCAL_END = 13  # 9 values (4:13)
 
-FASER_CAL_START = 13
-FASER_CAL_END = 28  # 15 values (13:28)
-
-
-def is_escaping(coords, metadata):
+def augment(
+    coords, 
+    modules, 
+    feats, 
+    labels, 
+    momenta, 
+    global_feats, 
+    primary_vertex,
+    metadata,
+    stage1 = False,
+    aug_prob=1.0
+):
     """
-    Check whether hits are on the edge(s) of the volume
-    (potential escaping particles)
+    Performs augmentations.
+    """        
+    # Mirror
+    if np.random.random() < aug_prob:
+        coords, modules, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = mirror(
+            coords, modules, momenta, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['x', 'y'],
+        )              
+
+    # Rotation
+    if np.random.random() < aug_prob:
+        coords, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = rotate_90(
+            coords, momenta, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
+        )
+
+    # Translation
+    if np.random.random() < aug_prob:
+        coords, modules, global_feats['rear_cal_modules'], primary_vertex, _ = translate(
+            coords, modules, global_feats['rear_cal_modules'], 
+            primary_vertex, metadata, selected_axes=['x', 'y'],
+        )
+
+    # Global features multiplicative jitter
+    if np.random.random() < aug_prob:
+        global_feats = module_multiplicative_jitter(
+            global_feats, log_sigma=dict(faser=0.1, rear_cal=0.1, rear_hcal=0.1, rear_mucal=0.1),
+        )
+
+    # Scaling
+    if np.random.random() < aug_prob:
+        feats, global_feats, _, _ = scale_all_by_global_shift_lognormal(
+            feats, global_feats, log_sigma=0.1
+        )
+
+    # Jitter per-hit multiplicative
+    if np.random.random() < aug_prob:
+        feats = jitter_energy_multiplicative(
+            feats, log_sigma=0.12, clamp_min=0.0
+        )
+
+    # Jitter sqrt-law additive
+    if np.random.random() < aug_prob:
+        feats = jitter_energy_sqrtlaw(
+            feats, a=0.06, b=0.18, clamp_min=0.0
+        )
+
+    # Voxel dropping
+    if np.random.random() < aug_prob:
+        coords, modules, feats, labels = drop_hits(
+            coords, modules, feats, labels, max_drop=0.05, min_hits=5,
+        )
+
+    return coords, modules, feats, labels, momenta, global_feats, primary_vertex
+
+
+def mirror(
+    coords,
+    modules,
+    dirs,
+    rear_cal_modules,
+    primary_vertex,
+    metadata,
+    selected_axes=None
+):
     """
-    on_boundary = (
-        (coords[:, 0] <= 0) | (coords[:, 0] >= metadata['x'].shape[0] - 1),
-        (coords[:, 1] <= 0) | (coords[:, 1] >= metadata['y'].shape[0] - 1),
-        (coords[:, 2] <= 0) | (coords[:, 2] >= metadata['z'].shape[0] - 1)
-    )
-
-    return np.any(on_boundary, axis=1)
-
-
-def mirror(coords, modules, dirs, rear_cal_modules, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
+    Randomly mirror coords, module indices, dir‐vectors, and a 2D rear_cal_modules image 
+    along each of the X/Y/Z axes (independently) if that axis is in selected_axes.
+    Returns all updated arrays, plus a list of axes actually flipped.
+    """
+    if selected_axes is None:
+        selected_axes = ['x', 'y', 'z']
     axes = ['x', 'y', 'z']
-    for axis in range(3):
-        if axes[axis] in selected_axes and np.random.choice([True, False]):
-            # flip coords
-            if axis<2:
-                coords[:, axis] = metadata[axes[axis]].shape[0] - coords[:, axis] - 1
-            else:
-                module_size = int((metadata['z'][:,1]==0).sum())
-                n_mod       = metadata['z'][:,1].max() + 1
-                coords[:, axis] = module_size - coords[:, axis] - 1
-                modules = n_mod - modules - 1
-
-            # flip primary vertex
-            primary_vertex[axis] = metadata[axes[axis]].shape[0] - primary_vertex[axis] - 1
+    flipped = []
+    coords = coords.copy()
+    dirs = [d.copy() for d in dirs]
+    primary_vertex = primary_vertex.copy()
+    for axis_idx, ax in enumerate(axes):
+        if ax in selected_axes and np.random.rand() < 0.5:
+            # flip coords and primary vertex
+            L = metadata[ax].shape[0]
+            coords[:, axis_idx] = (L - 1) - coords[:, axis_idx]
+            primary_vertex[axis_idx] = (L - 1) - primary_vertex[axis_idx]
 
             # flip direction vectors
-            for x in dirs:
-                x[axis] *= -1
+            for d in dirs:
+                d[axis_idx] *= -1
 
-            # flip the rearCal modules
-            if axis < 2:
-                # axis==0 (x): flip columns  => axis=1 of the 2D array
-                # axis==1 (y): flip rows     => axis=0 of the 2D array
-                flip_axis = 1 - axis
+            if axis_idx == 2:
+                # assume modules is a 1D array of module‐IDs in [0..n_mod-1]
+                n_mod = metadata['z'][:, 1].max() + 1
+                modules = (n_mod - 1) - modules
+            else:
+                # flip the 2D rear_cal_modules in XY plane
+                flip_axis = 1 - axis_idx  # x => 1 (cols), y => 0 (rows)
                 rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis)
+
+            flipped.append(ax)
+
+    return coords, modules, dirs, rear_cal_modules, primary_vertex, flipped
+
+
+def apply_mirror(
+    coords,
+    modules,
+    dirs,
+    rear_cal_modules,
+    primary_vertex,
+    metadata,
+    flipped
+):
+    """
+    Apply the same mirroring operations as `mirror` did, but using the explicit
+    list of axes in `flipped`.  
+    Returns updated (coords, modules, dirs, rear_cal_modules, primary_vertex).
+    """
+    coords = coords.copy()
+    dirs    = [d.copy() for d in dirs]
+    primary_vertex = primary_vertex.copy()
+
+    axes = ['x', 'y', 'z']
+    for ax in flipped:
+        axis_idx = axes.index(ax)
+
+        # flip coords and primary vertex
+        L = metadata[ax].shape[0]
+        coords[:, axis_idx] = (L - 1) - coords[:, axis_idx]
+        primary_vertex[axis_idx] = (L - 1) - primary_vertex[axis_idx]
+
+        # flip direction vectors
+        for d in dirs:
+            d[axis_idx] *= -1
+
+        if axis_idx == 2:
+            n_mod = metadata['z'][:, 1].max() + 1
+            modules = (n_mod - 1) - modules
+        else:
+            flip_axis = 1 - axis_idx
+            rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis)
 
     return coords, modules, dirs, rear_cal_modules, primary_vertex
 
 
-def rotate_90(coords, dirs, rear_cal_modules, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
-    # Rotation matrices for 90, 180, and 270 degrees on each axis
-    rotations = {
-        'x': {0: np.eye(3),
-             90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
-             180: np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]]),
-             270: np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])},
-        'y': {0: np.eye(3),
-              90: np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]]),
-              180: np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]]),
-              270: np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])},
-        'z': {0: np.eye(3),
-              90: np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]),
-              180: np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]),
-              270: np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])}
-    }
-
-    final_rotation_matrix = np.eye(3)
-    reference_point = np.array([
-        (metadata['x'].shape[0] - 1) / 2.,
-        (metadata['y'].shape[0] - 1) / 2.,
-        (metadata['z'][:, 1] == 0).sum() / 2., #(metadata['z'].shape[0] - 1) / 2.
-    ])  
-
-    for axis in ['x', 'y', 'z']:
-        if axis in selected_axes:
-            angle = np.random.choice([0, 90, 180, 270])
-            final_rotation_matrix = final_rotation_matrix @ rotations[axis][angle]
-
-            if axis == 'z' and angle != 0:
-                k = angle // 90  # number of 90° CCW turns
-                rear_cal_modules = np.rot90(rear_cal_modules, k)
-
-    translated_points = coords - reference_point
-    translated_vertex = primary_vertex - reference_point
-    rotated_points = translated_points @ final_rotation_matrix
-    rotated_vertex = translated_vertex @ final_rotation_matrix
-    final_points = rotated_points + reference_point
-    final_vertex = rotated_vertex + reference_point
-    rotated_dirs = [x @ final_rotation_matrix for x in dirs]
-
-    return final_points, rotated_dirs, rear_cal_modules, final_vertex
-
-
-def shear_rotation_2d(points_2d, theta):
+def rotate_90(
+    coords,
+    dirs,
+    rear_cal_modules,
+    primary_vertex,
+    metadata,
+    selected_axes=None
+):
     """
-    Applies the shear-based rotation in 2D (for points in one plane).
-    
-    This implements the three-shear algorithm for 2D rotation:
-      1. x = x - tan(theta/2) * y
-      2. y = y + sin(theta) * x
-      3. x = x - tan(theta/2) * y
-    
-    Parameters:
-      points_2d (np.ndarray): Array of shape (N, 2) containing points in 2D.
-      theta (float): Rotation angle in radians.
-    
-    Returns:
-      np.ndarray: Rotated points (rounded after each shear).
+    Randomly rotates (multiple of 90 degress) coords, dir‐vectors, and a 2D rear_cal_modules image 
+    along each of the X/Y/Z axes (independently) if that axis is in selected_axes.
+    Returns all updated arrays, plus a list of axes actually rotated and the angles.
     """
-    pts = points_2d.copy()
-    pts[:, 0] = np.round(pts[:, 0] - np.tan(theta / 2) * pts[:, 1])
-    pts[:, 1] = np.round(pts[:, 1] + np.sin(theta) * pts[:, 0])
-    pts[:, 0] = np.round(pts[:, 0] - np.tan(theta / 2) * pts[:, 1])
-    
-    return pts
+    if selected_axes is None:
+        selected_axes = ['x','y','z']
 
+    # build the composite rotation
+    R_final = np.eye(3)
+    chosen_angles: Dict[str,int] = {}
+    for ax in ['x', 'y', 'z']:
+        if ax in selected_axes:
+            choices = [0, 90, 180, 270] if ax == 'z' else [0, 180]
+            angle = int(np.random.choice(choices))
+            chosen_angles[ax] = angle
+            R_final = R_final @ ROTATIONS[ax][angle]
 
-def shear_rotation_axis(points, axis, theta):
-    """
-    Applies a shear-based rotation about a single axis in 3D.
-    
-    The function extracts the appropriate 2D plane, applies the shear rotation,
-    and then puts the points back together.
-    
-    Parameters:
-      points (np.ndarray): The input point cloud of shape (N, 3).
-      axis (str): The axis to rotate about ("x", "y", or "z").
-      theta (float): The rotation angle (in radians) to apply.
-    
-    Returns:
-      np.ndarray: The transformed point cloud.
-    """
-    pts = points.copy()
-    
-    if axis == "z":
-        pts_xy = pts[:, [0, 1]]  # get x, y
-        pts_rot = shear_rotation_2d(pts_xy, theta)
-        pts[:, 0] = pts_rot[:, 0]
-        pts[:, 1] = pts_rot[:, 1]
-        
-    elif axis == "x":
-        pts_yz = pts[:, [1, 2]]
-        pts_rot = shear_rotation_2d(pts_yz, theta)
-        pts[:, 1] = pts_rot[:, 0]
-        pts[:, 2] = pts_rot[:, 1]
-        
-    elif axis == "y":
-        pts_zx = pts[:, [2, 0]]
-        pts_rot = shear_rotation_2d(pts_zx, theta)
-        pts[:, 2] = pts_rot[:, 0]
-        pts[:, 0] = pts_rot[:, 1]
-        
-    else:
-        raise ValueError("Invalid axis: choose 'x', 'y', or 'z'.")
-    
-    return pts
+    # rotate the RearCal image only if z‑axis turned
+    rear_rot = rear_cal_modules
+    if chosen_angles.get('z', 0) != 0:
+        k = chosen_angles['z'] // 90
+        rear_rot = np.rot90(rear_rot, k)
 
-
-def shear_rotation_random(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
-    """
-    Applies shear-based rotations about each specified axis sequentially.
-       
-    For each axis specified in selected_axes, a random rotation angle is chosen
-    (from fixed values based on: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf)
-    and the shear rotation (decomposed into 3 shear steps) is applied. Rounding is performed 
-    after each shear to ensure that the mapping is exactly grid-preserving (assuming the input points, 
-    or their rounded version, are on an integer grid).
-    
-    Parameters:
-      coords (np.ndarray): Input point cloud, shape (N, 3).
-      dirs (np.ndarray): Direction vectors to be rotated. Can be None.
-      primary_vertex (np.ndarray): Primary vertex that is rotated.
-      metadata: Dataset metadata. Expects 'x', 'y', 'z' keys with shape information.
-      selected_axes (list, optional): List of axes (e.g., ["x", "y", "z"]) to rotate about.
-      
-    Returns:
-      np.ndarray: Transformed point cloud after all shear rotations.
-    """
-    pts = coords.copy()
-    primary_vertex = primary_vertex.copy()
-    if dirs is not None:
-        dirs = dirs.copy() 
-
-    reference_point = np.array([
-        (metadata['x'].shape[0] - 1) / 2.,
-        (metadata['y'].shape[0] - 1) / 2.,
-        (metadata['z'].shape[0] - 1) / 2.
-    ]).astype(int)
-
-    pts -= reference_point
-    primary_vertex -= reference_point
-
-    for axis in selected_axes:
-        # Why no more than 45 degrees: https://graphicsinterface.org/wp-content/uploads/gi1986-15.pdf
-        #angle_deg = np.random.uniform(-45, 45)
-        #angle_deg = np.random.choice([0, 22.62, 28.07, 36.87, 53.13, 67.38, 73.74])  # values from link above
-        angle_deg = np.random.uniform(5, 5)
-        angle = np.deg2rad(angle_deg)
-        if angle == 0:
-            continue
-        pts = shear_rotation_axis(pts, axis, angle)
-        rotation = R.from_euler(axis, angle_deg, degrees=True)
-        primary_vertex = rotation.apply(primary_vertex)
-        if dirs is not None:
-            dirs = rotation.apply(dirs) 
-
-    pts += reference_point
-    primary_vertex += reference_point
-    return pts, dirs, primary_vertex
-
-
-def rotate(coords, dirs, primary_vertex, metadata, selected_axes=['x', 'y', 'z']):
-    escaping = is_escaping(coords, metadata)
-    #if np.all(escaping):
-    #    return coords, dirs, primary_vertex
-
-    # Compute center of volume as rotation reference point
-    reference_point = np.array([
-        (metadata['x'].shape[0] - 1) / 2.,
-        (metadata['y'].shape[0] - 1) / 2.,
-        (metadata['z'].shape[0] - 1) / 2.
+    # apply to coords and vertex about the true centre
+    center = np.array([
+        (metadata['x'].shape[0]-1)/2.,
+        (metadata['y'].shape[0]-1)/2.,
+        (metadata['z'].shape[0]-1)/2.,
     ])
+    pts = (coords - center) @ R_final + center
+    vert = (primary_vertex - center) @ R_final + center
 
-    # Shift coords and primary vertex relative to the center
-    shifted_coords = coords - reference_point
-    shifted_primary = primary_vertex - reference_point
+    # rotate the direction vectors
+    dirs_rot = [(d @ R_final) for d in dirs]
 
-    if dirs is not None:
-        dirs = np.asarray(dirs)
-        rotated_dirs = dirs.copy()
-    else:
-        rotated_dirs = None
-
-    axes_indices = {'x': 0, 'y': 1, 'z': 2}
-    affected_axes = {
-        'x': ['y', 'z'],
-        'y': ['x', 'z'],
-        'z': ['x', 'y'],
-    }
-
-    for axis in selected_axes:
-        affected = affected_axes[axis]
-        angle_deg = np.random.uniform(-2, 2)  # You can adjust this range
-        rotation = R.from_euler(axis, angle_deg, degrees=True)
-
-        shifted_coords = rotation.apply(shifted_coords)
-        shifted_primary = rotation.apply(shifted_primary[np.newaxis, :])[0]
-
-        if rotated_dirs is not None:
-            rotated_dirs = rotation.apply(rotated_dirs)
-
-    # Recenter coordinates back
-    rotated_coords = (shifted_coords + reference_point).round()
-    rotated_vertex = shifted_primary + reference_point
-
-    if len(np.unique(rotated_coords, axis=0)) < 2:
-        return coords, dirs, primary_vertex
-
-    return rotated_coords, rotated_dirs, rotated_vertex
+    return pts, dirs_rot, rear_rot, vert, chosen_angles
 
 
-def translate(coords, modules, primary_vertex, metadata, shift=8, selected_axes=['x', 'y', 'z'], shift_modules=False):
+def apply_rotate_90(
+    coords,
+    dirs,
+    rear_cal_modules,
+    primary_vertex,
+    metadata,
+    chosen_angles: dict
+):
     """
-    coords[:,2] is assumed to be the *in-module* z (0..module_size-1).
-    modules[:] is the integer module index (0..n_mod-1).
-    primary_vertex[2] is also a module index.
+    Apply the exact 90°-step rotations recorded in `chosen_angles`
+    to coords, dir‐vectors, and the 2D rear_cal_modules image,
+    returning (pts, dirs_rot, rear_rot, vert).
 
-    We allow X/Y shifts ±5 voxels,
-    and Z shifts by ±k modules (no partial modules).
+    `chosen_angles` should be the dict returned by rotate_90.
     """
+    R_final = np.eye(3)
+    for ax in ['x', 'y', 'z']:
+        angle = chosen_angles.get(ax, 0)
+        R_final = R_final @ ROTATIONS[ax][angle]
 
-    if 'x' in selected_axes:
-        shift_x = np.random.randint(0, shift)
-        coords[:, 0]       += shift_x
-        primary_vertex[0]  += shift_x
+    angle_z = chosen_angles.get('z', 0)
+    rear_rot = rear_cal_modules
+    if angle_z != 0:
+        k = (angle_z // 90) % 4
+        rear_rot = np.rot90(rear_rot, k)
 
-    if 'y' in selected_axes:
-        shift_y = np.random.randint(0, shift)
-        coords[:, 1]       += shift_y
-        primary_vertex[1]  += shift_y
+    center = np.array([
+        (metadata['x'].shape[0]-1)/2.,
+        (metadata['y'].shape[0]-1)/2.,
+        (metadata['z'].shape[0]-1)/2.,
+    ])
+    pts      = (coords - center) @ R_final + center
+    vert     = (primary_vertex - center) @ R_final + center
+    dirs_rot = [(d @ R_final) for d in dirs]
 
+    return pts, dirs_rot, rear_rot, vert
+
+
+def translate(
+    coords,
+    modules,
+    rear_cal_modules,
+    primary_vertex,
+    metadata,
+    selected_axes=None,
+):
+    """
+    Translate a point‐cloud + module indices + primary‐vertex within the grid.
+
+    coords are voxel indices in X/Y/Z (0…W-1 / 0…H-1, 0..D-1).
+    modules are module‐indices (0…n_mod-1).
+
+    X/Y: pick a single integer shift so that after shifting, all coords[:,axis]
+         lie in [0, grid_len-1].  If any hit already touches 0 or grid_len-1,
+         we consider that “escaping” and do not shift along that axis.
+
+    Z: ±K‐module shifts.
+    """
+    if selected_axes is None:
+        selected_axes = ['x','y','z']
+
+    coords = coords.copy()
+    modules = modules.copy()
+    primary_vertex = primary_vertex.copy()
+    rear = rear_cal_modules.copy()
+    shifts: Dict[str,int] = {}
+
+    # helpers
+    def _is_touching_border(axis):
+        L = metadata[axis].shape[0]
+        c = coords[:, {'x':0, 'y':1}[axis]]
+        return np.any((c <= 0) | (c >= L-1))
+
+    def _shift_image(img, p, axis):
+        """ Shift 2D img by p pixels along axis (0=rows, 1=cols). 
+            Vacated entries get zero. """
+        out = np.zeros_like(img)
+        if p > 0:
+            if axis == 1:
+                out[:, p:] = img[:, :-p]
+            else:  # axis==0
+                out[p:, :] = img[:-p, :]
+        elif p < 0:
+            if axis == 1:
+                out[:, :p] = img[:, -p:]
+            else:
+                out[:p, :] = img[-p:, :]
+        else:
+            out = img.copy()
+        return out
+
+    # X and Y
+    for ax, idx in (('x', 0), ('y', 1)):
+        if ax in selected_axes and not _is_touching_border(ax):
+            L = metadata[ax].shape[0]
+            c = coords[:, idx]
+            s = np.random.randint(-c.min(), (L-1) - c.max() + 1)
+            coords[:, idx]      += s
+            primary_vertex[idx] += s
+            shifts[ax] = s
+
+            # compute 5×5 pixel shift
+            ps = int(round(s * 5 / L))
+            rear = _shift_image(rear, ps, axis=1-idx)
+                
+    # Z
     if 'z' in selected_axes:
         module_size = (metadata['z'][:, 1] == 0).sum()
         n_mod = int(metadata['z'][:,1].max() + 1)
 
-        # pick shifts (in module units) so that all (modules + s) stay in [0, n_mod-1]
+        # shift modules by whole modules
         cur_min, cur_max = int(modules.min()), int(modules.max())
-        if shift_modules:
-            valid_shifts = [
-                s for s in range(-cur_min, n_mod - cur_max)
-            ]
-            if valid_shifts:
-                s = np.random.choice(valid_shifts)
-                modules += s         # shift every hit’s module
+        valid_s = list(range(-cur_min, n_mod - cur_max))
+        if valid_s:
+            s_mod = np.random.choice(valid_s)
+            modules += s_mod
+            coords[:, 2]       += s_mod * module_size
+            primary_vertex[2]  += s_mod * module_size
+            shifts['z'] = s_mod * module_size
 
-        shift_z = np.random.randint(0, shift//2)
-        coords[:, 2]       += shift_z
-        primary_vertex[2]  += shift_z
-
-    return coords, modules, primary_vertex
+    return coords, modules, rear, primary_vertex, shifts
 
 
-def drop(coords, modules, feats, labels, std_dev=0.1):
-    if np.random.rand() > 0.5:
-        return coords, modules, feats, labels
-    p = abs(np.random.randn(1) * std_dev)
-    mask = np.random.rand(coords.shape[0]) > p
-    if mask.sum() < 2 or len(np.unique(coords[mask], axis=0)) < 2:
-        #don't drop all coordinates
-        return coords, modules, feats, labels
-    return coords[mask], modules[mask], feats[mask], [x[mask] for x in labels]
-
-
-def shift_q_uniform(feats, max_scale_factor=0.1):
-    shift = 1 - np.random.rand(*feats.shape) * max_scale_factor
-    return feats * shift
-
-
-def shift_q_gaussian(feats, std_dev=0.1):
-    shift = 1 - np.random.randn(*feats.shape) * std_dev
-    return feats * shift
-
-
-def add_noise_global_params(feats_global):
-    # Compute initial sums before applying noise
-    rear_hcal_sum = feats_global[REAR_HCAL_START:REAR_HCAL_END].sum()
-    faser_cal_sum = feats_global[FASER_CAL_START:FASER_CAL_END].sum()
-
-    # Apply Gaussian noise
-    feats_global[REAR_CAL_ENERGY_IDX] = shift_q_gaussian(feats_global[REAR_CAL_ENERGY_IDX])
-    feats_global[REAR_MUCAL_ENERGY_IDX] = shift_q_gaussian(feats_global[REAR_MUCAL_ENERGY_IDX])
-    feats_global[REAR_HCAL_START:REAR_HCAL_END] = shift_q_gaussian(feats_global[REAR_HCAL_START:REAR_HCAL_END])
-    feats_global[FASER_CAL_START:FASER_CAL_END] = shift_q_gaussian(feats_global[FASER_CAL_START:FASER_CAL_END])
-
-    # Adjust the energy values proportionally after adding noise
-    new_rear_hcal_sum = feats_global[REAR_HCAL_START:REAR_HCAL_END].sum()
-    new_faser_cal_sum = feats_global[FASER_CAL_START:FASER_CAL_END].sum()
-    if rear_hcal_sum > 0:
-        feats_global[REAR_HCAL_ENERGY_IDX] *= new_rear_hcal_sum / rear_hcal_sum
-    if faser_cal_sum > 0:
-        feats_global[FASER_CAL_ENERGY_IDX] *= new_faser_cal_sum / faser_cal_sum
-
-    return feats_global
-
-
-def add_gaussian_noise(probs, std=0.05, shuffle_prob=0.01):
+def apply_translate(
+    coords,
+    modules,
+    rear_cal_modules,
+    primary_vertex,
+    metadata,
+    shifts: dict
+):
     """
-    Adds Gaussian noise to a probability distribution while ensuring the sum remains 1.
-    Additionally, in 1% of cases, it either shuffles the probabilities (if num_classes > 1)
-    or applies (1 - current_value) when num_classes = 1.
-
-    :param probs: NumPy array of shape (batch_size, num_classes) with probability distributions.
-    :param std: Standard deviation of Gaussian noise.
-    :param shuffle_prob: Probability of applying shuffling (or 1 - value if num_classes = 1).
-    :return: Noisy probability distributions of the same shape as probs.
+    Apply the same translations recorded in `shifts`.
+    `shifts` should be the dict returned by translate(),
+    mapping 'x','y' to a voxel‐shift s, and 'z' to a shift in Z‐voxels.
     """
-    batch_size, num_classes = probs.shape
+    coords = coords.copy()
+    modules = modules.copy()
+    primary_vertex = primary_vertex.copy()
+    rear = rear_cal_modules.copy()
 
-    # Add Gaussian noise
-    noise = np.random.normal(0, std, size=(batch_size, num_classes))
-    noisy_probs = probs + noise
-    noisy_probs = np.clip(noisy_probs, 0, 1)  # Ensure values are in the range (0,1)
-    if num_classes > 1:
-        noisy_probs /= noisy_probs.sum(axis=1, keepdims=True)  # Normalize each row
+    def _shift_image(img, p, axis):
+        out = np.zeros_like(img)
+        if p > 0:
+            if axis == 1:
+                out[:, p:] = img[:, :-p]
+            else:
+                out[p:, :] = img[:-p, :]
+        elif p < 0:
+            if axis == 1:
+                out[:, :p] = img[:, -p:]
+            else:
+                out[:p, :] = img[-p:, :]
+        else:
+            out = img.copy()
+        return out
 
-    # Create mask for selected rows that need shuffling (num_classes > 1) or inversion (num_classes = 1)
-    shuffle_mask = np.random.rand(batch_size) < shuffle_prob
+    for ax, idx in (('x', 0), ('y', 1)):
+        if ax in shifts:
+            s = shifts[ax]
+            coords[:, idx]      += s
+            primary_vertex[idx] += s
+            L = metadata[ax].shape[0]
+            ps = int(round(s * 5 / L))
+            rear = _shift_image(rear, ps, axis=1-idx)
 
-    if num_classes > 1:
-        # Shuffle probabilities within selected rows
-        shuffled_probs = np.apply_along_axis(np.random.permutation, 1, probs)
-        noisy_probs[shuffle_mask] = shuffled_probs[shuffle_mask]
+    if 'z' in shifts:
+        p_voxel = shifts['z']
+        module_size = (metadata['z'][:, 1] == 0).sum()
+        s_mod = int(p_voxel // module_size)
+        modules += s_mod
+        coords[:, 2]      += p_voxel
+        primary_vertex[2] += p_voxel
+
+    return coords, modules, rear, primary_vertex
+    
+
+def drop_hits(
+    coords,
+    modules,
+    feats,
+    labels,
+    max_drop=0.05,
+    min_hits=5,
+):
+    """
+    Randomly drop up to max_drop fraction of hits, but never below min_hits.
+    """
+    N = len(coords)
+    p = np.random.rand() * max_drop
+    mask = np.random.rand(N) > p
+
+    # don’t drop if under min_hits
+    if mask.sum() < min_hits:
+        return coords, modules, feats, labels
+
+    return coords[mask], modules[mask], feats[mask], [lab[mask] if lab is not None else None for lab in labels]
+
+
+def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
+    """
+    Apply a global multiplicative energy/momentum scale shift to all relevant features.
+    
+    Parameters:
+    - feats: np.ndarray, typically (N_hits,) or (N_hits, D), representing hit charges or features in MeV.
+    - momentums: list of np.ndarray, each of shape (3,) representing a 3D momentum vector (in MeV/c)
+    - global_feats: dict[str, np.ndarray], global calorimeter features, etc., values in MeV or GeV.
+    - std_dev: float, standard deviation for Gaussian noise on shift factor (centered at 1.0)
+
+    Returns:
+    - scaled_feats: np.ndarray
+    - scaled_momentums: list of np.ndarray
+    - scaled_global_feats: dict[str, np.ndarray]
+    - shift: float, the applied scalar shift factor
+    """
+    shift = 1 - np.random.randn() * std_dev
+
+    # Scale hits
+    scaled_feats = feats * shift
+
+    # Scale each 3D momentum vector
+    scaled_momentums = [p * shift for p in momentums]
+
+    # Scale each global feature (array or scalar)
+    scaled_global_feats = {
+        k: v * shift for k, v in global_feats.items()
+    }
+
+    return scaled_feats, scaled_momentums, scaled_global_feats, shift
+
+
+def scale_all_by_global_shift_lognormal(feats, global_feats, log_sigma=0.1, momenta=None):
+    # shift ~ LogNormal(mean=0, sigma=log_sigma) so E[shift]≈exp(0.5*log_sigma^2)
+    # If you want mean≈1 exactly, divide by that factor.
+    shift = np.exp(np.random.randn() * log_sigma)
+    shift /= np.exp(0.5 * log_sigma**2)   # center around 1.0
+    momenta = [p * shift for p in momenta] if momenta is not None else None
+    return feats * shift, {k: v * shift for k, v in global_feats.items()}, momenta, shift
+
+
+def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):
+    """
+    Additive Gaussian jitter to voxel energies.
+    
+    Args:
+        feats (Tensor): voxel energies, shape [N] or [B, ...]
+        sigma (float): std dev of Gaussian noise (in same units as feats)
+        clamp_min (float): minimum value after jitter (default=0 for energies)
+    
+    Returns:
+        Tensor of same shape as feats, jittered.
+    """
+    noise = np.random.randn(*feats.shape) * sigma
+    return (feats + noise).clip(min=clamp_min)
+
+
+def jitter_energy_multiplicative(feats, log_sigma=0.15, clamp_min=0.0):
+    mult = np.exp(np.random.randn(*feats.shape) * log_sigma)
+    mult /= np.exp(0.5 * log_sigma**2)   # mean≈1
+    return np.maximum(feats * mult, clamp_min)
+
+
+def jitter_energy_sqrtlaw(feats, a=0.1, b=0.2, clamp_min=0.0, eps=1e-6):
+    # sigma(feat) = sqrt(a^2 + b^2 * max(feat,0))
+    sigma = np.sqrt(a*a + b*b * np.clip(feats, 0, None))
+    return np.maximum(feats + np.random.randn(*feats.shape) * sigma, clamp_min)
+
+
+def smooth_labels(targets, smoothing: float, num_classes: int = None):
+    """
+    Apply label smoothing.
+
+    Parameters
+    ----------
+    targets : array-like, shape (N,) or (N, C)
+        - If num_classes is provided: 1-D array of integer class labels in [0, num_classes-1].
+        - Else:
+          - 1-D (N,) or 2-D (N,1): binary labels or probabilities for the positive class.
+          - 2-D (N, C) with C>1: one-hot or soft multi-class labels.
+    smoothing : float in [0, 1)
+        amount of smoothing to apply.
+    num_classes : int, optional
+        number of classes to one‑hot encode 1-D `targets` into before smoothing.
+    
+    Returns
+    -------
+    smoothed : ndarray of shape (N,) or (N, C)
+        smoothed probabilities.
+    """
+    if smoothing <= 0:
+        return targets
+    targets = np.asarray(targets, dtype=np.float32)
+
+    # If supplied num_classes, force multi-class path
+    if num_classes is not None:
+        if targets.ndim != 1:
+            raise ValueError("With num_classes set, targets must be 1-D class indices.")
+        N = targets.shape[0]
+        C = num_classes
+        # one-hot encode
+        one_hot = np.zeros((N, C), dtype=np.float32)
+        one_hot[np.arange(N), targets.astype(int)] = 1.0
+        # smooth
+        return one_hot * (1.0 - smoothing) + smoothing / float(C)
+
+    # --- binary classification case ---
+    if targets.ndim == 1 or (targets.ndim == 2 and targets.shape[1] == 1):
+        probs = targets.reshape(-1)
+        smooth_pos = probs * (1.0 - smoothing) + 0.5 * smoothing
+        return smooth_pos.reshape(targets.shape)
+
+    # --- multi‑class classification case ---
+    elif targets.ndim == 2:
+        N, C = targets.shape
+        return targets * (1.0 - smoothing) + smoothing / float(C)
+
     else:
-        # Apply (1 - current_value) for single-class cases
-        noisy_probs[shuffle_mask] = 1 - noisy_probs[shuffle_mask]
+        raise ValueError(f"Unsupported target shape {targets.shape}, must be 1-D or 2-D.")
 
-    return noisy_probs
 
+def _sync_totals_from_modules(global_feats, eps=1e-9):
+    """Make totals equal the sum of their module arrays (when present)."""
+    if 'faser_cal_modules' in global_feats:
+        s = float(np.clip(np.sum(global_feats['faser_cal_modules']), 0.0, None))
+        global_feats['faser_cal_energy'] = max(s, eps)
+    if 'rear_cal_modules' in global_feats:
+        s = float(np.clip(np.sum(global_feats['rear_cal_modules'] / 1000.), 0.0, None))   # correction to GeV
+        global_feats['rear_cal_energy'] = max(s, eps)
+    if 'rear_hcal_modules' in global_feats:
+        s = float(np.clip(np.sum(global_feats['rear_hcal_modules']) / 1000., 0.0, None))  # correction to GeV
+        global_feats['rear_hcal_energy'] = max(s, eps)
+    # mucal has no module map; ensure strictly positive:
+    if 'rear_mucal_energy' in global_feats:
+        global_feats['rear_mucal_energy'] = max(float(global_feats['rear_mucal_energy']), eps)
+    return global_feats
+
+
+def module_multiplicative_jitter(global_feats, log_sigma=dict(faser=0.1, rear_cal=0.1, rear_hcal=0.1, rear_mucal=0.1)):
+    """
+    Independent per-cell multiplicative jitter (mean≈1), then sync totals.
+    """
+    gf = global_feats
+    def _per_cell(a, s):
+        mult = np.exp(np.random.randn(*a.shape) * s) / np.exp(0.5 * s * s)
+        return np.maximum(a * mult, 0.0)
+
+    if 'faser_cal_modules' in gf:
+        gf['faser_cal_modules'] = _per_cell(np.asarray(gf['faser_cal_modules'], dtype=float),
+                                            log_sigma.get('faser', 0.1))
+    if 'rear_cal_modules' in gf:
+        gf['rear_cal_modules'] = _per_cell(np.asarray(gf['rear_cal_modules'], dtype=float),
+                                           log_sigma.get('rear_cal', 0.1))
+    if 'rear_hcal_modules' in gf:
+        gf['rear_hcal_modules'] = _per_cell(np.asarray(gf['rear_hcal_modules'], dtype=float),
+                                            log_sigma.get('rear_hcal', 0.1))
+    if 'rear_mucal_energy' in gf:
+        gf['rear_mucal_energy'] = _per_cell(np.asarray(gf['rear_mucal_energy'], dtype=float),
+                                            log_sigma.get('rear_mucal', 0.1))
+    return _sync_totals_from_modules(gf)

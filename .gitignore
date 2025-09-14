@@ -4,6 +4,11 @@ log*/
 tb_logs/
 lightning_logs/
 core
-notebooks/
+.vscode*
+out*
+notebook*
 checkpoint*/
 *db
+INSTALL
+*bak*
+*copy*
