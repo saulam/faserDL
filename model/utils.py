@@ -5,39 +5,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 from timm.models.vision_transformer import Attention, Block, LayerScale
-from timm.models.layers import DropPath, Mlp
-from MinkowskiEngine import (
-    SparseTensor,
-    MinkowskiDepthwiseConvolution,
-    MinkowskiLinear,
-    MinkowskiGELU,
-)
+from timm.layers import DropPath, Mlp
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
 HAS_SDPA = hasattr(F, "scaled_dot_product_attention")
 
 
 def _attn_classic(q, k, v, mask, drop_p, training, is_causal):
-    # q:[B,H,Q,D], k/v:[B,H,K,D]; mask: bool keep or additive float broadcastable to [B,1,Q,K]
-    scale = 1.0 / math.sqrt(q.size(-1))
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    # q:[B,H,Q,D], k/v:[B,H,K,D]; mask can be:
+    # - additive float (0 keep, -inf/-1e9 block)
+    # - boolean KEEP mask (True=keep, False=block)
+
+    B, H, Q, D = q.shape
+    Klen = k.size(-2)
+
+    # compute logits in fp32 for stability
+    scale = 1.0 / math.sqrt(D)
+    qf = (q * scale).to(torch.float32)
+    kf = k.to(torch.float32)
+    scores = torch.matmul(qf, kf.transpose(-2, -1))  # [B,H,Q,K]
+
+    if is_causal:
+        # lower-triangular keep mask [Q,K]
+        causal = torch.ones(Q, Klen, dtype=torch.bool, device=scores.device).tril()
+        scores = scores.masked_fill(~causal, float('-inf'))
+
     if mask is not None:
-        scores = scores + mask
-    attn = torch.softmax(scores, dim=-1)
+        if mask.dtype == torch.bool:
+            scores = scores.masked_fill(~mask, float('-inf'))
+        else:
+            scores = scores + mask.to(dtype=scores.dtype)
+
+    # softmax in fp32; guard fully-masked rows -> zeros
+    attn = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    attn = torch.nan_to_num(attn, nan=0.0)  # handles all -inf rows
+
     if training and drop_p > 0.0:
-        attn = F.dropout(attn, p=drop_p)
-    return torch.matmul(attn, v)
+        attn = F.dropout(attn, p=drop_p, training=True)
+
+    return torch.matmul(attn.to(v.dtype), v)
 
 
 def _attn_sdpa(q, k, v, mask, drop_p, training, is_causal):
-    # Prefer Flash, never mem-efficient; allow math fallback
     try:
-        with torch.backends.cuda.sdp_kernel(enable_flash=True,
-                                            enable_mem_efficient=False,
-                                            enable_math=True):
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
             return F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=mask,
+                q.contiguous(), k.contiguous(), v.contiguous(),
+                attn_mask=mask.contiguous() if mask is not None else None,
                 dropout_p=(drop_p if training else 0.0),
                 is_causal=is_causal
             )
@@ -78,9 +93,6 @@ def _to_sdpa_mask(mask, B, Q, K, device, dtype):
         m = mask.view(B, 1, Q, K).to(device=device)
     else:
         raise ValueError(f"Bad mask shape {tuple(mask.shape)}")
-    if mask.dtype == torch.bool:
-        NEG = -1e4 if dtype in (torch.float16, torch.bfloat16) else -1e9
-        m = torch.where(m, 0.0, NEG)
     return m
 
 
@@ -119,7 +131,7 @@ class BlockWithMask(Block):
             num_heads,
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
-            drop=drop,
+            proj_drop=drop,
             attn_drop=attn_drop,
             init_values=init_values,
             drop_path=drop_path,
@@ -542,204 +554,4 @@ class CylindricalHeadEta(nn.Module):
             "p_cart": p_cart,
             "pT": pT, "eta": eta, "cos_phi": cos_phi, "sin_phi": sin_phi
         }
-
-    
-    
-class MinkowskiLayerNorm(nn.Module):
-    """ Channel-wise layer normalization for sparse tensors.
-    """
-    def __init__(
-        self,
-        normalized_shape,
-        eps=1e-6,
-    ):
-        super(MinkowskiLayerNorm, self).__init__()
-        self.ln = nn.LayerNorm(normalized_shape, eps=eps)
-    def forward(self, input):
-        output = self.ln(input.F)
-        return SparseTensor(
-            output,
-            coordinate_map_key=input.coordinate_map_key,
-            coordinate_manager=input.coordinate_manager)
-
-
-class BlockDense(nn.Module):
-    """ Dense ConvNeXtV2 Block.
-    
-    Args:
-        dim (int): Number of input channels.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-    """
-    def __init__(self, dim, kernel_size=7, padding=3, drop_path=0.):
-        super().__init__()
-        self.dwconv = nn.Conv3d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim)
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim)
-        self.act = nn.GELU()
-        self.grn = GRN(4 * dim)
-        self.pwconv2 = nn.Linear(4 * dim, dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x):
-        input = x
-
-        # small workaround (conv_depthwise3d not implemented for bf16)
-        with autocast(enabled=False):
-            x_fp32 = self.dwconv(x.float())
-        x = x_fp32.to(input.dtype)
-        
-        x = x.permute(0, 2, 3, 4, 1) # (N, C, H, W, D) -> (N, H, W, D, C)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.grn(x)
-        x = self.pwconv2(x)
-        x = x.permute(0, 4, 1, 2, 3) # (N, H, W, D, C) -> (N, C, H, W, D)
-
-        x = input + self.drop_path(x)
-        return x
-        
-
-class BlockSparse(nn.Module):
-    """ Sparse ConvNeXtV2 Block. 
-
-    Args:
-        dim (int): Number of input channels.
-        kernel_size (int): Size of input kernel.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-    """
-    def __init__(self, dim, kernel_size=7, dilation=1, drop_path=0., D=3):
-        super().__init__()
-        
-        self.dwconv = MinkowskiDepthwiseConvolution(
-            dim, 
-            kernel_size=kernel_size,
-            dilation=dilation,
-            bias=True,
-            dimension=D)
-        self.norm = MinkowskiLayerNorm(dim, 1e-6)
-        self.pwconv1 = MinkowskiLinear(dim, 4 * dim)   
-        self.act = MinkowskiGELU()
-        self.grn = MinkowskiGRN(4  * dim)
-        self.pwconv2 = MinkowskiLinear(4 * dim, dim)
-        self.drop_path = MinkowskiDropPath(drop_path)
-    
-    def forward(self, x):
-        input = x
-        x = self.dwconv(x)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.grn(x)
-        x = self.pwconv2(x)
-        x = input + self.drop_path(x)
-
-        return x
-
-
-class MinkowskiGRN(nn.Module):
-    """ GRN layer for sparse tensors.
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, dim))
-        self.beta = nn.Parameter(torch.zeros(1, dim))
-
-    def forward(self, x):
-        cm = x.coordinate_manager
-        in_key = x.coordinate_map_key
-
-        Gx = torch.norm(x.F, p=2, dim=0, keepdim=True)
-        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
-        return SparseTensor(
-                self.gamma * (x.F * Nx) + self.beta + x.F,
-                coordinate_map_key=in_key,
-                coordinate_manager=cm)
-
-
-class MinkowskiDropPath(nn.Module):
-    """ Drop Path for sparse tensors.
-    """
-
-    def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
-        super(MinkowskiDropPath, self).__init__()
-        self.drop_prob = drop_prob
-        self.scale_by_keep = scale_by_keep
-    
-    def forward(self, x):
-        if self.drop_prob == 0. or not self.training:
-            return x
-        cm = x.coordinate_manager
-        in_key = x.coordinate_map_key
-        keep_prob = 1 - self.drop_prob
-        mask = torch.cat([
-            torch.ones(len(_)) if random.uniform(0, 1) > self.drop_prob
-            else torch.zeros(len(_)) for _ in x.decomposed_coordinates
-        ]).view(-1, 1).to(x.device)
-        if keep_prob > 0.0 and self.scale_by_keep:
-            mask.div_(keep_prob)
-        return SparseTensor(
-                x.F * mask,
-                coordinate_map_key=in_key,
-                coordinate_manager=cm)
-
-
-class MinkowskiLayerNorm(nn.Module):
-    """ Channel-wise layer normalization for sparse tensors.
-    """
-    def __init__(
-        self,
-        normalized_shape,
-        eps=1e-6,
-    ):
-        super(MinkowskiLayerNorm, self).__init__()
-        self.ln = nn.LayerNorm(normalized_shape, eps=eps)
-    def forward(self, input):
-        output = self.ln(input.F)
-        return SparseTensor(
-            output,
-            coordinate_map_key=input.coordinate_map_key,
-            coordinate_manager=input.coordinate_manager)
-
-
-class LayerNorm(nn.Module):
-    """ LayerNorm that supports two data formats: channels_last (default) or channels_first. 
-    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
-    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
-    with shape (batch_size, channels, height, width).
-    """
-    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        self.eps = eps
-        self.data_format = data_format
-        if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError 
-        self.normalized_shape = (normalized_shape, )
-    
-    def forward(self, x):
-        if self.data_format == "channels_last":
-            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        elif self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None] * x + self.bias[:, None, None]
-            return x
-
-
-class GRN(nn.Module):
-    """ GRN (Global Response Normalization) layer
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
-        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
-
-    def forward(self, x):
-        Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
-        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
-        return self.gamma * (x * Nx) + self.beta + x
         

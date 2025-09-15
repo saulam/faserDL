@@ -11,12 +11,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-import timm.optim.optim_factory as optim_factory
+import timm.optim as optim_factory
+from spconv.pytorch import SparseConvTensor
 from utils import (
-    arrange_sparse_minkowski, arrange_truth, soft_focal_bce_with_logits,
+    arrange_input, arrange_truth, soft_focal_bce_with_logits,
     prototype_contrastive_loss,  ghost_pushaway_loss,
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
+
+def _move_obj(o, device):
+    if isinstance(o, SparseConvTensor):
+        ind = o.indices.to(device)
+        if ind.dtype != torch.int32:
+            ind = ind.int()
+        return SparseConvTensor(o.features.to(device), ind, o.spatial_shape, o.batch_size)
+    if isinstance(o, torch.Tensor):
+        return o.to(device)
+    if isinstance(o, dict):
+        return {k: _move_obj(v, device) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(_move_obj(v, device) for v in o)
+    return o
 
 
 class MAEPreTrainer(pl.LightningModule):
@@ -51,6 +66,10 @@ class MAEPreTrainer(pl.LightningModule):
         }
 
 
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        return _move_obj(batch, device)
+    
+
     def on_train_start(self):
         "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
@@ -75,7 +94,7 @@ class MAEPreTrainer(pl.LightningModule):
 
 
     def _arrange_batch(self, batch):
-        batch_input, *global_params = arrange_sparse_minkowski(batch, self.device)
+        batch_input, *global_params = arrange_input(batch)
         labels = arrange_truth(batch)
         hit_track_id = labels['hit_track_id']
         hit_primary_id = labels['hit_primary_id']
@@ -223,19 +242,19 @@ class MAEPreTrainer(pl.LightningModule):
         return sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask
     
 
-    def compute_encoder_losses(
+    def compute_contrastive_losses(
         self,
         pred_track: torch.Tensor,
         pred_primary: torch.Tensor,
         pred_pid: torch.Tensor,
-        enc_idx_targets: torch.Tensor,
+        idx_targets: torch.Tensor,
         hit_track_id: torch.Tensor,
         hit_primary_id: torch.Tensor,
         hit_pdg: torch.Tensor,
         hit_event_id: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
-        raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(enc_idx_targets)
+        raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(idx_targets)
 
         # Gather embeddings and labels
         z_track = pred_track[tok_row, sub_idx, :]         # [N_valid, D]
@@ -254,7 +273,7 @@ class MAEPreTrainer(pl.LightningModule):
         return loss_trk, loss_pri, loss_pid, part_losses_enc
 
 
-    def compute_decoder_losses(
+    def compute_reconstruction_losses(
         self,
         targ_reg: torch.Tensor,         # [N_hits, C_in]
         pred_occ: torch.Tensor,         # [M, P]
@@ -356,25 +375,25 @@ class MAEPreTrainer(pl.LightningModule):
 
     def compute_losses(
         self,
-        pred_track: torch.Tensor,       # encoder
-        pred_primary: torch.Tensor,     # encoder
-        pred_pid: torch.Tensor,         # encoder
-        pred_occ: torch.Tensor,         # decoder
-        pred_reg: torch.Tensor,         # decoder
-        targ_reg: torch.Tensor,         # [N_hits, C_in]
-        enc_idx_targets: torch.Tensor,  # encoder
-        hit_track_id: torch.Tensor,     # encoder
-        hit_primary_id: torch.Tensor,   # encoder
-        hit_pdg: torch.Tensor,          # encoder
-        hit_event_id: torch.Tensor,     # encoder
-        idx_targets: torch.Tensor,      # decoder
-        ghost_mask: torch.Tensor,       # encoder
+        pred_track: torch.Tensor,
+        pred_primary: torch.Tensor,
+        pred_pid: torch.Tensor,
+        pred_occ: torch.Tensor,
+        pred_reg: torch.Tensor,
+        targ_reg: torch.Tensor,
+        con_idx_targets: torch.Tensor,
+        rec_idx_targets: torch.Tensor,
+        hit_track_id: torch.Tensor,
+        hit_primary_id: torch.Tensor,
+        hit_pdg: torch.Tensor,
+        hit_event_id: torch.Tensor,
+        ghost_mask: torch.Tensor,
     ):
-        loss_trk, loss_pri, loss_pid, part_enc = self.compute_encoder_losses(
-            pred_track, pred_primary, pred_pid, enc_idx_targets, hit_track_id, hit_primary_id, hit_pdg, hit_event_id, ghost_mask
+        loss_trk, loss_pri, loss_pid, part_enc = self.compute_contrastive_losses(
+            pred_track, pred_primary, pred_pid, con_idx_targets, hit_track_id, hit_primary_id, hit_pdg, hit_event_id, ghost_mask
         )
-        loss_occ, loss_reg, part_dec = self.compute_decoder_losses(
-            targ_reg, pred_occ, pred_reg, idx_targets, ghost_mask
+        loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
+            targ_reg, pred_occ, pred_reg, rec_idx_targets, ghost_mask
         )
 
         # Kendall et al. aggregation
@@ -395,12 +414,12 @@ class MAEPreTrainer(pl.LightningModule):
 
 
     def common_step(self, batch):
-        batch_size = len(batch["c"])
         batch_input, *batch_input_global, labels = self._arrange_batch(batch)
+        batch_size = batch_input.batch_size
         hit_track_id, hit_primary_id, hit_pdg, ghost_mask, hit_event_id = labels
 
         # Forward pass
-        pred_track, pred_primary, pred_pid, pred_occ, pred_reg, idx_targets, enc_idx_targets, _, _, = self.forward(
+        pred_track, pred_primary, pred_pid, pred_occ, pred_reg, con_idx_targets, rec_idx_targets, _, _, = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
@@ -409,13 +428,13 @@ class MAEPreTrainer(pl.LightningModule):
             pred_pid,
             pred_occ,
             pred_reg,
-            batch_input.F,
-            enc_idx_targets,
+            batch_input.features,
+            con_idx_targets,
+            rec_idx_targets,
             hit_track_id,
             hit_primary_id,
             hit_pdg,
             hit_event_id,
-            idx_targets,
             ghost_mask,
         )
 

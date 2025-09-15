@@ -10,10 +10,9 @@ Description:
 
 import copy
 import torch
-import MinkowskiEngine as ME
+import spconv.pytorch as spconv
 from functools import partial
-from sklearn.model_selection import KFold
-from torch.utils.data import random_split, ConcatDataset, DataLoader
+from torch.utils.data import random_split, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
 
@@ -83,29 +82,103 @@ def create_loader(ds, shuffle, drop_last, collate_fn=None, args=None):
     )
 
 
-def collate(batch, test: bool = True):
+def _make_spconv_tensor(
+    feats,                 # [N, C]
+    coords_list,           # length B, each [Ni, D] (no batch col), ints
+    device,
+    axis_order,            # "XYZ" (keep ME-style) or "ZYX"
+    spatial_shape = None,  # predefine if you want fixed grid
+):
+    assert len(coords_list) > 0, "Empty batch."
+    D = coords_list[0].shape[1]
+    assert all(c.shape[1] == D for c in coords_list), "All coords must have same D."
+
+    if device is None:
+        device = feats.device
+
+    # Build batched indices in XYZ first: [N, 1+D] = [b, x, y, (z…)]
+    bcols, ccols = [], []
+    for b, c in enumerate(coords_list):
+        n = c.size(0)
+        if n == 0:  # skip empty items (we filtered earlier, but be safe)
+            continue
+        bcols.append(torch.full((n, 1), b, dtype=torch.int32, device=device))
+        ccols.append(c.to(device=device, dtype=torch.int32))
+    indices_xyz = torch.cat([torch.cat(bcols, 0), torch.cat(ccols, 0)], dim=1)  # [N, 1+D]
+    assert indices_xyz.numel() > 0, "No coordinates after batching."
+
+    # Choose axis order for spconv
+    if axis_order.upper() == "XYZ":
+        indices_spatial = indices_xyz[:, 1:]
+        if spatial_shape is None:
+            spatial_shape = tuple((indices_spatial.max(0).values + 1).tolist())  # (X, Y, Z…)
+        indices_spconv = indices_xyz  # [b, x, y, z…]
+    elif axis_order.upper() == "ZYX":
+        xyz = indices_xyz[:, 1:]
+        zyx = xyz.flip(dims=[1])
+        if spatial_shape is None:
+            spatial_shape = tuple((zyx.max(0).values + 1).tolist())             # (Z, Y, X…)
+        indices_spconv = torch.cat([indices_xyz[:, :1], zyx], dim=1)            # [b, z, y, x…]
+    else:
+        raise ValueError("axis_order must be 'XYZ' or 'ZYX'.")
+
+    x_sp = spconv.SparseConvTensor(
+        features=feats.to(device),
+        indices=indices_spconv.to(torch.int32),
+        spatial_shape=spatial_shape,
+        batch_size=len(coords_list),
+    )
+    return x_sp, spatial_shape
+
+
+def collate(
+    batch,
+    test: bool = True,
+    *,
+    axis_order: str = "XYZ",
+    device = None,
+    spatial_shape = (48, 48, 200),  # set (X, Y, Z) if fixed grid
+):
     """
-    Unified collate for 'train' and 'test'.
-    - mode='train': matches collate_train behavior (tensors via cat/stack).
-    - mode='test' : matches collate_test behavior (lists; some .numpy()/.item()).
+    Collate that returns a spconv-ready dict.
+    Expects each item 'd' to have:
+      - d["coords"]: [Ni, D] integer coords (no batch column)
+      - d["feats"] : [Ni, C] features
+      - optional: same fields you already propagate
     """
     mode = 'test' if test else 'train'
     batch = [d for d in batch if len(d["coords"]) > 0]
+    if len(batch) == 0:
+        # Return an empty-shaped stub to avoid downstream crashes
+        return {
+            "x_sp": None, "spatial_shape": spatial_shape, "batch_size": 0,
+            "hit_event_id": torch.empty(0, dtype=torch.long),
+        }
 
     coords_list = [d["coords"] for d in batch]
-    feats_list  = [d["feats"] for d in batch]
+    feats_list  = [d["feats"]  for d in batch]
+
+    # Build hit_event_id exactly like your current collate
     num_hits = torch.tensor([len(x) for x in feats_list], dtype=torch.long)
     hit_event_id = torch.arange(len(feats_list), dtype=torch.long).repeat_interleave(num_hits)
 
+    feats_cat = torch.cat(feats_list, dim=0)
+    x_sp, spatial_shape_out = _make_spconv_tensor(
+        feats_cat, coords_list, device=device, axis_order=axis_order, spatial_shape=spatial_shape
+    )
+
     ret = {
-        "f": torch.cat(feats_list, dim=0),
-        "c": coords_list,
+        "x_sp": x_sp,
+        "spatial_shape": spatial_shape_out,
+        "batch_size": len(coords_list),
         "hit_event_id": hit_event_id,
-        "f_glob": torch.stack([d["feats_global"] for d in batch]),
-        "faser_cal_modules": torch.stack([d["faser_cal_modules"] for d in batch]),
-        "rear_cal_modules": torch.stack([d["rear_cal_modules"] for d in batch]),
-        "rear_hcal_modules": torch.stack([d["rear_hcal_modules"] for d in batch]),
     }
+
+    # Keep your existing extras 1:1
+    ret["f_glob"] = torch.stack([d["feats_global"] for d in batch])
+    ret["faser_cal_modules"] = torch.stack([d["faser_cal_modules"] for d in batch])
+    ret["rear_cal_modules"] = torch.stack([d["rear_cal_modules"] for d in batch])
+    ret["rear_hcal_modules"] = torch.stack([d["rear_hcal_modules"] for d in batch])
 
     if mode == "test":
         optional_keys = [
@@ -117,10 +190,8 @@ def collate(batch, test: bool = True):
             "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
         ]
         to_numpy = {"primlepton_labels", "seg_labels", "flavour_label", "charm"}
-        to_item  = {
-            "e_vis", "pt_miss", "vis_sp_momentum_mag",
-            "out_lepton_momentum_mag", "jet_momentum_mag",
-        }
+        to_item  = {"e_vis", "pt_miss", "vis_sp_momentum_mag",
+                    "out_lepton_momentum_mag", "jet_momentum_mag"}
 
         for key in optional_keys:
             if key in batch[0]:
@@ -164,21 +235,18 @@ def collate(batch, test: bool = True):
     return ret
 
 
-def arrange_sparse_minkowski(data, device):
-    tensor = ME.SparseTensor(
-        features=data['f'],
-        coordinates=ME.utils.batched_coordinates(data['c'], dtype=torch.int),
-        device=device
-    )
+def arrange_input(data):
+    x_sp = data['x_sp']
     faser_cal = data['faser_cal_modules']
     rear_cal = data['rear_cal_modules']
     rear_hcal = data['rear_hcal_modules']
     tensor_global = data['f_glob']
 
-    return tensor, faser_cal, rear_cal, rear_hcal, tensor_global
+    return x_sp, faser_cal, rear_cal, rear_hcal, tensor_global
+
 
 def arrange_truth(data):
-    output = {'coords': [x.detach().cpu().numpy() for x in data['c']]}
+    output = {}
     
     optional_keys = [
         'hit_track_id', 'hit_primary_id', 'hit_pdg', 'ghost_mask', 'hit_event_id',
