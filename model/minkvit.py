@@ -8,11 +8,11 @@ Description: PyTorch ViT model with MinkowskiEngine patching.
 
 import torch
 import torch.nn as nn
-import MinkowskiEngine as ME
+#import MinkowskiEngine as ME
 import timm.models.vision_transformer as vit
 from functools import partial
 from timm.models.layers import trunc_normal_
-from MinkowskiEngine import MinkowskiConvolution
+#from MinkowskiEngine import MinkowskiConvolution
 from .utils import (
     get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
     CrossAttnBlock, CrossAttention, CylindricalHeadNormalized

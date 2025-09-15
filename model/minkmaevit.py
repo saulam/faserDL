@@ -9,9 +9,8 @@ Description: PyTorch MAE-ViT model with MinkowskiEngine patching.
 import math
 import torch
 import torch.nn as nn
-import MinkowskiEngine as ME
+from spconv.pytorch import SparseConv3d
 from functools import partial
-from MinkowskiEngine import MinkowskiConvolution
 from .utils import (
     get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
     CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead
@@ -79,9 +78,9 @@ class MinkMAEViT(nn.Module):
         self.num_intra_positions = G_h * G_w * self.module_depth_patches
 
         # patch embedding
-        self.patch_embed = MinkowskiConvolution(
+        self.patch_embed = SparseConv3d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
-            bias=True, dimension=D,
+            padding=0, bias=True
         )
 
         # Precompute dense patch templates
@@ -224,10 +223,10 @@ class MinkMAEViT(nn.Module):
 
 
     def _init_weights(self, m):
-        if isinstance(m, MinkowskiConvolution):
+        if isinstance(m, SparseConv3d):
             # initialize conv like nn.Linear
-            w = m.kernel.data
-            torch.nn.init.xavier_uniform_(w.view(-1, w.size(2)))
+            w = m.weight
+            torch.nn.init.xavier_uniform_(w.view(w.size(0), -1))
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
@@ -248,36 +247,27 @@ class MinkMAEViT(nn.Module):
             'latents_free',
             'query_tokens.con',
             'query_tokens.rec',
-            'patch_embed.bias',
         }
+    
 
+    def densify_patches(self, x_sp):
+        B = x_sp.batch_size
+        C = x_sp.features.size(1)
+        X, Y, Z = x_sp.spatial_shape  # == (H, W, D)
 
-    def densify_patches(self, x_sparse):
-        coords = x_sparse.C.long()  # [N,4]
-        feats  = x_sparse.F
+        # Dense is [B, C, X, Y, Z] → flatten H->W->D by permuting to [B, X, Y, Z, C]
+        x_dense = x_sp.dense()  # [B, C, X, Y, Z]
+        dense_tokens = x_dense.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
 
-        B      = int(coords[:, 0].max().item()) + 1
-        G_h, G_w, G_d = self.grid_size
-        Np     = self.num_patches
-        C      = feats.size(1)
+        # Mask from indices
+        idx = x_sp.indices.long()
+        b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
+        occ = torch.zeros((B, X, Y, Z), dtype=torch.bool, device=x_sp.features.device)
+        occ[b, h, w, d] = True
+        attn_mask = occ.view(B, -1)  # H->W->D order matches the permute above
 
-        # convert from voxel coords to patch-grid coords
-        h = coords[:, 1] // self.patch_size[0]
-        w = coords[:, 2] // self.patch_size[1]
-        d = coords[:, 3] // self.patch_size[2]
-
-        patch_ids = (h * (G_w * G_d)) + (w * G_d) + d
-        batch_ids = coords[:, 0].long()
-        
-        # scatter into dense tensor
-        dense = feats.new_zeros(B, Np, C)
-        dense[batch_ids, patch_ids, :] = feats
-
-        attn_mask = torch.zeros(B, Np, dtype=torch.bool, device=feats.device)
-        attn_mask[batch_ids, patch_ids] = True
         intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
-
-        return dense, attn_mask, intra_idx
+        return dense_tokens, attn_mask, intra_idx
 
 
     def build_patch_occupancy_map(self, x):
@@ -285,29 +275,22 @@ class MinkMAEViT(nn.Module):
         From the original sparse tensor coordinates, build a [B, N_patches, P] mapping
         with the raw id of the actual hit in that sub‐voxel.
         """
-        coords     = x.C
-        device     = coords.device
-        event_ids  = coords[:, 0].long()
-        x_, y_, z_ = coords[:, 1:].long().unbind(-1)
-    
-        p_h, p_w, p_d  = self.patch_size.tolist()
-        G_h, G_w, G_d  = self.grid_size
-        P              = self.patch_voxels
-        Np             = self.num_patches
-        B              = int(event_ids.max().item()) + 1
-        N              = coords.shape[0]
-    
-        patch_idx = (x_ // p_h) * (G_w * G_d) \
-                  + (y_ // p_w) * G_d \
-                  + (z_ // p_d)
-        sub_idx   = (x_ % p_h) * (p_w * p_d) \
-                  + (y_ % p_w) * p_d \
-                  + (z_ % p_d)
+        idx = x.indices.long()  # [N, 4] = [b, x, y, z] == [b, h, w, d]
+        b  = idx[:, 0]
+        h, w, d = idx[:, 1], idx[:, 2], idx[:, 3]
 
-        raw_inds = torch.arange(N, device=device)
-        idx_map = torch.full ((B, Np, P), -1, dtype=torch.long, device=device)
-        idx_map[event_ids, patch_idx, sub_idx] = raw_inds
-    
+        p_h, p_w, p_d = self.patch_size.tolist()
+        Gh, Gw, Gd    = self.grid_size
+        P             = self.patch_voxels
+        Np            = self.num_patches
+        B             = int(b.max().item()) + 1
+        N             = idx.size(0)
+
+        patch_idx = (h // p_h) * (Gw * Gd) + (w // p_w) * Gd + (d // p_d)
+        sub_idx   = (h %  p_h) * (p_w * p_d) + (w %  p_w) * p_d + (d %  p_d)
+
+        idx_map = torch.full((B, Np, P), -1, dtype=torch.long, device=idx.device)
+        idx_map[b, patch_idx, sub_idx] = torch.arange(N, device=idx.device)
         return idx_map
     
 
@@ -337,7 +320,7 @@ class MinkMAEViT(nn.Module):
             x:          [B, M, Lm, C]   tokens per module
             attn_mask:  [B, M, Lm]      True = real token, False = pad/invalid
             mask_ratio: float           desired mask ratio over *real* tokens
-            enforce_both (bool): if True, for modules with v>=2, keep at least 1 and mask at least 1
+            enforce_both (bool):        if True, for modules with v>=2, keep at least 1 and mask at least 1
 
         Returns:
             x_keep:       [B, M, Lk, C]      gathered tokens (padded with dummies)
@@ -372,20 +355,20 @@ class MinkMAEViT(nn.Module):
 
         # sample Lk candidate positions among valids (invalids set to +inf)
         noise = torch.rand(B, M, Lm, device=device).masked_fill(~valid, float('inf'))
-        ids_keep_all = torch.topk(noise, k=Lk, dim=-1, largest=False, sorted=False).indices  # [B,M,Lk]
+        ids_keep_all = torch.topk(noise, k=Lk, dim=-1, largest=False, sorted=False).indices  # [B, M, Lk]
 
         # flags telling which gathered slots are real vs invalid
-        real_flags = torch.gather(valid, 2, ids_keep_all)                 # [B,M,Lk], bool
+        real_flags = torch.gather(valid, 2, ids_keep_all)                 # [B, M, Lk], bool
 
         # among gathered real slots, mark only the first 'keep' as actually kept
-        real_cum = real_flags.int().cumsum(dim=-1)                        # [B,M,Lk]
-        attn_keep = real_flags & (real_cum <= keep.unsqueeze(-1))    # [B,M,Lk], bool
+        real_cum = real_flags.int().cumsum(dim=-1)                        # [B, M, Lk]
+        attn_keep = real_flags & (real_cum <= keep.unsqueeze(-1))         # [B, M, Lk], bool
 
         # gather tokens (padding stays; masked out by attn_keep downstream)
         x_keep = torch.gather(x, 2, ids_keep_all.unsqueeze(-1).expand(-1, -1, -1, C))  # [B,M,Lk,C]
 
         # build rand_mask over original intra space: real & not kept -> True
-        kept_full = torch.zeros_like(valid)                                # [B,M,Lm], bool
+        kept_full = torch.zeros_like(valid)                                # [B, M, Lm], bool
         kept_full.scatter_(2, ids_keep_all, attn_keep)                     # mark real-kept only
         rand_mask = valid & (~kept_full)                                   # True = masked real, False else
 
@@ -461,25 +444,15 @@ class MinkMAEViT(nn.Module):
         return self._pack_tokens(kv, attn_mask)
 
     
-    def _prepare_queries_and_mask(
+    def _prepare_queries(
         self,
-        cls_mod: torch.Tensor,      # [B, M, C]  per-module CLS
-        kv_keep: torch.Tensor,      # [B, Nk]    bool, real K/V positions
-        *,
-        adaptive: bool = True,
-        alpha: float = 1.0,         # free queries ~ alpha * sqrt(#KV)
-        min_free: int = 2,          # minimum number of free queries when adaptive
-        jitter: int = 1,            # ± jitter on active free queries when training
+        cls_mod: torch.Tensor,  # [B, M, C]  per-module CLS
     ):
         """
-        Returns:
-        queries      [B, Q, C]   (Q = M + K_free)
-        q_mask       [B, Q]      bool, which queries are active
-        pair_mask    [B, Q, Nk]  bool, (active query) AND (real KV)
+        Returns: queries        [B, Q, C]   (Q = M + K_free)
         """
         B, M, C = cls_mod.shape
         device  = cls_mod.device
-        Q_total = self.latent_tokens
 
         # Anchored CLS queries
         mod_ids   = torch.arange(M, device=device)
@@ -492,32 +465,7 @@ class MinkMAEViT(nn.Module):
         else:
             queries = q_anchor                                                 # [B, M, C]
 
-        # Query mask
-        q_mask = torch.zeros(B, Q_total, dtype=torch.bool, device=device)
-        q_mask[:, :M] = True  # anchors always active
-
-        if self.latent_free_tokens > 0:
-            if adaptive:
-                # how many free queries to activate per event (0..K_free)
-                v_b = kv_keep.sum(dim=1).float()                  # [B]
-                k_b = (alpha * v_b.sqrt()).round().clamp_(min_free, self.latent_free_tokens).long()
-                if self.training and jitter > 0:
-                    k_b = (k_b + torch.randint(-jitter, jitter + 1, k_b.shape, device=device)).clamp_(min_free, self.latent_free_tokens)
-
-                num = int(k_b.max().item())
-                if num > 0:
-                    # sample which free slots to activate (ensures tail slots get trained over time)
-                    idx  = torch.rand(B, self.latent_free_tokens, device=device).topk(num, dim=1, largest=False, sorted=False).indices  # [B,num]
-                    take = (torch.arange(num, device=device).unsqueeze(0) < k_b.unsqueeze(1))                           # [B,num]
-                    r, c = take.nonzero(as_tuple=True)
-                    q_mask[r, M + idx[r, c]] = True
-            else:
-                q_mask[:, :] = True
-
-        # Single pair mask for CrossAttnBlock
-        pair_mask = q_mask.unsqueeze(-1) & kv_keep.unsqueeze(1)  # [B, Q, Nk]
-
-        return queries, q_mask, pair_mask
+        return queries
 
 
     def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
@@ -568,30 +516,28 @@ class MinkMAEViT(nn.Module):
         g_tokens = g_tokens.to(tok_mod.dtype)
 
         # Perceiver-IO encoder: latents attend to all kept tokens
-        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_keep)  # [B, Nk(_max), C], [B, Nk(_max)]
+        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_keep)  # [B, Nk, C], [B, Nk]
 
         # append global tokens to kv
-        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                    # [B, Nk(_max)+G, C]
+        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                    # [B, Nk+G, C]
         kv_keep   = torch.cat([kv_keep, torch.ones(
-            kv_keep.size(0), self.num_global_tokens, 
-            dtype=torch.bool, device=kv_keep.device)], dim=1)                  # [B, Nk(_max)+G]
-        
+            kv_keep.size(0), self.num_global_tokens,
+            dtype=torch.bool, device=kv_keep.device)], dim=1)                  # [B, Nk+G]
+
         # prepare queries and masks
-        queries, q_mask, pair_mask = self._prepare_queries_and_mask(
-            cls_mod, kv_keep, adaptive=False,
-        )
-        lat = queries                                                          # [B, Q, C]
+        queries = self._prepare_queries(cls_mod)                               # [B, M+K_free, C]
+        lat = queries
         for xa, sa in zip(self.latent_xattn_blocks, self.latent_self_blocks):
-            lat = xa(lat, kv_tokens, attn_mask=pair_mask)                      # cross: lat <- tokens
-            lat = sa(lat, attn_mask=q_mask)                                    # self-attn over latents
-        lat = self.latent_norm(lat)                                            # [B, Q, C]
+            lat = xa(lat, kv_tokens, attn_mask=kv_keep)                        # cross: lat <- tokens
+            lat = sa(lat, attn_mask=None)                                      # self-attn over latents
+        lat = self.latent_norm(lat)                                            # [B, M+K_free, C]
 
         return (
-            lat, q_mask, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
+            lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
         )
         
 
-    def forward_contrastive(self, latents, latent_mask, attn_mask_keep, ids_keep, idx_map):
+    def forward_contrastive(self, latents, attn_mask_keep, ids_keep, idx_map):
         """
         latents:        [B, K, Cenc]
         attn_mask_keep: [B, M, Lk]
@@ -623,14 +569,13 @@ class MinkMAEViT(nn.Module):
 
         # decode with latents
         KV = self.latents_to_dec(latents)                                  # [B, K, Cdec]
-        kv_mask = latent_mask
         X  = Q
         for blk in self.decode_xattn_blocks:
-            X = blk(X, KV, attn_mask=kv_mask)
+            X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
         # heads
-        shared = self.shared_voxel_head["con"](out_flat)                   # [Nk, P, H]
+        shared       = self.shared_voxel_head["con"](out_flat)             # [Nk, P, H]
         pred_track   = self.track_head(shared)                             # [Nk, P, E]
         pred_primary = self.primary_head(shared)                           # [Nk, P, E]
         pred_pid     = self.pid_head(shared)                               # [Nk, P, E]
@@ -642,7 +587,7 @@ class MinkMAEViT(nn.Module):
         return pred_track, pred_primary, pred_pid, idx_targets_kept
 
 
-    def forward_reconstruction(self, latents, latent_mask, rand_mask, attn_mask_mod, idx_map):
+    def forward_reconstruction(self, latents, rand_mask, attn_mask_mod, idx_map):
         """
         latents:       [B, K, Cenc]
         rand_mask:     [B, M, Lm]
@@ -673,14 +618,13 @@ class MinkMAEViT(nn.Module):
 
         # decode with latents
         KV = self.latents_to_dec(latents)                                    # [B, K, Cdec]
-        kv_mask = latent_mask
         X  = Q
         for blk in self.decode_xattn_blocks:
-            X = blk(X, KV, attn_mask=kv_mask)
+            X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
         # heads
-        shared = self.shared_voxel_head["rec"](out_flat)                     # [Nm, P, H]
+        shared   = self.shared_voxel_head["rec"](out_flat)                   # [Nm, P, H]
         pred_occ = self.occ_head(shared).squeeze(-1)                         # [Nm, P]
         pred_reg = self.reg_head(shared)                                     # [Nm, P, in_chans]
 
@@ -695,20 +639,20 @@ class MinkMAEViT(nn.Module):
         idx_map = self.build_patch_occupancy_map(x)
 
         # Encoder
-        lat, latent_mask, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \
+        lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \
             self.forward_encoder(x, x_glob, mask_ratio)
 
         # Contrastive path
-        pred_track, pred_primary, pred_pid, enc_idx_targets = \
-            self.forward_contrastive(lat, latent_mask, attn_mask_keep, ids_keep, idx_map)
+        pred_track, pred_primary, pred_pid, con_idx_targets = \
+            self.forward_contrastive(lat, attn_mask_keep, ids_keep, idx_map)
         
         # Reconstruction path
-        pred_occ, pred_reg, idx_targets, row_event_ids, row_patch_ids = \
-            self.forward_reconstruction(lat, latent_mask, rand_mask, attn_mask_mod, idx_map)
+        pred_occ, pred_reg, rec_idx_targets, row_event_ids, row_patch_ids = \
+            self.forward_reconstruction(lat, rand_mask, attn_mask_mod, idx_map)
 
         return (
             pred_track, pred_primary, pred_pid,
-            pred_occ, pred_reg, idx_targets, enc_idx_targets,
+            pred_occ, pred_reg, con_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )
 
@@ -908,7 +852,7 @@ def mae_vit_base(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=1,
         latent_tokens=32, io_depth=4, io_decode_depth=6,
-        num_modes=32, contrastive_embed_dim=32,
+        num_modes=32, contrastive_embed_dim=64,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )

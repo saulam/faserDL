@@ -13,7 +13,7 @@ from typing import Any
 from torch_ema import ExponentialMovingAverage
 from utils import (
     param_groups_lrd, KinematicsMultiTaskLoss,
-    arrange_sparse_minkowski, arrange_truth, 
+    arrange_input, arrange_truth, 
     CustomLambdaLR, CombinedScheduler, weighted_loss
 )
 
