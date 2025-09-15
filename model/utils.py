@@ -9,8 +9,32 @@ from timm.layers import DropPath, Mlp
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
-HAS_SDPA = hasattr(F, "scaled_dot_product_attention")
+# --- SDPA availability / compatibility layer -------------------------------
+# torch 2.3+:   from torch.nn.attention import sdpa_kernel, SDPBackend
+# torch 2.1.x:  from torch.backends.cuda import sdp_kernel (note: no "a"), SDPBackend
+HAS_SDPA    = hasattr(F, "scaled_dot_product_attention")
+_SDPA_CTX   = None
+_SDPBackend = None
+_SDPA_API   = None  # "nn.attention" (2.3+) | "backends.cuda" (2.1) | None
 
+if HAS_SDPA:
+    try:
+        # Preferred (2.3+)
+        from torch.nn.attention import sdpa_kernel as _sdpa_kernel_new, SDPBackend as _SDPBackend_new
+        _SDPA_CTX = _sdpa_kernel_new
+        _SDPBackend = _SDPBackend_new
+        _SDPA_API = "nn.attention"
+    except Exception:
+        try:
+            # Fallback (2.1.x)
+            from torch.backends.cuda import sdp_kernel as _sdpa_kernel_old, SDPBackend as _SDPBackend_old
+            _SDPA_CTX = _sdpa_kernel_old
+            _SDPBackend = _SDPBackend_old
+            _SDPA_API = "backends.cuda"
+        except Exception:
+            _SDPA_CTX = None
+            _SDPBackend = None
+            _SDPA_API = None
 
 def _attn_classic(q, k, v, mask, drop_p, training, is_causal):
     # q:[B,H,Q,D], k/v:[B,H,K,D]; mask can be:
@@ -48,16 +72,40 @@ def _attn_classic(q, k, v, mask, drop_p, training, is_causal):
 
 
 def _attn_sdpa(q, k, v, mask, drop_p, training, is_causal):
-    try:
-        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+    attn_mask = mask if mask is not None else None
+    dropout_p = drop_p if training else 0.0
+
+    # If we have the context manager + backend enum, try to select kernels explicitly
+    if _SDPA_CTX is not None and _SDPBackend is not None:
+        try:
+            if _SDPA_API == "nn.attention":
+                # torch 2.3+ API: pass a list of backends
+                with _SDPA_CTX([_SDPBackend.FLASH_ATTENTION,
+                                _SDPBackend.EFFICIENT_ATTENTION,
+                                _SDPBackend.MATH]):
+                    return F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+                    )
+            else:
+                # torch 2.1.x API: bool flags for enabling backends
+                with _SDPA_CTX(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+                    return F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+                    )
+        except Exception as e:
+            # If a specific kernel isn't available on the current device, fall back safely
+            warnings.warn(f"SDPA kernel selection failed ({e}); falling back to classic attention.")
+            return _attn_classic(q, k, v, mask, drop_p, training, is_causal)
+    else:
+        # No kernel selection API available (very old / CPU-only), still try SDPA direct
+        print("Warning: SDPA kernel selection API not available; trying default SDPA.")
+        try:
             return F.scaled_dot_product_attention(
-                q.contiguous(), k.contiguous(), v.contiguous(),
-                attn_mask=mask.contiguous() if mask is not None else None,
-                dropout_p=(drop_p if training else 0.0),
-                is_causal=is_causal
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
             )
-    except Exception as e:
-        raise e
+        except Exception as e:
+            warnings.warn(f"SDPA not available ({e}); using classic attention.")
+            return _attn_classic(q, k, v, mask, drop_p, training, is_causal)
 
 
 _ATTENTION_IMPL = _attn_classic if (not HAS_SDPA) else _attn_sdpa
