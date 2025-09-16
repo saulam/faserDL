@@ -6,7 +6,7 @@ metadata_path="/scratch/salonso/sparse-nns/faser/events_new_v5.1b/metadata_stats
 shardshuffle=200
 shuffle=4000
 model="base"
-eps=1e-12
+eps=1e-8
 batch_size=256
 preprocessing_input="log"
 label_smoothing=0.02
@@ -21,8 +21,8 @@ epochs=400
 num_workers=16
 blr=1.5e-4
 accum_grad_batches=2
-warmup_steps=40
-cosine_annealing_steps=360
+warmup_epochs=40
+cosine_annealing_epochs=360
 weight_decay=0.05
 beta1=0.9
 beta2=0.95
@@ -58,8 +58,8 @@ python -m train.pretrain \
     --num_workers $num_workers \
     --blr $blr \
     --accum_grad_batches $accum_grad_batches \
-    --warmup_steps $warmup_steps \
-    --cosine_annealing_steps $cosine_annealing_steps \
+    --warmup_epochs $warmup_epochs \
+    --cosine_annealing_epochs $cosine_annealing_epochs \
     --weight_decay $weight_decay \
     --beta1 $beta1 \
     --beta2 $beta2 \

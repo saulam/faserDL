@@ -14,7 +14,7 @@ from torch_ema import ExponentialMovingAverage
 from utils import (
     param_groups_lrd, KinematicsMultiTaskLoss,
     arrange_input, arrange_truth, 
-    CustomLambdaLR, CombinedScheduler, weighted_loss
+    CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj
 )
 
 
@@ -93,6 +93,10 @@ class ViTFineTuner(pl.LightningModule):
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
+
+    
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        return move_obj(batch, device)
 
     
     def on_save_checkpoint(self, checkpoint):
@@ -282,7 +286,6 @@ class ViTFineTuner(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        torch.cuda.empty_cache()
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         if torch.isnan(loss):
@@ -302,8 +305,6 @@ class ViTFineTuner(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        torch.cuda.empty_cache()
-
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(f"loss_total/val", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)

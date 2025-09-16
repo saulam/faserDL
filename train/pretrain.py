@@ -99,8 +99,8 @@ def main():
     if args.blr is not None:
         # overwrite lr by linearly-scaled blr if args.blr is defined
         args.lr = args.blr * (args.batch_size * denom) / 256.
-    args.scheduler_steps = nb_batches_train * args.cosine_annealing_steps // denom
-    args.warmup_steps = nb_batches_train * args.warmup_steps // denom
+    args.scheduler_steps = nb_batches_train * args.cosine_annealing_epochs // denom
+    args.warmup_steps = nb_batches_train * args.warmup_epochs // denom
     args.start_cosine_step = (nb_batches_train * args.epochs // denom) - args.scheduler_steps
     print(f"lr                = {args.lr}")
     print(f"scheduler_steps   = {args.scheduler_steps}")
@@ -169,6 +169,8 @@ def main():
         limit_train_batches=nb_batches_train//nb_gpus if args.web_dataset_path else None,
         limit_val_batches=nb_batches_val//nb_gpus if args.web_dataset_path else None,
         max_epochs=args.epochs,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
         callbacks=callbacks,
         accelerator="gpu",
         devices=nb_gpus,

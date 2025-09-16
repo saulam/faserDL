@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import warnings
 from timm.models.vision_transformer import Attention, Block, LayerScale
 from timm.layers import DropPath, Mlp
-from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
 # --- SDPA availability / compatibility layer -------------------------------
@@ -509,12 +508,13 @@ class SharedLatentVoxelHead(nn.Module):
     Expand once to V ∈ R^{P×H}
     """
     def __init__(self, in_dim, basis: SeparableDCT3D,
-                 H=16, norm_layer=nn.LayerNorm):
+                 H=16, norm_layer=nn.LayerNorm, post_norm=False):
         super().__init__()
         self.basis = basis
         self.H = H
         self.norm = norm_layer(in_dim)
         self.proj = nn.Linear(in_dim, H * basis.K_total)
+        self.post_norm = norm_layer(H) if post_norm else None
 
     def forward(self, token_emb):  # [N_tokens, D]
         x = self.norm(token_emb)
@@ -522,10 +522,13 @@ class SharedLatentVoxelHead(nn.Module):
         N = coef.size(0)
         coef = coef.view(N, self.H,
                          self.basis.Kx, self.basis.Ky, self.basis.Kz)
+        coef = coef / math.sqrt(self.basis.K_total)
         V = self.basis.expand(coef)             # [N, H, P]
 
         # per-voxel linear maps (vectorized)
         Vt = V.transpose(1, 2)                  # [N, P, H]
+        if self.post_norm is not None:
+            Vt = self.post_norm(Vt)
         return Vt
 
 

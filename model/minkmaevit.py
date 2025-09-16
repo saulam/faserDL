@@ -16,6 +16,7 @@ from .utils import (
     CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead
 )
 
+
 class MinkMAEViT(nn.Module):
     def __init__(
         self,
@@ -31,7 +32,7 @@ class MinkMAEViT(nn.Module):
         io_depth=4,
         io_decode_depth=4,
         num_heads=16,
-        num_modes=8,
+        num_modes=(16, 8),
         contrastive_embed_dim=64,
         decoder_embed_dim=192,
         decoder_num_heads=16,
@@ -173,18 +174,18 @@ class MinkMAEViT(nn.Module):
 
         # Heads
         self.sep_basis = SeparableDCT3D(self.patch_size.tolist())
-        H, E = num_modes, contrastive_embed_dim
         self.shared_voxel_head = nn.ModuleDict({
             name: SharedLatentVoxelHead(
-                decoder_embed_dim, self.sep_basis, H=H, norm_layer=norm_layer
+                decoder_embed_dim, self.sep_basis, H=num_modes[i], 
+                norm_layer=norm_layer, post_norm=True if name=="rec" else False
             )
-            for name in ["con", "rec"]
+            for i, name in enumerate(["con", "rec"])
         })
-        self.track_head   = nn.Linear(H, E)
-        self.primary_head = nn.Linear(H, E)
-        self.pid_head     = nn.Linear(H, E)
-        self.occ_head     = nn.Linear(H, 1)
-        self.reg_head     = nn.Linear(H, self.in_chans)
+        self.track_head   = nn.Linear(num_modes[0], contrastive_embed_dim)
+        self.primary_head = nn.Linear(num_modes[0], contrastive_embed_dim)
+        self.pid_head     = nn.Linear(num_modes[0], contrastive_embed_dim)
+        self.occ_head     = nn.Linear(num_modes[1], 1)
+        self.reg_head     = nn.Linear(num_modes[1], self.in_chans)
 
         self.initialize_weights()
 
@@ -587,7 +588,7 @@ class MinkMAEViT(nn.Module):
         return pred_track, pred_primary, pred_pid, idx_targets_kept
 
 
-    def forward_reconstruction(self, latents, rand_mask, attn_mask_mod, idx_map):
+    def forward_reconstruction(self, latents, attn_mask_mod, rand_mask, idx_map):
         """
         latents:       [B, K, Cenc]
         rand_mask:     [B, M, Lm]
@@ -648,65 +649,13 @@ class MinkMAEViT(nn.Module):
         
         # Reconstruction path
         pred_occ, pred_reg, rec_idx_targets, row_event_ids, row_patch_ids = \
-            self.forward_reconstruction(lat, rand_mask, attn_mask_mod, idx_map)
+            self.forward_reconstruction(lat, attn_mask_mod, rand_mask, idx_map)
 
         return (
             pred_track, pred_primary, pred_pid,
             pred_occ, pred_reg, con_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )
-
-        
-    def replace_depthwise_with_channelwise(self):
-        """
-        Replace all MinkowskiDepthwiseConvolution modules with
-        MinkowskiChannelwiseConvolution modules preserving the parameters.
-        """
-        for name, module in self.named_modules():
-            if isinstance(module, ME.MinkowskiDepthwiseConvolution):
-                # Retrieve parameters of the current depthwise convolution
-                in_channels = module.in_channels
-                kernel_size = module.kernel_generator.kernel_size
-                stride = module.kernel_generator.kernel_stride
-                dilation = module.kernel_generator.kernel_dilation
-                bias = module.bias is not None
-                dimension = module.dimension
-                
-                # Create a new channelwise convolution with the same parameters
-                new_conv = ME.MinkowskiChannelwiseConvolution(
-                    in_channels=in_channels,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                    bias=bias,
-                    dimension=dimension
-                )
-                new_conv.kernel = module.kernel
-                if bias:
-                    new_conv.bias = module.bias
-                
-                # Replace the old module with the new one
-                parent_module, attr_name = self._get_parent_module(name)
-                setattr(parent_module, attr_name, new_conv)
-        
-        return
-
-    
-    def _get_parent_module(self, layer_name):
-        """
-        Retrieve the parent module and attribute name for a given layer.
-        
-        Args:
-            layer_name (str): Dot-separated module path.
-        
-        Returns:
-            Tuple of (parent_module, attribute_name)
-        """
-        components = layer_name.split('.')
-        parent = self
-        for comp in components[:-1]:
-            parent = getattr(parent, comp)
-        return parent, components[-1]
     
 
     def print_param_report(self):
@@ -839,7 +788,7 @@ def mae_vit_tiny(**kwargs):
         embed_dim=528, patch_size=(16, 16, 4),
         depth=2, num_heads=12, num_global_tokens=1,
         latent_tokens=16, io_depth=2, io_decode_depth=4,
-        num_modes=16, contrastive_embed_dim=16,
+        num_modes=(16, 8), contrastive_embed_dim=16,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -852,7 +801,7 @@ def mae_vit_base(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=1,
         latent_tokens=32, io_depth=4, io_decode_depth=6,
-        num_modes=32, contrastive_embed_dim=64,
+        num_modes=(32, 8), contrastive_embed_dim=32,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -865,7 +814,7 @@ def mae_vit_large(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=8, num_heads=12, num_global_tokens=2,
         latent_tokens=32, io_depth=8, io_decode_depth=8,
-        num_modes=64, contrastive_embed_dim=64,
+        num_modes=(48, 16), contrastive_embed_dim=64,
         decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -878,7 +827,7 @@ def mae_vit_huge(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=16, num_heads=12, num_global_tokens=4,
         latent_tokens=64, io_depth=16, io_decode_depth=16,
-        num_modes=128, contrastive_embed_dim=128,
+        num_modes=(64, 16), contrastive_embed_dim=128,
         decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )

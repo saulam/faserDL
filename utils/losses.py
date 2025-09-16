@@ -1292,13 +1292,13 @@ def prototype_contrastive_loss(
     z: torch.Tensor, 
     class_id: torch.Tensor, 
     event_id: torch.Tensor,
-    num_neg: int = 64, 
-    temperature: float = 0.07, 
+    num_neg: int = 64,
     normalize: bool = True,
     semi_hard: bool = False, 
     semi_hard_pool_mult: int = 4, 
     semi_hard_margin: float = 0.05,
     min_class_size: int = 4,
+    logit_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Leave-one-out prototype InfoNCE with negatives sampled without replacement.
@@ -1379,12 +1379,12 @@ def prototype_contrastive_loss(
     # Similarities
     pos_sim = (z * P_pos).sum(-1, keepdim=True)          # [M,1]
     neg_sim_full = torch.einsum('md,mkd->mk', z, P_negs) # [M,K_pool]
-    neg_sim_full = neg_sim_full.masked_fill(~neg_valid, float('-inf'))
+    neg_sim_full = neg_sim_full.masked_fill(~neg_valid, float('-1e4'))
 
     # semi-hard selection (top-K just below positive, within a margin)
     if semi_hard:
         sh_mask = (neg_sim_full < pos_sim) & (neg_sim_full > (pos_sim - semi_hard_margin))
-        sh_scores = neg_sim_full.masked_fill(~sh_mask, float('-inf'))
+        sh_scores = neg_sim_full.masked_fill(~sh_mask, float('-1e4'))
         sh_idx = torch.topk(sh_scores, k=K_final, dim=1).indices   # [M,K_final]
         got_mask = torch.gather(sh_mask, 1, sh_idx)                # [M,K_final]
         enough = got_mask.sum(dim=1) >= K_final
@@ -1401,9 +1401,11 @@ def prototype_contrastive_loss(
         neg_sim = torch.gather(neg_sim_full, 1, idx_sel)
 
     # Logits and loss
-    logits  = torch.cat([pos_sim, neg_sim], dim=1) / temperature  # [M,1+K_final]
+    logits  = torch.cat([pos_sim, neg_sim], dim=1)                 # [M,1+K_final]
+    if logit_scale is not None:
+        logits = logits * logit_scale.to(device=logits.device, dtype=logits.dtype)
     targets = torch.zeros(M, dtype=torch.long, device=z.device)
-    return F.cross_entropy(logits, targets, reduction="mean")
+    return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 def ghost_pushaway_loss(
@@ -1412,8 +1414,8 @@ def ghost_pushaway_loss(
     event_id: torch.Tensor,
     ghost_mask: torch.Tensor,
     num_neg: int = 32,
-    temperature: float = 0.07,
     normalize: bool = True,
+    logit_scale: torch.Tensor = None
 ) -> torch.Tensor:
     # build real prototypes (fixed for stability)
     real = class_id >= 0
@@ -1489,7 +1491,7 @@ def ghost_pushaway_loss(
     # Uniform w/o replacement via masked top-k over random scores
     work_dtype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
     scores = torch.rand(counts.numel(), Umax, device=z.device, dtype=work_dtype)
-    scores = scores.masked_fill(~valid_ev, float('-inf'))
+    scores = scores.masked_fill(~valid_ev, float('-1e4'))
     sel_local = torch.topk(scores, k=K, dim=1).indices   # [E, K]
 
     # Clamp local indices so base indexing is always in-range
@@ -1505,8 +1507,10 @@ def ghost_pushaway_loss(
     valid_g  = sel_val.index_select(0, eidx)                               # [M,K]
 
     # similarities & log-mean-exp push-away
-    sims = torch.einsum('md,mkd->mk', z_g, Pg) / temperature               # [M,K]
-    sims = sims.masked_fill(~valid_g, float('-inf'))
-    lse   = torch.logsumexp(sims, dim=1)                                   # [M]
+    sims = torch.einsum('md,mkd->mk', z_g, Pg)                             # [M,K]
+    if logit_scale is not None:
+        sims = sims * logit_scale.to(device=sims.device, dtype=sims.dtype)
+    sims = sims.masked_fill(~valid_g, float('-1e4'))
+    lse   = torch.logsumexp(sims.float(), dim=1)                                   # [M]
     k_eff = valid_g.sum(dim=1).clamp_min(1).to(lse.dtype)
     return (lse - torch.log(k_eff)).mean()
