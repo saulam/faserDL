@@ -8,11 +8,9 @@ Description: PyTorch ViT model with MinkowskiEngine patching.
 
 import torch
 import torch.nn as nn
-#import MinkowskiEngine as ME
 import timm.models.vision_transformer as vit
 from functools import partial
 from timm.models.layers import trunc_normal_
-#from MinkowskiEngine import MinkowskiConvolution
 from .utils import (
     get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
     CrossAttnBlock, CrossAttention, CylindricalHeadNormalized
@@ -449,14 +447,14 @@ class MinkViT(vit.VisionTransformer):
         x_intra = self.norm(x_intra)
 
         # discard intra-module CLS and add module embedding
-        cls_mod = x_intra[:, 0, :].view(B, M, C)                      # [B, M, C]
-        tok_mod = x_intra[:, 1:, :].reshape(B, M, L, C)               # [B, M, L, C]
+        cls_mod = x_intra[:, 0, :].view(B, M, C)                              # [B, M, C]
+        tok_mod = x_intra[:, 1:, :].reshape(B, M, L, C)                       # [B, M, L, C]
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
 
         # global input
-        g_enc   = self.global_feats_encoder(x_glob)                   # [B, C]
-        g_tokens = g_enc.unsqueeze(1) + self.global_mem               # [B, G, C]
+        g_enc   = self.global_feats_encoder(x_glob)                           # [B, C]
+        g_tokens = g_enc.unsqueeze(1) + self.global_mem                       # [B, G, C]
         g_tokens = g_tokens.to(tok_mod.dtype)
 
         # Perceiver-IO encoder: latents attend to all kept tokens
@@ -504,58 +502,6 @@ class MinkViT(vit.VisionTransformer):
         x = self.forward_features(x, x_glob)
         x = self.forward_head(x)
         return x
-
-        
-    def replace_depthwise_with_channelwise(self):
-        """
-        Replace all MinkowskiDepthwiseConvolution modules with
-        MinkowskiChannelwiseConvolution modules preserving the parameters.
-        """
-        for name, module in self.named_modules():
-            if isinstance(module, ME.MinkowskiDepthwiseConvolution):
-                # Retrieve parameters of the current depthwise convolution
-                in_channels = module.in_channels
-                kernel_size = module.kernel_generator.kernel_size
-                stride = module.kernel_generator.kernel_stride
-                dilation = module.kernel_generator.kernel_dilation
-                bias = module.bias is not None
-                dimension = module.dimension
-                
-                # Create a new channelwise convolution with the same parameters
-                new_conv = ME.MinkowskiChannelwiseConvolution(
-                    in_channels=in_channels,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    dilation=dilation,
-                    bias=bias,
-                    dimension=dimension
-                )
-                new_conv.kernel = module.kernel
-                if bias:
-                    new_conv.bias = module.bias
-                
-                # Replace the old module with the new one
-                parent_module, attr_name = self._get_parent_module(name)
-                setattr(parent_module, attr_name, new_conv)
-        
-        return
-
-    
-    def _get_parent_module(self, layer_name):
-        """
-        Retrieve the parent module and attribute name for a given layer.
-        
-        Args:
-            layer_name (str): Dot-separated module path.
-        
-        Returns:
-            Tuple of (parent_module, attribute_name)
-        """
-        components = layer_name.split('.')
-        parent = self
-        for comp in components[:-1]:
-            parent = getattr(parent, comp)
-        return parent, components[-1]
 
 
 def vit_tiny(**kwargs):

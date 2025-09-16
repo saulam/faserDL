@@ -11,6 +11,7 @@ Description:
 import copy
 import torch
 import spconv.pytorch as spconv
+from spconv.pytorch import SparseConvTensor
 from functools import partial
 from torch.utils.data import random_split, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
@@ -25,7 +26,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
         args (Namespace): Arguments containing batch_size, num_workers.
         splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
         seed (int): Seed for reproducibility. Default is 7.
-        test (bool): Whether to use collate_test or collate_sparse_minkowski. Default is False.
+        test (bool): Default is False.
         extra_dataset (torch.utils.data.Dataset or None): Extra dataset to append to the training loader. Default is None.
 
     Returns:
@@ -375,3 +376,17 @@ def load_mae_encoder(model_vit, mae_ckpt):
     #print("Dropped from ckpt:", len(dropped))
     print("Load msg:", msg)
 
+
+def move_obj(o, device):
+    if isinstance(o, SparseConvTensor):
+        ind = o.indices.to(device)
+        if ind.dtype != torch.int32:
+            ind = ind.int()
+        return SparseConvTensor(o.features.to(device), ind, o.spatial_shape, o.batch_size)
+    if isinstance(o, torch.Tensor):
+        return o.to(device)
+    if isinstance(o, dict):
+        return {k: move_obj(v, device) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(move_obj(v, device) for v in o)
+    return o

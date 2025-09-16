@@ -7,6 +7,7 @@ Description: PyTorch Lightning model - stage 1: masked autoencoder.
 """
 
 from typing import Tuple
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,22 +17,8 @@ from spconv.pytorch import SparseConvTensor
 from utils import (
     arrange_input, arrange_truth, soft_focal_bce_with_logits,
     prototype_contrastive_loss,  ghost_pushaway_loss,
-    CustomLambdaLR, CombinedScheduler, weighted_loss
+    CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
-
-def _move_obj(o, device):
-    if isinstance(o, SparseConvTensor):
-        ind = o.indices.to(device)
-        if ind.dtype != torch.int32:
-            ind = ind.int()
-        return SparseConvTensor(o.features.to(device), ind, o.spatial_shape, o.batch_size)
-    if isinstance(o, torch.Tensor):
-        return o.to(device)
-    if isinstance(o, dict):
-        return {k: _move_obj(v, device) for k, v in o.items()}
-    if isinstance(o, (list, tuple)):
-        return type(o)(_move_obj(v, device) for v in o)
-    return o
 
 
 class MAEPreTrainer(pl.LightningModule):
@@ -65,9 +52,26 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": self.log_sigma_reg,
         }
 
+        # learnable scale logits for contrastive losses (init at 1/0.07 ≈ 14.285  => log ≈ 2.659)
+        init = math.log(1/0.07)
+        self.logit_scale_trk = nn.Parameter(torch.tensor(init))
+        self.logit_scale_pri = nn.Parameter(torch.tensor(init))
+        self.logit_scale_pid = nn.Parameter(torch.tensor(init))
+        self._logit_scale_params = {
+            "trk": self.logit_scale_trk,
+            "pri": self.logit_scale_pri,
+            "pid": self.logit_scale_pid,
+        }
+
+
+    @staticmethod
+    def _scale(p: torch.Tensor) -> torch.Tensor:
+        # clamp exp(logit_scale) in [1/100, 100]
+        return p.clamp(math.log(1/100), math.log(100)).exp()
+
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
-        return _move_obj(batch, device)
+        return move_obj(batch, device)
     
 
     def on_train_start(self):
@@ -127,46 +131,50 @@ class MAEPreTrainer(pl.LightningModule):
         event_id: torch.Tensor,          # [N] int64
         ghost_mask: torch.Tensor,        # [N] bool
         num_neg: int = 16,
-        temperature: float = 0.07,
         normalize: bool = True,
-        pushaway_weight: float = 0.1,
+        pushaway_weight: float = 0.05,
     ):
         """
         Computes both losses (same-track, same-primary, same-pid) in one call.
         Assumes inputs are already masked/aligned (no ghosts/invisible hits).
         """
+        s_trk   = self._scale(self.logit_scale_trk)
+        s_pri   = self._scale(self.logit_scale_pri)
+        s_pid   = self._scale(self.logit_scale_pid)
+        
         loss_trk = prototype_contrastive_loss(
             z_track, track_id, event_id, num_neg=num_neg, 
-            temperature=temperature, normalize=normalize,
+            normalize=normalize, logit_scale=s_trk,
         )
         loss_pri = prototype_contrastive_loss(
             z_primary, primary_id, event_id, num_neg=num_neg, 
-            temperature=temperature, normalize=normalize,
+            normalize=normalize, logit_scale=s_pri,
         )
+        pid_event_id = torch.zeros_like(event_id) # trick: pid loss across events
         loss_pid = prototype_contrastive_loss(
-            z_pid, pid_id, event_id, num_neg=num_neg,
-            temperature=temperature, normalize=normalize,
+            z_pid, pid_id, pid_event_id, num_neg=num_neg,
+            normalize=normalize, logit_scale=s_pid,
         )
         loss_trk_ghost = ghost_pushaway_loss(
-            z_track, track_id, event_id, ghost_mask, num_neg=num_neg, 
-            temperature=temperature, normalize=normalize
+            z_track, track_id, event_id, ghost_mask, num_neg=num_neg,
+            normalize=normalize, logit_scale=s_trk,
         )
         loss_pri_ghost = ghost_pushaway_loss(
-            z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg, 
-            temperature=temperature, normalize=normalize
+            z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg,
+            normalize=normalize, logit_scale=s_pri,
         )
         loss_pid_ghost = ghost_pushaway_loss(
             z_pid, pid_id, event_id, ghost_mask, num_neg=num_neg,
-            temperature=temperature, normalize=normalize
+            normalize=normalize, logit_scale=s_pid,
         )
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
         loss_pri_all = loss_pri + pushaway_weight * loss_pri_ghost
         loss_pid_all = loss_pid + pushaway_weight * loss_pid_ghost
 
         part_losses_enc = {
-            'trk/pos': loss_trk, 'trk/ghost': loss_trk_ghost,
-            'pri/pos': loss_pri, 'pri/ghost': loss_pri_ghost,
-            'pid/pos': loss_pid, 'pid/ghost': loss_pid_ghost,
+            "trk/pos": loss_trk.detach(), "trk/ghost": loss_trk_ghost.detach(),
+            "pri/pos": loss_pri.detach(), "pri/ghost": loss_pri_ghost.detach(),
+            "pid/pos": loss_pid.detach(), "pid/ghost": loss_pid_ghost.detach(),
         }
 
         return loss_trk_all, loss_pri_all, loss_pid_all, part_losses_enc
@@ -367,8 +375,8 @@ class MAEPreTrainer(pl.LightningModule):
         reg_neg_loss = reg_row[N_pos:].mean()
 
         part_losses_dec = {
-            'occ/total': loss_occ, 'occ/pos': occ_pos_loss, 'occ/neg': occ_neg_loss,
-            'reg/total': loss_reg, 'reg/pos': reg_pos_loss, 'reg/neg': reg_neg_loss,
+            'occ/total': loss_occ.detach(), 'occ/pos': occ_pos_loss.detach(), 'occ/neg': occ_neg_loss.detach(),
+            'reg/total': loss_reg.detach(), 'reg/pos': reg_pos_loss.detach(), 'reg/neg': reg_neg_loss.detach(),
         }
         return loss_occ, loss_reg, part_losses_dec
     
@@ -443,13 +451,11 @@ class MAEPreTrainer(pl.LightningModule):
    
 
     def training_step(self, batch, batch_idx):
-        torch.cuda.empty_cache()
-
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(
             f"loss_total/train",
-            loss.item(), 
+            loss.detach(), 
             batch_size=batch_size, 
             on_step=True, 
             on_epoch=True,
@@ -459,7 +465,7 @@ class MAEPreTrainer(pl.LightningModule):
         for key, value in part_losses.items():
             self.log(
                 "{}/train".format(key),
-                value.item(), 
+                value, 
                 batch_size=batch_size, 
                 on_step=True, 
                 on_epoch=True, 
@@ -470,10 +476,23 @@ class MAEPreTrainer(pl.LightningModule):
 
         # log the actual sigmas (exp(-log_sigma))
         for key, log_sigma in self._uncertainty_params.items():
-            uncertainty = torch.exp(-log_sigma)
+            uncertainty = torch.exp(-log_sigma).detach()
             self.log(
                 f'uncertainty/{key}',
                 uncertainty,
+                batch_size=batch_size,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True
+            )
+
+        # log the actual logit scales
+        for key, logit_scale in self._logit_scale_params.items():
+            scale = self._scale(logit_scale).detach()
+            self.log(
+                f'logit_scale/{key}',
+                scale,
                 batch_size=batch_size,
                 on_step=True,
                 on_epoch=True,
@@ -485,13 +504,11 @@ class MAEPreTrainer(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        torch.cuda.empty_cache()
-
         loss, part_losses, batch_size, lr = self.common_step(batch)
 
         self.log(
             f"loss_total/val",
-            loss.item(),
+            loss.detach(),
             batch_size=batch_size,
             on_step=False,
             on_epoch=True,
@@ -501,7 +518,7 @@ class MAEPreTrainer(pl.LightningModule):
         for key, value in part_losses.items():
             self.log(
                 "{}/val".format(key),
-                value.item(),
+                value,
                 batch_size=batch_size,
                 on_step=False,
                 on_epoch=True,
@@ -518,7 +535,7 @@ class MAEPreTrainer(pl.LightningModule):
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
-            'params': list(self._uncertainty_params.values()),
+            'params': list(self._uncertainty_params.values())+ list(self._logit_scale_params.values()),
             'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })
