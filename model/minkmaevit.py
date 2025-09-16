@@ -788,7 +788,7 @@ def mae_vit_tiny(**kwargs):
         embed_dim=528, patch_size=(16, 16, 4),
         depth=2, num_heads=12, num_global_tokens=1,
         latent_tokens=16, io_depth=2, io_decode_depth=4,
-        num_modes=(16, 8), contrastive_embed_dim=16,
+        num_modes=(32, 8), contrastive_embed_dim=16,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -801,7 +801,7 @@ def mae_vit_base(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=1,
         latent_tokens=32, io_depth=4, io_decode_depth=6,
-        num_modes=(32, 8), contrastive_embed_dim=32,
+        num_modes=(48, 16), contrastive_embed_dim=32,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
@@ -814,7 +814,7 @@ def mae_vit_large(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=8, num_heads=12, num_global_tokens=2,
         latent_tokens=32, io_depth=8, io_decode_depth=8,
-        num_modes=(48, 16), contrastive_embed_dim=64,
+        num_modes=(64, 16), contrastive_embed_dim=64,
         decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )

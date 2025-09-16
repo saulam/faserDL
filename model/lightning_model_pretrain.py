@@ -142,31 +142,37 @@ class MAEPreTrainer(pl.LightningModule):
         s_pri   = self._scale(self.logit_scale_pri)
         s_pid   = self._scale(self.logit_scale_pid)
         
+        # track
         loss_trk = prototype_contrastive_loss(
             z_track, track_id, event_id, num_neg=num_neg, 
             normalize=normalize, logit_scale=s_trk,
-        )
-        loss_pri = prototype_contrastive_loss(
-            z_primary, primary_id, event_id, num_neg=num_neg, 
-            normalize=normalize, logit_scale=s_pri,
-        )
-        pid_event_id = torch.zeros_like(event_id) # trick: pid loss across events
-        loss_pid = prototype_contrastive_loss(
-            z_pid, pid_id, pid_event_id, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pid,
         )
         loss_trk_ghost = ghost_pushaway_loss(
             z_track, track_id, event_id, ghost_mask, num_neg=num_neg,
             normalize=normalize, logit_scale=s_trk,
         )
+
+        # primary
+        loss_pri = prototype_contrastive_loss(
+            z_primary, primary_id, event_id, num_neg=num_neg, 
+            normalize=normalize, logit_scale=s_pri,
+        )
         loss_pri_ghost = ghost_pushaway_loss(
             z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg,
             normalize=normalize, logit_scale=s_pri,
         )
-        loss_pid_ghost = ghost_pushaway_loss(
-            z_pid, pid_id, event_id, ghost_mask, num_neg=num_neg,
+
+        # pid
+        pid_event_id = torch.zeros_like(event_id)  # trick: pid loss across events
+        loss_pid = prototype_contrastive_loss(
+            z_pid, pid_id, pid_event_id, num_neg=num_neg,
             normalize=normalize, logit_scale=s_pid,
         )
+        loss_pid_ghost = ghost_pushaway_loss(
+            z_pid, pid_id, pid_event_id, ghost_mask, num_neg=num_neg,
+            normalize=normalize, logit_scale=s_pid,
+        )
+
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
         loss_pri_all = loss_pri + pushaway_weight * loss_pri_ghost
         loss_pid_all = loss_pid + pushaway_weight * loss_pid_ghost
