@@ -1,9 +1,9 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 07.25
+Date: 09.25
 
-Description: PyTorch MAE-ViT model with MinkowskiEngine patching.
+Description: PyTorch MAE-ViT model with spconv patching.
 """
 
 import math
@@ -121,7 +121,7 @@ class MinkMAEViT(nn.Module):
         self.blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[i], norm_layer=norm_layer
             )
             for i in range(self.intra_depth)
@@ -148,7 +148,7 @@ class MinkMAEViT(nn.Module):
         self.latent_self_blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=0., norm_layer=norm_layer
             )
             for _ in range(io_depth)
@@ -162,15 +162,21 @@ class MinkMAEViT(nn.Module):
             name: nn.Parameter(torch.zeros(1, decoder_embed_dim))
             for name in ["con", "rec"]
         })
-        self.latents_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
-        self.decode_xattn_blocks = nn.ModuleList([
-            CrossAttnBlock(
-                dim=decoder_embed_dim, num_heads=decoder_num_heads, 
-                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec, 
-                attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
-            )
-            for _ in range(io_decode_depth)
-        ])
+        self.latents_to_dec = nn.ModuleDict({
+            name: nn.Linear(embed_dim, decoder_embed_dim)
+            for name in ["con", "rec"]
+        })
+        self.decode_xattn_blocks = nn.ModuleDict({
+            name: nn.ModuleList([
+                CrossAttnBlock(
+                    dim=decoder_embed_dim, num_heads=decoder_num_heads, 
+                    mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec, 
+                    attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
+                )
+                for _ in range(io_decode_depth)
+            ])
+            for name in ["con", "rec"]
+        })
 
         # Heads
         self.sep_basis = SeparableDCT3D(self.patch_size.tolist())
@@ -569,9 +575,9 @@ class MinkMAEViT(nn.Module):
         Q[b_ids, within] = q                                               # place queries by (b, rank)
 
         # decode with latents
-        KV = self.latents_to_dec(latents)                                  # [B, K, Cdec]
+        KV = self.latents_to_dec["con"](latents)                           # [B, K, Cdec]
         X  = Q
-        for blk in self.decode_xattn_blocks:
+        for blk in self.decode_xattn_blocks["con"]:
             X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
@@ -618,9 +624,9 @@ class MinkMAEViT(nn.Module):
         Q[b_ids, within] = q                                                 # place queries by (b, rank)
 
         # decode with latents
-        KV = self.latents_to_dec(latents)                                    # [B, K, Cdec]
+        KV = self.latents_to_dec["rec"](latents)                             # [B, K, Cdec]
         X  = Q
-        for blk in self.decode_xattn_blocks:
+        for blk in self.decode_xattn_blocks["rec"]:
             X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
@@ -787,7 +793,7 @@ def mae_vit_tiny(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(16, 16, 4),
         depth=2, num_heads=12, num_global_tokens=1,
-        latent_tokens=16, io_depth=2, io_decode_depth=4,
+        latent_tokens=16, io_depth=2, io_decode_depth=2,
         num_modes=(32, 8), contrastive_embed_dim=16,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -800,7 +806,7 @@ def mae_vit_base(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=1,
-        latent_tokens=32, io_depth=4, io_decode_depth=6,
+        latent_tokens=32, io_depth=4, io_decode_depth=4,
         num_modes=(48, 16), contrastive_embed_dim=32,
         decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -813,7 +819,7 @@ def mae_vit_large(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=8, num_heads=12, num_global_tokens=2,
-        latent_tokens=32, io_depth=8, io_decode_depth=8,
+        latent_tokens=32, io_depth=8, io_decode_depth=6,
         num_modes=(64, 16), contrastive_embed_dim=64,
         decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -826,7 +832,7 @@ def mae_vit_huge(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=16, num_heads=12, num_global_tokens=4,
-        latent_tokens=64, io_depth=16, io_decode_depth=16,
+        latent_tokens=64, io_depth=16, io_decode_depth=12,
         num_modes=(64, 16), contrastive_embed_dim=128,
         decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),

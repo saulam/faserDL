@@ -11,213 +11,8 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from typing import Optional, Sequence, Union
+from typing import Dict, Tuple, Optional, Sequence, Union
 
-'''
-class KinematicsMultiTaskLoss(nn.Module):
-    """
-    Multi-task regression loss for vis/lepton (and optional jet) with analysis-aligned residuals.
-
-    Inputs to forward():
-      p_vis_hat:  (B,3) predicted visible momentum (Cartesian)
-      p_lep_hat:  (B,3) predicted lepton momentum (Cartesian)
-      p_vis_true: (B,3) true visible momentum
-      p_lep_true: (B,3) true lepton momentum
-      is_cc:      (B,)  1 for CC, 0 for NC (bool or float)
-      vis_latents, lep_latents: optional tensors from Option-A heads (e.g., [zT, zz]);
-                                if given, a tiny latent prior is applied.
-
-    Configure with:
-      - Scales s_*_* (MADN) for component and magnitude losses (register_buffer’d)
-      - tau_ptmiss_cc/nc, tau_evis_cc/nc (per-class denominator floors)
-      - Weights: zero_attractor_w, jet_aux_w, latent_prior_w, lam_mag, lam_dir
-      - use_uncertainty: learn Kendall–Gal weights over [vis, lep, ptmiss, evis, jet]
-      - enforce_nonneg_truth_pz: enforce pz >= 0 for truth vectors (vis and lep)
-    """
-    def __init__(
-        self,
-        *,
-        # --- robust scales for VIS ---
-        s_vis_xyz,                    # (3,) tuple/list: MADN per component for vis
-        s_vis_mag,                    # float: MADN of ||p_vis||
-        # --- robust scales for LEP ---
-        s_lep_xyz,                    # (3,)
-        s_lep_mag,                    # float
-        # --- robust scales for JET ---
-        s_jet_xyz,                    # (3,) 
-        s_jet_mag,                    # float
-        # --- residual floors (per-class) ---
-        tau_ptmiss_cc=0.05, tau_ptmiss_nc=0.05,
-        tau_evis_cc=0.05,   tau_evis_nc=0.05,
-        # --- weights / knobs ---
-        huber_delta=1.0,
-        lam_mag=1.0, lam_dir=1.0,     # weights inside vector losses
-        zero_attractor_w=0.1,
-        jet_aux_w=0.0,                # set >0 to enable aux jet loss (CC-only)
-        latent_prior_w=0.0,           # tiny (e.g., 1e-3) if passing latents
-        enforce_nonneg_truth_pz=True, # enforce pz >= 0 for truth vectors (vis and lep)
-    ):
-        super().__init__()
-        # register robust scales
-        self.register_buffer("s_vis_xyz", torch.tensor(s_vis_xyz, dtype=torch.float32).view(1,3))
-        self.register_buffer("s_lep_xyz", torch.tensor(s_lep_xyz, dtype=torch.float32).view(1,3))
-        self.s_vis_mag = float(s_vis_mag)
-        self.s_lep_mag = float(s_lep_mag)
-
-        if s_jet_xyz is None: s_jet_xyz = s_vis_xyz
-        if s_jet_mag is None: s_jet_mag = s_vis_mag
-        self.register_buffer("s_jet_xyz", torch.tensor(s_jet_xyz, dtype=torch.float32).view(1,3))
-        self.s_jet_mag = float(s_jet_mag)
-
-        # residual floors
-        self.tau_ptmiss_cc = float(tau_ptmiss_cc)
-        self.tau_ptmiss_nc = float(tau_ptmiss_nc)
-        self.tau_evis_cc   = float(tau_evis_cc)
-        self.tau_evis_nc   = float(tau_evis_nc)
-
-        # knobs
-        self.huber_delta = float(huber_delta)
-        self.lam_mag = float(lam_mag)
-        self.lam_dir = float(lam_dir)
-        self.zero_attractor_w = float(zero_attractor_w)
-        self.jet_aux_w = float(jet_aux_w)
-        self.latent_prior_w = float(latent_prior_w)
-        self.enforce_nonneg_truth_pz = bool(enforce_nonneg_truth_pz)
-
-    # ---------- primitives ----------
-    @staticmethod
-    def _huber(x, delta):
-        ax = x.abs()
-        quad = torch.clamp(ax, max=delta)
-        lin = ax - quad
-        return 0.5 * quad**2 + delta * lin
-
-    @staticmethod
-    def _cosine_dir_loss(p_hat, p_true, eps=1e-8):
-        num = (p_hat * p_true).sum(-1)
-        den = p_hat.norm(dim=-1) * p_true.norm(dim=-1)
-        return 1.0 - num / (den + eps)
-
-    def _component_loss(self, p_hat, p_true, s_xyz):
-        z = (p_hat - p_true) / s_xyz
-        return self._huber(z, self.huber_delta).sum(-1)
-
-    def _magnitude_loss(self, p_hat, p_true, s_mag):
-        z = (p_hat.norm(dim=-1) - p_true.norm(dim=-1)) / s_mag
-        return self._huber(z, self.huber_delta)
-
-    def _residual_scalar_loss(self, x_true, x_hat, tau):
-        # tau can be scalar or (B,)
-        denom = torch.maximum(x_true, tau)
-        r = (x_true - x_hat) / denom
-        return self._huber(r, self.huber_delta)
-
-    # ---------- forward ----------
-    def forward(
-        self,
-        p_vis_hat, p_lep_hat,
-        p_vis_true, p_lep_true,
-        is_cc,
-        vis_latents=None, lep_latents=None,
-    ):
-        device = p_vis_hat.device
-        B = p_vis_hat.shape[0]
-        eps = 1e-8
-
-        if self.enforce_nonneg_truth_pz:
-            p_vis_true = p_vis_true.clone()
-            p_lep_true = p_lep_true.clone()
-            p_vis_true[..., 2] = p_vis_true[..., 2].clamp_min(0.0)
-            p_lep_true[..., 2] = p_lep_true[..., 2].clamp_min(0.0)
-
-        # calculate jet as (vis - lep)
-        p_jet_true = p_vis_true - p_lep_true
-        p_jet_hat = p_vis_hat - p_lep_hat
-
-        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)      # (B,)
-        m_nc = 1.0 - m_cc
-        cc_mask = m_cc > 0.5
-
-        # ----- Visible vector losses -----
-        L_vis_comp = self._component_loss(p_vis_hat, p_vis_true, self.s_vis_xyz)
-        L_vis_mag  = self._magnitude_loss(p_vis_hat, p_vis_true, self.s_vis_mag)
-        L_vis_dir  = self._cosine_dir_loss(p_vis_hat, p_vis_true)
-        L_vis      = L_vis_comp + self.lam_mag * L_vis_mag + self.lam_dir * L_vis_dir
-
-        if vis_latents is not None and self.latent_prior_w > 0.0:
-            L_vis = L_vis + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
-
-        # ----- Lepton vector losses (CC-supervised) -----
-        L_lep_comp = self._component_loss(p_lep_hat, p_lep_true, self.s_lep_xyz)
-        L_lep_mag  = self._magnitude_loss(p_lep_hat, p_lep_true, self.s_lep_mag)
-        L_lep_dir  = self._cosine_dir_loss(p_lep_hat, p_lep_true)
-        L_lep_cc   = (L_lep_comp + self.lam_mag * L_lep_mag + self.lam_dir * L_lep_dir) * m_cc
-
-        # zero-attractor on NC
-        z_nc = (p_lep_hat / self.s_lep_xyz) * m_nc.view(-1,1)
-        L_lep_zero = self._huber(z_nc, self.huber_delta).sum(-1) * self.zero_attractor_w
-
-        if lep_latents is not None and self.latent_prior_w > 0.0:
-            L_lep_cc = L_lep_cc + self.latent_prior_w * (lep_latents.pow(2).sum(-1)) * m_cc
-
-        # ----- Residual scalars from visible only -----
-        pt_true = torch.sqrt(p_vis_true[...,0]**2 + p_vis_true[...,1]**2 + eps)
-        pt_hat  = torch.sqrt(p_vis_hat[...,0]**2  + p_vis_hat[...,1]**2  + eps)
-        e_true  = p_vis_true.norm(dim=-1)
-        e_hat   = p_vis_hat.norm(dim=-1)
-
-        tau_pt = (self.tau_ptmiss_cc * m_cc + self.tau_ptmiss_nc * m_nc).to(device)
-        tau_ev = (self.tau_evis_cc   * m_cc + self.tau_evis_nc   * m_nc).to(device)
-
-        L_ptmiss = self._residual_scalar_loss(pt_true, pt_hat, tau_pt)
-        L_evis   = self._residual_scalar_loss(e_true,  e_hat,  tau_ev)
-
-        # ----- Jet aux loss (define safe zeros first) -----
-        L_jet_comp = torch.zeros(B, device=device)
-        L_jet_mag  = torch.zeros(B, device=device)
-        L_jet_dir  = torch.zeros(B, device=device)
-        L_jet      = torch.zeros(B, device=device)
-
-        if self.jet_aux_w > 0.0:
-            L_jet_comp = self._component_loss(p_jet_hat, p_jet_true, self.s_jet_xyz)
-            L_jet_mag  = self._magnitude_loss(p_jet_hat, p_jet_true, self.s_jet_mag)
-            L_jet_dir  = self._cosine_dir_loss(p_jet_hat, p_jet_true)
-            L_jet      = (L_jet_comp + self.lam_mag * L_jet_mag + self.lam_dir * L_jet_dir) * m_cc
-
-        # ---------- per-sample outputs for total loss ----------
-        per_sample = {
-            "loss_vis":   L_vis,                            # (B,)
-            "loss_lep":   L_lep_cc + L_lep_zero,            # (B,)
-            "loss_ptmiss":L_ptmiss,                         # (B,)
-            "loss_evis":  L_evis,                           # (B,)
-            "loss_jet":   L_jet,                            # (B,)
-        }
-
-        # ---------- ready-to-log means ----------
-        def _safe_mean(x):
-            # supports zero-length selections
-            return (x.mean() if x.numel() > 0 else torch.tensor(0.0, device=device))
-
-        logs = {
-            'loss_reg_vis/vis_comp': L_vis_comp.mean(),
-            'loss_reg_vis/vis_mag':  L_vis_mag.mean(),
-            'loss_reg_vis/vis_dir':  L_vis_dir.mean(),
-            'loss_reg_vis/vis':      L_vis.mean(),
-            'loss_reg_vis/evis':     L_evis.mean(),
-            'loss_reg_vis/pt_miss':  L_ptmiss.mean(),
-            'loss_reg_lep/lep_comp': L_lep_comp.mean(),
-            'loss_reg_lep/lep_mag':  L_lep_mag.mean(),
-            'loss_reg_lep/lep_dir':  L_lep_dir.mean(),
-            'loss_reg_lep/lep_cc':   _safe_mean(L_lep_cc[cc_mask]),
-            'loss_reg_lep/lep_zero': L_lep_zero.mean(),
-            'loss_reg_jet/jet_comp': L_jet_comp.mean(),
-            'loss_reg_jet/jet_mag':  L_jet_mag.mean(),
-            'loss_reg_jet/jet_dir':  L_jet_dir.mean(),
-            'loss_reg_jet/jet':      (_safe_mean(L_jet[cc_mask]) if self.jet_aux_w > 0.0 else torch.tensor(0.0, device=device)),
-        }
-
-        return {"per_sample": per_sample, "logs": logs}
-'''
 
 class KinematicsMultiTaskLoss(nn.Module):
     """
@@ -536,46 +331,6 @@ class SphericalAngularLoss(torch.nn.Module):
             angular_loss = angular_loss.sum()
 
         return angular_loss
-
-
-class MomentumLoss(torch.nn.Module):
-    """
-    Custom loss function for predicting 3D momentum vectors.
-    Combines:
-    - Cosine similarity loss for direction.
-    - Mean Absolute Error (MAE) for magnitude.
-
-    Args:
-        lambda_magnitude (float): Weight for magnitude loss. Default is 0.1.
-    """
-    def __init__(self, lambda_magnitude=0.1):
-        super(MomentumLoss, self).__init__()
-        self.lambda_magnitude = lambda_magnitude
-
-    def forward(self, pred, target):
-        """
-        Compute the loss given predicted and target 3D momentum vectors.
-
-        Args:
-            pred (Tensor): Predicted momentum vectors (batch_size, 3).
-            target (Tensor): Ground truth momentum vectors (batch_size, 3).
-
-        Returns:
-            Tensor: The computed loss value.
-        """
-        # Normalize predictions and targets to unit vectors
-        pred_norm = pred / (torch.norm(pred, dim=1, keepdim=True) + 1e-8)  # Avoid division by zero
-        target_norm = target / (torch.norm(target, dim=1, keepdim=True) + 1e-8)
-
-        # Cosine similarity loss (1 - cos(theta))
-        cos_loss = 1 - torch.sum(pred_norm * target_norm, dim=1).mean()
-
-        # Magnitude loss (Mean Absolute Error on norms)
-        mag_loss = torch.abs(torch.norm(pred, dim=1) - torch.norm(target, dim=1)).mean()
-
-        # Combined loss
-        loss = cos_loss + self.lambda_magnitude * mag_loss
-        return loss
 
 
 class LogCoshLoss(torch.nn.Module):
@@ -906,352 +661,6 @@ def soft_focal_cross_entropy(
     return loss
 
 
-def dice_score(inputs: torch.Tensor,
-               targets: torch.Tensor,
-               smooth_num: float = 0,
-               smooth_den: float = 1e-12):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs.
-        smooth: A smoothing constant to smooth gradients. 
-    Returns:
-        dice_score: Dice loss value.
-    """
-    reduce_axes: list[int] = torch.arange(1, len(inputs.shape)).tolist()
-    intersection = torch.sum(targets * inputs, dim=reduce_axes)
-    union = torch.sum(targets, dim=reduce_axes) + torch.sum(inputs, dim=reduce_axes)
-
-    dice_score = (2. * intersection + smooth_num) / (union + smooth_den)
-    
-    return torch.mean(dice_score)
-
-
-def dice_loss(inputs: torch.Tensor or list[torch.Tensor],
-              targets: torch.Tensor or list[torch.Tensor],
-              sigmoid: bool = True,
-              smooth_num: float = 0,
-              smooth_den: float = 1e-12,
-              reduction: str = "none",
-) -> torch.Tensor:
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs.
-        sigmoid: A boolean indicating binary or multi-class.
-        smooth: A smoothing constant to avoid division by zero. 
-    Returns:
-        dice_loss: Dice loss value.
-
-    Note:
-        Assumes class in dimension 1.
-    """
-    # If inputs and targets are not lists, convert them to lists
-    if not isinstance(inputs, list):
-        inputs = [inputs]
-    if not isinstance(targets, list):
-        targets = [targets]
-
-    assert len(inputs) == len(targets), "batch size not the same for inputs and targets"
-    batch_size = len(inputs)
-
-    scores = torch.zeros(batch_size, device=inputs[0].device)
-    if sigmoid:
-        # binary
-        for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)):
-            if ipt.size(-1) == 1:
-                ipt = ipt.squeeze(-1)
-            if tgt.size(-1) == 1:
-                tgt = tgt.squeeze(-1) 
-            ipt = torch.sigmoid(ipt)
-            scores[batch_idx] = dice_score(ipt, tgt, smooth_num, smooth_den)
-    else:
-        # multi-class
-        for batch_idx, (ipt, tgt) in enumerate(zip(inputs, targets)):
-            ipt = torch.softmax(ipt, 1)
-            nb_labels = ipt.size(1)
-            score = 0.
-            # Check target shape: if the target has the same number of dimensions as ipt,
-            # assume it is one-hot encoded, otherwise assume it's class IDs.
-            if tgt.ndim == ipt.ndim:
-                for i in range(nb_labels):
-                    ipt_i = ipt[:, i]
-                    tgt_i = tgt[:, i].float()
-                    score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
-            else:
-                for i in range(nb_labels):
-                    ipt_i = ipt[:, i]
-                    tgt_i = (tgt == i).float()
-                    score += dice_score(ipt_i, tgt_i, smooth_num, smooth_den)
-            score /= nb_labels
-            scores[batch_idx] = score
-        
-    loss = 1 - scores
-
-    if reduction == 'mean':
-        loss = loss.mean()
-    elif reduction == 'sum':
-        loss = loss.sum()
-
-    return loss
-
-
-def contrastive_loss_class_labels(
-    x_i, x_j, labels, temperature=0.1, gather_distributed=False, same_label_weight=0.5
-):
-    """
-    Contrastive loss function from bmdillon/JetCLR
-
-    Uses class labels to define positive pairs.
-
-    Args:
-        x_i (torch.Tensor): Input tensor of shape (batch_size, n_features)
-        x_j (torch.Tensor): Input tensor of shape after augmentations (batch_size, n_features)
-        temperature (float, optional): Temperature parameter. Defaults to 0.1.
-    Returns:
-        torch.Tensor: Contrastive loss
-    """
-    if gather_distributed and get_world_size() == 1:
-        raise ValueError("gather_distributed=True but number of processes is 1")
-
-    xdevice = x_i.get_device()
-
-    if gather_distributed:
-        x_i = torch.cat(GatherLayer.apply(x_i), dim=0)
-        x_j = torch.cat(GatherLayer.apply(x_j), dim=0)
-
-    batch_size = x_i.shape[0]
-    z_i = F.normalize(x_i, dim=1 )
-    z_j = F.normalize(x_j, dim=1 )
-    z = torch.cat( [z_i, z_j], dim=0 )
-    similarity_matrix = F.cosine_similarity( z.unsqueeze(1), z.unsqueeze(0), dim=2 )
-
-    # 0.5 for same class pairs, 1.0 for same image pairs
-    labels = torch.cat([labels, labels], dim=0)
-    positives_mask = (labels[:, None] == labels[None, :]).float() * same_label_weight
-    ids = torch.cat([torch.arange(batch_size), torch.arange(batch_size)], dim=0)
-    positives_mask += (ids[:, None] == ids[None, :]).float() * (1.0 - same_label_weight)
-    positives_mask *= (~torch.eye(2 * batch_size, 2 * batch_size, dtype=bool)).float()
-    positives_mask = positives_mask.to(xdevice)
-    nominator = positives_mask * torch.exp(similarity_matrix / temperature)
-
-    negatives_mask = ( ~torch.eye( 2*batch_size, 2*batch_size, dtype=bool ) ).float()
-    negatives_mask = negatives_mask.to( xdevice )
-    denominator = negatives_mask * torch.exp( similarity_matrix / temperature )
-
-    loss_partial = -torch.log( torch.sum(nominator, dim=1) / torch.sum( denominator, dim=1 ) )
-    loss = torch.sum( loss_partial )/( 2*batch_size )
-
-    return loss
-
-
-def label_based_contrastive_loss_random_chunk(projs, labels, temperature=0.1, chunk_size=512, eps=1e-6):
-    """
-    Computes the contrastive loss for two random chunks to reduce memory usage,
-    ensuring that each voxel is compared to all other voxels, and using binary labels.
-    
-    Args:
-        projs: Tensor of shape (N, proj_dim), where N is the number of voxels and proj_dim is the dimensionality of the projections.
-        labels: Tensor of shape (N,) containing the binary labels (0 or 1) for each voxel.
-        temperature: Scaling factor for logits.
-        chunk_size: The size of the chunk of voxels to process at a time.
-        eps: Small constant to prevent NaNs.
-
-    Returns:
-        loss: The accumulated contrastive loss for the entire input tensor.
-    """
-    N, device = projs.shape[0], projs.device
-
-    if N < chunk_size * 2:
-        chunk_size = N // 2
-
-    indices = torch.randperm(N)
-    chunk1_indices = indices[:chunk_size]
-    chunk2_indices = indices[chunk_size:2*chunk_size]
-
-    projs1 = projs[chunk1_indices]
-    projs2 = projs[chunk2_indices]
-    labels1 = labels[chunk1_indices]
-    labels2 = labels[chunk2_indices]
-
-    projs1 = F.normalize(projs1)
-    projs2 = F.normalize(projs2)
-
-    similarity_matrix = F.cosine_similarity(projs1.unsqueeze(1), projs2.unsqueeze(0), dim=2 )
-
-    positives_mask = (labels1[:, None] == labels2[None, :]).float()
-    nominator = positives_mask * torch.exp(similarity_matrix / temperature)
-    denominator = torch.exp(similarity_matrix / temperature)    
-
-    loss_partial = -torch.log((torch.sum(nominator, dim=1) + eps) / (torch.sum(denominator, dim=1) + eps))
-    loss = torch.sum(loss_partial) / chunk_size
-
-    return loss
-
-
-def supervised_pixel_contrastive_loss(features_ori_list: torch.Tensor,
-                                      features_aug_list: torch.Tensor,
-                                      labels_ori_list: torch.Tensor,
-                                      labels_aug_list: torch.Tensor,
-                                      label_weights: list = None,
-                                      temperature: float = 0.07,
-                                      chunk_size: int = 512,
-                                      ignore_labels: list = [-1],
-                                      within_image_loss: bool = False):
-    """
-    Computes pixel-level supervised contrastive loss for batches with variable-sized inputs.
-    
-    Inspiration: https://github.com/google-research/google-research/blob/master/supervised_pixel_contrastive_loss/contrastive_loss.py
-    Paper: https://arxiv.org/abs/2012.06985
-    
-    Args:
-        features_ori_list: List of tensors for original features
-        features_aug_list: List of tensors for augmented features
-        labels_ori_list: List of tensors for original labels
-        labels_aug_list: List of tensors for augmented labels
-        label_weights: Weight for each label in the loss computation
-        temperature: Temperature to use in contrastive loss
-        chunk_size: Maximum number of voxels per event.
-        ignore_labels: A list of labels to ignore.
-        within_image_loss: whether to use within_image or cross_image loss.
-
-    Returns:
-        Scalar contrastive loss for the batch
-
-    Note:
-        Expect feats and labels be (batch_size, -1, num_channels)
-    """
-
-    batch_size = len(labels_ori_list)
-
-    features_aug_list = features_aug_list[::-1]
-    labels_aug_list = labels_aug_list[::-1]
-
-    total_loss = 0.0
-    for i in range(batch_size):
-        features_ori = features_ori_list[i]
-        features_aug = features_aug_list[i]
-        labels_ori = labels_ori_list[i].squeeze()
-        labels_aug = labels_aug_list[i].squeeze()
-
-        N_ori, N_aug = features_ori.size(0), features_aug.size(0)
-        if N_ori > chunk_size:
-            shuffled_idx = torch.randperm(N_ori)
-            chunk_idx = shuffled_idx[:chunk_size]
-            features_ori = features_ori[chunk_idx]
-            labels_ori = labels_ori[chunk_idx]
-        if N_aug > chunk_size:
-            shuffled_idx = torch.randperm(N_aug)
-            chunk_idx = shuffled_idx[:chunk_size]
-            features_aug = features_aug[chunk_idx]
-            labels_aug = labels_aug[chunk_idx]
-
-        features_ori = F.normalize(features_ori, p=2, dim=-1)
-        features_aug = F.normalize(features_aug, p=2, dim=-1)
-
-        if within_image_loss:
-            curr_loss = within_image_supervised_pixel_contrastive_loss(features_ori, labels_ori, label_weights, temperature)
-        else:
-            curr_loss = cross_image_supervised_pixel_contrastive_loss(features_ori, features_aug, labels_ori, labels_aug, label_weights, temperature)
-
-        total_loss += curr_loss
-
-    return total_loss / batch_size
-
-
-def within_image_supervised_pixel_contrastive_loss(features: torch.Tensor, labels: torch.Tensor, label_weights, temperature):
-    """Computes within-image supervised pixel contrastive loss for two individual images."""
-    logits = torch.matmul(features, features.T) / temperature
-    positive_mask, negative_mask = generate_positive_and_negative_masks(labels, labels, label_weights)
-    return compute_contrastive_loss(logits, positive_mask, negative_mask)
-
-
-def cross_image_supervised_pixel_contrastive_loss(features1, features2, labels1, labels2, label_weights, temperature):
-    """Computes cross-image supervised pixel contrastive loss for two individual images."""
-    num_pixels1 = features1.size(0)  # Number of pixels in image 1
-    num_pixels2 = features2.size(0)  # Number of pixels in image 2
-
-    features2 = torch.cat([features1, features2], dim=0)  # Concatenate pixel features from both images
-    labels2 = torch.cat([labels1, labels2], dim=0)        # Concatenate labels
-
-    same_image_mask = generate_same_image_mask([num_pixels1],
-                                               [num_pixels1, num_pixels2],
-                                               device=features1.device)
-
-    # Compute logits across all pixel pairs from the two images
-    logits = torch.matmul(features1, features2.T) / temperature
-    #logits = F.cosine_similarity( features.unsqueeze(1), features.unsqueeze(0), dim=2 ) / temperature
-    
-    positive_mask, negative_mask = generate_positive_and_negative_masks(labels1, labels2, label_weights)
-    negative_mask *= same_image_mask  # Only consider negatives within the same image
-
-    return compute_contrastive_loss(logits, positive_mask, negative_mask)
-
-
-def compute_contrastive_loss(logits, positive_mask, negative_mask, eps=1e-12, original=True):
-    """Contrastive loss function."""
-
-    if original:
-        exp_logits = torch.exp(logits)
-    
-        normalized_exp_logits = exp_logits / (exp_logits + torch.sum(exp_logits * negative_mask, dim=1, keepdim=True))
-        neg_log_likelihood = -torch.log(normalized_exp_logits)
-
-        positive_mask_sum = torch.sum(positive_mask, dim=1, keepdim=True)
-        normalized_weight = positive_mask / torch.clamp(positive_mask_sum, min=1e-6)
-        neg_log_likelihood = torch.sum(neg_log_likelihood * normalized_weight, dim=1)
-
-        # Handle the case where there are no positive pairs
-        valid_index = 1 - (positive_mask_sum.squeeze() == 0).float()
-        normalized_weight = valid_index / torch.clamp(valid_index.sum(), min=1e-6)
-    
-        loss = torch.mean(neg_log_likelihood * normalized_weight)    
-    else:
-        validity_mask = 1 - torch.eye(positive_mask.size(0), positive_mask.size(1),
-            dtype=bool, device=positive_mask.device).float()
-        validity_mask *= (positive_mask + negative_mask)
-        positive_mask = positive_mask * validity_mask
-
-        exp_logits = torch.exp(logits)
-
-        nominator = positive_mask * exp_logits
-        denominator = validity_mask * exp_logits
-
-        loss_partial = -torch.log((torch.sum(nominator, dim=1) + eps) / (torch.sum(denominator, dim=1)) + eps)
-
-        loss = torch.mean(loss_partial)
-    return loss
-
-
-def generate_same_image_mask(num_pixels1, num_pixels2, device):
-    """Generates a mask indicating if two pixels belong to the same image or not."""
-    image_ids1, image_ids2 = [], []
-    for img_id, pixel_count in enumerate(num_pixels1):
-        image_ids1 += [img_id] * pixel_count
-    for img_id, pixel_count in enumerate(num_pixels2):
-        image_ids2 += [img_id] * pixel_count
-
-    image_ids1 = torch.tensor(image_ids1, device=device).view(-1, 1)
-    image_ids2 = torch.tensor(image_ids2, device=device).view(-1, 1)
-    same_image_mask = (image_ids1 == image_ids2.T).float()
-
-    return same_image_mask
-
-
-def generate_positive_and_negative_masks(labels1: torch.Tensor, labels2: torch.Tensor, label_weights):
-    """Generates positive and negative masks used by contrastive loss."""
-    positive_mask = (labels1[:, None] == labels2[None, :]).float()
-    if label_weights is not None:
-        weights_tensor = torch.tensor(label_weights, device=labels1.device)
-        label_weights = weights_tensor[labels1.long()]
-        positive_mask *= label_weights[:, None]
-    negative_mask = 1 - positive_mask
-
-    return positive_mask, negative_mask
-
-
 @torch.no_grad()
 def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
     cid = class_id.to(torch.int64); eid = event_id.to(torch.int64)
@@ -1287,6 +696,13 @@ def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
         "ord_g": ord_g, "rank": rank_in_event, "eidx": eidx_for_group,
         "counts": counts, "offset": offset, "events_sorted": events_sorted
     }
+
+
+def _count_indices_deterministic(idx: torch.Tensor, size: int) -> torch.Tensor:
+    # Deterministic integer counts on the same device as idx (instead of bincount).
+    out = torch.zeros(size, dtype=torch.long, device=idx.device)
+    out.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
+    return out
     
 
 def prototype_contrastive_loss(
@@ -1300,12 +716,15 @@ def prototype_contrastive_loss(
     semi_hard_margin: float = 0.05,
     min_class_size: int = 4,
     logit_scale: torch.Tensor = None,
+    per_event_mean: bool = False,
 ) -> torch.Tensor:
     """
     Leave-one-out prototype InfoNCE with negatives from other classes.
     - Positives: class prototype excluding the anchor.
     - Negatives: other class prototypes.
     - Dense fast-path when all event_id are identical (e.g., PID with collapsed events).
+
+    If per_event_mean=True, compute the mean loss per event first, then average across events.
     Returns a scalar tensor on the same dtype/device as z.
     """
     if z.numel() == 0:
@@ -1330,7 +749,8 @@ def prototype_contrastive_loss(
     # Per-group sums and counts
     P_sum = z.new_zeros((G, D))
     P_sum.index_add_(0, inv_group, z)
-    cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)  # [G]
+    #cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)  # [G]
+    cnt_vec = _count_indices_deterministic(inv_group, G).clamp_min_(1)
 
     # Per-hit metadata
     g         = inv_group                         # [M] group id of each hit
@@ -1351,6 +771,7 @@ def prototype_contrastive_loss(
     Ue       = Ue[keep]
     off      = off[keep]
     cls_cnt  = cls_cnt[keep]
+    eidx     = eidx[keep]
 
     # Positive = leave-one-out prototype
     P_pos = (P_sum[g] - z) / (cls_cnt - 1).unsqueeze(1).to(z.dtype)
@@ -1449,8 +870,16 @@ def prototype_contrastive_loss(
     if logit_scale is not None:
         logits32 = logits32 * logit_scale.float()
 
-    loss = F.cross_entropy(logits32, torch.zeros(M, dtype=torch.long, device=z.device))
-    return loss.to(z.dtype)
+    per_sample = F.cross_entropy(
+        logits32, torch.zeros(M, dtype=torch.long, device=z.device), reduction='none'
+    )  # [M]
+
+    if per_event_mean:
+        uniq = torch.unique(eidx)
+        means = [per_sample[eidx == u].mean() for u in uniq]
+        return torch.stack(means).mean().to(z.dtype)
+    else:
+        return per_sample.mean().to(z.dtype)
 
 
 def ghost_pushaway_loss(
@@ -1462,6 +891,7 @@ def ghost_pushaway_loss(
     pool_mult: int = 4,                # oversample factor (K_pool = num_neg * pool_mult)
     normalize: bool = True,
     logit_scale: torch.Tensor = None,  # bounded value, not raw param
+    per_event_mean: bool = False,
 ) -> torch.Tensor:
     """
     Push ghost anchors away from real (event,class) prototypes.
@@ -1470,6 +900,7 @@ def ghost_pushaway_loss(
     - Else: vectorized per-row sampling (no loops, no [M_g,Umax,D] tensors),
             then keep top num_neg per row.
 
+    If per_event_mean=True, compute the mean loss per event first, then average across events.
     Returns a scalar tensor on z.dtype/device.
     """
     if z.numel() == 0 or num_neg is None or num_neg <= 0:
@@ -1497,7 +928,8 @@ def ghost_pushaway_loss(
 
     P_sum = z_r.new_zeros((G, D))
     P_sum.index_add_(0, inv_group, z_r)
-    cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)
+    #cnt_vec = torch.bincount(inv_group, minlength=G).clamp_min_(1)
+    cnt_vec = _count_indices_deterministic(inv_group, G).clamp_min_(1)
     P_mean = P_sum / cnt_vec.unsqueeze(1).to(P_sum.dtype)         # [G, D]
     if normalize:
         P_mean = F.normalize(P_mean, dim=-1, eps=1e-6)
@@ -1552,6 +984,259 @@ def ghost_pushaway_loss(
     if logit_scale is not None:
         sims = sims * logit_scale.float()
 
-    lse  = torch.logsumexp(sims, dim=1)
-    loss = (lse - math.log(float(k))).mean()                              # size-normalized
-    return loss.to(z.dtype)
+    per_sample = (torch.logsumexp(sims, dim=1) - math.log(float(k)))     # [M_g]
+
+    if per_event_mean:
+        uniq = torch.unique(eidx_g)
+        means = [per_sample[eidx_g == u].mean() for u in uniq]
+        return torch.stack(means).mean().to(z.dtype)
+    else:
+        return per_sample.mean().to(z.dtype)
+
+
+def occ_supervision_mask(
+    idx_targets: torch.Tensor,          # [M, P], -1 => empty sub-voxel, >=0 => raw index of hit
+    patch_shape: Tuple[int, int, int],  # (p_h, p_w, p_d)
+    ghost_mask: torch.Tensor,
+    occ_empty_beta: float = 0.5,
+    dilate: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        sup_mask:         [M, P] bool — (positives ∪ border ∪ sampled_negatives)
+        sup_targ:         [M, P] float — 1 for positives; 0 otherwise
+        pos_mask:         [M, P] bool — non-ghost occupied subvoxels
+        border_mask:      [M, P] bool
+        sampled_neg_mask: [M, P] bool — negatives actually sampled
+    """
+    device = idx_targets.device
+    M, P   = idx_targets.shape
+    p_h, p_w, p_d = patch_shape
+
+    is_occ = (idx_targets >= 0)
+    is_ghost = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
+    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]]
+    pos_mask = is_occ & ~is_ghost
+
+    # Border via dilation
+    occ = pos_mask.float().view(M, 1, p_h, p_w, p_d)
+    if dilate > 0:
+        ksz = 2 * dilate + 1
+        kernel = torch.ones((1, 1, ksz, ksz, ksz), device=device)
+        dil = F.conv3d(occ, kernel, padding=dilate) > 0
+    else:
+        dil = occ.bool()
+    border_mask = dil.view(M, P) & (~pos_mask)
+
+    # Eligible negatives & global budget (proportional to #positives)
+    eligible_neg = ~(pos_mask | border_mask)
+    pos_counts = pos_mask.sum()
+    neg_counts_r = eligible_neg.sum(dim=1)  # [M]
+    total_neg = int(neg_counts_r.sum().item())
+
+    target_total_negs = int(min(total_neg, round(occ_empty_beta * int(pos_counts.item()))))
+
+    q_r = (neg_counts_r.float() / max(1, total_neg) * target_total_negs).floor().to(torch.long)
+    q_r = torch.minimum(q_r, neg_counts_r)
+    K_max = int(q_r.max().item())
+
+    sampled_neg_mask = torch.zeros_like(eligible_neg, dtype=torch.bool)
+    if K_max > 0:
+        rnd = torch.rand(M, P, device=device).masked_fill(~eligible_neg, float("inf"))
+        _, idxs = torch.topk(-rnd, k=K_max, dim=1)  # [M, K_max]
+        rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_max)
+        keep = (torch.arange(K_max, device=device).unsqueeze(0) < q_r.unsqueeze(1))
+        sampled_neg_mask[rows[keep], idxs[keep]] = True
+
+    sup_mask = pos_mask | border_mask | sampled_neg_mask
+    sup_targ = pos_mask.float()
+
+    return sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask
+
+
+def _row_event_ids(idx_targets: torch.Tensor, hit_event_id: torch.Tensor) -> torch.Tensor:
+    """
+    Map each token row to an event id using the first occupied sub-voxel in that row.
+    Rows with no occupied sub-voxels get -1.
+    """
+    device = idx_targets.device
+    M, P = idx_targets.shape
+    valid = idx_targets >= 0
+    any_valid = valid.any(dim=1)
+    first_col = torch.argmax(valid.to(torch.int64), dim=1)  # arbitrary first True
+    row_idx = torch.arange(M, device=device)
+    raw = idx_targets[row_idx, first_col]
+    raw = torch.where(any_valid, raw, torch.zeros_like(raw))
+    row_event = hit_event_id[raw]
+    row_event = torch.where(any_valid, row_event, torch.full_like(row_event, -1))
+    return row_event  # [M]
+
+
+def _eventwise_mean(values: torch.Tensor, event_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Unweighted mean per event (event_ids >= 0), then mean across events.
+    Falls back to global mean if nothing is assigned.
+    """
+    valid = event_ids >= 0
+    if valid.sum() == 0:
+        return values.mean()
+    ev = event_ids[valid]
+    vals = values[valid]
+    uniq = torch.unique(ev)
+    means = []
+    for u in uniq:
+        m = vals[ev == u].mean()
+        means.append(m)
+    return torch.stack(means).mean()
+
+
+def _eventwise_weighted_mean(values: torch.Tensor, weights: torch.Tensor, event_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Weighted mean per event (event_ids >= 0), then mean across events (unweighted across events).
+    Falls back to global weighted mean if nothing is assigned.
+    """
+    valid = event_ids >= 0
+    if valid.sum() == 0:
+        return (weights * values).sum() / (weights.sum() + 1e-12)
+    ev = event_ids[valid]
+    vals = values[valid]
+    wts  = weights[valid]
+    uniq = torch.unique(ev)
+    means = []
+    for u in uniq:
+        mask = (ev == u)
+        m = (wts[mask] * vals[mask]).sum() / (wts[mask].sum() + 1e-12)
+        means.append(m)
+    return torch.stack(means).mean()
+
+
+def reconstruction_losses_masked_simple(
+    targ_reg: torch.Tensor,         # [N_hits, C_in]
+    pred_occ: torch.Tensor,         # [M, P]
+    pred_reg: torch.Tensor,         # [M, P*C_in]
+    idx_targets: torch.Tensor,      # [M, P]
+    ghost_mask: torch.Tensor,       # [N_hits]
+    hit_event_id: torch.Tensor,     # [N_hits]
+    *,
+    patch_shape: Tuple[int, int, int],
+    dataset,
+    preprocessing_input: str,
+    # hyper/behaviour
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 1.5,
+    focal_alpha: Optional[float] = None,
+    occ_dilate: int = 2,
+    huber_delta: float = 1.0,
+    reg_weight_lam: float = 1.0,
+    reg_weight_alpha: float = 0.5,
+    reg_weight_q0: Optional[float] = None,
+    reg_weight_wmax: Optional[float] = None,
+    occ_empty_beta: float = 0.5,
+    per_event_mean: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Mirrors the 'metric_losses_masked_simple' style: returns (loss_occ, loss_reg, part_losses_dec).
+    If per_event_mean=True, compute mean per event first (where possible) before averaging across events.
+    """
+    device = idx_targets.device
+    M, P = idx_targets.shape
+    C_in = targ_reg.shape[1]
+
+    sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask = occ_supervision_mask(
+        idx_targets, patch_shape, ghost_mask, occ_empty_beta=occ_empty_beta, dilate=occ_dilate
+    )
+
+    # OCC targets (with optional smoothing)
+    if label_smoothing > 0.0:
+        eps = label_smoothing
+        sup_targ = sup_targ * (1.0 - eps) + 0.5 * eps
+
+    # Flat supervised OCC logits/targets
+    occ_logits_sup = pred_occ[sup_mask]
+    occ_targ_sup   = sup_targ[sup_mask]
+
+    # Focal BCE (uses the version already in your utils)
+    # soft_focal_bce_with_logits is assumed to be available in this module
+    occ_losses = soft_focal_bce_with_logits(
+        occ_logits_sup, occ_targ_sup, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
+    )  # [N_sup]
+
+    # Break down for logging
+    pos_or_border = (pos_mask | border_mask)[sup_mask]
+    neg_only = sampled_neg_mask[sup_mask]
+    occ_pos_loss = occ_losses[pos_or_border].mean() if pos_or_border.any() else torch.tensor(0., device=device)
+    occ_neg_loss = occ_losses[neg_only].mean() if neg_only.any() else torch.tensor(0., device=device)
+
+    # ----- Per-event mean for OCC (if enabled) -----
+    # Map each supervised (row, col) to a row event, then average per event where known.
+    if per_event_mean:
+        row_event = _row_event_ids(idx_targets, hit_event_id)  # [M]
+        sup_rows = sup_mask.nonzero(as_tuple=True)[0]          # [N_sup]
+        sup_events = row_event[sup_rows]                       # [-1 or event_id]
+        loss_occ = _eventwise_mean(occ_losses, sup_events)
+    else:
+        loss_occ = occ_losses.mean()
+
+    # ===================== REG =====================
+    flat_idx_targets = idx_targets.view(-1)
+    pos_idx = torch.where(pos_mask.view(-1))[0]
+    neg_idx = torch.where(sampled_neg_mask.view(-1))[0]
+    all_idx = torch.cat([pos_idx, neg_idx], dim=0)
+    N_pos = pos_idx.numel()
+
+    # Predictions
+    pred_reg_flat = pred_reg.view(-1, C_in)[all_idx]  # [N_all, C_in]
+
+    # Targets (positives from hits; negatives to 'empty' representative)
+    reg_empty = targ_reg.amin(dim=0)                  # [C_in]
+    targ_reg_flat = reg_empty.unsqueeze(0).expand(all_idx.numel(), -1).clone()
+    if N_pos > 0:
+        raw_pos = flat_idx_targets[pos_idx]
+        targ_reg_flat[:N_pos] = targ_reg[raw_pos]
+
+    # Huber / Smooth L1 row loss
+    reg_elem = F.smooth_l1_loss(pred_reg_flat, targ_reg_flat, beta=huber_delta, reduction='none')  # [N_all,C_in]
+    reg_row = reg_elem.sum(dim=1)  # [N_all]
+
+    # charge-aware weights (positives only)
+    w = torch.ones_like(reg_row)
+    if N_pos > 0:
+        q_pos_orig = dataset.unpreprocess(
+            targ_reg_flat[:N_pos], 'q', preprocessing=preprocessing_input
+        ).squeeze(-1)  # [N_pos]
+        eps = 1e-6
+        if reg_weight_q0 is None:
+            q0 = torch.quantile(q_pos_orig.detach(), 0.75).clamp_min(eps)
+        else:
+            q0 = torch.as_tensor(reg_weight_q0, dtype=q_pos_orig.dtype, device=q_pos_orig.device).clamp_min(eps)
+
+        w_pos = 1.0 + reg_weight_lam * (q_pos_orig / q0).clamp_min(0.).pow(reg_weight_alpha)
+        if reg_weight_wmax is not None:
+            w_pos = torch.clamp(w_pos, max=float(reg_weight_wmax))
+        w[:N_pos] = w_pos
+
+    # Per-event mean for REG (if enabled)
+    # Assign each flat index to a row -> event id
+    row_event = _row_event_ids(idx_targets, hit_event_id)  # [M]
+    all_rows = all_idx // P                                # [N_all]
+    all_events = row_event[all_rows]                       # [-1 or event_id]
+
+    if per_event_mean:
+        loss_reg = _eventwise_weighted_mean(reg_row, w, all_events)
+        # For logging: keep pos/neg breakdown (standard means)
+        reg_pos_loss = (w[:N_pos] * reg_row[:N_pos]).sum() / (w[:N_pos].sum() + 1e-12) if N_pos > 0 else torch.tensor(0., device=device)
+        reg_neg_loss = reg_row[N_pos:].mean() if reg_row.numel() > N_pos else torch.tensor(0., device=device)
+    else:
+        loss_reg = (w * reg_row).sum() / (w.sum() + 1e-12)
+        reg_pos_loss = (w[:N_pos] * reg_row[:N_pos]).sum() / (w[:N_pos].sum() + 1e-12) if N_pos > 0 else torch.tensor(0., device=device)
+        reg_neg_loss = reg_row[N_pos:].mean() if reg_row.numel() > N_pos else torch.tensor(0., device=device)
+
+    part_losses_dec = {
+        'occ/total': loss_occ.detach(),
+        'occ/pos': occ_pos_loss.detach(),
+        'occ/neg': occ_neg_loss.detach(),
+        'reg/total': loss_reg.detach(),
+        'reg/pos': reg_pos_loss.detach(),
+        'reg/neg': reg_neg_loss.detach(),
+    }
+    return loss_occ, loss_reg, part_losses_dec

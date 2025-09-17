@@ -152,9 +152,9 @@ class ViTFineTuner(pl.LightningModule):
 
 
     def _arrange_batch(self, batch):
-        batch_input, *batch_input_global = arrange_sparse_minkowski(batch, self.device)
+        batch_input, *global_params = arrange_input(batch)
         target = arrange_truth(batch)
-        return batch_input, *batch_input_global, target
+        return batch_input, *global_params, target
 
 
     def compute_losses(self, batch_output, target):
@@ -272,8 +272,8 @@ class ViTFineTuner(pl.LightningModule):
 
     
     def common_step(self, batch):
-        batch_size = len(batch["c"])
         batch_input, *batch_input_global, target = self._arrange_batch(batch)
+        batch_size = batch_input.batch_size
 
         # Forward pass
         batch_output = self.forward(batch_input, batch_input_global)

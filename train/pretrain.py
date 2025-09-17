@@ -121,15 +121,7 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
 
-    # Define logger and checkpoint
-    logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
-    tb_logger = SplitTensorBoardLogger(   
-        save_dir=f"{args.save_dir}/tb_logs",
-        name=f"{args.name}",
-        other_target="train",
-        strip_suffix=True,
-        val_suffix = "_epoch",
-    )
+    # Checkpoint
     callbacks = []
     monitored_losses = [
             'loss_total/val',
@@ -155,6 +147,15 @@ def main():
             mode='min' 
         )
         callbacks.append(early_stop_callback)
+
+    logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
+    tb_logger = SplitTensorBoardLogger(   
+        save_dir=f"{args.save_dir}/tb_logs",
+        name=f"{args.name}",
+        other_target="train",
+        strip_suffix=True,
+        val_suffix = "_epoch",
+    )
     logger.log_hyperparams(vars(args))
     tb_logger.log_hyperparams(vars(args))
 
@@ -178,7 +179,7 @@ def main():
         strategy="ddp" if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
-        deterministic=False,
+        deterministic=True,
         accumulate_grad_batches=args.accum_grad_batches,
     )
 

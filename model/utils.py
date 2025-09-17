@@ -166,31 +166,38 @@ class BlockWithMask(Block):
             num_heads,
             mlp_ratio=4.,
             qkv_bias=False,
-            drop=0.,
+            qk_norm=False,
+            scale_attn_norm=False,
+            scale_mlp_norm=False,
+            proj_bias=False,
+            proj_drop=0.,
             attn_drop=0.,
             init_values=None,
             drop_path=0.,
             act_layer=nn.GELU,
-            norm_layer=nn.LayerNorm
+            norm_layer=nn.LayerNorm,
+            mlp_layer=Mlp,
     ):
         super().__init__(
             dim,
-            num_heads,
+            num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
-            proj_drop=drop,
+            proj_drop=proj_drop,
             attn_drop=attn_drop,
             init_values=init_values,
             drop_path=drop_path,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            mlp_layer=mlp_layer,
         )
         self.attn = MaskableAttention(
             dim=dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
             attn_drop=attn_drop,
-            proj_drop=drop,
+            proj_drop=proj_drop,
         )
 
     def forward(self, x, attn_mask=None):
@@ -525,7 +532,7 @@ class SharedLatentVoxelHead(nn.Module):
         coef = coef / math.sqrt(self.basis.K_total)
         V = self.basis.expand(coef)             # [N, H, P]
 
-        # per-voxel linear maps (vectorized)
+        # per-voxel linear maps
         Vt = V.transpose(1, 2)                  # [N, P, H]
         if self.post_norm is not None:
             Vt = self.post_norm(Vt)

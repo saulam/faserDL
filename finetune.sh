@@ -7,7 +7,7 @@ shardshuffle=200
 shuffle=2000
 model="base"
 eps=1e-8
-batch_size=512
+batch_size=256
 mixup_alpha=0.0
 preprocessing_input="log"
 preprocessing_output="log"
@@ -19,7 +19,7 @@ epochs=50
 num_workers=16
 blr=1e-3
 layer_decay=0.75
-accum_grad_batches=1
+accum_grad_batches=2
 warmup_epochs=5
 cosine_annealing_epochs=45
 weight_decay=0.05
@@ -28,13 +28,13 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v20"
+name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v21"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v20"
+checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v21"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v13/loss_total_val/epoch=105-step=19186.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v16/loss_total_val/epoch=62-step=11403.ckpt"
 gpus=(1)
 
 python -m train.finetune \

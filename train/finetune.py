@@ -117,7 +117,7 @@ def main():
         metadata = metadata,
     )
     assert args.load_checkpoint is not None, "checkpoint not given as argument"
-    checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
+    checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
     load_mae_encoder(model, checkpoint)
     '''
     state_dict = {key.replace("model.", ""): value for key, value in checkpoint['state_dict'].items()}
@@ -171,7 +171,6 @@ def main():
         strip_suffix=True,
         val_suffix = "_epoch",
     )
-    
     callbacks = make_callbacks()
     logger.log_hyperparams(vars(args))
     tb_logger.log_hyperparams(vars(args))
