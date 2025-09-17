@@ -54,10 +54,9 @@ class SplitTensorBoardLogger(Logger):
     def val_experiment(self):
         return self.val_logger.experiment
 
-    def log_hyperparams(self, params: Any) -> None:
-        # Write hparams to both runs so they’re self-contained
-        self.train_logger.log_hyperparams(params)
-        self.val_logger.log_hyperparams(params)
+    def log_hyperparams(self, params: Any, metrics: Optional[Dict[str, float]] = None) -> None:
+        self.train_logger.log_hyperparams(params, metrics)
+        self.val_logger.log_hyperparams(params, metrics)
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
         train_metrics, val_metrics, others_for_train, others_for_val = {}, {}, {}, {}

@@ -1,14 +1,15 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 07.25
+Date: 09.25
 
-Description: PyTorch ViT model with MinkowskiEngine patching.
+Description: PyTorch ViT model with spconv patching.
 """
 
 import torch
 import torch.nn as nn
 import timm.models.vision_transformer as vit
+from spconv.pytorch import SparseConv3d
 from functools import partial
 from timm.models.layers import trunc_normal_
 from .utils import (
@@ -19,7 +20,7 @@ from .utils import (
 
 class MinkViT(vit.VisionTransformer):
     """ 
-    Vision Transformer with MinkowskiEngine patching 
+    Vision Transformer with spconv patching
     and support for global average pooling
     """
     def __init__(
@@ -74,9 +75,9 @@ class MinkViT(vit.VisionTransformer):
 
         # patch embedding
         del self.cls_token, self.patch_embed, self.pos_embed, self.norm_pre, self.fc_norm, self.head
-        self.patch_embed = MinkowskiConvolution(
+        self.patch_embed = SparseConv3d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
-            bias=True, dimension=D,
+            padding=0, bias=True
         )
 
         # Precompute dense patch templates
@@ -93,13 +94,12 @@ class MinkViT(vit.VisionTransformer):
 
         self.register_buffer('idx_template',       flat_ids.long())       # [Np]
         self.register_buffer('intra_idx_template', intra.long())          # [Np]
-        self.register_buffer('module_id_template', module.long())         # [Np]
 
         # Per-module token index mapping [M, Lm]
         M = self.num_modules
         module_indices = []
         for m in range(M):
-            mask = (self.module_id_template == m)
+            mask = (module.long() == m)
             intra_m = self.intra_idx_template[mask]
             flat_m  = self.idx_template[mask]
             order   = torch.argsort(intra_m)      # stable intra order
@@ -139,7 +139,7 @@ class MinkViT(vit.VisionTransformer):
         self.latent_self_blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[depth + i*2], norm_layer=norm_layer
             )
             for i in range(io_depth)
@@ -209,10 +209,10 @@ class MinkViT(vit.VisionTransformer):
 
 
     def _init_weights(self, m):
-        if isinstance(m, MinkowskiConvolution):
+        if isinstance(m, SparseConv3d):
             # initialize conv like nn.Linear
-            w = m.kernel.data
-            torch.nn.init.xavier_uniform_(w.view(-1, w.size(2)))
+            w = m.weight
+            torch.nn.init.xavier_uniform_(w.view(w.size(0), -1))
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
@@ -229,7 +229,7 @@ class MinkViT(vit.VisionTransformer):
             'module_cls_token',
             'module_embed_enc.weight',
             'global_mem',
-            'latent_free',
+            'latents_free',
             'task_tokens',
             'patch_embed.bias',
         }
@@ -251,32 +251,24 @@ class MinkViT(vit.VisionTransformer):
         )
 
 
-    def densify_patches(self, x_sparse):
-        coords = x_sparse.C.long()  # [N,4]
-        feats  = x_sparse.F
+    def densify_patches(self, x_sp):
+        B = x_sp.batch_size
+        C = x_sp.features.size(1)
+        X, Y, Z = x_sp.spatial_shape  # == (H, W, D)
 
-        B      = int(coords[:, 0].max().item()) + 1
-        G_h, G_w, G_d = self.grid_size
-        Np     = self.num_patches
-        C      = feats.size(1)
+        # Dense is [B, C, X, Y, Z] → flatten H->W->D by permuting to [B, X, Y, Z, C]
+        x_dense = x_sp.dense()  # [B, C, X, Y, Z]
+        dense_tokens = x_dense.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
 
-        # convert from voxel coords to patch-grid coords
-        h = coords[:, 1] // self.patch_size[0]
-        w = coords[:, 2] // self.patch_size[1]
-        d = coords[:, 3] // self.patch_size[2]
+        # Mask from indices
+        idx = x_sp.indices.long()
+        b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
+        occ = torch.zeros((B, X, Y, Z), dtype=torch.bool, device=x_sp.features.device)
+        occ[b, h, w, d] = True
+        attn_mask = occ.view(B, -1)  # H->W->D order matches the permute above
 
-        patch_ids = (h * (G_w * G_d)) + (w * G_d) + d
-        batch_ids = coords[:, 0]
-        
-        # scatter into dense tensor
-        dense = feats.new_zeros(B, Np, C)
-        dense[batch_ids, patch_ids, :] = feats
-
-        attn_mask = torch.zeros(B, Np, dtype=torch.bool, device=feats.device)
-        attn_mask[batch_ids, patch_ids] = True
         intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
-
-        return dense, attn_mask, intra_idx
+        return dense_tokens, attn_mask, intra_idx
     
 
     def _group_tokens_by_module(self, x, attn_mask):
@@ -365,25 +357,15 @@ class MinkViT(vit.VisionTransformer):
         return self._pack_tokens(kv, attn_mask)
     
 
-    def _prepare_queries_and_mask(
+    def _prepare_queries(
         self,
-        cls_mod: torch.Tensor,      # [B, M, C]  per-module CLS
-        kv_keep: torch.Tensor,      # [B, N]    bool, real K/V positions
-        *,
-        adaptive: bool = True,
-        alpha: float = 1.0,         # free queries ~ alpha * sqrt(#KV)
-        min_free: int = 2,          # minimum number of free queries when adaptive
-        jitter: int = 1,            # ± jitter on active free queries when training
+        cls_mod: torch.Tensor,  # [B, M, C]  per-module CLS
     ):
         """
-        Returns:
-        queries      [B, Q, C]   (Q = M + K_free)
-        q_mask       [B, Q]      bool, which queries are active
-        pair_mask    [B, Q, N]   bool, (active query) AND (real KV)
+        Returns: queries        [B, Q, C]   (Q = M + K_free)
         """
         B, M, C = cls_mod.shape
         device  = cls_mod.device
-        Q_total = self.latent_tokens
 
         # Anchored CLS queries
         mod_ids   = torch.arange(M, device=device)
@@ -396,32 +378,7 @@ class MinkViT(vit.VisionTransformer):
         else:
             queries = q_anchor                                                 # [B, M, C]
 
-        # Query mask
-        q_mask = torch.zeros(B, Q_total, dtype=torch.bool, device=device)
-        q_mask[:, :M] = True  # anchors always active
-
-        if self.latent_free_tokens > 0:
-            if adaptive:
-                # how many free queries to activate per event (0..K_free)
-                v_b = kv_keep.sum(dim=1).float()                  # [B]
-                k_b = (alpha * v_b.sqrt()).round().clamp_(min_free, self.latent_free_tokens).long()
-                if self.training and jitter > 0:
-                    k_b = (k_b + torch.randint(-jitter, jitter + 1, k_b.shape, device=device)).clamp_(min_free, self.latent_free_tokens)
-
-                num = int(k_b.max().item())
-                if num > 0:
-                    # sample which free slots to activate (ensures tail slots get trained over time)
-                    idx  = torch.rand(B, self.latent_free_tokens, device=device).topk(num, dim=1, largest=False, sorted=False).indices  # [B,num]
-                    take = (torch.arange(num, device=device).unsqueeze(0) < k_b.unsqueeze(1))                           # [B,num]
-                    r, c = take.nonzero(as_tuple=True)
-                    q_mask[r, M + idx[r, c]] = True
-            else:
-                q_mask[:, :] = True
-
-        # Single pair mask for CrossAttnBlock
-        pair_mask = q_mask.unsqueeze(-1) & kv_keep.unsqueeze(1)  # [B, Q, N]
-
-        return queries, q_mask, pair_mask
+        return queries
     
 
     def forward_features(self, x_sparse, x_glob):
@@ -458,22 +415,20 @@ class MinkViT(vit.VisionTransformer):
         g_tokens = g_tokens.to(tok_mod.dtype)
 
         # Perceiver-IO encoder: latents attend to all kept tokens
-        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_mod)  # [B, N(_max), C], [B, N(_max)]
+        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_mod)  # [B, N, C], [B, N]
 
         # append global tokens to kv
-        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                   # [B, N(_max)+G, C]
+        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                   # [B, N+G, C]
         kv_keep  = torch.cat([kv_keep, torch.ones(
             kv_keep.size(0), self.num_global_tokens, 
-            dtype=torch.bool, device=kv_keep.device)], dim=1)                 # [B, N(_max)+G]
+            dtype=torch.bool, device=kv_keep.device)], dim=1)                 # [B, N+G]
         
         # prepare queries and masks
-        queries, q_mask, pair_mask = self._prepare_queries_and_mask(
-            cls_mod, kv_keep, adaptive=False,
-        )
+        queries = self._prepare_queries(cls_mod)
         lat = queries
         for xa, sa in zip(self.latent_xattn_blocks, self.latent_self_blocks):
-            lat = xa(lat, kv_tokens, attn_mask=pair_mask)                     # cross: lat <- tokens
-            lat = sa(lat, attn_mask=q_mask)                                   # self-attn over latents
+            lat = xa(lat, kv_tokens, attn_mask=kv_keep)                       # cross: lat <- tokens
+            lat = sa(lat, attn_mask=None)                                     # self-attn over latents
 
         # Task-specific heads
         if self.global_pool:

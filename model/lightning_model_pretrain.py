@@ -6,17 +6,15 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 1: masked autoencoder.
 """
 
-from typing import Tuple
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
 import timm.optim as optim_factory
-from spconv.pytorch import SparseConvTensor
 from utils import (
-    arrange_input, arrange_truth, soft_focal_bce_with_logits,
-    prototype_contrastive_loss,  ghost_pushaway_loss,
+    arrange_input, arrange_truth,
+    prototype_contrastive_loss, ghost_pushaway_loss,
+    reconstruction_losses_masked_simple,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
 
@@ -62,7 +60,7 @@ class MAEPreTrainer(pl.LightningModule):
             "pri": self.logit_scale_pri,
             "pid": self.logit_scale_pid,
         }
-
+        
 
     @staticmethod
     def _scale(p: torch.Tensor) -> torch.Tensor:
@@ -133,6 +131,7 @@ class MAEPreTrainer(pl.LightningModule):
         num_neg: int = 16,
         normalize: bool = True,
         pushaway_weight: float = 0.05,
+        per_event_mean: bool = True,
     ):
         """
         Computes both losses (same-track, same-primary, same-pid) in one call.
@@ -145,32 +144,32 @@ class MAEPreTrainer(pl.LightningModule):
         # track
         loss_trk = prototype_contrastive_loss(
             z_track, track_id, event_id, num_neg=num_neg, 
-            normalize=normalize, logit_scale=s_trk,
+            normalize=normalize, logit_scale=s_trk, per_event_mean=per_event_mean,
         )
         loss_trk_ghost = ghost_pushaway_loss(
             z_track, track_id, event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_trk,
+            normalize=normalize, logit_scale=s_trk, per_event_mean=per_event_mean,
         )
 
         # primary
         loss_pri = prototype_contrastive_loss(
             z_primary, primary_id, event_id, num_neg=num_neg, 
-            normalize=normalize, logit_scale=s_pri,
+            normalize=normalize, logit_scale=s_pri, per_event_mean=per_event_mean,
         )
         loss_pri_ghost = ghost_pushaway_loss(
             z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pri,
+            normalize=normalize, logit_scale=s_pri, per_event_mean=per_event_mean,
         )
 
         # pid
         pid_event_id = torch.zeros_like(event_id)  # trick: pid loss across events
         loss_pid = prototype_contrastive_loss(
             z_pid, pid_id, pid_event_id, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pid,
+            normalize=normalize, logit_scale=s_pid, per_event_mean=per_event_mean,
         )
         loss_pid_ghost = ghost_pushaway_loss(
             z_pid, pid_id, pid_event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pid,
+            normalize=normalize, logit_scale=s_pid, per_event_mean=per_event_mean,
         )
 
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
@@ -184,76 +183,6 @@ class MAEPreTrainer(pl.LightningModule):
         }
 
         return loss_trk_all, loss_pri_all, loss_pid_all, part_losses_enc
-
-
-    def _occ_supervision_mask(
-        self,
-        idx_targets: torch.Tensor,          # [M, P], -1 => empty sub-voxel, >=0 => raw index of hit
-        patch_shape: Tuple[int, int, int],  # (p_h, p_w, p_d)
-        ghost_mask: torch.Tensor,
-        dilate: int = 1,
-    ):
-        """
-        Positives: occupied, non-ghost subvoxels
-        Border   : dilation around positives
-        Negatives: sampled from the remaining voxels, with a GLOBAL budget
-                proportional to the number of positives (Option C).
-
-        Returns:
-            sup_mask:         [M, P] bool — (positives ∪ border ∪ sampled_negatives)
-            sup_targ:         [M, P] float — 1 for positives; 0 otherwise
-            pos_mask:         [M, P] bool — non-ghost occupied subvoxels
-            sampled_neg_mask: [M, P] bool — negatives actually sampled
-        """
-        device = idx_targets.device
-        M, P   = idx_targets.shape
-        p_h, p_w, p_d = patch_shape
-
-        # Positives = occupied and non-ghost
-        is_occ = (idx_targets >= 0)
-        is_ghost  = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
-        is_ghost[is_occ]  = ghost_mask[idx_targets[is_occ]]
-        pos_mask = is_occ & ~is_ghost  # [M, P]
-
-        # Border via dilation around positives
-        occ = pos_mask.float().view(M, 1, p_h, p_w, p_d)
-        if dilate > 0:
-            ksz    = 2 * dilate + 1
-            kernel = torch.ones((1, 1, ksz, ksz, ksz), device=device)
-            dil    = F.conv3d(occ, kernel, padding=dilate) > 0
-        else:
-            dil = occ.bool()
-        border_mask = dil.view(M, P) & (~pos_mask)
-
-        # Eligible negatives = everything else (not pos, not border)
-        eligible_neg = ~(pos_mask | border_mask)          # [M, P]
-        pos_counts   = pos_mask.sum()                     # scalar (# positives in batch)
-        neg_counts_r = eligible_neg.sum(dim=1)            # [M] per-token negative counts
-        total_neg    = int(neg_counts_r.sum().item())
-
-        # Global budget: proportional to positives
-        beta = getattr(self, "occ_empty_beta", 0.5)
-        target_total_negs = int(min(total_neg, round(beta * int(pos_counts.item()))))
-        
-        # Proportional quota per token (floored)
-        q_r = (neg_counts_r.float() / max(1, total_neg) * target_total_negs).floor().to(torch.long)
-        q_r = torch.minimum(q_r, neg_counts_r)  # can't exceed available
-        K_max = int(q_r.max().item())
-
-        sampled_neg_mask = torch.zeros_like(eligible_neg, dtype=torch.bool)
-        if K_max > 0:
-            # Random scores; pick top-k per row according to q_r
-            rnd = torch.rand(M, P, device=device).masked_fill(~eligible_neg, float("inf"))
-            _, idxs = torch.topk(-rnd, k=K_max, dim=1)                                   # [M, K_max]
-            rows = torch.arange(M, device=device).unsqueeze(1).expand(-1, K_max)
-            keep = (torch.arange(K_max, device=device).unsqueeze(0) < q_r.unsqueeze(1))  # [M, K_max]
-            sampled_neg_mask[rows[keep], idxs[keep]] = True
-
-        # Final OCC supervision
-        sup_mask = pos_mask | border_mask | sampled_neg_mask
-        sup_targ = pos_mask.float()
-
-        return sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask
     
 
     def compute_contrastive_losses(
@@ -293,99 +222,35 @@ class MAEPreTrainer(pl.LightningModule):
         pred_occ: torch.Tensor,         # [M, P]
         pred_reg: torch.Tensor,         # [M, P*C_in]
         idx_targets: torch.Tensor,      # [M, P]
-        ghost_mask: torch.Tensor,
+        hit_event_id: torch.Tensor,     # [N_hits]
+        ghost_mask: torch.Tensor,       # [N_hits]
+        per_event_mean: bool = True,
     ):
-        C_in       = self.model.in_chans
         p_h, p_w, p_d = self.model.patch_size.tolist()
-        focal_gamma = getattr(self, "focal_gamma", 1.5)
-        focal_alpha = getattr(self, "focal_alpha", None)
-
-        # Masks & negatives
-        sup_mask, sup_targ, pos_mask, border_mask, sampled_neg_mask = self._occ_supervision_mask(
-            idx_targets,
-            patch_shape=(p_h, p_w, p_d),
+        loss_occ, loss_reg, part_losses_dec = reconstruction_losses_masked_simple(
+            targ_reg=targ_reg,
+            pred_occ=pred_occ,
+            pred_reg=pred_reg,
+            idx_targets=idx_targets,
             ghost_mask=ghost_mask,
-            dilate=getattr(self, "occ_dilate", 2),
+            hit_event_id=hit_event_id,
+            patch_shape=(p_h, p_w, p_d),
+            dataset=self.dataset,
+            preprocessing_input=self.preprocessing_input,
+            label_smoothing=getattr(self, "label_smoothing", 0.0),
+            focal_gamma=getattr(self, "focal_gamma", 1.5),
+            focal_alpha=getattr(self, "focal_alpha", None),
+            occ_dilate=getattr(self, "occ_dilate", 2),
+            huber_delta=getattr(self, "huber_delta", 1.0),
+            reg_weight_lam=getattr(self, "reg_weight_lam", 1.0),
+            reg_weight_alpha=getattr(self, "reg_weight_alpha", 0.5),
+            reg_weight_q0=getattr(self, "reg_weight_q0", None),
+            reg_weight_wmax=getattr(self, "reg_weight_wmax", None),
+            occ_empty_beta=getattr(self, "occ_empty_beta", 0.5),
+            per_event_mean=per_event_mean,
         )
-
-        # OCC (optionally smoothed)
-        if self.model.training and getattr(self, "label_smoothing", 0.0) > 0.0:
-            eps = self.label_smoothing
-            sup_targ = sup_targ * (1.0 - eps) + 0.5 * eps
-        occ_logits_sup = pred_occ[sup_mask]
-        occ_targ_sup   = sup_targ[sup_mask]
-        occ_losses = soft_focal_bce_with_logits(
-            occ_logits_sup, occ_targ_sup, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
-        )  # [N_sup]
-        loss_occ = occ_losses.mean()
-        occ_pos_loss = occ_losses[(pos_mask | border_mask)[sup_mask]].mean()
-        occ_neg_loss = occ_losses[sampled_neg_mask[sup_mask]].mean()
-
-        # REG only on positives and sampled negatives
-        flat_idx_targets = idx_targets.view(-1)
-        pos_idx = torch.where(pos_mask.view(-1))[0]
-        neg_idx = torch.where(sampled_neg_mask.view(-1))[0]
-        all_idx = torch.cat([pos_idx, neg_idx], dim=0)               # [N_all]
-        N_pos, N_neg = pos_idx.numel(), neg_idx.numel()
-        N_all = all_idx.numel()
-
-        # Predictions
-        pred_reg_flat = pred_reg.view(-1, C_in)[all_idx]             # [N_all, C_in]
-        
-        # Targets
-        reg_empty = targ_reg.amin(dim=0)                             # [C_in]
-        targ_reg_flat = reg_empty.unsqueeze(0).expand(N_all, -1).clone()
-        if N_pos > 0:
-            raw_pos = flat_idx_targets[pos_idx]
-            targ_reg_flat[:N_pos] = targ_reg[raw_pos]
-
-        # REG
-        huber_delta = getattr(self, "huber_delta", 1.0)
-        reg_elem = F.smooth_l1_loss(
-            pred_reg_flat, targ_reg_flat, beta=huber_delta, reduction='none'
-        )  # [N_all, C_in]
-        reg_row = reg_elem.sum(dim=1)
-
-        # charge-aware weights (positives only)
-        w = torch.ones_like(reg_row)
-        if N_pos > 0:
-            # recover original charges for positives
-            # targ_reg[raw_pos]: [N_pos, C_in] in preprocessed (log/standardized) space
-            # unpreprocess back to original units; assume channel 0 is charge if C_in>1
-            q_pos_orig = self.dataset.unpreprocess(
-                targ_reg[raw_pos], 'q', preprocessing=self.preprocessing_input
-            ).squeeze(-1)  # [N_pos]
-
-            # robust scale q0 and weight function
-            lam   = getattr(self, "reg_weight_lam", 1.0)
-            alpha = getattr(self, "reg_weight_alpha", 0.5)
-            q0_cfg = getattr(self, "reg_weight_q0", None)
-
-            eps = 1e-6
-            if q0_cfg is None:
-                # 75th percentile within the batch positives
-                q0 = torch.quantile(q_pos_orig.detach(), 0.75).clamp_min(eps)
-            else:
-                q0 = torch.as_tensor(q0_cfg, dtype=q_pos_orig.dtype, device=q_pos_orig.device).clamp_min(eps)
-
-            w_pos = 1.0 + lam * (q_pos_orig / q0).clamp_min(0.).pow(alpha)
-            wmax = getattr(self, "reg_weight_wmax", None)
-            if wmax is not None:
-                w_pos = torch.clamp(w_pos, max=float(wmax))
-
-            w[:N_pos] = w_pos
-
-        # Weighted loss (positives upweighted; negatives weight=1)
-        loss_reg = (w * reg_row).sum() / w.sum()
-        reg_pos_loss = (w[:N_pos] * reg_row[:N_pos]).sum() / (w[:N_pos].sum() + 1e-12)
-        reg_neg_loss = reg_row[N_pos:].mean()
-
-        part_losses_dec = {
-            'occ/total': loss_occ.detach(), 'occ/pos': occ_pos_loss.detach(), 'occ/neg': occ_neg_loss.detach(),
-            'reg/total': loss_reg.detach(), 'reg/pos': reg_pos_loss.detach(), 'reg/neg': reg_neg_loss.detach(),
-        }
         return loss_occ, loss_reg, part_losses_dec
-    
+
 
     def compute_losses(
         self,
@@ -404,10 +269,10 @@ class MAEPreTrainer(pl.LightningModule):
         ghost_mask: torch.Tensor,
     ):
         loss_trk, loss_pri, loss_pid, part_enc = self.compute_contrastive_losses(
-            pred_track, pred_primary, pred_pid, con_idx_targets, hit_track_id, hit_primary_id, hit_pdg, hit_event_id, ghost_mask
+            pred_track, pred_primary, pred_pid, con_idx_targets, hit_track_id, hit_primary_id, hit_pdg, hit_event_id, ghost_mask,
         )
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
-            targ_reg, pred_occ, pred_reg, rec_idx_targets, ghost_mask
+            targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
         )
 
         # Kendall et al. aggregation
