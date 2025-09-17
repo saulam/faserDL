@@ -703,6 +703,39 @@ def _count_indices_deterministic(idx: torch.Tensor, size: int) -> torch.Tensor:
     out = torch.zeros(size, dtype=torch.long, device=idx.device)
     out.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
     return out
+
+
+def _segment_mean_from_contiguous_idx_det(
+    values: torch.Tensor,  # [N]
+    idx: torch.Tensor,     # [N] int64 in [0..size-1]
+    size: int,
+    weights: torch.Tensor = None  # [N] or None
+) -> torch.Tensor:
+    """
+    Deterministic counts via _count_indices_deterministic; sums via index_add_.
+    Returns the mean of per-segment means over segments with >0 mass.
+    """
+    device = values.device
+    dtype  = values.dtype
+
+    if weights is None:
+        # sums
+        sums = torch.zeros(size, dtype=dtype, device=device)
+        sums.index_add_(0, idx, values)
+        # counts (deterministic)
+        counts = _count_indices_deterministic(idx, size).to(dtype)
+        valid = counts > 0
+        means = sums[valid] / counts[valid].clamp_min(1)
+        return means.mean() if valid.any() else values.new_zeros(())
+    else:
+        # weighted sums and weighted counts
+        sums = torch.zeros(size, dtype=dtype, device=device)
+        sums.index_add_(0, idx, values * weights)
+        den = torch.zeros(size, dtype=dtype, device=device)
+        den.index_add_(0, idx, weights)
+        valid = den > 0
+        means = sums[valid] / den[valid].clamp_min(1e-12)
+        return means.mean() if valid.any() else values.new_zeros(())
     
 
 def prototype_contrastive_loss(
@@ -875,9 +908,8 @@ def prototype_contrastive_loss(
     )  # [M]
 
     if per_event_mean:
-        uniq = torch.unique(eidx)
-        means = [per_sample[eidx == u].mean() for u in uniq]
-        return torch.stack(means).mean().to(z.dtype)
+        E = int(Pidx["counts"].numel())  # number of events in the grouping
+        return _segment_mean_from_contiguous_idx_det(per_sample, eidx, E, weights=None).to(z.dtype)
     else:
         return per_sample.mean().to(z.dtype)
 
@@ -987,9 +1019,8 @@ def ghost_pushaway_loss(
     per_sample = (torch.logsumexp(sims, dim=1) - math.log(float(k)))     # [M_g]
 
     if per_event_mean:
-        uniq = torch.unique(eidx_g)
-        means = [per_sample[eidx_g == u].mean() for u in uniq]
-        return torch.stack(means).mean().to(z.dtype)
+        E = int(Pidx["counts"].numel())
+        return _segment_mean_from_contiguous_idx_det(per_sample, eidx_g, E, weights=None).to(z.dtype)
     else:
         return per_sample.mean().to(z.dtype)
 
@@ -1072,42 +1103,36 @@ def _row_event_ids(idx_targets: torch.Tensor, hit_event_id: torch.Tensor) -> tor
     return row_event  # [M]
 
 
-def _eventwise_mean(values: torch.Tensor, event_ids: torch.Tensor) -> torch.Tensor:
+def eventwise_mean(values: torch.Tensor, event_ids: torch.Tensor) -> torch.Tensor:
     """
-    Unweighted mean per event (event_ids >= 0), then mean across events.
-    Falls back to global mean if nothing is assigned.
+    Any (possibly non-contiguous) event ids, -1 = unknown (ignored).
+    Unweighted mean per event, then unweighted mean across events.
     """
-    valid = event_ids >= 0
-    if valid.sum() == 0:
+    valid = (event_ids >= 0)
+    if not torch.any(valid):
         return values.mean()
-    ev = event_ids[valid]
+    ev   = event_ids[valid]
     vals = values[valid]
-    uniq = torch.unique(ev)
-    means = []
-    for u in uniq:
-        m = vals[ev == u].mean()
-        means.append(m)
-    return torch.stack(means).mean()
+    # map to contiguous bins deterministically via sorting unique ids
+    uniq, inv = torch.unique(ev, return_inverse=True)  # sorted -> deterministic
+    size = uniq.numel()
+    return _segment_mean_from_contiguous_idx_det(vals, inv, size, weights=None)
 
 
-def _eventwise_weighted_mean(values: torch.Tensor, weights: torch.Tensor, event_ids: torch.Tensor) -> torch.Tensor:
+def eventwise_weighted_mean(values: torch.Tensor, weights: torch.Tensor, event_ids: torch.Tensor) -> torch.Tensor:
     """
-    Weighted mean per event (event_ids >= 0), then mean across events (unweighted across events).
-    Falls back to global weighted mean if nothing is assigned.
+    Any (possibly non-contiguous) event ids, -1 = unknown (ignored).
+    Weighted mean per event, then unweighted mean across events.
     """
-    valid = event_ids >= 0
-    if valid.sum() == 0:
+    valid = (event_ids >= 0)
+    if not torch.any(valid):
         return (weights * values).sum() / (weights.sum() + 1e-12)
-    ev = event_ids[valid]
+    ev   = event_ids[valid]
     vals = values[valid]
     wts  = weights[valid]
-    uniq = torch.unique(ev)
-    means = []
-    for u in uniq:
-        mask = (ev == u)
-        m = (wts[mask] * vals[mask]).sum() / (wts[mask].sum() + 1e-12)
-        means.append(m)
-    return torch.stack(means).mean()
+    uniq, inv = torch.unique(ev, return_inverse=True)  # sorted -> deterministic
+    size = uniq.numel()
+    return _segment_mean_from_contiguous_idx_det(vals, inv, size, weights=wts)
 
 
 def reconstruction_losses_masked_simple(
@@ -1173,7 +1198,7 @@ def reconstruction_losses_masked_simple(
         row_event = _row_event_ids(idx_targets, hit_event_id)  # [M]
         sup_rows = sup_mask.nonzero(as_tuple=True)[0]          # [N_sup]
         sup_events = row_event[sup_rows]                       # [-1 or event_id]
-        loss_occ = _eventwise_mean(occ_losses, sup_events)
+        loss_occ = eventwise_mean(occ_losses, sup_events)
     else:
         loss_occ = occ_losses.mean()
 
@@ -1222,7 +1247,7 @@ def reconstruction_losses_masked_simple(
     all_events = row_event[all_rows]                       # [-1 or event_id]
 
     if per_event_mean:
-        loss_reg = _eventwise_weighted_mean(reg_row, w, all_events)
+        loss_reg = eventwise_weighted_mean(reg_row, w, all_events)
         # For logging: keep pos/neg breakdown (standard means)
         reg_pos_loss = (w[:N_pos] * reg_row[:N_pos]).sum() / (w[:N_pos].sum() + 1e-12) if N_pos > 0 else torch.tensor(0., device=device)
         reg_neg_loss = reg_row[N_pos:].mean() if reg_row.numel() > N_pos else torch.tensor(0., device=device)

@@ -11,7 +11,7 @@ import torch.nn as nn
 import timm.models.vision_transformer as vit
 from spconv.pytorch import SparseConv3d
 from functools import partial
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 from .utils import (
     get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
     CrossAttnBlock, CrossAttention, CylindricalHeadNormalized
