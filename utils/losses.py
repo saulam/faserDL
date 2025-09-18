@@ -1257,11 +1257,7 @@ def reconstruction_losses_masked_simple(
         reg_neg_loss = reg_row[N_pos:].mean() if reg_row.numel() > N_pos else torch.tensor(0., device=device)
 
     part_losses_dec = {
-        'occ/total': loss_occ.detach(),
-        'occ/pos': occ_pos_loss.detach(),
-        'occ/neg': occ_neg_loss.detach(),
-        'reg/total': loss_reg.detach(),
-        'reg/pos': reg_pos_loss.detach(),
-        'reg/neg': reg_neg_loss.detach(),
+        'occ/total': loss_occ.detach(), 'occ/pos': occ_pos_loss.detach(), 'occ/neg': occ_neg_loss.detach(),
+        'reg/total': loss_reg.detach(), 'reg/pos': reg_pos_loss.detach(), 'reg/neg': reg_neg_loss.detach(),
     }
     return loss_occ, loss_reg, part_losses_dec

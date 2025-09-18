@@ -14,10 +14,12 @@ from pathlib import Path
 from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
 from dataset import *
 from model import *
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
 
 
+torch.backends.cudnn.allow_tf32=True
 torch.set_float32_matmul_precision("high")
 pl_major = int(pl.__version__.split(".")[0])
 MODEL_FACTORIES = {
@@ -176,7 +178,11 @@ def main():
         accelerator="gpu",
         devices=nb_gpus,
         precision="bf16-mixed" if pl_major >= 2 else 32,
-        strategy="ddp" if nb_gpus > 1 else "auto",
+        strategy=DDPStrategy(
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            static_graph=True
+        ) if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
         deterministic=True,

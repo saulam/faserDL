@@ -90,7 +90,10 @@ class MAEPreTrainer(pl.LightningModule):
             if hasattr(ds, "set_epoch"):
                 ds.set_epoch(self.trainer.current_epoch)
 
-    
+        lr = self.optimizers().param_groups[0]['lr']
+        self.log(f"lr", lr, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+
     def forward(self, x, x_glob, mask_ratio):
         return self.model(x, x_glob, mask_ratio)
 
@@ -177,9 +180,9 @@ class MAEPreTrainer(pl.LightningModule):
         loss_pid_all = loss_pid + pushaway_weight * loss_pid_ghost
 
         part_losses_enc = {
-            "trk/pos": loss_trk.detach(), "trk/ghost": loss_trk_ghost.detach(),
-            "pri/pos": loss_pri.detach(), "pri/ghost": loss_pri_ghost.detach(),
-            "pid/pos": loss_pid.detach(), "pid/ghost": loss_pid_ghost.detach(),
+            "trk/total": loss_trk_all.detach(), "trk/pos": loss_trk.detach(), "trk/ghost": loss_trk_ghost.detach(),
+            "pri/total": loss_pri_all.detach(), "pri/pos": loss_pri.detach(), "pri/ghost": loss_pri_ghost.detach(),
+            "pid/total": loss_pid_all.detach(), "pid/pos": loss_pid.detach(), "pid/ghost": loss_pid_ghost.detach(),
         }
 
         return loss_trk_all, loss_pri_all, loss_pid_all, part_losses_enc
@@ -317,18 +320,17 @@ class MAEPreTrainer(pl.LightningModule):
             ghost_mask,
         )
 
-        lr = self.optimizers().param_groups[0]['lr']
-        return loss, part_losses, batch_size, lr
+        return loss, part_losses, batch_size
    
 
     def training_step(self, batch, batch_idx):
-        loss, part_losses, batch_size, lr = self.common_step(batch)
+        loss, part_losses, batch_size = self.common_step(batch)
 
         self.log(
             f"loss_total/train",
             loss.detach(), 
             batch_size=batch_size, 
-            on_step=True, 
+            on_step=False, 
             on_epoch=True,
             prog_bar=True, 
             sync_dist=True
@@ -338,12 +340,11 @@ class MAEPreTrainer(pl.LightningModule):
                 "{}/train".format(key),
                 value, 
                 batch_size=batch_size, 
-                on_step=True, 
+                on_step=False, 
                 on_epoch=True, 
                 prog_bar=False, 
                 sync_dist=True
             )
-        self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
 
         # log the actual sigmas (exp(-log_sigma))
         for key, log_sigma in self._uncertainty_params.items():
@@ -352,7 +353,7 @@ class MAEPreTrainer(pl.LightningModule):
                 f'uncertainty/{key}',
                 uncertainty,
                 batch_size=batch_size,
-                on_step=True,
+                on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 sync_dist=True
@@ -365,7 +366,7 @@ class MAEPreTrainer(pl.LightningModule):
                 f'logit_scale/{key}',
                 scale,
                 batch_size=batch_size,
-                on_step=True,
+                on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 sync_dist=True
@@ -375,7 +376,7 @@ class MAEPreTrainer(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        loss, part_losses, batch_size, lr = self.common_step(batch)
+        loss, part_losses, batch_size = self.common_step(batch)
 
         self.log(
             f"loss_total/val",

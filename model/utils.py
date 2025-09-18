@@ -147,13 +147,13 @@ def _to_sdpa_mask(mask, B, Q, K, device, dtype):
 class MaskableAttention(Attention):
     def forward(self, x, attn_mask=None):  # x: [B, N, C]
         B, N, C = x.shape
-        qkv = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        qkv = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # [B,H,N,hdim]
         block = _to_sdpa_mask(attn_mask, B, Q=N, K=N, device=x.device, dtype=x.dtype)
         p = self.attn_drop.p if self.training and self.attn_drop.p > 0 else 0.0
         out = sdpa_safe(q, k, v, attn_mask=block, dropout_p=p, is_causal=False, training=self.training)
-        if torch.isnan(out).any() or torch.isinf(out).any():
-            raise RuntimeError("NaN/Inf in SDPA output (self-attn)")
+        #if torch.isnan(out).any() or torch.isinf(out).any():
+        #    raise RuntimeError("NaN/Inf in SDPA output (self-attn)")
         out = out.transpose(1, 2).reshape(B, N, C)
         out = self.proj(out)  # fp32
         return self.proj_drop(out)
@@ -222,8 +222,8 @@ class CrossAttention(nn.Module):
         B, Nq, C = q_in.shape
         Nk = kv_in.shape[1]
         H  = self.num_heads
-        q = self.q(q_in).view(B, Nq, H, C // H).transpose(1, 2).contiguous()              # [B, H, Nq, hdim]
-        kv = self.kv(kv_in).view(B, Nk, 2, H, C // H).permute(2, 0, 3, 1, 4).contiguous() # [2, B, H, Nk, hdim]
+        q = self.q(q_in).view(B, Nq, H, C // H).transpose(1, 2)                # [B, H, Nq, hdim]
+        kv = self.kv(kv_in).view(B, Nk, 2, H, C // H).permute(2, 0, 3, 1, 4)   # [2, B, H, Nk, hdim]
         k, v = kv.unbind(0)       # [B, H, Nk, hdim]
         block = _to_sdpa_mask(attn_mask, B, Q=Nq, K=Nk, device=q_in.device, dtype=q_in.dtype)
         p = self.attn_drop_p if (self.training and self.attn_drop_p > 0) else 0.0
@@ -613,3 +613,49 @@ class CylindricalHeadEta(nn.Module):
             "pT": pT, "eta": eta, "cos_phi": cos_phi, "sin_phi": sin_phi
         }
         
+
+# lightweight drop-in replacement the dense [B, Np, P] map
+class LazyIdxMap:
+    """
+    Supports: idx_map[b_ids, patch_ids] -> [K, P] (long).
+    Internally does a vectorized search on sorted keys, no big allocation.
+    """
+    def __init__(self, *, sorted_keys, sorted_to_raw, patches_per_evt, voxels_per_patch):
+        self.sorted_keys   = sorted_keys
+        self.sorted_to_raw = sorted_to_raw.to(torch.long)
+        self.Np = int(patches_per_evt)
+        self.P  = int(voxels_per_patch)
+        self.device = self.sorted_keys.device
+
+    @torch.no_grad()
+    def __getitem__(self, key):
+        # idx_map[b_ids, patch_ids] -> [K, P]
+        assert isinstance(key, tuple) and len(key) == 2, "Use idx_map[b_ids, patch_ids]"
+        b_ids, p_ids = key
+
+        if not torch.is_tensor(b_ids): b_ids = torch.tensor([b_ids], device=self.device)
+        if not torch.is_tensor(p_ids): p_ids = torch.tensor([p_ids], device=self.device)
+
+        b_ids = b_ids.to(device=self.device, dtype=torch.int64).reshape(-1)
+        p_ids = p_ids.to(device=self.device, dtype=torch.int64).reshape(-1)
+        K = b_ids.numel()
+
+        # Build all K*P queries
+        sub = torch.arange(self.P, device=self.device, dtype=torch.int64)              # [P]
+        sub = sub.unsqueeze(0).expand(K, -1).reshape(-1)                                # [K*P]
+        bb  = b_ids.unsqueeze(1).expand(-1, self.P).reshape(-1)                         # [K*P]
+        pp  = p_ids.unsqueeze(1).expand(-1, self.P).reshape(-1)                         # [K*P]
+        qk  = (bb * (self.Np * self.P)) + (pp * self.P) + sub                           # [K*P]
+
+        # Binary search
+        pos = torch.searchsorted(self.sorted_keys, qk)                                  # [K*P]
+        n   = self.sorted_keys.numel()
+
+        # clamp for comparison to avoid OOB on CUDA
+        safe_pos = pos.clamp_max(n - 1)
+        eq = (self.sorted_keys[safe_pos] == qk)
+        valid = (pos < n) & eq
+
+        out = torch.full((K * self.P,), -1, dtype=torch.long, device=self.device)
+        out[valid] = self.sorted_to_raw[safe_pos[valid]].to(torch.long)
+        return out.view(K, self.P)

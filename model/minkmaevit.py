@@ -13,7 +13,7 @@ from spconv.pytorch import SparseConv3d
 from functools import partial
 from .utils import (
     get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
-    CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead
+    CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead, LazyIdxMap
 )
 
 
@@ -283,8 +283,7 @@ class MinkMAEViT(nn.Module):
         with the raw id of the actual hit in that sub‐voxel.
         """
         idx = x.indices.long()  # [N, 4] = [b, x, y, z] == [b, h, w, d]
-        b  = idx[:, 0]
-        h, w, d = idx[:, 1], idx[:, 2], idx[:, 3]
+        b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
 
         p_h, p_w, p_d = self.patch_size.tolist()
         Gh, Gw, Gd    = self.grid_size
@@ -296,9 +295,21 @@ class MinkMAEViT(nn.Module):
         patch_idx = (h // p_h) * (Gw * Gd) + (w // p_w) * Gd + (d // p_d)
         sub_idx   = (h %  p_h) * (p_w * p_d) + (w %  p_w) * p_d + (d %  p_d)
 
-        idx_map = torch.full((B, Np, P), -1, dtype=torch.long, device=idx.device)
-        idx_map[b, patch_idx, sub_idx] = torch.arange(N, device=idx.device)
-        return idx_map
+        #idx_map = torch.full((B, Np, P), -1, dtype=torch.long, device=idx.device)
+        #idx_map[b, patch_idx, sub_idx] = torch.arange(N, device=idx.device)
+        #return idx_map
+        # pack to sortable 64-bit keys: (((b*Np)+patch)*P + sub)
+        key   = (b * (Np * P)) + (patch_idx.to(torch.int64) * P) + sub_idx.to(torch.int64)  # [N]
+        order = torch.argsort(key)                                                          # [N]
+        sorted_keys   = key[order].contiguous()
+        sorted_to_raw = order.contiguous()    # gives you raw hit ids (0..N-1), same as before
+
+        return LazyIdxMap(
+            sorted_keys=sorted_keys,
+            sorted_to_raw=sorted_to_raw,
+            patches_per_evt=Np,
+            voxels_per_patch=P,
+        )
     
 
     def _group_tokens_by_module(self, x, attn_mask):
@@ -474,15 +485,6 @@ class MinkMAEViT(nn.Module):
 
         return queries
 
-
-    def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
-        # b_ids must be nondecreasing (true for torch.nonzero over [B, ...]).
-        if N == 0:
-            return b_ids
-        _, counts = torch.unique_consecutive(b_ids, return_counts=True)  # [G]
-        starts = torch.cumsum(counts, dim=0) - counts                    # [G]
-        return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
-
     
     def forward_encoder(self, x_sparse, x_glob, mask_ratio):
         """
@@ -543,6 +545,15 @@ class MinkMAEViT(nn.Module):
             lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
         )
         
+
+    def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
+        # b_ids must be nondecreasing (true for torch.nonzero over [B, ...]).
+        if N == 0:
+            return b_ids
+        _, counts = torch.unique_consecutive(b_ids, return_counts=True)  # [G]
+        starts = torch.cumsum(counts, dim=0) - counts                    # [G]
+        return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
+    
 
     def forward_contrastive(self, latents, attn_mask_keep, ids_keep, idx_map):
         """
@@ -644,6 +655,8 @@ class MinkMAEViT(nn.Module):
 
     def forward(self, x, x_glob, mask_ratio=0.75):
         idx_map = self.build_patch_occupancy_map(x)
+        #idx = x.indices.long()
+        #sorted_keys, sorted_to_raw = self._make_hit_keys(idx, self.grid_size, self.patch_size)
 
         # Encoder
         lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \

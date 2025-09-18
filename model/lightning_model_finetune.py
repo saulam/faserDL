@@ -138,6 +138,9 @@ class ViTFineTuner(pl.LightningModule):
             ds = getattr(dl, "dataset", None)
             if hasattr(ds, "set_epoch"):
                 ds.set_epoch(self.trainer.current_epoch)
+
+        lr = self.get_lr_for_module(self.model.heads["flavour"])
+        self.log(f"lr", lr, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             
     
     def on_before_zero_grad(self, optimizer):
@@ -278,34 +281,30 @@ class ViTFineTuner(pl.LightningModule):
         # Forward pass
         batch_output = self.forward(batch_input, batch_input_global)
         loss, part_losses = self.compute_losses(batch_output, target)
-  
-        # Retrieve current learning rate
-        lr = self.get_lr_for_module(self.model.heads["flavour"])
 
-        return loss, part_losses, batch_size, lr
+        return loss, part_losses, batch_size
 
 
     def training_step(self, batch, batch_idx):
-        loss, part_losses, batch_size, lr = self.common_step(batch)
+        loss, part_losses, batch_size = self.common_step(batch)
 
         if torch.isnan(loss):
             return None
 
-        self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("{}/train".format(key), value, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log(f"lr", lr, batch_size=batch_size, prog_bar=True, sync_dist=True)
+            self.log("{}/train".format(key), value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
         
         # log the actual sigmas (exp(-log_sigma))
         for key, log_sigma in self._uncertainty_params.items():
             uncertainty = torch.exp(-log_sigma)
-            self.log(f'uncertainty/{key}', uncertainty, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log(f'uncertainty/{key}', uncertainty, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
 
 
     def validation_step(self, batch, batch_idx):
-        loss, part_losses, batch_size, lr = self.common_step(batch)
+        loss, part_losses, batch_size = self.common_step(batch)
 
         self.log(f"loss_total/val", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
