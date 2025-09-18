@@ -268,7 +268,7 @@ def arrange_truth(data):
 
 def weighted_loss(L, s):
     """
-    Calculates the uncertainty-weighted loss for any task.
+    Calculates Kendall et al. uncertainty-weighted loss for any task.
     L: The raw loss for the task (e.g., MSE, BCE, CrossEntropy).
     s: The learnable log-variance parameter for the task.
 
