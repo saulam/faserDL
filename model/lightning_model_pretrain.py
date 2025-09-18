@@ -131,7 +131,7 @@ class MAEPreTrainer(pl.LightningModule):
         num_neg: int = 16,
         normalize: bool = True,
         pushaway_weight: float = 0.05,
-        per_event_mean: bool = True,
+        per_event_mean: bool = False,
     ):
         """
         Computes both losses (same-track, same-primary, same-pid) in one call.
@@ -224,7 +224,7 @@ class MAEPreTrainer(pl.LightningModule):
         idx_targets: torch.Tensor,      # [M, P]
         hit_event_id: torch.Tensor,     # [N_hits]
         ghost_mask: torch.Tensor,       # [N_hits]
-        per_event_mean: bool = True,
+        per_event_mean: bool = False,
     ):
         p_h, p_w, p_d = self.model.patch_size.tolist()
         loss_occ, loss_reg, part_losses_dec = reconstruction_losses_masked_simple(
