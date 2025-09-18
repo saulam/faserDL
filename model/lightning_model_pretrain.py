@@ -407,7 +407,7 @@ class MAEPreTrainer(pl.LightningModule):
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
-            'params': list(self._uncertainty_params.values())+ list(self._logit_scale_params.values()),
+            'params': list(self._uncertainty_params.values()) + list(self._logit_scale_params.values()),
             'lr': self.lr * 0.01,
             'weight_decay': 0.0,
         })
@@ -444,7 +444,6 @@ class MAEPreTrainer(pl.LightningModule):
             scheduler2=cosine_scheduler,
             warmup_steps=self.warmup_steps,
             start_cosine_step=self.start_cosine_step,
-            lr_decay=1.0
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
