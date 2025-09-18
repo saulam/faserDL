@@ -748,7 +748,7 @@ def prototype_contrastive_loss(
     semi_hard_pool_mult: int = 4,
     semi_hard_margin: float = 0.05,
     min_class_size: int = 4,
-    logit_scale: torch.Tensor = None,
+    temperature: float = 0.07,
     per_event_mean: bool = False,
 ) -> torch.Tensor:
     """
@@ -852,8 +852,7 @@ def prototype_contrastive_loss(
 
         # Logits and CE (fp32), then cast back
         logits32 = torch.cat([pos_sim, neg_sim], dim=1)       # [M,1+K]
-        if logit_scale is not None:
-            logits32 = logits32 * logit_scale.float()
+        logits32 = logits32 / temperature
         loss = F.cross_entropy(logits32, torch.zeros(z.size(0), dtype=torch.long, device=z.device))
         return loss.to(z.dtype)
 
@@ -900,8 +899,7 @@ def prototype_contrastive_loss(
         neg_sim = neg_sim_full.gather(1, idx_sel)
 
     logits32 = torch.cat([pos_sim, neg_sim], dim=1)                          # [M,1+k]
-    if logit_scale is not None:
-        logits32 = logits32 * logit_scale.float()
+    logits32 = logits32 / temperature
 
     per_sample = F.cross_entropy(
         logits32, torch.zeros(M, dtype=torch.long, device=z.device), reduction='none'
@@ -922,7 +920,7 @@ def ghost_pushaway_loss(
     num_neg: int = 32,                 # negatives kept per anchor (top-k). Must be >0
     pool_mult: int = 1,                # oversample factor (K_pool = num_neg * pool_mult)
     normalize: bool = True,
-    logit_scale: torch.Tensor = None,  # bounded value, not raw param
+    temperature: float = 0.07,
     per_event_mean: bool = False,
 ) -> torch.Tensor:
     """
@@ -983,8 +981,7 @@ def ghost_pushaway_loss(
         k = min(num_neg, sims.size(1))
         if k < sims.size(1):
             sims = torch.topk(sims, k=k, dim=1).values          # keep top-k only
-        if logit_scale is not None:
-            sims = sims * logit_scale.float()
+        sims = sims / temperature
         lse = torch.logsumexp(sims, dim=1)
         loss = (lse - math.log(float(k))).mean()
         return loss.to(z.dtype)
@@ -1012,9 +1009,7 @@ def ghost_pushaway_loss(
     sims_full = torch.einsum('md,mkd->mk', z_g.float(), P_sel.float())    # [M_g,K_pool]
     k = min(num_neg, K_pool)
     sims = torch.topk(sims_full, k=k, dim=1).values                       # [M_g,k]
-
-    if logit_scale is not None:
-        sims = sims * logit_scale.float()
+    sims = sims / temperature
 
     per_sample = (torch.logsumexp(sims, dim=1) - math.log(float(k)))     # [M_g]
 

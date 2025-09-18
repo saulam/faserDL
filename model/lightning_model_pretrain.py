@@ -50,23 +50,6 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": self.log_sigma_reg,
         }
 
-        # learnable scale logits for contrastive losses (init at 1/0.07 ≈ 14.285  => log ≈ 2.659)
-        init = math.log(1/0.07)
-        self.logit_scale_trk = nn.Parameter(torch.tensor(init))
-        self.logit_scale_pri = nn.Parameter(torch.tensor(init))
-        self.logit_scale_pid = nn.Parameter(torch.tensor(init))
-        self._logit_scale_params = {
-            "trk": self.logit_scale_trk,
-            "pri": self.logit_scale_pri,
-            "pid": self.logit_scale_pid,
-        }
-        
-
-    @staticmethod
-    def _scale(p: torch.Tensor) -> torch.Tensor:
-        # clamp exp(logit_scale) in [1/100, 100]
-        return p.clamp(math.log(1/100), math.log(100)).exp()
-
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         return move_obj(batch, device)
@@ -139,40 +122,36 @@ class MAEPreTrainer(pl.LightningModule):
         """
         Computes both losses (same-track, same-primary, same-pid) in one call.
         Assumes inputs are already masked/aligned (no ghosts/invisible hits).
-        """
-        s_trk   = self._scale(self.logit_scale_trk)
-        s_pri   = self._scale(self.logit_scale_pri)
-        s_pid   = self._scale(self.logit_scale_pid)
-        
+        """        
         # track
         loss_trk = prototype_contrastive_loss(
             z_track, track_id, event_id, num_neg=num_neg, 
-            normalize=normalize, logit_scale=s_trk, per_event_mean=per_event_mean,
+            normalize=normalize, per_event_mean=per_event_mean,
         )
         loss_trk_ghost = ghost_pushaway_loss(
             z_track, track_id, event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_trk, per_event_mean=per_event_mean,
+            normalize=normalize, per_event_mean=per_event_mean,
         )
 
         # primary
         loss_pri = prototype_contrastive_loss(
             z_primary, primary_id, event_id, num_neg=num_neg, 
-            normalize=normalize, logit_scale=s_pri, per_event_mean=per_event_mean,
+            normalize=normalize, per_event_mean=per_event_mean,
         )
         loss_pri_ghost = ghost_pushaway_loss(
             z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pri, per_event_mean=per_event_mean,
+            normalize=normalize, per_event_mean=per_event_mean,
         )
 
         # pid
         pid_event_id = torch.zeros_like(event_id)  # trick: pid loss across events
         loss_pid = prototype_contrastive_loss(
             z_pid, pid_id, pid_event_id, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pid, per_event_mean=per_event_mean,
+            normalize=normalize, per_event_mean=per_event_mean,
         )
         loss_pid_ghost = ghost_pushaway_loss(
             z_pid, pid_id, pid_event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, logit_scale=s_pid, per_event_mean=per_event_mean,
+            normalize=normalize, per_event_mean=per_event_mean,
         )
 
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
@@ -359,19 +338,6 @@ class MAEPreTrainer(pl.LightningModule):
                 sync_dist=True
             )
 
-        # log the actual logit scales
-        for key, logit_scale in self._logit_scale_params.items():
-            scale = self._scale(logit_scale).detach()
-            self.log(
-                f'logit_scale/{key}',
-                scale,
-                batch_size=batch_size,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=True
-            )
-
         return loss
 
 
@@ -407,7 +373,7 @@ class MAEPreTrainer(pl.LightningModule):
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
-            'params': list(self._uncertainty_params.values()) + list(self._logit_scale_params.values()),
+            'params': list(self._uncertainty_params.values()),
             'lr': self.lr * 0.01,
             'weight_decay': 0.0,
         })
