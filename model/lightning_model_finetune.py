@@ -211,17 +211,17 @@ class ViTFineTuner(pl.LightningModule):
 
         # ----- Kendall-weighted total -----
         total_loss = (
-            weighted_loss(loss_flavour,           self.log_sigma_flavour).mean() +
-            weighted_loss(loss_charm,             self.log_sigma_charm).mean() +
-            weighted_loss(loss_vis_geom,          self.log_sigma_vis_geom).mean() +
-            weighted_loss(loss_vis_pt,            self.log_sigma_vis_pt).mean() +
-            weighted_loss(loss_vis_mag,           self.log_sigma_vis_mag).mean() +
-            weighted_loss(loss_jet_geom,          self.log_sigma_jet_geom).mean() +
-            weighted_loss(loss_jet_pt,            self.log_sigma_jet_pt).mean() +
-            weighted_loss(loss_jet_mag,           self.log_sigma_jet_mag).mean() +
-            weighted_loss(loss_lep_geom[cc_mask], self.log_sigma_lep_geom).mean() +  # normalise masked tasks
-            weighted_loss(loss_lep_pt[cc_mask],   self.log_sigma_lep_pt).mean() +
-            weighted_loss(loss_lep_mag[cc_mask],  self.log_sigma_lep_mag).mean()
+            weighted_loss(loss_flavour,           self.log_sigma_flavour,  kind="ce").mean()  +
+            weighted_loss(loss_charm,             self.log_sigma_charm,    kind="ce").mean()  +
+            weighted_loss(loss_vis_geom,          self.log_sigma_vis_geom, kind="reg").mean() +
+            weighted_loss(loss_vis_pt,            self.log_sigma_vis_pt,   kind="reg").mean() +
+            weighted_loss(loss_vis_mag,           self.log_sigma_vis_mag,  kind="reg").mean() +
+            weighted_loss(loss_jet_geom,          self.log_sigma_jet_geom, kind="reg").mean() +
+            weighted_loss(loss_jet_pt,            self.log_sigma_jet_pt,   kind="reg").mean() +
+            weighted_loss(loss_jet_mag,           self.log_sigma_jet_mag,  kind="reg").mean() +
+            weighted_loss(loss_lep_geom[cc_mask], self.log_sigma_lep_geom, kind="reg").mean() +  # normalise masked tasks
+            weighted_loss(loss_lep_pt[cc_mask],   self.log_sigma_lep_pt,   kind="reg").mean() +
+            weighted_loss(loss_lep_mag[cc_mask],  self.log_sigma_lep_mag,  kind="reg").mean()
         )
 
         # add NC zero-attractor OUTSIDE Kendall (normalised by NC fraction)

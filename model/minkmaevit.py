@@ -295,14 +295,10 @@ class MinkMAEViT(nn.Module):
         patch_idx = (h // p_h) * (Gw * Gd) + (w // p_w) * Gd + (d // p_d)
         sub_idx   = (h %  p_h) * (p_w * p_d) + (w %  p_w) * p_d + (d %  p_d)
 
-        #idx_map = torch.full((B, Np, P), -1, dtype=torch.long, device=idx.device)
-        #idx_map[b, patch_idx, sub_idx] = torch.arange(N, device=idx.device)
-        #return idx_map
-        # pack to sortable 64-bit keys: (((b*Np)+patch)*P + sub)
         key   = (b * (Np * P)) + (patch_idx.to(torch.int64) * P) + sub_idx.to(torch.int64)  # [N]
         order = torch.argsort(key)                                                          # [N]
         sorted_keys   = key[order].contiguous()
-        sorted_to_raw = order.contiguous()    # gives you raw hit ids (0..N-1), same as before
+        sorted_to_raw = order.contiguous()    # raw hit ids (0..N-1)
 
         return LazyIdxMap(
             sorted_keys=sorted_keys,
@@ -655,8 +651,6 @@ class MinkMAEViT(nn.Module):
 
     def forward(self, x, x_glob, mask_ratio=0.75):
         idx_map = self.build_patch_occupancy_map(x)
-        #idx = x.indices.long()
-        #sorted_keys, sorted_to_raw = self._make_hit_keys(idx, self.grid_size, self.patch_size)
 
         # Encoder
         lat, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep = \

@@ -266,7 +266,7 @@ def arrange_truth(data):
     return output
 
 
-def weighted_loss(L, s):
+def weighted_loss(L, s, kind):
     """
     Calculates Kendall et al. uncertainty-weighted loss for any task.
     L: The raw loss for the task (e.g., MSE, BCE, CrossEntropy).
@@ -274,7 +274,9 @@ def weighted_loss(L, s):
 
     https://arxiv.org/pdf/1705.07115
     """
-    return torch.exp(-s) * L + 0.5 * s
+    if kind in ("ce","bce","nce"):            # classification-ish (InfoNCE/focal/BCE/CE)
+        return torch.exp(-s) * L + s
+    return 0.5 * torch.exp(-s) * L + 0.5 * s  # regression-ish
 
 
 class CustomLambdaLR(LambdaLR):
