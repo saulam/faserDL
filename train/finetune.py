@@ -196,7 +196,7 @@ def main():
         ) if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
-        deterministic=True,
+        deterministic=False,
         accumulate_grad_batches=args.accum_grad_batches,
     )
 

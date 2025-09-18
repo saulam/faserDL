@@ -280,16 +280,16 @@ class MAEPreTrainer(pl.LightningModule):
 
         # Kendall et al. aggregation
         part_losses = {**part_enc, **part_dec}
-        def _weight(loss, attr):
+        def _weight(loss, attr, kind):
             ls = getattr(self, attr, None)
-            return weighted_loss(loss, ls) if ls is not None else loss
+            return weighted_loss(loss, ls, kind) if ls is not None else loss
 
         total_loss = (
-            _weight(loss_trk, "log_sigma_trk") +
-            _weight(loss_pri, "log_sigma_pri") +
-            _weight(loss_pid, "log_sigma_pid") +
-            _weight(loss_occ, "log_sigma_occ") +
-            _weight(loss_reg, "log_sigma_reg")
+            _weight(loss_trk, "log_sigma_trk", kind="nce") +
+            _weight(loss_pri, "log_sigma_pri", kind="nce") +
+            _weight(loss_pid, "log_sigma_pid", kind="nce") +
+            _weight(loss_occ, "log_sigma_occ", kind="ce")  +
+            _weight(loss_reg, "log_sigma_reg", kind="huber")
         )
 
         return total_loss, part_losses
@@ -408,7 +408,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         param_groups.append({
             'params': list(self._uncertainty_params.values())+ list(self._logit_scale_params.values()),
-            'lr': self.lr * 0.1,
+            'lr': self.lr * 0.01,
             'weight_decay': 0.0,
         })
         optimizer = torch.optim.AdamW(

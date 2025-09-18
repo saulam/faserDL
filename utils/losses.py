@@ -744,7 +744,7 @@ def prototype_contrastive_loss(
     event_id: torch.Tensor,
     num_neg: int = 32,
     normalize: bool = True,
-    semi_hard: bool = True,
+    semi_hard: bool = False,
     semi_hard_pool_mult: int = 4,
     semi_hard_margin: float = 0.05,
     min_class_size: int = 4,
@@ -920,7 +920,7 @@ def ghost_pushaway_loss(
     event_id: torch.Tensor,            # [N]
     ghost_mask: torch.Tensor,          # [N] True for ghost anchors
     num_neg: int = 32,                 # negatives kept per anchor (top-k). Must be >0
-    pool_mult: int = 4,                # oversample factor (K_pool = num_neg * pool_mult)
+    pool_mult: int = 1,                # oversample factor (K_pool = num_neg * pool_mult)
     normalize: bool = True,
     logit_scale: torch.Tensor = None,  # bounded value, not raw param
     per_event_mean: bool = False,
