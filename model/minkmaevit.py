@@ -162,15 +162,21 @@ class MinkMAEViT(nn.Module):
             name: nn.Parameter(torch.zeros(1, decoder_embed_dim))
             for name in ["con", "rec"]
         })
-        self.latents_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
-        self.decode_xattn_blocks = nn.ModuleList([
-            CrossAttnBlock(
-                dim=decoder_embed_dim, num_heads=decoder_num_heads, 
-                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec, 
-                attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
-            )
-            for _ in range(io_decode_depth)
-        ])
+        self.latents_to_dec = nn.ModuleDict({
+            name: nn.Linear(embed_dim, decoder_embed_dim)
+            for name in ["con", "rec"]
+        })
+        self.decode_xattn_blocks = nn.ModuleDict({
+            name: nn.ModuleList([
+                CrossAttnBlock(
+                    dim=decoder_embed_dim, num_heads=decoder_num_heads, 
+                    mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec, 
+                    attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
+                )
+                for _ in range(io_decode_depth)
+            ])
+        for name in ["con", "rec"]
+        })
 
         # Heads
         self.sep_basis = SeparableDCT3D(self.patch_size.tolist())
@@ -576,9 +582,9 @@ class MinkMAEViT(nn.Module):
         Q[b_ids, within] = q                                               # place queries by (b, rank)
 
         # decode with latents
-        KV = self.latents_to_dec(latents)                                   # [B, K, Cdec]
+        KV = self.latents_to_dec["con"](latents)                           # [B, K, Cdec]
         X  = Q
-        for blk in self.decode_xattn_blocks:
+        for blk in self.decode_xattn_blocks["con"]:
             X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
@@ -625,9 +631,9 @@ class MinkMAEViT(nn.Module):
         Q[b_ids, within] = q                                                 # place queries by (b, rank)
 
         # decode with latents
-        KV = self.latents_to_dec(latents)                                    # [B, K, Cdec]
+        KV = self.latents_to_dec["rec"](latents)                             # [B, K, Cdec]
         X  = Q
-        for blk in self.decode_xattn_blocks:
+        for blk in self.decode_xattn_blocks["rec"]:
             X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
