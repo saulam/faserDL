@@ -56,17 +56,17 @@ class ViTFineTuner(pl.LightningModule):
         )
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
-        self.log_sigma_flavour = nn.Parameter(torch.zeros(()))
-        self.log_sigma_charm = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis_geom = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis_pt = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis_mag = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_geom = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_pt = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_mag = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep_geom = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep_pt = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep_mag = nn.Parameter(torch.zeros(()))
+        self.log_sigma_flavour   = nn.Parameter(torch.zeros(()))
+        self.log_sigma_charm     = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis_geom  = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis_pt    = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vis_mag   = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_geom  = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_pt    = nn.Parameter(torch.zeros(()))
+        self.log_sigma_jet_mag   = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep_geom  = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep_pt    = nn.Parameter(torch.zeros(()))
+        self.log_sigma_lep_mag   = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
             "flavour":     self.log_sigma_flavour,
             "charm":       self.log_sigma_charm,
@@ -161,13 +161,13 @@ class ViTFineTuner(pl.LightningModule):
 
 
     def compute_losses(self, batch_output, target):
-        # ---- predicted outputs -----
+        # predicted outputs
         out_flavour = batch_output['out_flavour']
         out_charm   = batch_output['out_charm'].squeeze()
         out_vis     = batch_output['out_vis']
         out_jet     = batch_output['out_jet']
 
-        # ---- true outputs -----
+        # true outputs
         targ_iscc            = target['is_cc']
         targ_flavour         = target['flavour_label']
         targ_charm           = target['charm']
@@ -184,11 +184,11 @@ class ViTFineTuner(pl.LightningModule):
             jet_latents=out_jet.get("latents"),
         )
 
-        # ----- classification losses -----
+        # classification losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm   = self.loss_charm(out_charm, targ_charm)
 
-        # ----- regression per-sample tensors from the criterion -----
+        # regression per-sample tensors from the criterion
         loss_vis_geom    = outs["loss_vis/geom"]
         loss_vis_pt      = outs["loss_vis/pt"]
         loss_vis_mag     = outs["loss_vis/mag"]
@@ -209,7 +209,7 @@ class ViTFineTuner(pl.LightningModule):
         cc_frac = cc_mask.float().mean().clamp_min(1e-6)
         nc_frac = nc_mask.float().mean().clamp_min(1e-6)
 
-        # ----- Kendall-weighted total -----
+        # Kendall-weighted total
         total_loss = (
             weighted_loss(loss_flavour,           self.log_sigma_flavour,  kind="ce").mean()  +
             weighted_loss(loss_charm,             self.log_sigma_charm,    kind="ce").mean()  +
@@ -291,9 +291,9 @@ class ViTFineTuner(pl.LightningModule):
         if torch.isnan(loss):
             return None
 
-        self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
-            self.log("{}/train".format(key), value, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("{}/train".format(key), value, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         
         # log the actual sigmas (exp(-log_sigma))
         for key, log_sigma in self._uncertainty_params.items():
@@ -363,7 +363,6 @@ class ViTFineTuner(pl.LightningModule):
             scheduler2=cosine_scheduler,
             warmup_steps=self.warmup_steps,
             start_cosine_step=self.start_cosine_step,
-            lr_decay=1.0
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
