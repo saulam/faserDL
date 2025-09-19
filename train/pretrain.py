@@ -89,6 +89,7 @@ def main():
     else:
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
+        dataset.data_files = dataset.data_files[:1000]
         print("- Dataset size: {} events".format(len(dataset)))
         train_loader, valid_loader, _ = split_dataset(
             dataset, args, splits=[0.85, 0.05, 0.1],
@@ -122,7 +123,7 @@ def main():
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Total trainable params model (total): {}".format(total_params))
-
+    
     # Checkpoint
     callbacks = []
     monitored_losses = [
