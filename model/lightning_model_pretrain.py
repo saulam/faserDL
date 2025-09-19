@@ -6,7 +6,6 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 1: masked autoencoder.
 """
 
-import math
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -309,7 +308,7 @@ class MAEPreTrainer(pl.LightningModule):
             f"loss_total/train",
             loss.detach(), 
             batch_size=batch_size, 
-            on_step=False, 
+            on_step=True, 
             on_epoch=True,
             prog_bar=True, 
             sync_dist=True
@@ -319,7 +318,7 @@ class MAEPreTrainer(pl.LightningModule):
                 "{}/train".format(key),
                 value, 
                 batch_size=batch_size, 
-                on_step=False, 
+                on_step=True, 
                 on_epoch=True, 
                 prog_bar=False, 
                 sync_dist=True
@@ -332,7 +331,7 @@ class MAEPreTrainer(pl.LightningModule):
                 f'uncertainty/{key}',
                 uncertainty,
                 batch_size=batch_size,
-                on_step=False,
+                on_step=True,
                 on_epoch=True,
                 prog_bar=False,
                 sync_dist=True
@@ -374,7 +373,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         param_groups.append({
             'params': list(self._uncertainty_params.values()),
-            'lr': self.lr * 0.01,
+            'lr': self.lr * 0.05,
             'weight_decay': 0.0,
         })
         optimizer = torch.optim.AdamW(

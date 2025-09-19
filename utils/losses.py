@@ -744,8 +744,8 @@ def prototype_contrastive_loss(
     event_id: torch.Tensor,
     num_neg: int = 32,
     normalize: bool = True,
-    semi_hard: bool = False,
-    semi_hard_pool_mult: int = 4,
+    semi_hard: bool = True,
+    semi_hard_pool_mult: int = 1,
     semi_hard_margin: float = 0.05,
     min_class_size: int = 4,
     temperature: float = 0.07,
@@ -967,10 +967,16 @@ def ghost_pushaway_loss(
     # map ghost events to indices in the grouping’s event order
     euniq = Pidx["events_sorted"]
     eidx_g = torch.searchsorted(euniq, eid_g)
-    valid_ev = (eidx_g >= 0) & (eidx_g < euniq.numel()) & (euniq[eidx_g] == eid_g)
+    
+    # Only compare where the index is in range
+    in_range   = eidx_g < euniq.numel()
+    safe_eidx  = eidx_g.clamp_max(euniq.numel() - 1)  # won’t be used where !in_range
+    match      = torch.zeros_like(in_range, dtype=torch.bool)
+    if in_range.any():
+        match[in_range] = (euniq[safe_eidx[in_range]] == eid_g[in_range])
+    valid_ev = in_range & match
     if not torch.any(valid_ev):
         return z.new_zeros(())
-
     z_g   = z_g[valid_ev]
     eidx_g= eidx_g[valid_ev]
 
