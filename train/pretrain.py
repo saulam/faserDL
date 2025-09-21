@@ -89,7 +89,6 @@ def main():
     else:
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
-        dataset.data_files = dataset.data_files[:1000]
         print("- Dataset size: {} events".format(len(dataset)))
         train_loader, valid_loader, _ = split_dataset(
             dataset, args, splits=[0.85, 0.05, 0.1],

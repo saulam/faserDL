@@ -373,7 +373,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         param_groups.append({
             'params': list(self._uncertainty_params.values()),
-            'lr': self.lr * 0.05,
+            'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })
         optimizer = torch.optim.AdamW(
