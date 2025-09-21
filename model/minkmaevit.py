@@ -183,20 +183,20 @@ class MinkMAEViT(nn.Module):
         self.shared_voxel_head = nn.ModuleDict({
             name: SharedLatentVoxelHead(
                 decoder_embed_dim, self.sep_basis, H=num_modes[i], 
-                norm_layer=norm_layer,
+                norm_layer=norm_layer, post_norm=True
             )
             for i, name in enumerate(["con", "rec"])
         })
+        self.pre_heads_con = nn.Sequential(
+            nn.Linear(num_modes[0], 3*contrastive_embed_dim),
+            nn.GELU(),
+        )
         self.heads = nn.ModuleDict({
             name: (
                 nn.Sequential(
-                    norm_layer(num_modes[0]),
-                    nn.Linear(num_modes[0], contrastive_embed_dim*2),
-                    nn.GELU(),
-                    nn.Linear(contrastive_embed_dim*2, contrastive_embed_dim),
+                    nn.Linear(contrastive_embed_dim, contrastive_embed_dim),
                 ) if name in {"trk", "pri", "pid"} else
                 nn.Sequential(
-                    norm_layer(num_modes[1]),
                     nn.Linear(num_modes[1], self.in_chans if name=="reg" else 1),
                 )
             )
@@ -600,9 +600,11 @@ class MinkMAEViT(nn.Module):
 
         # heads
         shared       = self.shared_voxel_head["con"](out_flat)             # [Nk, P, H]
-        pred_track   = self.heads["trk"](shared)                           # [Nk, P, E]
-        pred_primary = self.heads["pri"](shared)                           # [Nk, P, E]
-        pred_pid     = self.heads["pid"](shared)                           # [Nk, P, E]
+        shared       = self.pre_heads_con(shared)                          # [Nk, P, 3*E]
+        h_trk, h_pri, h_pid = shared.chunk(3, dim=-1)
+        pred_track   = self.heads["trk"](h_trk)                            # [Nk, P, E]
+        pred_primary = self.heads["pri"](h_pri)                            # [Nk, P, E]
+        pred_pid     = self.heads["pid"](h_pid)                            # [Nk, P, E]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
