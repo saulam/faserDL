@@ -1161,7 +1161,7 @@ def reconstruction_losses_masked_simple(
     per_event_mean: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Mirrors the 'metric_losses_masked_simple' style: returns (loss_occ, loss_reg, part_losses_dec).
+    Returns (loss_occ, loss_reg, part_losses_dec).
     If per_event_mean=True, compute mean per event first (where possible) before averaging across events.
     """
     device = idx_targets.device
@@ -1172,7 +1172,7 @@ def reconstruction_losses_masked_simple(
         idx_targets, patch_shape, ghost_mask, occ_empty_beta=occ_empty_beta, dilate=occ_dilate
     )
 
-    # OCC targets (with optional smoothing)
+    # ===================== OCC =====================
     if label_smoothing > 0.0:
         eps = label_smoothing
         sup_targ = sup_targ * (1.0 - eps) + 0.5 * eps
@@ -1181,8 +1181,7 @@ def reconstruction_losses_masked_simple(
     occ_logits_sup = pred_occ[sup_mask]
     occ_targ_sup   = sup_targ[sup_mask]
 
-    # Focal BCE (uses the version already in your utils)
-    # soft_focal_bce_with_logits is assumed to be available in this module
+    # Focal BCE
     occ_losses = soft_focal_bce_with_logits(
         occ_logits_sup, occ_targ_sup, gamma=focal_gamma, alpha=focal_alpha, reduction='none'
     )  # [N_sup]
@@ -1193,8 +1192,7 @@ def reconstruction_losses_masked_simple(
     occ_pos_loss = occ_losses[pos_or_border].mean() if pos_or_border.any() else torch.tensor(0., device=device)
     occ_neg_loss = occ_losses[neg_only].mean() if neg_only.any() else torch.tensor(0., device=device)
 
-    # ----- Per-event mean for OCC (if enabled) -----
-    # Map each supervised (row, col) to a row event, then average per event where known.
+    # Per-event mean for OCC (if enabled)
     if per_event_mean:
         row_event = _row_event_ids(idx_targets, hit_event_id)  # [M]
         sup_rows = sup_mask.nonzero(as_tuple=True)[0]          # [N_sup]

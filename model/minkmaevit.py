@@ -183,15 +183,25 @@ class MinkMAEViT(nn.Module):
         self.shared_voxel_head = nn.ModuleDict({
             name: SharedLatentVoxelHead(
                 decoder_embed_dim, self.sep_basis, H=num_modes[i], 
-                norm_layer=norm_layer, post_norm=True if name=="rec" else False
+                norm_layer=norm_layer,
             )
             for i, name in enumerate(["con", "rec"])
         })
-        self.track_head   = nn.Linear(num_modes[0], contrastive_embed_dim)
-        self.primary_head = nn.Linear(num_modes[0], contrastive_embed_dim)
-        self.pid_head     = nn.Linear(num_modes[0], contrastive_embed_dim)
-        self.occ_head     = nn.Linear(num_modes[1], 1)
-        self.reg_head     = nn.Linear(num_modes[1], self.in_chans)
+        self.heads = nn.ModuleDict({
+            name: (
+                nn.Sequential(
+                    norm_layer(num_modes[0]),
+                    nn.Linear(num_modes[0], contrastive_embed_dim*2),
+                    nn.GELU(),
+                    nn.Linear(contrastive_embed_dim*2, contrastive_embed_dim),
+                ) if name in {"trk", "pri", "pid"} else
+                nn.Sequential(
+                    norm_layer(num_modes[1]),
+                    nn.Linear(num_modes[1], self.in_chans if name=="reg" else 1),
+                )
+            )
+            for name in ["trk", "pri", "pid", "occ", "reg"]
+        })
 
         self.initialize_weights()
 
@@ -283,7 +293,7 @@ class MinkMAEViT(nn.Module):
         with the raw id of the actual hit in that sub‐voxel.
         """
         idx = x.indices.long()  # [N, 4] = [b, x, y, z] == [b, h, w, d]
-        b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
+        b, h, w, d = idx.unbind(-1)
 
         p_h, p_w, p_d = self.patch_size.tolist()
         Gh, Gw, Gd    = self.grid_size
@@ -590,9 +600,9 @@ class MinkMAEViT(nn.Module):
 
         # heads
         shared       = self.shared_voxel_head["con"](out_flat)             # [Nk, P, H]
-        pred_track   = self.track_head(shared)                             # [Nk, P, E]
-        pred_primary = self.primary_head(shared)                           # [Nk, P, E]
-        pred_pid     = self.pid_head(shared)                               # [Nk, P, E]
+        pred_track   = self.heads["trk"](shared)                           # [Nk, P, E]
+        pred_primary = self.heads["pri"](shared)                           # [Nk, P, E]
+        pred_pid     = self.heads["pid"](shared)                           # [Nk, P, E]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
@@ -639,8 +649,8 @@ class MinkMAEViT(nn.Module):
 
         # heads
         shared   = self.shared_voxel_head["rec"](out_flat)                   # [Nm, P, H]
-        pred_occ = self.occ_head(shared).squeeze(-1)                         # [Nm, P]
-        pred_reg = self.reg_head(shared)                                     # [Nm, P, in_chans]
+        pred_occ = self.heads["occ"](shared).squeeze(-1)                     # [Nm, P]
+        pred_reg = self.heads["reg"](shared)                                 # [Nm, P, in_chans]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_ids]                  # [Nm]

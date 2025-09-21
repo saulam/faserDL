@@ -134,7 +134,7 @@ class MinkViT(vit.VisionTransformer):
                 drop_path=dpr[depth + i*2 - 1] if i>0 else 0.,  # never drop the ingestion step
                 norm_layer=norm_layer
             )
-            for i in range(io_depth)
+            for i in range(io_depth//2)
         ])
         self.latent_self_blocks = nn.ModuleList([
             BlockWithMask(
@@ -142,7 +142,7 @@ class MinkViT(vit.VisionTransformer):
                 qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[depth + i*2], norm_layer=norm_layer
             )
-            for i in range(io_depth)
+            for i in range(io_depth//2)
         ])
 
         # Task specifics
@@ -463,8 +463,8 @@ def vit_tiny(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(16, 16, 4),
-        depth=2, num_heads=12, num_global_tokens=1,
-        latent_tokens=16, io_depth=2,
+        depth=4, num_heads=12, num_global_tokens=1,
+        latent_tokens=16, io_depth=8,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)

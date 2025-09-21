@@ -515,13 +515,12 @@ class SharedLatentVoxelHead(nn.Module):
     Expand once to V ∈ R^{P×H}
     """
     def __init__(self, in_dim, basis: SeparableDCT3D,
-                 H=16, norm_layer=nn.LayerNorm, post_norm=False):
+                 H=16, norm_layer=nn.LayerNorm):
         super().__init__()
         self.basis = basis
         self.H = H
         self.norm = norm_layer(in_dim)
         self.proj = nn.Linear(in_dim, H * basis.K_total)
-        self.post_norm = norm_layer(H) if post_norm else None
 
     def forward(self, token_emb):  # [N_tokens, D]
         x = self.norm(token_emb)
@@ -534,8 +533,6 @@ class SharedLatentVoxelHead(nn.Module):
 
         # per-voxel linear maps
         Vt = V.transpose(1, 2)                  # [N, P, H]
-        if self.post_norm is not None:
-            Vt = self.post_norm(Vt)
         return Vt
 
 
