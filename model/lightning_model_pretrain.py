@@ -12,8 +12,7 @@ import pytorch_lightning as pl
 import timm.optim as optim_factory
 from utils import (
     arrange_input, arrange_truth,
-    prototype_contrastive_loss, ghost_pushaway_loss,
-    reconstruction_losses_masked_simple,
+    contrastive_with_ghost_shared, reconstruction_losses_masked_simple,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
 
@@ -113,7 +112,6 @@ class MAEPreTrainer(pl.LightningModule):
         pid_id: torch.Tensor,            # [N] int64
         event_id: torch.Tensor,          # [N] int64
         ghost_mask: torch.Tensor,        # [N] bool
-        num_neg: int = 16,
         normalize: bool = True,
         pushaway_weight: float = 0.05,
         per_event_mean: bool = False,
@@ -123,34 +121,22 @@ class MAEPreTrainer(pl.LightningModule):
         Assumes inputs are already masked/aligned (no ghosts/invisible hits).
         """        
         # track
-        loss_trk = prototype_contrastive_loss(
-            z_track, track_id, event_id, num_neg=num_neg, 
-            normalize=normalize, per_event_mean=per_event_mean,
-        )
-        loss_trk_ghost = ghost_pushaway_loss(
-            z_track, track_id, event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, per_event_mean=per_event_mean,
+        loss_trk, loss_trk_ghost = contrastive_with_ghost_shared(
+            z_track, track_id, event_id, num_neg=16, pool_mult=2,
+            normalize=normalize, per_event_mean=per_event_mean, ghost_mask=ghost_mask,
         )
 
         # primary
-        loss_pri = prototype_contrastive_loss(
-            z_primary, primary_id, event_id, num_neg=num_neg, 
-            normalize=normalize, per_event_mean=per_event_mean,
-        )
-        loss_pri_ghost = ghost_pushaway_loss(
-            z_primary, primary_id, event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, per_event_mean=per_event_mean,
+        loss_pri, loss_pri_ghost = contrastive_with_ghost_shared(
+            z_primary, primary_id, event_id, num_neg=8, pool_mult=2,
+            normalize=normalize, per_event_mean=per_event_mean, ghost_mask=ghost_mask,
         )
 
         # pid
         pid_event_id = torch.zeros_like(event_id)  # trick: pid loss across events
-        loss_pid = prototype_contrastive_loss(
-            z_pid, pid_id, pid_event_id, num_neg=num_neg,
-            normalize=normalize, per_event_mean=per_event_mean,
-        )
-        loss_pid_ghost = ghost_pushaway_loss(
-            z_pid, pid_id, pid_event_id, ghost_mask, num_neg=num_neg,
-            normalize=normalize, per_event_mean=per_event_mean,
+        loss_pid, loss_pid_ghost = contrastive_with_ghost_shared(
+            z_pid, pid_id, pid_event_id, num_neg=6, pool_mult=1,
+            normalize=normalize, per_event_mean=per_event_mean, ghost_mask=ghost_mask,
         )
 
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost

@@ -659,3 +659,19 @@ class LazyIdxMap:
         out = torch.full((K * self.P,), -1, dtype=torch.long, device=self.device)
         out[valid] = self.sorted_to_raw[safe_pos[valid]].to(torch.long)
         return out.view(K, self.P)
+
+
+def choose_k1_k2(patch_size, max_k1_vol=32):
+    # pick small per-axis factors so ∏k1 <= max_k1_vol and k1|patch
+    k1 = []
+    vol = 1
+    for p in patch_size:
+        f = 1
+        for cand in (4, 3, 2):
+            if p % cand == 0 and vol * cand <= max_k1_vol:
+                f = cand
+                break
+        k1.append(f)
+        vol *= f
+    k2 = [p // f for p, f in zip(patch_size, k1)]
+    return tuple(k1), tuple(k2)
