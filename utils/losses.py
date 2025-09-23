@@ -777,6 +777,7 @@ def contrastive_with_ghost_shared(
     temperature: float = 0.07,
     ghost_temperature: float = None,
     per_event_mean: bool = False,
+    detach_prototypes: bool = True,
 ):
     """
     Build real (event,class) prototypes once, then compute:
@@ -812,6 +813,10 @@ def contrastive_with_ghost_shared(
     P_sum.index_add_(0, inv_group, z_r)
     cnt_vec = _count_indices_deterministic(inv_group, G).clamp_min_(1)
 
+    # optional: stop-grad through prototypes (affects both P_pos and P_mean)
+    if detach_prototypes:
+        P_sum = P_sum.detach()
+
     group_ok, counts_ok, offset_ok, ord_ok, gid2compact, rank_valid = \
         _prepare_valid_groups(Pidx, cnt_vec, min_class_size)
 
@@ -834,7 +839,10 @@ def contrastive_with_ghost_shared(
         cls_cnt  = cnt_vec[g_a]
         eidx_a   = Pidx["eidx"][g_a]
 
+        # leave-one-out positive prototype
         P_pos = (P_sum[g_a] - z_a) / (cls_cnt - 1).unsqueeze(1).to(z_a.dtype)
+        if detach_prototypes:
+            P_pos = P_pos.detach()
         if normalize: P_pos = F.normalize(P_pos, dim=-1, eps=1e-6)
 
         z32, P_pos32 = z_a.float(), P_pos.float()
