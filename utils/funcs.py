@@ -10,7 +10,6 @@ Description:
 
 import copy
 import torch
-import spconv.pytorch as spconv
 from spconv.pytorch import SparseConvTensor
 from functools import partial
 from torch.utils.data import random_split, DataLoader
@@ -123,7 +122,7 @@ def _make_spconv_tensor(
     else:
         raise ValueError("axis_order must be 'XYZ' or 'ZYX'.")
 
-    x_sp = spconv.SparseConvTensor(
+    x_sp = SparseConvTensor(
         features=feats.to(device),
         indices=indices_spconv.to(torch.int32),
         spatial_shape=spatial_shape,
@@ -274,10 +273,10 @@ def weighted_loss(L, s, kind):
 
     https://arxiv.org/pdf/1705.07115
     """
-    #if kind in ("ce","bce","nce"):            # classification-ish (InfoNCE/focal/BCE/CE)
-    #    return torch.exp(-s) * L + s
+    #if kind in ("ce","bce","nce","focal"):    # classification-ish (InfoNCE/focal/BCE/CE)
+    #    return torch.exp(-s) * L + 0.5 * s
     #return 0.5 * torch.exp(-s) * L + 0.5 * s  # regression-ish
-    return torch.exp(-s) * L + 0.5 * s
+    return torch.exp(-s) * L + 0.5 * s  # works best for me in practice
 
 
 class CustomLambdaLR(LambdaLR):

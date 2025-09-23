@@ -389,6 +389,7 @@ class SparseFASERCALDataset(Dataset):
         out_lepton_momentum = data['out_lepton_momentum']
         jet_momentum = data['jet_momentum']
         tau_vis_momentum = data['tau_vis_momentum']
+        tau_decay_mode = data['tau_decay_mode'].item()
         charm = data['charm']
         global_feats = {
             'e_vis':             data['e_vis'],
@@ -416,7 +417,7 @@ class SparseFASERCALDataset(Dataset):
                 train=self.train,            # argmax if False, sampling if True
                 weight_threshold=0.05,
             )
-            hit_pdg = cluster_labels_from_pdgs(hit_pdg)
+            hit_pdg = cluster_labels_from_pdgs(hit_pdg, tau_decay_mode)
 
         # initial transformations
         coords = reco_hits[:, :3]

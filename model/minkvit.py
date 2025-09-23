@@ -9,11 +9,11 @@ Description: PyTorch ViT model with spconv patching.
 import torch
 import torch.nn as nn
 import timm.models.vision_transformer as vit
-from spconv.pytorch import SparseConv3d
+from spconv.pytorch import SparseConv3d, SparseSequential
 from functools import partial
 from timm.layers import trunc_normal_
 from .utils import (
-    get_3d_sincos_pos_embed, BlockWithMask, GlobalFeatureEncoderSimple, 
+    get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, GlobalFeatureEncoderSimple, 
     CrossAttnBlock, CrossAttention, CylindricalHeadNormalized
 )
 
@@ -31,6 +31,7 @@ class MinkViT(vit.VisionTransformer):
         num_global_tokens=1,
         latent_tokens=32,
         io_depth=4,
+        head_init=2e-5,
         global_pool=False,
         metadata=None,
         **kwargs
@@ -38,6 +39,7 @@ class MinkViT(vit.VisionTransformer):
         super(MinkViT, self).__init__(**kwargs)
         
         self.metadata = metadata
+        self.head_init = head_init
         depth = kwargs['depth']
         num_heads = kwargs['num_heads']
         mlp_ratio = kwargs['mlp_ratio']
@@ -55,11 +57,7 @@ class MinkViT(vit.VisionTransformer):
         assert H % p_h == 0 and W % p_w == 0 and D_img % p_d == 0, \
             "img_size must be divisible by patch_size"
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
-        self.num_patches = (
-            self.grid_size[0] 
-            * self.grid_size[1]
-            * self.grid_size[2]
-        )
+        self.num_patches = (self.grid_size[0] * self.grid_size[1] * self.grid_size[2])
         self.patch_voxels = p_h * p_w * p_d
         self.register_buffer('patch_size', torch.tensor(patch_size, dtype=torch.long))
 
@@ -75,10 +73,21 @@ class MinkViT(vit.VisionTransformer):
 
         # patch embedding
         del self.cls_token, self.patch_embed, self.pos_embed, self.norm_pre, self.fc_norm, self.head
-        self.patch_embed = SparseConv3d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
-            padding=0, bias=True
-        )
+        if self.patch_size.prod().item() > 512:
+            # too large -> use two-step conv
+            mid = embed_dim // 4
+            k1, k2 = choose_k1_k2(patch_size)
+            self.patch_embed = SparseSequential(
+                SparseConv3d(in_chans, mid, kernel_size=k1, stride=k1, padding=0, bias=False),
+                norm_layer(mid),
+                nn.GELU(),
+                SparseConv3d(mid, embed_dim, kernel_size=k2, stride=k2, padding=0, bias=True)
+            )
+        else:
+            self.patch_embed = SparseConv3d(
+                in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
+                padding=0, bias=True,
+            )
 
         # Precompute dense patch templates
         mh = torch.arange(G_h)
@@ -203,7 +212,7 @@ class MinkViT(vit.VisionTransformer):
             lin = head[2]
             if name in self.metadata and hasattr(lin, "mlp"):
                 lin = lin.mlp
-            trunc_normal_(lin.weight, std=2e-5)
+            trunc_normal_(lin.weight, std=self.head_init)
             if lin.bias is not None:
                 lin.bias.data.fill_(0)
 
@@ -462,7 +471,7 @@ class MinkViT(vit.VisionTransformer):
 def vit_tiny(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=528, patch_size=(16, 16, 4),
+        embed_dim=528, patch_size=(12, 12, 10),
         depth=4, num_heads=12, num_global_tokens=1,
         latent_tokens=16, io_depth=8,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
