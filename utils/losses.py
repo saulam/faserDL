@@ -774,8 +774,8 @@ def contrastive_with_ghost_shared(
     pool_mult: int = 1,
     normalize: bool = True,
     min_class_size: int = 5,
-    temperature: float = 0.07,
-    ghost_temperature: float = None,
+    logit_scale: torch.Tensor = None,
+    ghost_logit_scale: torch.Tensor = None,
     per_event_mean: bool = False,
     detach_prototypes: bool = True,
 ):
@@ -861,7 +861,7 @@ def contrastive_with_ghost_shared(
                 K = min(num_neg, K_avail)
                 idx = torch.topk(sim_all, k=K, dim=1).indices
                 neg_sim = sim_all.gather(1, idx)
-                logits32 = torch.cat([pos_sim, neg_sim], dim=1) / temperature
+                logits32 = torch.cat([pos_sim, neg_sim], dim=1) * logit_scale.float()
                 loss_real = F.cross_entropy(
                     logits32, torch.zeros(z_a.size(0), dtype=torch.long, device=z.device)
                 ).to(z.dtype)
@@ -888,7 +888,7 @@ def contrastive_with_ghost_shared(
             k = min(num_neg, K_pool)
             neg_sim = torch.topk(neg_sim_full, k=k, dim=1).values
 
-            logits32 = torch.cat([pos_sim, neg_sim], dim=1) / temperature
+            logits32 = torch.cat([pos_sim, neg_sim], dim=1) * logit_scale.float()
             per_sample = F.cross_entropy(
                 logits32, torch.zeros(M, dtype=torch.long, device=z.device), reduction='none'
             )
@@ -918,14 +918,14 @@ def contrastive_with_ghost_shared(
             num_events_ok = int((counts_ok > 0).sum().item())
             single_event_ghost = (num_events_ok == 1) and (int(torch.unique(eg).numel()) == 1)
 
-            t_g = temperature if (ghost_temperature is None) else float(ghost_temperature)
+            t_g = ghost_logit_scale if ghost_logit_scale is not None else logit_scale
 
             if single_event_ghost:
                 sims = (zg @ P_mean.t()).float()
                 k = min(num_neg, sims.size(1))
                 if k < sims.size(1):
                     sims = torch.topk(sims, k=k, dim=1).values
-                per_sample_g = torch.logsumexp(sims / t_g, dim=1) - math.log(float(k))
+                per_sample_g = torch.logsumexp(sims * t_g, dim=1) - math.log(float(k))
             else:
                 counts_e = counts_ok
                 offset_e = offset_ok
@@ -945,7 +945,7 @@ def contrastive_with_ghost_shared(
                 sims_full = torch.einsum('md,mkd->mk', zg.float(), P_sel.float())
                 k = min(num_neg, K_pool)
                 sims = torch.topk(sims_full, k=k, dim=1).values
-                per_sample_g = torch.logsumexp(sims / t_g, dim=1) - math.log(float(k))
+                per_sample_g = torch.logsumexp(sims * t_g, dim=1) - math.log(float(k))
 
             if per_event_mean:
                 E = int(Pidx["counts"].numel())
