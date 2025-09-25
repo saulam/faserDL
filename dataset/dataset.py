@@ -238,129 +238,127 @@ class SparseFASERCALDataset(Dataset):
 
         return x
     
-
-    def build_per_hit_ids_from_csr(
+    
+    def build_per_hit_labels_from_csr(
         self,
         true_track_id: np.ndarray,      # [T] int64
         true_primary_id: np.ndarray,    # [T] int64
         true_pdg: np.ndarray,           # [T] int64
-        indptr: np.ndarray,             # [N+1] int64
-        true_index: np.ndarray,         # [E] int64
-        link_weight: np.ndarray,        # [E] float
-        ghost_mask: np.ndarray,         # [N] bool
-        train: bool = False,            # False: argmax; True: weighted sampling
-        weight_threshold: float = 0.0,
+        indptr: np.ndarray,             # [N+1] int64  CSR row ptr per hit
+        true_index: np.ndarray,         # [E]   int64  edge -> true index
+        link_weight: np.ndarray,        # [E]   float  contribution weight per edge (>=0)
+        ghost_mask: np.ndarray,         # [N]   bool   hits to be treated as ghosts
+        weight_threshold: float = 0.0,  # drop edges with w <= thr BEFORE renorm
+        normalize_rows: bool = True,
     ):
         """
-        Fully vectorized per-hit ID selection from CSR rows.
-        Returns:
-        hit_track_id   [N] int64  (=-1 if none)
-        hit_primary_id [N] int64  (=-1 if none)
-        hit_pdg        [N] int64  (=-1 if none)
-        active         [N] bool   (True if some edge selected)
-        chosen_true    [N] int64  chosen true index per hit (=-1 if none)
-        """
+        Build compact per-hit soft-label CSRs for three label spaces: PDG, track, primary.
 
+        Returns a dict with three entries: 'pdg', 'track', 'primary'.
+        Each entry is a tuple:
+            (label_indptr: [N+1] int64,
+            label_ids:    [L]   int64,   deduped per row,
+            label_weight: [L]   float32, row-normalized if normalize_rows=True,
+            row_has_labels: [N] bool)
+        """
         indptr = indptr.astype(np.int64, copy=False)
         true_index = true_index.astype(np.int64, copy=False)
-        w = link_weight.astype(np.float64, copy=False)  # float64 for stable cumsum
-        t_tr = true_track_id.astype(np.int64, copy=False)
-        t_pr = true_primary_id.astype(np.int64, copy=False)
+        w = link_weight.astype(np.float64, copy=False)    # float64 for stable sums
+        t_trk = true_track_id.astype(np.int64, copy=False)
+        t_pri = true_primary_id.astype(np.int64, copy=False)
         t_pdg = true_pdg.astype(np.int64, copy=False)
 
         N = indptr.size - 1
         deg = np.diff(indptr)                 # [N]
         rows = np.arange(N, dtype=np.int64)
-        has_edges = deg > 0
+        row_of_edge = np.repeat(rows, deg)    # [E]
 
-        # Map each edge -> its row (length E)
-        row_of_edge = np.repeat(rows, deg)
-
-        # Apply threshold (<= thr treated as zero for sampling / invalid for argmax)
         if weight_threshold > 0.0:
-            w_valid = np.where(w > weight_threshold, w, 0.0)
+            w_eff = np.where(w > weight_threshold, w, 0.0)
         else:
-            # assume non-negative weights; keep zeros
-            w_valid = np.where(w >= 0.0, w, 0.0)
-
-        # Zero-out all edges belonging to ghost rows (they will be ignored)
+            w_eff = np.where(w >= 0.0, w, 0.0)
         if ghost_mask is not None:
-            w_valid[ghost_mask[row_of_edge]] = 0.0
+            w_eff[ghost_mask[row_of_edge]] = 0.0
 
-        # Outputs (defaults)
-        hit_trk = np.full(N, -1, dtype=np.int64)
-        hit_pri = np.full(N, -1, dtype=np.int64)
-        hit_pdg = np.full(N, -1, dtype=np.int64)
-        active  = np.zeros(N, dtype=bool)
-        chosen_true = np.full(N, -1, dtype=np.int64)
+        # Edge -> per-field ids
+        t_idx = true_index
+        edge_trk = t_trk[t_idx].astype(np.int64, copy=False)
+        edge_pri = t_pri[t_idx].astype(np.int64, copy=False)
+        edge_pdg = t_pdg[t_idx].astype(np.int64, copy=False)
 
-        if train:
-            # -------- Weighted sampling per row (O(E)) --------
-            # Global cumsum; sample target in [base, base+rowsum) for each row
-            cs = np.cumsum(w_valid)                             # [E]
-            cs_prev = np.concatenate(([0.0], cs[:-1]))          # [E]
+        def _build_single(edge_ids: np.ndarray):
+            """
+            Build one CSR over hits for a given edge-level id array.
+            """
+            # Keep only edges with positive effective weight
+            pos = w_eff > 0.0
+            if not np.any(pos):
+                # Empty CSR
+                return (np.zeros(N + 1, dtype=np.int64),
+                        np.zeros(0, dtype=np.int64),
+                        np.zeros(0, dtype=np.float32),
+                        np.zeros(N, dtype=bool))
 
-            s = indptr[:-1]                                     # starts
-            e = indptr[1:]                                      # ends
-            base = np.zeros(N, dtype=np.float64)
-            rowsum = np.zeros(N, dtype=np.float64)
+            r = row_of_edge[pos]
+            c = edge_ids[pos]
+            ww = w_eff[pos]
 
-            # Only rows with edges contribute to base/rowsum
-            base[has_edges] = cs_prev[s[has_edges]]
-            rowsum[has_edges] = cs[e[has_edges] - 1] - base[has_edges]
+            # Sort by (row, id) and segment-sum duplicates
+            order = np.lexsort((c, r))
+            r = r[order]; c = c[order]; ww = ww[order]
 
-            # Active rows are those with positive total weight
-            positive = has_edges & (rowsum > 0)
-            if positive.any():
-                u = np.random.random(positive.sum()) * rowsum[positive]
-                targets = base[positive] + u                    # [R+]
-                # Pick first index where cs > target (rightmost cdf inverse)
-                edge_idx = np.searchsorted(cs, targets, side='right')  # [R+], in [0..E-1]
+            seg_start = np.ones_like(r, dtype=bool)
+            seg_start[1:] = (r[1:] != r[:-1]) | (c[1:] != c[:-1])
+            seg_id = np.cumsum(seg_start) - 1
+            nseg = int(seg_id[-1]) + 1
 
-                # Fill outputs for those rows
-                pos_rows = np.flatnonzero(positive)
-                t_idx = true_index[edge_idx]
-                hit_trk[pos_rows] = t_tr[t_idx]
-                hit_pri[pos_rows] = t_pr[t_idx]
-                hit_pdg[pos_rows] = t_pdg[t_idx]
-                active[pos_rows] = True
-                chosen_true[pos_rows] = t_idx
+            # Sum weights per (row, id) segment
+            w_acc = np.zeros(nseg, dtype=np.float64)
+            np.add.at(w_acc, seg_id, ww)
 
-            # Rows with rowsum==0 (all zeroed weights) remain -1/inactive
+            # Representative (row,id) per segment
+            r_rep = r[seg_start]
+            c_rep = c[seg_start]
 
-        else:
-            # -------- Argmax per row (O(E log E) via single sort) --------
-            # Make invalid edges -inf so they lose the argmax
-            w_arg = w.copy()
-            # threshold
-            if weight_threshold > 0.0:
-                w_arg[w_arg <= weight_threshold] = -np.inf
-            # ghosts
-            if ghost_mask is not None:
-                w_arg[ghost_mask[row_of_edge]] = -np.inf
+            keep = (w_acc > 0.0)
+            if not np.any(keep):
+                return (np.zeros(N + 1, dtype=np.int64),
+                        np.zeros(0, dtype=np.int64),
+                        np.zeros(0, dtype=np.float32),
+                        np.zeros(N, dtype=bool))
 
-            # Sort by (row, weight), take the last edge within each row
-            order = np.lexsort((w_arg, row_of_edge))            # by row, then weight asc
-            ends_in_order = np.cumsum(deg) - 1                  # position of last edge of each row in 'order'
-            rows_nonempty = np.flatnonzero(has_edges)
-            if rows_nonempty.size:
-                last_pos = ends_in_order[rows_nonempty]         # indices into 'order'
-                edge_max = order[last_pos]                      # edge indices chosen for those rows
+            r_keep = r_rep[keep]
+            c_keep = c_rep[keep]
+            w_keep = w_acc[keep]
 
-                # Exclude rows where all edges were invalid (-inf)
-                valid_rows_mask = ~np.isneginf(w_arg[edge_max])
-                if valid_rows_mask.any():
-                    sel_rows = rows_nonempty[valid_rows_mask]
-                    sel_edges = edge_max[valid_rows_mask]
-                    t_idx = true_index[sel_edges]
-                    hit_trk[sel_rows] = t_tr[t_idx]
-                    hit_pri[sel_rows] = t_pr[t_idx]
-                    hit_pdg[sel_rows] = t_pdg[t_idx]
-                    active[sel_rows] = True
-                    chosen_true[sel_rows] = t_idx
+            # Build indptr via bincount over kept rows
+            indptr_out = np.zeros(N + 1, dtype=np.int64)
+            counts = np.bincount(r_keep, minlength=N).astype(np.int64)
+            indptr_out[1:] = np.cumsum(counts)
 
-        return hit_trk, hit_pri, hit_pdg, active, chosen_true
+            # Optional per-row normalization
+            if normalize_rows:
+                row_sums = np.zeros(N, dtype=np.float64)
+                np.add.at(row_sums, r_keep, w_keep)
+                w_keep = (w_keep / row_sums[r_keep]).astype(np.float32, copy=False)
+            else:
+                w_keep = w_keep.astype(np.float32, copy=False)
 
+            row_has = np.zeros(N, dtype=bool)
+            row_has[r_keep] = True
+
+            return indptr_out, c_keep.astype(np.int64, copy=False), w_keep, row_has
+
+        # Build all three CSRs
+        track_csr   = _build_single(edge_trk)
+        primary_csr = _build_single(edge_pri)
+        pdg_csr     = _build_single(edge_pdg)
+
+        return {
+            "trk": track_csr,
+            "pri": primary_csr,
+            "pdg": pdg_csr,
+        }
 
 
     def _prepare_event(self, data):
@@ -392,7 +390,6 @@ class SparseFASERCALDataset(Dataset):
         tau_decay_mode = data['tau_decay_mode'].item()
         charm = data['charm']
         global_feats = {
-            'e_vis':             data['e_vis'],
             'faser_cal_energy':  data['faser_cal_energy'],
             'rear_cal_energy':   data['rear_cal_energy'],
             'rear_hcal_energy':  data['rear_hcal_energy'],
@@ -404,9 +401,10 @@ class SparseFASERCALDataset(Dataset):
         if is_tau:
             assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"
 
-        hit_track_id, hit_primary_id, hit_pdg = None, None, None
+        csr_trk, csr_pri, csr_pdg = None, None, None
         if self.stage1:
-            hit_track_id, hit_primary_id, hit_pdg, _, _ = self.build_per_hit_ids_from_csr(
+            true_pdg = cluster_labels_from_pdgs(true_pdg, tau_decay_mode)
+            csr = self.build_per_hit_labels_from_csr(
                 true_track_id=true_track_id,
                 true_primary_id=true_primary_id,
                 true_pdg=true_pdg,
@@ -414,10 +412,11 @@ class SparseFASERCALDataset(Dataset):
                 true_index=true_index,
                 link_weight=link_weight,
                 ghost_mask=ghost_mask,
-                train=self.train,            # argmax if False, sampling if True
-                weight_threshold=0.05,
+                weight_threshold=0.0,
             )
-            hit_pdg = cluster_labels_from_pdgs(hit_pdg, tau_decay_mode)
+            csr_trk = csr["trk"][:3]
+            csr_pri = csr["pri"][:3]
+            csr_pdg = csr["pdg"][:3]
 
         # initial transformations
         coords = reco_hits[:, :3]
@@ -432,10 +431,10 @@ class SparseFASERCALDataset(Dataset):
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
-            coords, modules, q, (hit_track_id, hit_primary_id, ghost_mask), \
+            coords, modules, q, (csr_trk, csr_pri, csr_pdg, ghost_mask), \
             (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
             global_feats, _ = augment(
-                coords, modules, q, (hit_track_id, hit_primary_id, ghost_mask), 
+                coords, modules, q, (csr_trk, csr_pri, csr_pdg, ghost_mask), 
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
                 global_feats, primary_vertex, self.metadata, self.stage1
             )
@@ -455,9 +454,9 @@ class SparseFASERCALDataset(Dataset):
         return {
             'run_number': run_number,
             'event_id': event_id,
-            'hit_track_id': hit_track_id,
-            'hit_primary_id': hit_primary_id,
-            'hit_pdg': hit_pdg,
+            'csr_trk': csr_trk,
+            'csr_pri': csr_pri,
+            'csr_pdg': csr_pdg,
             'ghost_mask': ghost_mask,
             'coords': coords,
             'modules': modules,
@@ -470,7 +469,6 @@ class SparseFASERCALDataset(Dataset):
             'flavour_label': flavour_label,
             'charm': charm,
             'vis_sp_momentum': vis_sp_momentum,
-            'e_vis': global_feats['e_vis'],
             'primary_vertex': primary_vertex,
             'in_neutrino_pdg': in_neutrino_pdg,
             'in_neutrino_energy': in_neutrino_energy,
@@ -500,21 +498,10 @@ class SparseFASERCALDataset(Dataset):
         out_lepton_momentum = event['out_lepton_momentum']
         jet_momentum = event['jet_momentum']
 
-        # Decompose momentum
-        vis_magnitude, vis_dir = self.decompose_momentum(vis_sp_momentum)
-        out_lepton_magnitude, out_lepton_dir = self.decompose_momentum(out_lepton_momentum)
-        jet_magnitude, jet_dir = self.decompose_momentum(jet_momentum)
-
         # Preprocess outputs
-        #pt_miss = torch.tensor([np.sqrt(event['vis_sp_momentum'][0]**2 + event['vis_sp_momentum'][1]**2)])
-        #pt_miss = self.preprocess(pt_miss, 'pt_miss', self.preprocessing_output)
-        #e_vis = self.preprocess(event['e_vis'], 'e_vis', self.preprocessing_output)
         vis_sp_momentum = self.preprocess(vis_sp_momentum, 'vis_sp_momentum')
         out_lepton_momentum = self.preprocess(out_lepton_momentum, 'out_lepton_momentum')
         jet_momentum = self.preprocess(jet_momentum, 'jet_momentum')
-        #vis_mag = self.preprocess(vis_magnitude, 'vis_sp_momentum_magnitude', self.preprocessing_output)
-        #out_mag = self.preprocess(out_lepton_magnitude, 'out_lepton_momentum_magnitude', self.preprocessing_output)
-        #jet_mag = self.preprocess(jet_magnitude, 'jet_momentum_magnitude', self.preprocessing_output)
 
         # Assemble output
         output = {
@@ -529,26 +516,24 @@ class SparseFASERCALDataset(Dataset):
         }
         if self.stage1:
             output.update({
-                'hit_track_id': torch.from_numpy(event['hit_track_id']).long(),
-                'hit_primary_id': torch.from_numpy(event['hit_primary_id']).long(),
-                'hit_pdg': torch.from_numpy(event['hit_pdg']).long(),
+                'csr_trk_indptr': torch.from_numpy(event['csr_trk'][0]).long(),
+                'csr_trk_ids': torch.from_numpy(event['csr_trk'][1]).long(),
+                'csr_trk_weights': torch.from_numpy(event['csr_trk'][2]).float(),
+                'csr_pri_indptr': torch.from_numpy(event['csr_pri'][0]).long(),
+                'csr_pri_ids': torch.from_numpy(event['csr_pri'][1]).long(),
+                'csr_pri_weights': torch.from_numpy(event['csr_pri'][2]).float(),
+                'csr_pdg_indptr': torch.from_numpy(event['csr_pdg'][0]).long(),
+                'csr_pdg_ids': torch.from_numpy(event['csr_pdg'][1]).long(),
+                'csr_pdg_weights': torch.from_numpy(event['csr_pdg'][2]).float(),
                 'ghost_mask': torch.from_numpy(event['ghost_mask']).bool(),
             })
             
         if not self.train or not self.stage1:
             output.update({
                 'charm': torch.from_numpy(np.atleast_1d(event['charm'])).float(),
-                #'e_vis': e_vis.float(),
-                #'pt_miss': pt_miss.float(),
                 'vis_sp_momentum': vis_sp_momentum.float(),
-                #'vis_sp_momentum_mag': vis_mag.float(),
-                #'vis_sp_momentum_dir': vis_dir.float(),
                 'out_lepton_momentum': out_lepton_momentum.float(),
-                #'out_lepton_momentum_mag': out_mag.float(),
-                #'out_lepton_momentum_dir': out_lepton_dir.float(),
                 'jet_momentum': jet_momentum.float(),
-                #'jet_momentum_mag': jet_mag.float(),
-                #'jet_momentum_dir': jet_dir.float(),
                 'is_cc': torch.tensor(event['is_cc']).reshape(1,).float(),
             })
         if not self.train:

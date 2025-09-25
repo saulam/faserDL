@@ -661,45 +661,50 @@ def soft_focal_cross_entropy(
 
 
 @torch.no_grad()
-def _build_grouping(event_id: torch.Tensor, class_id: torch.Tensor):
-    cid = class_id.to(torch.int64); eid = event_id.to(torch.int64)
+def _build_grouping_from_edges(event_id_rows: torch.Tensor,
+                               class_id_edges: torch.Tensor):
+    """Group edges (each edge = one (row i, class c) contribution) by (event, class)."""
+    eid = event_id_rows.to(torch.int64)
+    cid = class_id_edges.to(torch.int64)
     key = (eid << 32) | cid
-    uniq_key, inv_group = torch.unique(key, return_inverse=True)  # groups G
-    G = uniq_key.numel()
+    uniq_key, inv = torch.unique(key, return_inverse=True)  # groups G
     group_eid = (uniq_key >> 32)
+
+    # order groups by event, then build per-event segment metadata
     ord_g = torch.argsort(group_eid)
     ge_sorted = group_eid[ord_g]
-
     first = torch.ones_like(ge_sorted, dtype=torch.bool)
-    first[1:] = ge_sorted[1:] != ge_sorted[:-1]
+    if ge_sorted.numel() > 0:
+        first[1:] = ge_sorted[1:] != ge_sorted[:-1]
     starts = torch.nonzero(first, as_tuple=False).squeeze(1)
     counts = torch.diff(torch.cat([starts, ge_sorted.new_tensor([ge_sorted.numel()])]))
     E = starts.numel()
 
-    pos = torch.arange(G, device=class_id.device)
+    pos = torch.arange(uniq_key.numel(), device=cid.device)
     start_for_pos = starts.repeat_interleave(counts)
     rank_sorted = pos - start_for_pos
-    rank_in_event = torch.empty(G, dtype=torch.long, device=class_id.device)
+    rank_in_event = torch.empty_like(rank_sorted)
     rank_in_event[ord_g] = rank_sorted
 
-    eidx_for_pos = torch.arange(E, device=class_id.device).repeat_interleave(counts)
-    eidx_for_group = torch.empty(G, dtype=torch.long, device=class_id.device)
+    eidx_for_pos = torch.arange(E, device=cid.device).repeat_interleave(counts)
+    eidx_for_group = torch.empty_like(eidx_for_pos)
     eidx_for_group[ord_g] = eidx_for_pos
 
-    offset = torch.zeros(E, dtype=torch.long, device=class_id.device)
-    if E > 1: offset[1:] = torch.cumsum(counts[:-1], dim=0)
+    offset = torch.zeros(E, dtype=torch.long, device=cid.device)
+    if E > 1:
+        offset[1:] = torch.cumsum(counts[:-1], dim=0)
 
     events_sorted = ge_sorted[starts]  # unique event ids in segment order
 
-    return inv_group, {
+    return inv, {
         "ord_g": ord_g, "rank": rank_in_event, "eidx": eidx_for_group,
         "counts": counts, "offset": offset, "events_sorted": events_sorted
     }
 
 
-def _count_indices_deterministic(idx: torch.Tensor, size: int) -> torch.Tensor:
-    out = torch.zeros(size, dtype=torch.long, device=idx.device)
-    out.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
+def _sum_indices_deterministic(idx: torch.Tensor, val: torch.Tensor, size: int) -> torch.Tensor:
+    out = torch.zeros(size, dtype=val.dtype, device=val.device)
+    out.index_add_(0, idx, val)
     return out
 
 
@@ -710,7 +715,8 @@ def _segment_mean_from_contiguous_idx_det(values: torch.Tensor,
     if weights is None:
         sums = torch.zeros(size, dtype=values.dtype, device=values.device)
         sums.index_add_(0, idx, values)
-        counts = _count_indices_deterministic(idx, size).to(values.dtype)
+        counts = torch.zeros(size, dtype=values.dtype, device=values.device)
+        counts.index_add_(0, idx, torch.ones_like(values, dtype=values.dtype))
         valid = counts > 0
         means = sums[valid] / counts[valid].clamp_min(1)
         return means.mean() if valid.any() else values.new_zeros(())
@@ -724,101 +730,105 @@ def _segment_mean_from_contiguous_idx_det(values: torch.Tensor,
         return means.mean() if valid.any() else values.new_zeros(())
 
 
-def _prepare_valid_groups(Pidx, cnt_vec: torch.Tensor, min_class_size: int):
-    """Groups with class_size>=thr and events with >=2 such groups; plus compact per-event order."""
-    G = cnt_vec.numel()
-    E = int(Pidx["counts"].numel())
-    thr = max(2, int(min_class_size))
-
-    eidx_g = Pidx["eidx"]                 # [G]
-    ok_cls = (cnt_vec >= thr)             # [G]
-
-    counts_ok = torch.zeros(E, dtype=torch.long, device=cnt_vec.device)
-    if ok_cls.any():
-        counts_ok.index_add_(0, eidx_g[ok_cls], torch.ones_like(eidx_g[ok_cls], dtype=torch.long))
-    event_ok = (counts_ok >= 2)           # [E]
-    group_ok = ok_cls & event_ok[eidx_g]  # [G]
-
-    ord_g = Pidx["ord_g"]                 # [G]
-    ord_ok = ord_g[group_ok[ord_g]]       # [sum counts_ok[event_ok]]
-
-    counts_ok = counts_ok * event_ok.long()
-    offset_ok = torch.zeros_like(counts_ok)
-    if E > 1:
-        offset_ok[1:] = torch.cumsum(counts_ok[:-1], dim=0)
-
-    total_ok = int(counts_ok.sum().item())
-    if total_ok == 0:
-        gid2compact = cnt_vec.new_full((G,), -1, dtype=torch.long)
-        rank_valid = cnt_vec.new_full((G,), -1, dtype=torch.long)
-        return group_ok, counts_ok, offset_ok, ord_ok, gid2compact, rank_valid
-
-    pos = torch.arange(total_ok, device=cnt_vec.device)
-    eidx_pos = torch.arange(E, device=cnt_vec.device).repeat_interleave(counts_ok)
-    rank_sorted = pos - offset_ok[eidx_pos]
-    rank_valid = cnt_vec.new_full((G,), -1, dtype=torch.long)
-    rank_valid[ord_ok] = rank_sorted
-
-    gid2compact = cnt_vec.new_full((G,), -1, dtype=torch.long)
-    gid2compact[ord_ok] = torch.arange(total_ok, device=cnt_vec.device)
-
-    return group_ok, counts_ok, offset_ok, ord_ok, gid2compact, rank_valid
-
-
 def contrastive_with_ghost_shared(
-    z: torch.Tensor,                   # [N,D]
-    class_id: torch.Tensor,            # [N] >=0 real, <0 ghost
+    z: torch.Tensor,                   # [N, D], L2-normalized if normalize=True
     event_id: torch.Tensor,            # [N]
     ghost_mask: torch.Tensor,          # [N] True for ghost anchors
+    label_indptr: torch.Tensor,        # [N+1]
+    label_class: torch.Tensor,         # [L]
+    label_weight: torch.Tensor,        # [L] per-hit normalized (sum to 1 for non-ghost)
     num_neg: int = 32,
     pool_mult: int = 1,
     normalize: bool = True,
-    min_class_size: int = 5,
+    min_class_size: float = 5.0,       # minimum *effective* weight per (event,class)
     logit_scale: torch.Tensor = None,
     ghost_logit_scale: torch.Tensor = None,
     per_event_mean: bool = False,
     detach_prototypes: bool = True,
 ):
     """
-    Build real (event,class) prototypes once, then compute:
-    - real InfoNCE (positives: leave-one-out; negatives: valid class prototypes in same event)
-    - ghost push-away (no positives; negatives: valid class prototypes in same event)
-    Returns (loss_real, loss_ghost) as scalars on z.dtype/device.
+    Soft-label InfoNCE with ghost push-away.
+    Each non-ghost anchor contributes one positive per (class with y>0), weighted by y.
+    Negatives are other valid class prototypes from the same event, with *all* anchor
+    positives excluded (vectorized).
     """
     if z.numel() == 0 or num_neg <= 0:
         zero = z.new_zeros(())
         return zero, zero
 
-    rmask = (class_id >= 0)
-    gmask = ghost_mask.bool()
-    if not torch.any(rmask):
+    device, D = z.device, z.size(1)
+    if normalize:
+        z = F.normalize(z, dim=-1, eps=1e-6)
+
+    # Expand CSR rows to edges
+    N = z.size(0)
+    label_weight = label_weight.clamp_min(0)
+
+    deg = (label_indptr[1:] - label_indptr[:-1])  # [N]
+    if deg.numel() != N:
+        raise ValueError("label_indptr shape mismatch with N")
+    if deg.sum().item() == 0:
         zero = z.new_zeros(())
         return zero, zero
 
-    z_r   = z[rmask]
-    cid_r = class_id[rmask].long()
-    eid_r = event_id[rmask].long()
-    z_g   = z[gmask] if torch.any(gmask) else z.new_zeros((0, z.size(1)))
-    eid_g = event_id[gmask].long() if torch.any(gmask) else event_id.new_zeros((0,))
+    rows = torch.arange(N, device=device, dtype=torch.long).repeat_interleave(deg)  # [L]
+    eids_edge = event_id[rows].to(torch.int64)  # [L]
+    cids_edge = label_class                     # [L]
+    w_edge    = label_weight                    # [L]
 
-    if normalize:
-        z_r = F.normalize(z_r, dim=-1, eps=1e-6)
-        if z_g.numel() > 0:
-            z_g = F.normalize(z_g, dim=-1, eps=1e-6)
+    # Group by (event, class)
+    inv_group_edge, Pidx = _build_grouping_from_edges(eids_edge, cids_edge)
+    G = int(Pidx["rank"].numel())
 
-    inv_group, Pidx = _build_grouping(eid_r, cid_r)
-    G, D = int(Pidx["rank"].numel()), z_r.size(1)
+    # Weighted prototypes and total weights per (event,class)
+    P_sum = z.new_zeros((G, D))
+    P_sum.index_add_(0, inv_group_edge, z[rows] * w_edge.unsqueeze(1))
+    cnt_vec = _sum_indices_deterministic(inv_group_edge, w_edge, G).clamp_min_(1e-12)
 
-    P_sum = z_r.new_zeros((G, D))
-    P_sum.index_add_(0, inv_group, z_r)
-    cnt_vec = _count_indices_deterministic(inv_group, G).clamp_min_(1)
-
-    # optional: stop-grad through prototypes (affects both P_pos and P_mean)
     if detach_prototypes:
         P_sum = P_sum.detach()
+        cnt_vec = cnt_vec.detach()
+
+    # Valid groups/events
+    def _prepare_valid_groups_soft(Pidx, cnt_vec, min_class_weight: float):
+        G = cnt_vec.numel()
+        E = int(Pidx["counts"].numel())
+        thr = max(2.0, float(min_class_weight))
+        eidx_g = Pidx["eidx"]                     # [G]
+        ok_cls = (cnt_vec >= thr)                 # [G]
+        counts_ok = torch.zeros(E, dtype=torch.long, device=cnt_vec.device)
+        if ok_cls.any():
+            counts_ok.index_add_(0, eidx_g[ok_cls], torch.ones_like(eidx_g[ok_cls], dtype=torch.long))
+        event_ok = (counts_ok >= 2)               # [E]
+        group_ok = ok_cls & event_ok[eidx_g]      # [G]
+
+        ord_g = Pidx["ord_g"]
+        ord_ok = ord_g[group_ok[ord_g]]
+
+        counts_ok_eff = counts_ok * event_ok.long()
+        offset_ok = torch.zeros_like(counts_ok_eff)
+        if E > 1:
+            offset_ok[1:] = torch.cumsum(counts_ok_eff[:-1], dim=0)
+
+        total_ok = int(counts_ok_eff.sum().item())
+        if total_ok == 0:
+            gid2compact = cnt_vec.new_full((G,), -1, dtype=torch.long)
+            rank_valid = cnt_vec.new_full((G,), -1, dtype=torch.long)
+            return group_ok, counts_ok_eff, offset_ok, ord_ok, gid2compact, rank_valid
+
+        pos = torch.arange(total_ok, device=cnt_vec.device)
+        eidx_pos = torch.arange(E, device=cnt_vec.device).repeat_interleave(counts_ok_eff)
+        rank_sorted = pos - offset_ok[eidx_pos]
+        rank_valid = cnt_vec.new_full((G,), -1, dtype=torch.long)
+        rank_valid[ord_ok] = rank_sorted
+
+        gid2compact = cnt_vec.new_full((G,), -1, dtype=torch.long)
+        gid2compact[ord_ok] = torch.arange(total_ok, device=cnt_vec.device)
+
+        return group_ok, counts_ok_eff, offset_ok, ord_ok, gid2compact, rank_valid
 
     group_ok, counts_ok, offset_ok, ord_ok, gid2compact, rank_valid = \
-        _prepare_valid_groups(Pidx, cnt_vec, min_class_size)
+        _prepare_valid_groups_soft(Pidx, cnt_vec, min_class_size)
 
     total_ok = int(counts_ok.sum().item())
     if total_ok == 0:
@@ -829,129 +839,131 @@ def contrastive_with_ghost_shared(
     if normalize:
         P_mean = F.normalize(P_mean, dim=-1, eps=1e-6)
 
-    # ===== Real InfoNCE =====
-    loss_real = z.new_zeros(())
-    g = inv_group
-    keep_real = group_ok[g]
-    if keep_real.any():
-        z_a      = z_r[keep_real]
-        g_a      = g[keep_real]
-        cls_cnt  = cnt_vec[g_a]
-        eidx_a   = Pidx["eidx"][g_a]
+    # ===== REAL LOSS (edge-weighted) =====
+    g_edge = inv_group_edge                              # [L]
+    edge_ok = group_ok[g_edge] & (~ghost_mask.bool()[rows])
+    if not torch.any(edge_ok):
+        loss_real = z.new_zeros(())
+    else:
+        rows_e  = rows[edge_ok]                          # [M]
+        gids_e  = g_edge[edge_ok]                        # [M]
+        w_e     = w_edge[edge_ok]                        # [M]
+        eidx_e  = Pidx["eidx"][gids_e]                   # [M] event index
+        local_e = rank_valid[gids_e]                     # [M] local pos index in event
 
-        # leave-one-out positive prototype
-        P_pos = (P_sum[g_a] - z_a) / (cls_cnt - 1).unsqueeze(1).to(z_a.dtype)
-        if detach_prototypes:
-            P_pos = P_pos.detach()
-        if normalize: P_pos = F.normalize(P_pos, dim=-1, eps=1e-6)
+        valid_event = (counts_ok[eidx_e] >= 2) & (local_e >= 0)
+        rows_e, gids_e, w_e, eidx_e, local_e = \
+            rows_e[valid_event], gids_e[valid_event], w_e[valid_event], eidx_e[valid_event], local_e[valid_event]
 
-        z32, P_pos32 = z_a.float(), P_pos.float()
-        pos_sim = (z32 * P_pos32).sum(-1, keepdim=True)
-
-        num_events_ok = int((counts_ok > 0).sum().item())
-        single_event_real = (num_events_ok == 1)
-
-        if single_event_real:
-            g_compact = gid2compact[g_a]
-            sim_all = z32 @ P_mean.float().t()
-            sim_all.scatter_(1, g_compact.unsqueeze(1), -1e4)
-
-            K_avail = max(0, int(P_mean.size(0)) - 1)
-            if K_avail > 0:
-                K = min(num_neg, K_avail)
-                idx = torch.topk(sim_all, k=K, dim=1).indices
-                neg_sim = sim_all.gather(1, idx)
-                logits32 = torch.cat([pos_sim, neg_sim], dim=1) * logit_scale.float()
-                loss_real = F.cross_entropy(
-                    logits32, torch.zeros(z_a.size(0), dtype=torch.long, device=z.device)
-                ).to(z.dtype)
+        if rows_e.numel() == 0:
+            loss_real = z.new_zeros(())
         else:
-            # oversample within-event negatives, then take hardest-K
-            M = z_a.size(0)
-            ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
-            local_pos = rank_valid[g_a]                 # index among valid groups
-            Ue = counts_ok[eidx_a]                     # valid groups in event
-            off = offset_ok[eidx_a]
+            # Leave-one-out positive prototype
+            cnt_e = cnt_vec[gids_e].to(z.dtype)
+            denom = (cnt_e - w_e).clamp_min(1e-12)
+            P_pos_raw = (P_sum[gids_e].to(z.dtype) - z[rows_e] * w_e.unsqueeze(1)) / denom.unsqueeze(1)
+            if detach_prototypes:
+                P_pos_raw = P_pos_raw.detach()
+            P_pos = F.normalize(P_pos_raw, dim=-1, eps=1e-6) if normalize else P_pos_raw
+
+            z_e = z[rows_e]
+            pos_sim = (z_e.float() * P_pos.float()).sum(-1, keepdim=True)  # [M,1]
+
+            # Vectorized exclusion of all anchor positives
+            urows, inv_rows = torch.unique(rows_e, return_inverse=True)     # urows: [R], inv_rows maps M->R
+            R = urows.numel()
+            lcl_all = rank_valid[g_edge]                                    # [L], -1 if group invalid
+            row_map = torch.full((N,), -1, dtype=torch.long, device=device)
+            row_map[urows] = torch.arange(R, device=device)
+            r_idx_all = row_map[rows]                                       # [L] in -1..R-1
+            sel_all = (r_idx_all >= 0) & (lcl_all >= 0)
+            r_sel   = r_idx_all[sel_all]                                     # [L_sel]
+            l_sel   = lcl_all[sel_all]                                       # [L_sel]
+            euniq = Pidx["events_sorted"]
+            eidx_rows = torch.searchsorted(euniq, event_id[urows].to(torch.int64))
+            # (rows_e come from valid_event, so this should match)
+            Ue_rows = counts_ok[eidx_rows]                                   # [R]
+            maxU = int(Ue_rows.max().item()) if R > 0 else 0
+            ex_mask = torch.zeros(R, maxU, dtype=torch.bool, device=device)
+            if r_sel.numel() > 0:
+                # Advanced indexing performs OR semantics for duplicates effectively
+                ex_mask[r_sel, l_sel] = True
             K_pool = max(1, int(num_neg) * int(pool_mult))
+            ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else torch.float32
+            Ue = counts_ok[eidx_e]                                           # [M]
+            rnd = torch.rand(rows_e.size(0), K_pool, device=device, dtype=ftype)
+            base_raw = torch.floor(rnd * Ue.unsqueeze(1).to(ftype)).to(torch.long)  # [M,K_pool]
 
-            rnd = torch.rand(M, K_pool, device=z.device, dtype=ftype)
-            avail = (Ue - 1).clamp_min(1).to(ftype)    # skip positive class
-            base_raw = torch.floor(rnd * avail.unsqueeze(1)).to(torch.long)     # [M,K_pool] in [0..Ue-2]
-            neg_local = base_raw + (base_raw >= local_pos.unsqueeze(1)).to(torch.long)
-            base = off.unsqueeze(1) + neg_local
+            # gather per-edge row index in [0..R-1] and mask out any candidate in ex_mask
+            r_e = inv_rows                                                  # [M]
+            exclude_mask = ex_mask[r_e.unsqueeze(1), base_raw]              # [M,K_pool]
 
-            ord_valid = ord_ok
-            neg_group = ord_valid[base]
-            P_negs = P_mean[gid2compact[neg_group]]    # [M,K_pool,D]
+            # negatives: select other groups (absolute indices in ord_ok segment)
+            base = offset_ok[eidx_e].unsqueeze(1) + base_raw                # [M,K_pool]
+            neg_group = ord_ok[base]                                        # [M,K_pool]
+            P_negs = P_mean[gid2compact[neg_group]]                         # [M,K_pool,D]
 
-            neg_sim_full = torch.einsum('md,mkd->mk', z32, P_negs.float())
+            neg_sim_full = torch.einsum('md,mkd->mk', z_e.float(), P_negs.float())  # [M,K_pool]
+            neg_sim_full = neg_sim_full.masked_fill(exclude_mask, torch.finfo(torch.float32).min/4)
+
+            # Hardest-k
             k = min(num_neg, K_pool)
             neg_sim = torch.topk(neg_sim_full, k=k, dim=1).values
 
-            logits32 = torch.cat([pos_sim, neg_sim], dim=1) * logit_scale.float()
-            per_sample = F.cross_entropy(
-                logits32, torch.zeros(M, dtype=torch.long, device=z.device), reduction='none'
-            )
+            t = (logit_scale if logit_scale is not None else z.new_tensor(1.0)).float()
+            logits32 = torch.cat([pos_sim, neg_sim], dim=1) * t
+            per_edge = F.cross_entropy(
+                logits32, torch.zeros(rows_e.size(0), dtype=torch.long, device=device),
+                reduction='none'
+            ) * w_e.to(logits32.dtype)
+
             if per_event_mean:
                 E = int(Pidx["counts"].numel())
-                loss_real = _segment_mean_from_contiguous_idx_det(per_sample, eidx_a, E).to(z.dtype)
+                loss_real = _segment_mean_from_contiguous_idx_det(per_edge.to(z.dtype), eidx_e, E)
             else:
-                loss_real = per_sample.mean().to(z.dtype)
+                # Average over anchors that contribute any edge
+                per_row_sum = torch.zeros(z.size(0), dtype=per_edge.dtype, device=device)
+                per_row_sum.index_add_(0, rows_e, per_edge)
+                row_mask = torch.zeros(z.size(0), dtype=torch.bool, device=device)
+                row_mask[rows_e] = True
+                denom_rows = row_mask.to(per_edge.dtype).sum().clamp_min(1)
+                loss_real = (per_row_sum[row_mask].sum() / denom_rows).to(z.dtype)
 
-    # ===== Ghost push-away =====
+    # ===== GHOST PUSH-AWAY =====
     loss_ghost = z.new_zeros(())
-    if z_g.numel() > 0:
+    if torch.any(ghost_mask):
         euniq = Pidx["events_sorted"]
+        eid_g = event_id[ghost_mask].to(torch.int64)
         eidx_g = torch.searchsorted(euniq, eid_g)
-
         in_range = eidx_g < euniq.numel()
         safe = eidx_g.clamp_max(euniq.numel() - 1)
         match = torch.zeros_like(in_range, dtype=torch.bool)
         if in_range.any():
             match[in_range] = (euniq[safe[in_range]] == eid_g[in_range])
-
         valid_ev = match & (counts_ok[eidx_g] >= 2)
         if valid_ev.any():
-            zg = z_g[valid_ev]
+            zg = z[ghost_mask][valid_ev]
             eg = eidx_g[valid_ev]
 
-            num_events_ok = int((counts_ok > 0).sum().item())
-            single_event_ghost = (num_events_ok == 1) and (int(torch.unique(eg).numel()) == 1)
+            t_g = (ghost_logit_scale if ghost_logit_scale is not None else logit_scale)
+            t_g = (t_g if t_g is not None else z.new_tensor(1.0)).float()
 
-            t_g = ghost_logit_scale if ghost_logit_scale is not None else logit_scale
-
-            if single_event_ghost:
-                sims = (zg @ P_mean.t()).float()
-                k = min(num_neg, sims.size(1))
-                if k < sims.size(1):
-                    sims = torch.topk(sims, k=k, dim=1).values
-                per_sample_g = torch.logsumexp(sims * t_g, dim=1) - math.log(float(k))
-            else:
-                counts_e = counts_ok
-                offset_e = offset_ok
-                ord_valid = ord_ok
-
-                M_g = zg.size(0)
-                Ue = counts_e[eg]
-                K_pool = max(1, int(num_neg) * int(pool_mult))
-                ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
-
-                rnd = torch.rand(M_g, K_pool, device=z.device, dtype=ftype)
-                si = torch.floor(rnd * Ue.unsqueeze(1).to(ftype)).to(torch.long)
-                base = offset_e[eg].unsqueeze(1) + si
-                grp = ord_valid[base]
-
-                P_sel = P_mean[gid2compact[grp]]
-                sims_full = torch.einsum('md,mkd->mk', zg.float(), P_sel.float())
-                k = min(num_neg, K_pool)
-                sims = torch.topk(sims_full, k=k, dim=1).values
-                per_sample_g = torch.logsumexp(sims * t_g, dim=1) - math.log(float(k))
-
-            if per_event_mean:
-                E = int(Pidx["counts"].numel())
-                loss_ghost = _segment_mean_from_contiguous_idx_det(per_sample_g, eg, E).to(z.dtype)
-            else:
-                loss_ghost = per_sample_g.mean().to(z.dtype)
+            # sample within-event negatives
+            counts_e, offset_e, ord_valid = counts_ok, offset_ok, ord_ok
+            M_g = zg.size(0)
+            Ue = counts_e[eg]
+            K_pool = max(1, int(num_neg) * int(pool_mult))
+            ftype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else torch.float32
+            rnd = torch.rand(M_g, K_pool, device=device, dtype=ftype)
+            si = torch.floor(rnd * Ue.unsqueeze(1).to(ftype)).to(torch.long)
+            base = offset_e[eg].unsqueeze(1) + si
+            grp = ord_valid[base]
+            P_sel = P_mean[gid2compact[grp]]
+            sims_full = torch.einsum('md,mkd->mk', zg.float(), P_sel.float())
+            k = min(num_neg, K_pool)
+            sims = torch.topk(sims_full, k=k, dim=1).values
+            per_sample_g = torch.logsumexp(sims * t_g, dim=1) - math.log(float(k))
+            loss_ghost = (per_sample_g.mean()).to(z.dtype)
 
     return loss_real, loss_ghost
 

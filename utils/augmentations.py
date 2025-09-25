@@ -8,6 +8,7 @@ Description:
 """
 
 import numpy as np
+from typing import Dict
 
 
 ROTATIONS = {
@@ -52,7 +53,7 @@ def augment(
     if np.random.random() < aug_prob:
         coords, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = rotate_90(
             coords, momenta, global_feats['rear_cal_modules'], 
-            primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
+            primary_vertex, metadata, selected_axes=['z'],
         )
 
     # Translation
@@ -141,47 +142,6 @@ def mirror(
     return coords, modules, dirs, rear_cal_modules, primary_vertex, flipped
 
 
-def apply_mirror(
-    coords,
-    modules,
-    dirs,
-    rear_cal_modules,
-    primary_vertex,
-    metadata,
-    flipped
-):
-    """
-    Apply the same mirroring operations as `mirror` did, but using the explicit
-    list of axes in `flipped`.  
-    Returns updated (coords, modules, dirs, rear_cal_modules, primary_vertex).
-    """
-    coords = coords.copy()
-    dirs    = [d.copy() for d in dirs]
-    primary_vertex = primary_vertex.copy()
-
-    axes = ['x', 'y', 'z']
-    for ax in flipped:
-        axis_idx = axes.index(ax)
-
-        # flip coords and primary vertex
-        L = metadata[ax].shape[0]
-        coords[:, axis_idx] = (L - 1) - coords[:, axis_idx]
-        primary_vertex[axis_idx] = (L - 1) - primary_vertex[axis_idx]
-
-        # flip direction vectors
-        for d in dirs:
-            d[axis_idx] *= -1
-
-        if axis_idx == 2:
-            n_mod = metadata['z'][:, 1].max() + 1
-            modules = (n_mod - 1) - modules
-        else:
-            flip_axis = 1 - axis_idx
-            rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis)
-
-    return coords, modules, dirs, rear_cal_modules, primary_vertex
-
-
 def rotate_90(
     coords,
     dirs,
@@ -227,44 +187,6 @@ def rotate_90(
     dirs_rot = [(d @ R_final) for d in dirs]
 
     return pts, dirs_rot, rear_rot, vert, chosen_angles
-
-
-def apply_rotate_90(
-    coords,
-    dirs,
-    rear_cal_modules,
-    primary_vertex,
-    metadata,
-    chosen_angles: dict
-):
-    """
-    Apply the exact 90°-step rotations recorded in `chosen_angles`
-    to coords, dir‐vectors, and the 2D rear_cal_modules image,
-    returning (pts, dirs_rot, rear_rot, vert).
-
-    `chosen_angles` should be the dict returned by rotate_90.
-    """
-    R_final = np.eye(3)
-    for ax in ['x', 'y', 'z']:
-        angle = chosen_angles.get(ax, 0)
-        R_final = R_final @ ROTATIONS[ax][angle]
-
-    angle_z = chosen_angles.get('z', 0)
-    rear_rot = rear_cal_modules
-    if angle_z != 0:
-        k = (angle_z // 90) % 4
-        rear_rot = np.rot90(rear_rot, k)
-
-    center = np.array([
-        (metadata['x'].shape[0]-1)/2.,
-        (metadata['y'].shape[0]-1)/2.,
-        (metadata['z'].shape[0]-1)/2.,
-    ])
-    pts      = (coords - center) @ R_final + center
-    vert     = (primary_vertex - center) @ R_final + center
-    dirs_rot = [(d @ R_final) for d in dirs]
-
-    return pts, dirs_rot, rear_rot, vert
 
 
 def translate(
@@ -352,60 +274,6 @@ def translate(
     return coords, modules, rear, primary_vertex, shifts
 
 
-def apply_translate(
-    coords,
-    modules,
-    rear_cal_modules,
-    primary_vertex,
-    metadata,
-    shifts: dict
-):
-    """
-    Apply the same translations recorded in `shifts`.
-    `shifts` should be the dict returned by translate(),
-    mapping 'x','y' to a voxel‐shift s, and 'z' to a shift in Z‐voxels.
-    """
-    coords = coords.copy()
-    modules = modules.copy()
-    primary_vertex = primary_vertex.copy()
-    rear = rear_cal_modules.copy()
-
-    def _shift_image(img, p, axis):
-        out = np.zeros_like(img)
-        if p > 0:
-            if axis == 1:
-                out[:, p:] = img[:, :-p]
-            else:
-                out[p:, :] = img[:-p, :]
-        elif p < 0:
-            if axis == 1:
-                out[:, :p] = img[:, -p:]
-            else:
-                out[:p, :] = img[-p:, :]
-        else:
-            out = img.copy()
-        return out
-
-    for ax, idx in (('x', 0), ('y', 1)):
-        if ax in shifts:
-            s = shifts[ax]
-            coords[:, idx]      += s
-            primary_vertex[idx] += s
-            L = metadata[ax].shape[0]
-            ps = int(round(s * 5 / L))
-            rear = _shift_image(rear, ps, axis=1-idx)
-
-    if 'z' in shifts:
-        p_voxel = shifts['z']
-        module_size = (metadata['z'][:, 1] == 0).sum()
-        s_mod = int(p_voxel // module_size)
-        modules += s_mod
-        coords[:, 2]      += p_voxel
-        primary_vertex[2] += p_voxel
-
-    return coords, modules, rear, primary_vertex
-    
-
 def drop_hits(
     coords,
     modules,
@@ -424,8 +292,17 @@ def drop_hits(
     # don’t drop if under min_hits
     if mask.sum() < min_hits:
         return coords, modules, feats, labels
+    
+    labels_masked = []
+    for label in labels:
+        if label is not None:
+            if isinstance(label, np.ndarray):
+                labels_masked.append(label[mask])
+            else:
+                csr = csr_keep_rows_numpy(*label, mask)
+                labels_masked.append(csr)
 
-    return coords[mask], modules[mask], feats[mask], [lab[mask] if lab is not None else None for lab in labels]
+    return coords[mask], modules[mask], feats[mask], labels_masked
 
 
 def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
@@ -588,3 +465,40 @@ def module_multiplicative_jitter(global_feats, log_sigma=dict(faser=0.1, rear_ca
         gf['rear_mucal_energy'] = _per_cell(np.asarray(gf['rear_mucal_energy'], dtype=float),
                                             log_sigma.get('rear_mucal', 0.1))
     return _sync_totals_from_modules(gf)
+
+
+def csr_keep_rows_numpy(label_indptr, label_ids, label_weight, mask):
+    """
+    NumPy version of row filtering for CSR.
+    """
+    N = label_indptr.size - 1
+    assert mask.size == N and mask.dtype == bool
+
+    kept_rows = np.flatnonzero(mask)                 # [M]
+    M = kept_rows.size
+    starts = label_indptr[:-1][kept_rows]
+    ends   = label_indptr[1:][kept_rows]
+    counts = ends - starts
+
+    L = int(label_indptr[-1])
+    if L == 0 or M == 0:
+        return (np.zeros(M + 1, dtype=label_indptr.dtype),
+                np.empty(0, dtype=label_ids.dtype),
+                np.empty(0, dtype=label_weight.dtype),
+                kept_rows)
+
+    diff = np.zeros(L + 1, dtype=np.int64)
+    np.add.at(diff, starts,  1)
+    np.add.at(diff, ends,   -1)
+    edge_mask = np.cumsum(diff[:-1]) > 0
+
+    sel = np.flatnonzero(edge_mask)
+    new_ids    = label_ids[sel]
+    new_weight = label_weight[sel]
+
+    new_indptr = np.zeros(M + 1, dtype=label_indptr.dtype)
+    if M > 0:
+        new_indptr[1:] = np.cumsum(counts)
+
+    return new_indptr, new_ids, new_weight, kept_rows
+
