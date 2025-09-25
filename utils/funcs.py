@@ -202,20 +202,26 @@ def collate(
                 else:
                     ret[key] = [d[key] for d in batch]
         return ret
+    
+    # CSRs: stack row-wise
+    for key in ["trk", "pri", "pdg"]:
+        ret[f"csr_{key}_indptr"], ret[f"csr_{key}_ids"], ret[f"csr_{key}_weights"] = csr_stack_rows_torch(
+            [d[f"csr_{key}_indptr"] for d in batch],
+            [d[f"csr_{key}_ids"] for d in batch],
+            [d[f"csr_{key}_weights"] for d in batch]
+        )
 
     # mode == "train"
     opt_all = {
-        "hit_track_id", "hit_primary_id", "hit_pdg", "ghost_mask",
-        "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
+        "ghost_mask", "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
         "e_vis", "pt_miss", "vis_sp_momentum", "out_lepton_momentum",
         "vis_sp_momentum_mag", "vis_sp_momentum_dir",
         "out_lepton_momentum_mag", "out_lepton_momentum_dir",
         "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
     }
     cat_keys = {
-        "hit_track_id", "hit_primary_id", "hit_pdg", "ghost_mask",
-        "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
-        "e_vis", "pt_miss", "vis_sp_momentum_mag",
+        "ghost_mask", "primlepton_labels", "seg_labels", "is_cc", 
+        "flavour_label", "charm", "e_vis", "pt_miss", "vis_sp_momentum_mag",
         "out_lepton_momentum_mag", "jet_momentum_mag",
     }
     stack_keys = {
@@ -235,6 +241,44 @@ def collate(
     return ret
 
 
+def csr_stack_rows_torch(indptr_list, class_list, weight_list):
+    """
+    Concatenate K per-event CSRs row-wise into one CSR.
+
+    Inputs (lists length K):
+      indptr_list[k]:  [N_k+1] long
+      class_list[k]:   [L_k]   long
+      weight_list[k]:  [L_k]   float
+
+    Returns:
+      indptr: [N_total+1] long
+      cls:    [L_total]   long
+      w:      [L_total]   float
+    """
+    assert len(indptr_list) == len(class_list) == len(weight_list)
+    device = indptr_list[0].device
+    # Ensure everything is on the same device/dtype
+    indptr_list = [t.to(device=device, dtype=torch.long) for t in indptr_list]
+    class_list  = [t.to(device=device, dtype=torch.long) for t in class_list]
+    weight_list = [t.to(device=device, dtype=weight_list[0].dtype) for t in weight_list]
+
+    # Row counts per event, then one big cumulative sum
+    counts_each = [ip[1:] - ip[:-1] for ip in indptr_list]         # list of [N_k]
+    counts_all  = torch.cat(counts_each, dim=0) if counts_each else torch.zeros(0, dtype=torch.long, device=device)
+    indptr = torch.empty(counts_all.numel() + 1, dtype=torch.long, device=device)
+    indptr[0] = 0
+    if counts_all.numel():
+        indptr[1:] = counts_all.cumsum(0)
+
+    # Concatenate columns
+    cls = torch.cat(class_list, dim=0) if class_list else torch.zeros(0, dtype=torch.long, device=device)
+    w   = torch.cat(weight_list, dim=0) if weight_list else torch.zeros(0, dtype=weight_list[0].dtype, device=device)
+
+    # Sanity
+    assert indptr[-1].item() == cls.numel() == w.numel()
+    return indptr, cls, w
+
+
 def arrange_input(data):
     x_sp = data['x_sp']
     faser_cal = data['faser_cal_modules']
@@ -249,7 +293,10 @@ def arrange_truth(data):
     output = {}
     
     optional_keys = [
-        'hit_track_id', 'hit_primary_id', 'hit_pdg', 'ghost_mask', 'hit_event_id',
+        'csr_trk_indptr', 'csr_trk_ids', 'csr_trk_weight',
+        'csr_pri_indptr', 'csr_pri_ids', 'csr_pri_weight',
+        'csr_pdg_indptr', 'csr_pdg_ids', 'csr_pdg_weight',
+        'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
         'charm', 'e_vis', 'pt_miss', 
@@ -263,6 +310,59 @@ def arrange_truth(data):
             output[key] = data[key]
     
     return output
+
+
+def csr_keep_rows_torch(label_indptr, label_ids, label_weight, raw_idx):
+    """
+    Keep only the rows at integer indices `row_idx` from a CSR (label_indptr, label_ids, label_weight).
+
+    Args:
+      label_indptr : [N+1] long, row pointers
+      label_ids    : [L]    long, column ids per nonzero
+      label_weight : [L]    float/half, values per nonzero
+      raw_idx      : [M]    long/int, row indices to keep (can be any order; duplicates allowed)
+
+    Returns:
+      new_indptr : [M+1] long
+      new_ids    : [L_kept] long
+      new_weight : [L_kept] float/half
+      kept_rows  : [M] long  (same as `row_idx`, returned for convenience)
+    """
+    device = label_indptr.device
+    if not (label_ids.device == device and label_weight.device == device):
+        raise ValueError("All CSR tensors must be on the same device.")
+    label_indptr = label_indptr.to(torch.long)
+    label_ids = label_ids.to(torch.long)
+    raw_idx = raw_idx.to(device=device, dtype=torch.long)
+
+    N = label_indptr.numel() - 1
+    if raw_idx.numel() == 0:
+        return label_indptr.new_zeros(1), label_ids.new_empty(0), label_weight.new_empty(0), raw_idx
+
+    if (raw_idx.min() < 0) or (raw_idx.max() >= N):
+        raise IndexError("raw_idx contains out-of-bounds indices.")
+
+    starts = label_indptr[raw_idx]          # [M]
+    ends   = label_indptr[raw_idx + 1]      # [M]
+    counts = ends - starts                  # [M]
+
+    new_indptr = label_indptr.new_zeros(raw_idx.numel() + 1)
+    if counts.numel():
+        new_indptr[1:] = counts.cumsum(0)
+
+    L_kept = int(new_indptr[-1].item())
+    if L_kept == 0:
+        return new_indptr, label_ids.new_empty(0), label_weight.new_empty(0), raw_idx
+
+    start_rep   = torch.repeat_interleave(starts, counts)              # [L_kept]
+    row_offsets = torch.repeat_interleave(new_indptr[:-1], counts)     # [L_kept]
+    in_row_pos  = torch.arange(L_kept, device=device) - row_offsets    # [L_kept]
+    edge_sel    = start_rep + in_row_pos                               # [L_kept] in [0..L-1]
+
+    new_ids    = label_ids[edge_sel]
+    new_weight = label_weight[edge_sel]
+
+    return new_indptr, new_ids, new_weight, raw_idx
 
 
 def weighted_loss(L, s, kind):

@@ -604,18 +604,18 @@ class MinkMAEViT(nn.Module):
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
         # heads
-        shared       = self.shared_voxel_head["con"](out_flat)             # [Nk, P, H]
-        shared       = self.pre_heads_con(shared)                          # [Nk, P, 3*E]
+        shared              = self.shared_voxel_head["con"](out_flat)      # [Nk, P, H]
+        shared              = self.pre_heads_con(shared)                   # [Nk, P, 3*E]
         h_trk, h_pri, h_pid = shared.chunk(3, dim=-1)
-        pred_track   = self.heads["trk"](h_trk)                            # [Nk, P, E]
-        pred_primary = self.heads["pri"](h_pri)                            # [Nk, P, E]
-        pred_pid     = self.heads["pid"](h_pid)                            # [Nk, P, E]
+        pred_trk            = self.heads["trk"](h_trk)                     # [Nk, P, E]
+        pred_pri            = self.heads["pri"](h_pri)                     # [Nk, P, E]
+        pred_pid            = self.heads["pid"](h_pid)                     # [Nk, P, E]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
         idx_targets_kept = idx_map[b_ids, patch_ids]                       # [Nk, P]
 
-        return pred_track, pred_primary, pred_pid, idx_targets_kept
+        return pred_trk, pred_pri, pred_pid, idx_targets_kept
 
 
     def forward_reconstruction(self, latents, attn_mask_mod, rand_mask, idx_map):
@@ -672,7 +672,7 @@ class MinkMAEViT(nn.Module):
         # Contrastive path
         lat_full, _, _, attn_mask_full, ids_full = \
             self.forward_encoder(x, x_glob, mask_ratio=0.0)
-        pred_track, pred_primary, pred_pid, con_idx_targets = \
+        pred_trk, pred_pri, pred_pid, con_idx_targets = \
             self.forward_contrastive(lat_full, attn_mask_full, ids_full, idx_map)
 
         # Reconstruction path
@@ -682,7 +682,7 @@ class MinkMAEViT(nn.Module):
             self.forward_reconstruction(lat_masked, attn_mask_masked, rand_mask, idx_map)
 
         return (
-            pred_track, pred_primary, pred_pid,
+            pred_trk, pred_pri, pred_pid,
             pred_occ, pred_reg, con_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )
