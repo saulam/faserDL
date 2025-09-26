@@ -157,7 +157,7 @@ class MinkViT(vit.VisionTransformer):
         # Task specifics
         self.global_pool = global_pool
         self.head_channels = {
-            "flavour": 4,
+            "flavour": 6,
             "charm": 1,
             "vis": 3,
             "jet": 3,

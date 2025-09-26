@@ -205,11 +205,12 @@ def collate(
     
     # CSRs: stack row-wise
     for key in ["trk", "pri", "pdg"]:
-        ret[f"csr_{key}_indptr"], ret[f"csr_{key}_ids"], ret[f"csr_{key}_weights"] = csr_stack_rows_torch(
-            [d[f"csr_{key}_indptr"] for d in batch],
-            [d[f"csr_{key}_ids"] for d in batch],
-            [d[f"csr_{key}_weights"] for d in batch]
-        )
+        if f"csr_{key}_indptr" in batch[0]:
+            ret[f"csr_{key}_indptr"], ret[f"csr_{key}_ids"], ret[f"csr_{key}_weights"] = csr_stack_rows_torch(
+                [d[f"csr_{key}_indptr"] for d in batch],
+                [d[f"csr_{key}_ids"] for d in batch],
+                [d[f"csr_{key}_weights"] for d in batch]
+            )
 
     # mode == "train"
     opt_all = {

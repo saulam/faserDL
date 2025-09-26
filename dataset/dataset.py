@@ -74,61 +74,18 @@ class SparseFASERCALDataset(Dataset):
             
         return mapped
 
-
-    def within_limits(self, coords, feats=None, labels=None, voxelised=False, mask_axes=(0, 1, 2)):
-        """
-        Filters coordinates, features, and labels based on given axis limits.
-        Allows selecting which axes to apply the mask using mask_axes parameter.
-        """
-        if voxelised:
-            range_x = 0, self.metadata['x'].shape[0]
-            range_y = 0, self.metadata['y'].shape[0]
-            range_z = 0, self.metadata['z'].shape[0]
-        else:
-            range_x = self.metadata['x'].min(), self.metadata['x'].max()
-            range_y = self.metadata['y'].min(), self.metadata['y'].max()
-            range_z = self.metadata['z'][:, 0].min(), self.metadata['z'][:, 0].max()
-
-        ranges = [range_x, range_y, range_z]
-        mask = np.ones(coords.shape[0], dtype=bool)
-
-        for axis in mask_axes:
-            mask &= (coords[:, axis] >= ranges[axis][0]) & (coords[:, axis] < ranges[axis][1])
-
-        coords_filtered = coords[mask]
-        feats_filtered = feats[mask] if feats is not None else None
-        if isinstance(labels, (list, tuple)):
-            labels_filtered = [x[mask] for x in labels]
-        else:
-            labels_filtered = labels[mask] if labels is not None else None
-        
-        return coords_filtered, feats_filtered, labels_filtered
-
     
-    def normalise_seg_labels(self, seg_labels, smoothing=0.0, eps=1e-8):
-        """
-        Normalises segmentation labels and combines them into a final format.
-        """
-        labels = seg_labels.copy().astype(np.float32)
-        sum_vals = np.sum(labels[:, 1:], axis=1, keepdims=True)
-        mask = sum_vals.squeeze() > eps
-        
-        # Normalize EM and Hadronic components to sum to (1 - ghost_fraction)
-        labels[mask, 1:] = (1 - labels[mask, :1]) * (labels[mask, 1:] / sum_vals[mask])
-
-        if smoothing > 0:
-            return smooth_labels(labels, smoothing=smoothing)
-        
-        return labels
-
-    
-    def pdg2label(self, pdg, iscc):
+    def pdg2label(self, pdg, iscc, tau_decay_mode):
         """Converts PDG ID to a classification label (0-3)."""
         if iscc:
-            if pdg in [-12, 12]: return 0  # CC nue
-            if pdg in [-14, 14]: return 1  # CC numu
-            if pdg in [-16, 16]: return 2  # CC nutau
-        return 3  # NC
+            if pdg in [-12, 12]: return 0           # CC nue
+            if pdg in [-14, 14]: return 1           # CC numu
+            if pdg in [-16, 16]:                    # CC nutau
+                assert tau_decay_mode > 0, "Tau events must have a valid decay mode"
+                if tau_decay_mode == 1:   return 2  # tau->e
+                elif tau_decay_mode == 2: return 3  # tau->mu
+                else:                     return 4  # tau->hadrons
+        return 5                                    # NC
 
 
     def decompose_momentum(self, momentum):
@@ -383,7 +340,6 @@ class SparseFASERCALDataset(Dataset):
         in_neutrino_pdg = data['in_neutrino_pdg']
         in_neutrino_energy = data['in_neutrino_energy']
         vis_sp_momentum = data['vis_sp_momentum']
-        seg_labels_raw = data['seg_labels']
         out_lepton_momentum = data['out_lepton_momentum']
         jet_momentum = data['jet_momentum']
         tau_vis_momentum = data['tau_vis_momentum']
@@ -425,9 +381,13 @@ class SparseFASERCALDataset(Dataset):
         modules = self.metadata['z'][module_idx, 1]
         coords = self.voxelise(coords)
         primary_vertex = self.voxelise(primary_vertex)
-
-        if is_cc and is_tau:  # nutau
+        if is_cc and is_tau:  
+            # for CC tau events, replace the outgoing lepton momentum with the visible tau decay products
             out_lepton_momentum = tau_vis_momentum
+        if not is_cc:
+            # NC events don't have visible outgoing leptons
+            out_lepton_momentum.fill(0)
+        flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc, tau_decay_mode)])
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
@@ -440,16 +400,10 @@ class SparseFASERCALDataset(Dataset):
             )
             charm = smooth_labels(np.array([charm]), smoothing=self.label_smoothing)
             flavour_label = smooth_labels(
-                np.array([self.pdg2label(in_neutrino_pdg, is_cc)]),
+                flavour_label,
                 smoothing=self.label_smoothing,
-                num_classes=4
+                num_classes=6
             )
-            seg_labels = self.normalise_seg_labels(seg_labels_raw, smoothing=self.label_smoothing)
-        else:
-            flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc)])
-            seg_labels = self.normalise_seg_labels(seg_labels_raw)
-            if not is_cc:
-                out_lepton_momentum.fill(0)
 
         return {
             'run_number': run_number,
@@ -461,14 +415,12 @@ class SparseFASERCALDataset(Dataset):
             'coords': coords,
             'modules': modules,
             'q': q,
-            'seg_labels': seg_labels,
             'vis_sp_momentum': vis_sp_momentum,
             'out_lepton_momentum': out_lepton_momentum,
             'jet_momentum': jet_momentum,
             'global_feats': global_feats,
             'flavour_label': flavour_label,
             'charm': charm,
-            'vis_sp_momentum': vis_sp_momentum,
             'primary_vertex': primary_vertex,
             'in_neutrino_pdg': in_neutrino_pdg,
             'in_neutrino_energy': in_neutrino_energy,
