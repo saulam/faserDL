@@ -41,19 +41,19 @@ def augment(
 ):
     """
     Performs augmentations.
-    """        
+    """      
     # Mirror
     if np.random.random() < aug_prob:
         coords, modules, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = mirror(
             coords, modules, momenta, global_feats['rear_cal_modules'], 
             primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['x', 'y'],
-        )              
+        )   
 
     # Rotation
     if np.random.random() < aug_prob:
         coords, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = rotate_90(
             coords, momenta, global_feats['rear_cal_modules'], 
-            primary_vertex, metadata, selected_axes=['z'],
+            primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
         )
 
     # Translation
@@ -135,7 +135,7 @@ def mirror(
             else:
                 # flip the 2D rear_cal_modules in XY plane
                 flip_axis = 1 - axis_idx  # x => 1 (cols), y => 0 (rows)
-                rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis)
+                rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis).copy()
 
             flipped.append(ax)
 
@@ -170,9 +170,13 @@ def rotate_90(
 
     # rotate the RearCal image only if z‑axis turned
     rear_rot = rear_cal_modules
+    if chosen_angles.get('x', 0) == 180:
+        rear_rot = np.flip(rear_rot, axis=0).copy()
+    if chosen_angles.get('y', 0) == 180:
+        rear_rot = np.flip(rear_rot, axis=1).copy()
     if chosen_angles.get('z', 0) != 0:
         k = chosen_angles['z'] // 90
-        rear_rot = np.rot90(rear_rot, k)
+        rear_rot = np.rot90(rear_rot, k).copy()
 
     # apply to coords and vertex about the true centre
     center = np.array([
@@ -252,8 +256,8 @@ def translate(
             primary_vertex[idx] += s
             shifts[ax] = s
 
-            # compute 5×5 pixel shift
-            ps = int(round(s * 5 / L))
+            # compute pixel shift
+            ps = int(round(s * rear.shape[1-idx] / L))
             rear = _shift_image(rear, ps, axis=1-idx)
                 
     # Z
@@ -295,12 +299,13 @@ def drop_hits(
     
     labels_masked = []
     for label in labels:
-        if label is not None:
-            if isinstance(label, np.ndarray):
-                labels_masked.append(label[mask])
-            else:
-                csr = csr_keep_rows_numpy(*label, mask)
-                labels_masked.append(csr)
+        if label is None:
+            labels_masked.append(None)
+        elif isinstance(label, np.ndarray):
+            labels_masked.append(label[mask])
+        else:
+            csr = csr_keep_rows_numpy(*label, mask)
+            labels_masked.append(csr)
 
     return coords[mask], modules[mask], feats[mask], labels_masked
 
@@ -337,7 +342,7 @@ def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
     return scaled_feats, scaled_momentums, scaled_global_feats, shift
 
 
-def scale_all_by_global_shift_lognormal(feats, global_feats, log_sigma=0.1, momenta=None):
+def scale_all_by_global_shift_lognormal(feats, global_feats, momenta=None, log_sigma=0.1):
     # shift ~ LogNormal(mean=0, sigma=log_sigma) so E[shift]≈exp(0.5*log_sigma^2)
     # If you want mean≈1 exactly, divide by that factor.
     shift = np.exp(np.random.randn() * log_sigma)
