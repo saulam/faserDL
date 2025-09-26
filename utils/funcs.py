@@ -7,7 +7,7 @@ Description:
     Auxiliary functions definitions.
 """
 
-
+import math
 import copy
 import torch
 from spconv.pytorch import SparseConvTensor
@@ -16,7 +16,7 @@ from torch.utils.data import random_split, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
 
-def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, extra_dataset=None):
+def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     """
     Splits the dataset into training, validation, and test sets based on the given splits.
 
@@ -26,12 +26,11 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
         splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
         seed (int): Seed for reproducibility. Default is 7.
         test (bool): Default is False.
-        extra_dataset (torch.utils.data.Dataset or None): Extra dataset to append to the training loader. Default is None.
 
     Returns:
         tuple: DataLoader objects for training, validation, and test sets.
     """
-    assert sum(splits) == 1, "The splits should sum up to 1."
+    assert len(splits) == 3 and math.isclose(sum(splits), 1.0, rel_tol=0, abs_tol=1e-6), "Splits must be a list of three floats that sum to 1."
 
     fulllen = len(dataset)
     train_len = int(fulllen * splits[0])
@@ -50,8 +49,8 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, ext
 
     train_set, val_set, test_set = (copy.deepcopy(dataset) for _ in range(3))
     train_set.data_files = extract_files(train_split.indices)
-    val_set.data_files = extract_files(val_split.indices)
-    test_set.data_files = extract_files(test_split.indices)
+    val_set.data_files   = extract_files(val_split.indices)
+    test_set.data_files  = extract_files(test_split.indices)
 
     if args.train and args.augmentations_enabled and not args.stage1 and args.mixup_alpha > 0:
         train_set.calc_primary_vertices()
@@ -148,13 +147,6 @@ def collate(
     """
     mode = 'test' if test else 'train'
     batch = [d for d in batch if len(d["coords"]) > 0]
-    if len(batch) == 0:
-        # Return an empty-shaped stub to avoid downstream crashes
-        return {
-            "x_sp": None, "spatial_shape": spatial_shape, "batch_size": 0,
-            "hit_event_id": torch.empty(0, dtype=torch.long),
-        }
-
     coords_list = [d["coords"] for d in batch]
     feats_list  = [d["feats"]  for d in batch]
 
@@ -294,9 +286,9 @@ def arrange_truth(data):
     output = {}
     
     optional_keys = [
-        'csr_trk_indptr', 'csr_trk_ids', 'csr_trk_weight',
-        'csr_pri_indptr', 'csr_pri_ids', 'csr_pri_weight',
-        'csr_pdg_indptr', 'csr_pdg_ids', 'csr_pdg_weight',
+        'csr_trk_indptr', 'csr_trk_ids', 'csr_trk_weights',
+        'csr_pri_indptr', 'csr_pri_ids', 'csr_pri_weights',
+        'csr_pdg_indptr', 'csr_pdg_ids', 'csr_pdg_weights',
         'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
@@ -388,7 +380,6 @@ class CustomLambdaLR(LambdaLR):
         Args:
             optimizer (torch.optim.Optimizer): The optimizer for which the learning rate will be scheduled.
             warmup_steps (int): number of iterations for warm-up.
-            lr_func (callable): A function to calculate the learning rate lambda.
         """
         self.warmup_steps = warmup_steps
         super(CustomLambdaLR, self).__init__(optimizer, lr_lambda=self.lr_lambda)
@@ -403,7 +394,7 @@ class CustomLambdaLR(LambdaLR):
         Returns:
             float: The learning rate lambda.
         """
-        return float(step) / max(1, self.warmup_steps)
+        return min(1.0, (step + 1) / self.warmup_steps)
 
 
 class CombinedScheduler(_LRScheduler):
@@ -418,6 +409,7 @@ class CombinedScheduler(_LRScheduler):
             warmup_steps (int): The number of steps for the warm-up phase (default: 100).
             start_cosine_step (int): The step to start cosine annealing scheduling.
         """
+        super().__init__(optimizer)
         self.optimizer = optimizer
         self.scheduler1 = scheduler1
         self.scheduler2 = scheduler2

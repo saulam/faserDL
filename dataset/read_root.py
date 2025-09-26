@@ -9,6 +9,7 @@ Description: script to generate numpy files.
 
 from ROOT import TFile
 import ROOT
+import os
 import glob
 import numpy as np
 import tqdm
@@ -23,6 +24,7 @@ path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau3/".format(version)
 true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau3/*".format(version))
 reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau3/*".format(version_reco))
 output_dir = '/scratch/salonso/sparse-nns/faser/events_new_v{}b_tau_3'.format(version_reco)
+os.makedirs(output_dir, exist_ok=True)
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
 
 # Placeholder for class objects
@@ -58,60 +60,46 @@ def get_true_hits(tcal_event):
         [TRACK_ID, PARENT_ID, PRIMARY_ID, PDG, X, Y, Z, MODULE, ENERGY]
         or None if no valid hits.
     """
-    all_hits_list = []
+    rows = []
+    hit_ids = []
+
     for track in tcal_event.getfTracks():
-        hits_info = []
-        for hit_id, energy in zip(track.fhitIDs, track.fEnergyDeposits):
+        for hit_id, energy in zip(track.fhitIDs, track.fEnergyDeposits):                
             if tcal_event.getChannelTypefromID(hit_id) != 0 or energy == 0:
                 continue
 
             pos = tcal_event.getChannelXYZfromID(hit_id)
             module = tcal_event.getChannelModulefromID(hit_id)
 
-            hits_info.append(np.array([
+            rows.append([
                 track.ftrackID, track.fparentID, track.fprimaryID, track.fPDG,
-                pos.x(), pos.y(), pos.z(), module, energy
-            ], dtype=np.float64))
+                pos.x(), pos.y(), pos.z(), module, energy,
+            ])
+            hit_ids.append(hit_id)
 
-        if hits_info:
-            all_hits_list.append(np.stack(hits_info))
+    if not rows:
+        return None, np.empty((0,), dtype=np.int64)
 
-    if not all_hits_list:
-        return None
+    hits = np.asarray(rows, dtype=np.float32)          # (N, 9) float32
+    hit_ids = np.asarray(hit_ids, dtype=np.int64)    # (N,) int64
 
-    hits = np.concatenate(all_hits_list, axis=0)
-
-    # Cast numeric columns
-    hits = hits.astype(object)
-    hits[:, TRACK_ID:PARENT_ID+1] = hits[:, TRACK_ID:PARENT_ID+1].astype(np.int32)
-    hits[:, PRIMARY_ID]           = hits[:, PRIMARY_ID].astype(np.int32)
-    hits[:, PDG]                  = hits[:, PDG].astype(np.int32)
-    hits[:, MODULE]               = hits[:, MODULE].astype(np.int16)
-    hits[:, ENERGY]               = hits[:, ENERGY].astype(np.float32)
-    hits[:, X_POS:Z_POS+1]        = hits[:, X_POS:Z_POS+1].astype(np.float32)
-    hits = np.array(hits.tolist())
-    return hits
+    return hits, hit_ids
 
 
 # -----------------------------
-# Mapping builder (CSR with weights)
+# Mapping CSR builder
 # -----------------------------
-def _build_true_spatial_index(true_hits):
-    """Map (x,y,z) -> list of true hit indices."""
-    if true_hits is None or true_hits.shape[0] == 0:
-        return {}
-
-    coords = true_hits[:, [X_POS, Y_POS, Z_POS]]
-    keys = [tuple(row) for row in coords]
+def _build_true_index_by_id(true_ids):
+    """Map channel_id (int64) -> array of true hit indices (int32)."""
     index = {}
-    for idx, key in enumerate(keys):
-        index.setdefault(key, []).append(idx)
+    for i, hid in enumerate(true_ids):
+        index.setdefault(int(hid), []).append(i)
     for k, v in index.items():
         index[k] = np.asarray(v, dtype=np.int32)
     return index
 
 
-def get_reco_hits_and_csr_map(fPORecoEvent, tcal_event, true_hits):
+def get_reco_hits_and_csr_map(fPORecoEvent, tcal_event, true_hits, true_ids):
     """
     Processes reconstructed hits and builds CSR-style mapping from reco -> true.
 
@@ -127,7 +115,7 @@ def get_reco_hits_and_csr_map(fPORecoEvent, tcal_event, true_hits):
     reco_hits = np.zeros((num_voxels, 6), dtype=np.float32)
     ghost_mask = np.zeros(num_voxels, dtype=bool)
 
-    spatial_index = _build_true_spatial_index(true_hits)
+    id_index = _build_true_index_by_id(true_ids)
     matched_lists, weight_lists = [], []
 
     for i, (voxel_id, psvoxel_3d) in enumerate(fPORecoEvent.PSvoxelmap):
@@ -140,17 +128,15 @@ def get_reco_hits_and_csr_map(fPORecoEvent, tcal_event, true_hits):
         reco_hits[i, 5] = float(psvoxel_3d.ghost)
 
         if psvoxel_3d.ghost == 0:
-            key = (reco_hits[i, 0], reco_hits[i, 1], reco_hits[i, 2])
-            matches = spatial_index.get(key, None)
+            ghost_mask[i] = False
+            matches = id_index.get(int(voxel_id))
             if matches is None or matches.size == 0:
                 reco_hits[i, 5] = 2.0
-                ghost_mask[i] = True
                 matched_lists.append(np.empty(0, dtype=np.int32))
                 weight_lists.append(np.empty(0, dtype=np.float32))
             else:
-                ghost_mask[i] = False
                 matched_lists.append(matches)
-
+                
                 # Compute per-link weights (fraction of energy)
                 energies = true_hits[matches, ENERGY].astype(np.float32, copy=False)
                 total = energies.sum()
@@ -161,6 +147,7 @@ def get_reco_hits_and_csr_map(fPORecoEvent, tcal_event, true_hits):
                 weight_lists.append(weights)
         else:
             ghost_mask[i] = True
+            reco_hits[i,5] = 1.0
             matched_lists.append(np.empty(0, dtype=np.int32))
             weight_lists.append(np.empty(0, dtype=np.float32))
 
@@ -210,7 +197,7 @@ def get_matched_true_hits(i, true_hits, true_index, indptr, link_weight=None):
 # Labels with per-link weights
 # -----------------------------
 def process_labels_csr(true_index, indptr, ghost_mask, true_hits,
-                       out_lepton_pdg, is_cc, istau, link_weight=None):
+                       out_lepton_pdg, is_cc, link_weight=None):
     """
     Computes seg_labels with optional weighted contributions.
 
@@ -298,21 +285,6 @@ def get_tracks(tktracks):
     return tracks
 
 
-def divide_list_into_chunks(input_list, num_chunks=1):
-    """
-    Divides a list into approximately equal-sized chunks.
-    """
-    chunk_size, remainder = divmod(len(input_list), num_chunks)
-    chunks, start = [], 0
-    
-    for i in range(num_chunks):
-        end = start + chunk_size + (1 if i < remainder else 0)
-        chunks.append(input_list[start:end])
-        start = end
-    
-    return chunks
-
-
 def th2d_to_numpy(hist):
     root_array = hist.GetArray()
     n_bins_x = hist.GetNbinsX()
@@ -349,7 +321,9 @@ def divide_list_into_chunks(input_list, num_chunks=1):
 def generate_events(number, chunks, disable):
     chunks = divide_list_into_chunks(reco_paths, num_chunks=chunks)
     chunk = chunks[number]
-   
+    if not chunk:
+        print(f"Chunk {number} is empty (len(reco_paths)={len(reco_paths)}, chunks={chunks}). Skipping.")
+        return   
     print("First path: {}".format(chunk[0]))
     print("Number of files: {}/{}".format(len(chunk), len(reco_paths)))
 
@@ -431,18 +405,19 @@ def generate_events(number, chunks, disable):
             tcal_event.Load_event(path, run_number, event_id, event_mask, po_event)
 
             # Extract true and reconstructed hits
-            true_hits = get_true_hits(tcal_event)
+            true_hits, true_ids = get_true_hits(tcal_event)
             reco_hits, true_index, indptr, ghost_mask, link_weight = get_reco_hits_and_csr_map(
-                tporeco_event, tcal_event, true_hits
+                tporeco_event, tcal_event, true_hits, true_ids
             )
             
-            if reco_hits.shape[0] - ghost_mask.sum() < 20:
-                print("Skipping event {} with {} non-ghost hits".format(event_id, reco_hits.shape[0]))
+            n_non_ghost = int((~ghost_mask).sum())
+            if n_non_ghost < 10:
+                print(f"Skipping event {event_id} with {n_non_ghost} non-ghost hits")
                 continue
 
             seg_labels = process_labels_csr(
                 true_index, indptr, ghost_mask, true_hits,
-                out_lepton_pdg, is_cc, is_tau, link_weight=link_weight
+                out_lepton_pdg, is_cc, link_weight=link_weight
             )
             
             # Save event data
@@ -490,6 +465,8 @@ def generate_events(number, chunks, disable):
                 seg_labels=seg_labels,
             )
 
+        reco_file.Close()
+
              
 # Main function to handle command-line arguments
 if __name__ == "__main__":
@@ -502,9 +479,8 @@ if __name__ == "__main__":
     chunks = args.chunks
     disable = args.disable
 
-    # Validate number range
-    if number < 0 or number >= chunks:
-        raise ValueError("Number must be between 0 and 9")
+    if not (0 <= number < chunks):
+        raise ValueError(f"number must be in [0, {chunks-1}]")
   
     generate_events(number, chunks, disable)
     print("{}/{} Done!".format(number, chunks))
