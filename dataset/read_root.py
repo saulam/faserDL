@@ -18,12 +18,12 @@ import argparse
 
 version = "5.1"
 version_reco = version# + "b"
-#version = version + "_tau"
-#version_reco = version_reco + "_tau"
-path = "/scratch2/salonso/faser/FASERCALDATA_v{}_tau3/".format(version)
-true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}_tau3/*".format(version))
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}_tau3/*".format(version_reco))
-output_dir = '/scratch/salonso/sparse-nns/faser/events_new_v{}b_tau_3'.format(version_reco)
+version = version + "_tau3"
+version_reco = version_reco + "_tau3"
+path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
+true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
+output_dir = '/scratch/salonso/sparse-nns/faser/events_new_v{}'.format(version_reco)
 os.makedirs(output_dir, exist_ok=True)
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
 
@@ -346,6 +346,7 @@ def generate_events(number, chunks, disable):
             
             run_number, event_id = po_event.run_number, po_event.event_id
             charm = po_event.isCharmed()
+            charmdecay = np.array([x.m_pdg_id for x in po_event.charmdecay])
             primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             is_cc = bool(po_event.isCC)
             is_tau = bool(po_event.istau)
@@ -365,6 +366,11 @@ def generate_events(number, chunks, disable):
             tau_decay_mode = int(po_event.tau_decaymode)  # =1 e, =2 mu, =3 1-prong, =4 rho =5 3-prong, =6 other
             tau_decay_length = float(po_event.tauDecaylength())
             tau_kink_angle = float(po_event.tauKinkAngle())
+
+            # not process nutaus
+            #if is_cc and abs(in_neutrino_pdg) == 16:
+            #    print(f"Skipping tau neutrino event {event_id}")
+            #    continue
             
             '''
             # Extract views
@@ -411,7 +417,7 @@ def generate_events(number, chunks, disable):
             )
             
             n_non_ghost = int((~ghost_mask).sum())
-            if n_non_ghost < 10:
+            if n_non_ghost < 20:
                 print(f"Skipping event {event_id} with {n_non_ghost} non-ghost hits")
                 continue
 
@@ -428,6 +434,7 @@ def generate_events(number, chunks, disable):
                 is_cc=is_cc,
                 is_tau=is_tau,
                 charm=charm,
+                charmdecay=charmdecay,
                 e_vis=e_vis,
                 sp_momentum=sp_momentum,
                 vis_sp_momentum=vis_sp_momentum,

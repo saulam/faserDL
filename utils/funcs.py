@@ -409,7 +409,6 @@ class CombinedScheduler(_LRScheduler):
             warmup_steps (int): The number of steps for the warm-up phase (default: 100).
             start_cosine_step (int): The step to start cosine annealing scheduling.
         """
-        super().__init__(optimizer)
         self.optimizer = optimizer
         self.scheduler1 = scheduler1
         self.scheduler2 = scheduler2

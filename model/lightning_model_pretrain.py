@@ -49,32 +49,9 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": self.log_sigma_reg,
         }
 
-        # learnable scale logits for contrastive losses (init at 1/0.07 ≈ 14.285  => log ≈ 2.659)
-        init = math.log(1/0.07)
-        self.logit_scale_trk = nn.Parameter(torch.tensor(init))
-        self.logit_scale_pri = nn.Parameter(torch.tensor(init))
-        self.logit_scale_pid = nn.Parameter(torch.tensor(init))
-        self.logit_scale_trk_ghost = nn.Parameter(torch.tensor(init))
-        self.logit_scale_pri_ghost = nn.Parameter(torch.tensor(init))
-        self.logit_scale_pid_ghost = nn.Parameter(torch.tensor(init))
-        self._logit_scale_params = {
-            "trk": self.logit_scale_trk,
-            "pri": self.logit_scale_pri,
-            "pid": self.logit_scale_pid,
-            "trk_ghost": self.logit_scale_trk_ghost,
-            "pri_ghost": self.logit_scale_pri_ghost,
-            "pid_ghost": self.logit_scale_pid_ghost,
-        }
-
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         return move_obj(batch, device)
-    
-
-    @staticmethod
-    def _scale(p: torch.Tensor) -> torch.Tensor:
-        # clamp exp(logit_scale) in [1/100, 100]
-        return p.clamp(math.log(1/100), math.log(100)).exp()
     
 
     def on_train_start(self):
@@ -106,9 +83,9 @@ class MAEPreTrainer(pl.LightningModule):
     def _arrange_batch(self, batch):
         batch_input, *global_params = arrange_input(batch)
         labels = arrange_truth(batch)
-        csr_trk = batch['csr_trk_indptr'], batch['csr_trk_ids'], batch['csr_trk_weights']
-        csr_pri = batch['csr_pri_indptr'], batch['csr_pri_ids'], batch['csr_pri_weights']
-        csr_pdg = batch['csr_pdg_indptr'], batch['csr_pdg_ids'], batch['csr_pdg_weights']
+        csr_trk = labels['csr_trk_indptr'], labels['csr_trk_ids'], labels['csr_trk_weights']
+        csr_pri = labels['csr_pri_indptr'], labels['csr_pri_ids'], labels['csr_pri_weights']
+        csr_pdg = labels['csr_pdg_indptr'], labels['csr_pdg_ids'], labels['csr_pdg_weights']
         ghost_mask = labels['ghost_mask']
         hit_event_id = labels['hit_event_id']
 
@@ -144,25 +121,18 @@ class MAEPreTrainer(pl.LightningModule):
         Computes both losses (same-track, same-primary, same-pid) in one call.
         Assumes inputs are already masked/aligned (no ghosts/invisible hits).
         """
-        s_trk   = self._scale(self.logit_scale_trk)
-        s_pri   = self._scale(self.logit_scale_pri)
-        s_pid   = self._scale(self.logit_scale_pid)
-        s_trk_g = self._scale(self.logit_scale_trk_ghost)
-        s_pri_g = self._scale(self.logit_scale_pri_ghost)
-        s_pid_g = self._scale(self.logit_scale_pid_ghost)
-
         # track
         loss_trk, loss_trk_ghost = contrastive_with_ghost_shared(
             z_trk, event_id, ghost_mask, *crs_trk, num_neg=16, pool_mult=2,
             normalize=normalize, per_event_mean=per_event_mean,
-            logit_scale=s_trk, ghost_logit_scale=s_trk_g
+            temperature=0.1, temperature_ghost=0.2,
         )
 
         # primary
         loss_pri, loss_pri_ghost = contrastive_with_ghost_shared(
             z_pri, event_id, ghost_mask, *crs_pri, num_neg=8, pool_mult=2,
             normalize=normalize, per_event_mean=per_event_mean,
-            logit_scale=s_pri, ghost_logit_scale=s_pri_g
+            temperature=0.1, temperature_ghost=0.2,
         )
 
         # pid
@@ -170,7 +140,7 @@ class MAEPreTrainer(pl.LightningModule):
         loss_pid, loss_pid_ghost = contrastive_with_ghost_shared(
             z_pid, pid_event_id, ghost_mask, *crs_pdg, num_neg=6, pool_mult=1,
             normalize=normalize, per_event_mean=per_event_mean,
-            logit_scale=s_pid, ghost_logit_scale=s_pid_g
+            temperature=0.1, temperature_ghost=0.2,
         )
 
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
@@ -357,19 +327,6 @@ class MAEPreTrainer(pl.LightningModule):
                 sync_dist=True
             )
 
-        # log the actual logit scales
-        for key, logit_scale in self._logit_scale_params.items():
-            scale = self._scale(logit_scale).detach()
-            self.log(
-                f'logit_scale/{key}',
-                scale,
-                batch_size=batch_size,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=True
-            )
-
         return loss
 
 
@@ -405,7 +362,7 @@ class MAEPreTrainer(pl.LightningModule):
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
-            'params': list(self._uncertainty_params.values()) + list(self._logit_scale_params.values()),
+            'params': list(self._uncertainty_params.values()),
             'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })

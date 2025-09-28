@@ -545,8 +545,8 @@ dataset = SparseFASERCALDataset(
         "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_2",
         "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_3",
         "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_tau",
-        "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_tau_2",
-        "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_tau_3",
+        "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_tau2",
+        "/scratch/salonso/sparse-nns/faser/events_new_v5.1b_tau3",
     ])
 
 def collate(batch):

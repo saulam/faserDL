@@ -741,8 +741,8 @@ def contrastive_with_ghost_shared(
     pool_mult: int = 1,
     normalize: bool = True,
     min_class_size: float = 5.0,       # minimum *effective* weight per (event,class)
-    logit_scale: torch.Tensor = None,
-    ghost_logit_scale: torch.Tensor = None,
+    temperature: float = 0.07,
+    temperature_ghost: float = None,
     per_event_mean: bool = False,
     detach_prototypes: bool = True,
 ):
@@ -910,8 +910,7 @@ def contrastive_with_ghost_shared(
             k = min(num_neg, K_pool)
             neg_sim = torch.topk(neg_sim_full, k=k, dim=1).values
 
-            t = (logit_scale if logit_scale is not None else z.new_tensor(1.0)).float()
-            logits32 = torch.cat([pos_sim, neg_sim], dim=1) * t
+            logits32 = torch.cat([pos_sim, neg_sim], dim=1) / temperature
             per_edge = F.cross_entropy(
                 logits32, torch.zeros(rows_e.size(0), dtype=torch.long, device=device),
                 reduction='none'
@@ -945,8 +944,7 @@ def contrastive_with_ghost_shared(
             zg = z[ghost_mask][valid_ev]
             eg = eidx_g[valid_ev]
 
-            t_g = (ghost_logit_scale if ghost_logit_scale is not None else logit_scale)
-            t_g = (t_g if t_g is not None else z.new_tensor(1.0)).float()
+            t_g = (temperature_ghost if temperature_ghost is not None else temperature)
 
             # sample within-event negatives
             counts_e, offset_e, ord_valid = counts_ok, offset_ok, ord_ok
@@ -962,7 +960,7 @@ def contrastive_with_ghost_shared(
             sims_full = torch.einsum('md,mkd->mk', zg.float(), P_sel.float())
             k = min(num_neg, K_pool)
             sims = torch.topk(sims_full, k=k, dim=1).values
-            per_sample_g = torch.logsumexp(sims * t_g, dim=1) - math.log(float(k))
+            per_sample_g = torch.logsumexp(sims / t_g, dim=1) - math.log(float(k))
             loss_ghost = (per_sample_g.mean()).to(z.dtype)
 
     return loss_real, loss_ghost
