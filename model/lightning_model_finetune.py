@@ -366,9 +366,3 @@ class ViTFineTuner(pl.LightningModule):
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
-
-
-    def lr_scheduler_step(self, scheduler, *args):
-        """Perform a learning rate scheduler step."""
-        scheduler.step()
-

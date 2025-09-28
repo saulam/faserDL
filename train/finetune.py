@@ -178,6 +178,8 @@ def main():
         limit_train_batches=nb_batches_train//nb_gpus if args.web_dataset_path else None,
         limit_val_batches=nb_batches_val//nb_gpus if args.web_dataset_path else None,
         max_epochs=args.epochs,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
         callbacks=callbacks,
         accelerator="gpu",
         devices=nb_gpus,

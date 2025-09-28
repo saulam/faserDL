@@ -20,7 +20,7 @@ mask_ratio=0.75
 epochs=400
 num_workers=16
 blr=1.5e-4
-accum_grad_batches=4
+accum_grad_batches=2
 warmup_epochs=40
 cosine_annealing_epochs=360
 weight_decay=0.05
@@ -34,7 +34,7 @@ checkpoint_path="checkpoints_final"
 checkpoint_name="pretrain_v5.1b_dlnu_log_base_v18"
 early_stop_patience=200
 load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
-gpus=(1)
+gpus=(0 1)
 
 python -m train.pretrain \
     --train \

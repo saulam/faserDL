@@ -28,6 +28,7 @@ class MinkViT(vit.VisionTransformer):
         D=3,
         img_size=(48, 48, 200),
         module_depth_voxels=20,
+        num_module_cls=1,
         num_global_tokens=1,
         latent_tokens=32,
         io_depth=4,
@@ -123,19 +124,15 @@ class MinkViT(vit.VisionTransformer):
                 blk.drop_path1.drop_prob = dpr[idx]
                 blk.drop_path2.drop_prob = dpr[idx]
                 
-        self.module_cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))        # per-module CLS (shared weights)
-        self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)  # fixed sin-cos per-module
-        self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)         # learned module index
+        self.num_module_cls = num_module_cls
+        self.module_cls_token = nn.Parameter(torch.zeros(1, num_module_cls, embed_dim))  # per-module CLS (shared weights)
+        self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per-module
+        self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index
 
         # Perceiver-IO bottleneck
         self.num_global_tokens = num_global_tokens
         self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim, dropout=drop_rate)
         self.global_mem = nn.Parameter(torch.zeros(1, self.num_global_tokens, embed_dim))
-        assert latent_tokens >= self.num_modules, \
-            f"latent_tokens ({latent_tokens}) must be >= num_modules ({self.num_modules})"
-        self.latent_tokens = latent_tokens
-        self.latent_free_tokens = max(latent_tokens - self.num_modules, 0)
-        self.latents_free = nn.Parameter(torch.zeros(1, self.latent_free_tokens, embed_dim))
         self.latent_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -199,7 +196,6 @@ class MinkViT(vit.VisionTransformer):
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.global_mem, std=.02)
-            nn.init.normal_(self.latents_free, std=.02)
             nn.init.normal_(self.module_cls_token, std=.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
             if not self.global_pool:
@@ -238,7 +234,6 @@ class MinkViT(vit.VisionTransformer):
             'module_cls_token',
             'module_embed_enc.weight',
             'global_mem',
-            'latents_free',
             'task_tokens',
             'patch_embed.bias',
         }
@@ -368,24 +363,18 @@ class MinkViT(vit.VisionTransformer):
 
     def _prepare_queries(
         self,
-        cls_mod: torch.Tensor,  # [B, M, C]  per-module CLS
+        cls_mod: torch.Tensor,  # [B, M, CLS, C]  per-module CLS
     ):
         """
-        Returns: queries        [B, Q, C]   (Q = M + K_free)
+        Returns: queries        [B, M*CLS, C]
         """
-        B, M, C = cls_mod.shape
+        B, M, CLS, C = cls_mod.shape
         device  = cls_mod.device
 
         # Anchored CLS queries
         mod_ids   = torch.arange(M, device=device)
-        q_anchor  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, C)     # [B, M, C]
-
-        # Free queries (K_free)
-        if self.latent_free_tokens > 0:
-            q_free = self.latents_free.expand(B, self.latent_free_tokens, -1)  # [B, K_free, C]
-            queries = torch.cat([q_anchor, q_free], dim=1)                     # [B, Q_total, C]
-        else:
-            queries = q_anchor                                                 # [B, M, C]
+        queries  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)  # [B, M, CLS, C]
+        queries = queries.view(B, M * CLS, C)                                 # [B, M*CLS, C]
 
         return queries
     
@@ -403,41 +392,43 @@ class MinkViT(vit.VisionTransformer):
         B, M, L, C = x_mod.shape
 
         # Intra-module transformer with per-module CLS
-        cls = self.module_cls_token.expand(B*M, 1, C)
+        cls = self.module_cls_token.expand(B*M, self.num_module_cls, C)
         x_intra = x_mod.reshape(B*M, L, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
         x_intra = self.pos_drop(x_intra)
-        attn_mask_intra = torch.cat([torch.ones(B*M, 1, dtype=torch.bool, device=x.device), attn_mask_mod.reshape(B*M, L)], dim=1)
+        attn_mask_intra = torch.cat(
+            [torch.ones(B*M, self.num_module_cls, dtype=torch.bool, device=x_intra.device),
+             attn_mask_mod.reshape(B*M, L)], dim=1)
         for blk in self.blocks:
             x_intra = blk(x_intra, attn_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
         # discard intra-module CLS and add module embedding
-        cls_mod = x_intra[:, 0, :].view(B, M, C)                              # [B, M, C]
-        tok_mod = x_intra[:, 1:, :].reshape(B, M, L, C)                       # [B, M, L, C]
+        cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)  # [B, M, C]
+        tok_mod = x_intra[:, self.num_module_cls:, :].reshape(B, M, L, C)                 # [B, M, L, C]
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
 
         # global input
-        g_enc   = self.global_feats_encoder(x_glob)                           # [B, C]
-        g_tokens = g_enc.unsqueeze(1) + self.global_mem                       # [B, G, C]
+        g_enc   = self.global_feats_encoder(x_glob)                                       # [B, C]
+        g_tokens = g_enc.unsqueeze(1) + self.global_mem                                   # [B, G, C]
         g_tokens = g_tokens.to(tok_mod.dtype)
 
         # Perceiver-IO encoder: latents attend to all kept tokens
-        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_mod)  # [B, N, C], [B, N]
+        kv_tokens, kv_keep = self._prepare_kv_tokens(tok_mod, attn_mask_mod)              # [B, N, C], [B, N]
 
         # append global tokens to kv
-        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                   # [B, N+G, C]
+        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                               # [B, N+G, C]
         kv_keep  = torch.cat([kv_keep, torch.ones(
             kv_keep.size(0), self.num_global_tokens, 
-            dtype=torch.bool, device=kv_keep.device)], dim=1)                 # [B, N+G]
+            dtype=torch.bool, device=kv_keep.device)], dim=1)                             # [B, N+G]
         
         # prepare queries and masks
-        queries = self._prepare_queries(cls_mod)
+        queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]
         lat = queries
         for xa, sa in zip(self.latent_xattn_blocks, self.latent_self_blocks):
-            lat = xa(lat, kv_tokens, attn_mask=kv_keep)                       # cross: lat <- tokens
-            lat = sa(lat, attn_mask=None)                                     # self-attn over latents
+            lat = xa(lat, kv_tokens, attn_mask=kv_keep)                                   # cross: lat <- tokens
+            lat = sa(lat, attn_mask=None)                                                 # self-attn over latents
 
         # Task-specific heads
         if self.global_pool:
@@ -473,7 +464,7 @@ def vit_tiny(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(12, 12, 10),
         depth=4, num_heads=12, num_global_tokens=1,
-        latent_tokens=16, io_depth=8,
+        latent_tokens=16, io_depth=8, num_module_cls=2,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -485,7 +476,7 @@ def vit_base(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=1,
-        latent_tokens=32, io_depth=4,
+        latent_tokens=32, io_depth=4, num_module_cls=2,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -497,7 +488,7 @@ def vit_large(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=1008, patch_size=(48, 48, 2),
         depth=8, num_heads=12, num_global_tokens=2,
-        latent_tokens=32, io_depth=8,
+        latent_tokens=32, io_depth=8, num_module_cls=4,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -509,7 +500,7 @@ def vit_huge(**kwargs):
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=1296, patch_size=(48, 48, 2),
         depth=16, num_heads=12, num_global_tokens=4,
-        latent_tokens=64, io_depth=16,
+        latent_tokens=64, io_depth=16, num_module_cls=4,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)

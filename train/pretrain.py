@@ -181,7 +181,7 @@ def main():
         strategy=DDPStrategy(
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
-            static_graph=True
+            static_graph=False
         ) if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,

@@ -108,9 +108,9 @@ class MAEPreTrainer(pl.LightningModule):
         z_trk: torch.Tensor,             # [N, Dt]
         z_pri: torch.Tensor,             # [N, Dp]
         z_pid: torch.Tensor,             # [N, Dp]
-        crs_trk: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
-        crs_pri: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
-        crs_pdg: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
+        csr_trk: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
+        csr_pri: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
+        csr_pdg: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         event_id: torch.Tensor,          # [N] int64
         ghost_mask: torch.Tensor,        # [N] bool
         normalize: bool = True,
@@ -123,24 +123,24 @@ class MAEPreTrainer(pl.LightningModule):
         """
         # track
         loss_trk, loss_trk_ghost = contrastive_with_ghost_shared(
-            z_trk, event_id, ghost_mask, *crs_trk, num_neg=16, pool_mult=2,
+            z_trk, event_id, ghost_mask, *csr_trk, num_neg=16, pool_mult=3,
             normalize=normalize, per_event_mean=per_event_mean,
-            temperature=0.1, temperature_ghost=0.2,
+            temperature=0.10, temperature_ghost=0.18,
         )
 
         # primary
         loss_pri, loss_pri_ghost = contrastive_with_ghost_shared(
-            z_pri, event_id, ghost_mask, *crs_pri, num_neg=8, pool_mult=2,
+            z_pri, event_id, ghost_mask, *csr_pri, num_neg=12, pool_mult=2,
             normalize=normalize, per_event_mean=per_event_mean,
-            temperature=0.1, temperature_ghost=0.2,
+            temperature=0.14, temperature_ghost=0.20,
         )
 
         # pid
         pid_event_id = torch.zeros_like(event_id)  # trick: pid loss across events
         loss_pid, loss_pid_ghost = contrastive_with_ghost_shared(
-            z_pid, pid_event_id, ghost_mask, *crs_pdg, num_neg=6, pool_mult=1,
+            z_pid, pid_event_id, ghost_mask, *csr_pdg, num_neg=5, pool_mult=1,
             normalize=normalize, per_event_mean=per_event_mean,
-            temperature=0.1, temperature_ghost=0.2,
+            temperature=0.25, temperature_ghost=0.35,
         )
 
         loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
@@ -402,8 +402,3 @@ class MAEPreTrainer(pl.LightningModule):
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
-
-
-    def lr_scheduler_step(self, scheduler, *args):
-        """Perform a learning rate scheduler step."""
-        scheduler.step()
