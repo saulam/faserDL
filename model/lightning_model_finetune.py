@@ -30,24 +30,7 @@ class ViTFineTuner(pl.LightningModule):
         
         # Loss functions
         self.loss_flavour = nn.CrossEntropyLoss(reduction='none')
-        self.loss_charm = nn.BCEWithLogitsLoss(reduction='none')
-        '''
-        self.crit = KinematicsMultiTaskLoss(
-            s_vis_xyz=stats["vis"]["s_xyz"], s_vis_mag=stats["vis"]["s_mag"],
-            s_lep_xyz=stats["lep"]["s_xyz"], s_lep_mag=stats["lep"]["s_mag"],
-            s_jet_xyz=get_or(stats.get("jet_loss_scales", {}), "s_xyz", stats["vis"]["s_xyz"]),
-            s_jet_mag=get_or(stats.get("jet_loss_scales", {}), "s_mag", stats["vis"]["s_mag"]),
-            tau_ptmiss_cc=stats.get("vis_tau_ptmiss_cc", stats["vis"]["tau_ptmiss"]),
-            tau_ptmiss_nc=stats.get("vis_tau_ptmiss_nc", stats["vis"]["tau_ptmiss"]),
-            tau_evis_cc=stats.get("vis_tau_evis_cc", stats["vis"]["tau_evis"]),
-            tau_evis_nc=stats.get("vis_tau_evis_nc", stats["vis"]["tau_evis"]),
-            zero_attractor_w=0.1,
-            jet_aux_w=0.2,           # 0.0 to disable aux jet loss
-            latent_prior_w=1e-3,     # tiny; only used if we pass latents
-            huber_delta=1.0,
-            lam_mag=1.0, lam_dir=1.0
-        )
-        '''
+        self.loss_charm = nn.CrossEntropyLoss(reduction='none')
         self.crit = KinematicsMultiTaskLoss(
             stats=stats,
             huber_delta=1.0, lam_dir_xy=1.0, lam_dir_3d=0.0,
@@ -163,14 +146,14 @@ class ViTFineTuner(pl.LightningModule):
     def compute_losses(self, batch_output, target):
         # predicted outputs
         out_flavour = batch_output['out_flavour']
-        out_charm   = batch_output['out_charm'].squeeze()
+        out_charm   = batch_output['out_charm']
         out_vis     = batch_output['out_vis']
         out_jet     = batch_output['out_jet']
 
         # true outputs
         targ_iscc            = target['is_cc']
         targ_flavour         = target['flavour_label']
-        targ_charm           = target['charm']
+        targ_charm           = target['charm_label']
         targ_vis_sp_momentum = target['vis_sp_momentum']
         targ_jet_momentum    = target['jet_momentum']
 

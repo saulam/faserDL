@@ -75,17 +75,46 @@ class SparseFASERCALDataset(Dataset):
         return mapped
 
     
-    def pdg2label(self, pdg, iscc, tau_decay_mode):
-        """Converts PDG ID to a classification label (0-3)."""
-        if iscc:
-            if pdg in [-12, 12]: return 0           # CC nue
-            if pdg in [-14, 14]: return 1           # CC numu
-            if pdg in [-16, 16]:                    # CC nutau
+    def pdg2label(self, pdg, is_cc, tau_decay_mode):
+        """Converts PDG ID to a classification label (0-5).
+
+        Returns:
+        - int: 
+            0 - CC nue
+            1 - CC numu
+            2 - CC nutau (tau -> e)
+            3 - CC nutau (tau -> mu)
+            4 - CC nutau (tau -> hadrons)
+            5 - NC
+        """
+        if is_cc:
+            if pdg in {-12, 12}: return 0           # CC nue
+            if pdg in {-14, 14}: return 1           # CC numu
+            if pdg in {-16, 16}:                    # CC nutau
                 assert tau_decay_mode > 0, "Tau events must have a valid decay mode"
-                if tau_decay_mode == 1:   return 2  # tau->e
-                elif tau_decay_mode == 2: return 3  # tau->mu
-                else:                     return 4  # tau->hadrons
-        return 5                                    # NC
+                if tau_decay_mode == 1:   return 2  # tau -> e
+                elif tau_decay_mode == 2: return 3  # tau -> mu
+                else:                     return 4  # tau -> hadrons
+        return 5
+
+
+    def charmdecay2label(self, charm, charm_decay):
+        """Classifies charm decays based on decay products.
+        
+        Returns:
+        - int: 
+            0 - no charm
+            1 - charm -> e
+            2 - charm -> mu
+            3 - charm -> hadron (everything else)
+        """
+        if not charm:
+            return 0  # no charm
+        if any(pid in {13, -13} for pid in charm_decay):
+            return 2  # charm -> mu
+        elif any(pid in {11, -11} for pid in charm_decay):
+            return 1  # charm -> e
+        return 3      # charm -> hadron
 
 
     def decompose_momentum(self, momentum):
@@ -337,14 +366,15 @@ class SparseFASERCALDataset(Dataset):
         primary_vertex = data['primary_vertex']
         is_cc = data['is_cc']
         is_tau = data['is_tau']
-        in_neutrino_pdg = data['in_neutrino_pdg']
-        in_neutrino_energy = data['in_neutrino_energy']
+        in_neutrino_pdg = data['in_neutrino_pdg'].item()
+        in_neutrino_energy = data['in_neutrino_energy'].item()
         vis_sp_momentum = data['vis_sp_momentum']
         out_lepton_momentum = data['out_lepton_momentum']
         jet_momentum = data['jet_momentum']
         tau_vis_momentum = data['tau_vis_momentum']
         tau_decay_mode = data['tau_decay_mode'].item()
         charm = data['charm']
+        charm_decay = data['charmdecay']
         global_feats = {
             'faser_cal_energy':  data['faser_cal_energy'],
             'rear_cal_energy':   data['rear_cal_energy'],
@@ -388,6 +418,7 @@ class SparseFASERCALDataset(Dataset):
             # NC events don't have visible outgoing leptons
             out_lepton_momentum.fill(0)
         flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc, tau_decay_mode)])
+        charm_label = np.array([self.charmdecay2label(charm, charm_decay)])
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
@@ -398,7 +429,11 @@ class SparseFASERCALDataset(Dataset):
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
                 global_feats, primary_vertex, self.metadata, self.stage1
             )
-            charm = smooth_labels(np.array([charm]), smoothing=self.label_smoothing)
+            charm_label = smooth_labels(
+                charm_label, 
+                smoothing=self.label_smoothing,
+                num_classes=4
+            )
             flavour_label = smooth_labels(
                 flavour_label,
                 smoothing=self.label_smoothing,
@@ -420,7 +455,7 @@ class SparseFASERCALDataset(Dataset):
             'jet_momentum': jet_momentum,
             'global_feats': global_feats,
             'flavour_label': flavour_label,
-            'charm': charm,
+            'charm_label': charm_label,
             'primary_vertex': primary_vertex,
             'in_neutrino_pdg': in_neutrino_pdg,
             'in_neutrino_energy': in_neutrino_energy,
@@ -465,6 +500,7 @@ class SparseFASERCALDataset(Dataset):
             'rear_cal_modules': rear_cal_mod.float(),
             'rear_hcal_modules': rear_hcal_mod.float(),
             'flavour_label': torch.from_numpy(event['flavour_label']),
+            'charm_label': torch.from_numpy(event['charm_label']),
         }
         if self.stage1:
             output.update({
@@ -482,7 +518,6 @@ class SparseFASERCALDataset(Dataset):
             
         if not self.train or not self.stage1:
             output.update({
-                'charm': torch.from_numpy(np.atleast_1d(event['charm'])).float(),
                 'vis_sp_momentum': vis_sp_momentum.float(),
                 'out_lepton_momentum': out_lepton_momentum.float(),
                 'jet_momentum': jet_momentum.float(),

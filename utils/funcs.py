@@ -176,12 +176,12 @@ def collate(
         optional_keys = [
             "run_number", "event_id", "primary_vertex", "is_cc", "in_neutrino_pdg",
             "in_neutrino_energy", "primlepton_labels", "seg_labels", "flavour_label",
-            "charm", "e_vis", "pt_miss",
+            "charm_label", "e_vis", "pt_miss",
             "vis_sp_momentum", "vis_sp_momentum_mag", "vis_sp_momentum_dir",
             "out_lepton_momentum", "out_lepton_momentum_mag", "out_lepton_momentum_dir",
             "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
         ]
-        to_numpy = {"primlepton_labels", "seg_labels", "flavour_label", "charm"}
+        to_numpy = {"primlepton_labels", "seg_labels", "flavour_label", "charm_label"}
         to_item  = {"e_vis", "pt_miss", "vis_sp_momentum_mag",
                     "out_lepton_momentum_mag", "jet_momentum_mag"}
 
@@ -206,7 +206,7 @@ def collate(
 
     # mode == "train"
     opt_all = {
-        "ghost_mask", "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm",
+        "ghost_mask", "primlepton_labels", "seg_labels", "is_cc", "flavour_label", "charm_label",
         "e_vis", "pt_miss", "vis_sp_momentum", "out_lepton_momentum",
         "vis_sp_momentum_mag", "vis_sp_momentum_dir",
         "out_lepton_momentum_mag", "out_lepton_momentum_dir",
@@ -214,7 +214,7 @@ def collate(
     }
     cat_keys = {
         "ghost_mask", "primlepton_labels", "seg_labels", "is_cc", 
-        "flavour_label", "charm", "e_vis", "pt_miss", "vis_sp_momentum_mag",
+        "flavour_label", "charm_label", "e_vis", "pt_miss", "vis_sp_momentum_mag",
         "out_lepton_momentum_mag", "jet_momentum_mag",
     }
     stack_keys = {
@@ -292,7 +292,7 @@ def arrange_truth(data):
         'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
-        'charm', 'e_vis', 'pt_miss', 
+        'charm_label', 'e_vis', 'pt_miss', 
         'vis_sp_momentum', 'vis_sp_momentum_mag', 'vis_sp_momentum_dir',
         'out_lepton_momentum', 'out_lepton_momentum_mag', 'out_lepton_momentum_dir',
         'jet_momentum', 'jet_momentum_mag', 'jet_momentum_dir'
