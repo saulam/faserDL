@@ -757,13 +757,11 @@ def contrastive_with_ghost_shared(
     normalize: bool = True,
     min_class_size: float = 10.0,
     temperature: float = 0.07,
-    temperature_ghost: float = None,
     per_event_mean: bool = False,
     detach_prototypes: bool = True,
 ):
     if z.numel() == 0 or num_neg <= 0:
-        zero = z.new_zeros(())
-        return zero, zero
+        return z.new_zeros(())
 
     device = z.device
     N, D = z.shape
@@ -778,8 +776,7 @@ def contrastive_with_ghost_shared(
     if deg.numel() != N:
         raise ValueError("label_indptr shape mismatch with N")
     if deg.sum().item() == 0:
-        zero = z.new_zeros(())
-        return zero, zero
+        return z.new_zeros(())
 
     rows = torch.arange(N, device=device, dtype=torch.long).repeat_interleave(deg)  # [L]
     eids_edge = event_id[rows].to(torch.int64)  # [L]
@@ -842,8 +839,7 @@ def contrastive_with_ghost_shared(
         _prepare_valid_groups_soft(Pidx, cnt_vec, min_class_size)
 
     if int(counts_ok.sum().item()) == 0:
-        zero = z.new_zeros(())
-        return zero, zero
+        return z.new_zeros(())
 
     P_mean = (P_sum[group_ok] / cnt_vec[group_ok].unsqueeze(1))
     if normalize:
@@ -981,58 +977,7 @@ def contrastive_with_ghost_shared(
                 denom_rows = row_mask.to(per_edge.dtype).sum().clamp_min(1)
                 loss_real = (per_row_sum[row_mask].sum() / denom_rows).to(z.dtype)
 
-    # ============================================================
-    # GHOST PUSH-AWAY (unchanged logic; uses the same guarding style if needed)
-    # ============================================================
-    loss_ghost = z.new_zeros(())
-    if torch.any(ghost_mask):
-        euniq = Pidx["events_sorted"]
-        eid_g = event_id[ghost_mask].to(torch.int64)
-        eidx_g = torch.searchsorted(euniq, eid_g)
-        safe = eidx_g.clamp_max(max(0, euniq.numel() - 1))
-        match = (euniq[safe] == eid_g)
-        valid_ev = match & (counts_ok[safe] >= 2)
-        if valid_ev.any():
-            zg = z[ghost_mask][valid_ev]
-            eg = safe[valid_ev]
-
-            t_g = (temperature_ghost if temperature_ghost is not None else temperature)
-
-            Ue = counts_ok[eg]
-            maxU = int(Ue.max().item())
-            if maxU > 0:
-                K_cap = max(1, int(num_neg) * int(pool_mult))
-                K_pool = min(K_cap, maxU)
-
-                ar = torch.arange(maxU, device=device)
-                valid_by_range = ar.unsqueeze(0) < Ue.unsqueeze(1)
-
-                gumb = torch.empty_like(valid_by_range, dtype=torch.float32).uniform_(0, 1)
-                gumb = -torch.log(-torch.log(gumb.clamp_min(1e-12)))
-                gumb = gumb.masked_fill(~valid_by_range, float('-inf'))
-
-                si = gumb.topk(k=K_pool, dim=1).indices                      # [Mg, K_pool]
-                selected_valid = valid_by_range.gather(1, si)
-
-                max_local_g = (Ue - 1).clamp_min(0).unsqueeze(1)             # [Mg,1]
-                si_safe = torch.minimum(si, max_local_g)                     # [Mg, K_pool]
-
-                base = offset_ok[eg].unsqueeze(1) + si_safe
-                grp  = ord_ok[base]
-                P_sel = P_mean[gid2compact[grp]]
-
-                comp_idx = gid2compact[grp]
-                P_sel = P_mean[comp_idx]
-
-                sims_full = torch.einsum('md,mkd->mk', zg.float(), P_sel.float())
-                sims_full = sims_full.masked_fill(~selected_valid, MINF32)
-
-                k = min(num_neg, K_pool)
-                sims = torch.topk(sims_full, k=k, dim=1).values
-                per_sample_g = torch.logsumexp(sims / t_g, dim=1) - math.log(float(k))
-                loss_ghost = (per_sample_g.mean()).to(z.dtype)
-
-    return loss_real, loss_ghost
+    return loss_real
 
 
 def occ_supervision_mask(
@@ -1269,3 +1214,141 @@ def reconstruction_losses_masked_simple(
         'reg/total': loss_reg.detach(), 'reg/pos': reg_pos_loss.detach(), 'reg/neg': reg_neg_loss.detach(),
     }
     return loss_occ, loss_reg, part_losses_dec
+
+
+def build_soft_targets_from_csr(indptr, cls, w, ghost_mask, num_classes, N):
+    device = cls.device
+    rows = torch.arange(N, device=device, dtype=torch.long).repeat_interleave(indptr[1:] - indptr[:-1])
+    target = torch.zeros(N, num_classes-1, device=device, dtype=w.dtype)
+    target.index_put_((rows, cls.to(torch.long)), w.clamp_min(0), accumulate=True)
+    target_sum = target.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    probs = target / target_sum  # [N, C]
+    ghost_col = ghost_mask.to(device=device, dtype=w.dtype).reshape(N, 1)
+    return torch.cat([probs, ghost_col], dim=1)
+
+
+def soft_ce_with_logits_csr(
+    logits: torch.Tensor,
+    csr: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, w)
+    ghost_mask: torch.Tensor = None,
+):
+    N, num_classes = logits.shape
+    soft_pid = build_soft_targets_from_csr(*csr, ghost_mask=ghost_mask, num_classes=num_classes, N=N)
+    loss = -(soft_pid * torch.log_softmax(logits, dim=-1)).sum(dim=1).mean()
+    return loss
+
+
+def pair_soft_overlap_bce(
+    z,                                 # [N, D] embeddings (already aligned to CSR rows)
+    event_id,                          # [N] int64
+    indptr, cls, w,                    # CSR rows->classes with weights, len(indptr)=N+1
+    ghost_mask=None,                   # [N] bool (optional)
+    topk_T=4,                          # keep top-T classes per *used* row
+    pairs_per_batch=8192,              # number of intra-event pairs
+    scale=10.0,
+    normalize=True,
+):
+    device = z.device
+    N, D = z.shape
+    if N == 0: return z.new_zeros(()), {"pairs": 0}
+    if normalize: z = F.normalize(z, dim=-1, eps=1e-6)
+
+    # valid rows (optionally drop ghosts)
+    valid = torch.ones(N, dtype=torch.bool, device=device)
+    if ghost_mask is not None: valid &= ~ghost_mask.bool()
+    if valid.sum() < 2: return z.new_zeros(()), {"pairs": 0}
+
+    # sort by event and sample intra-event pairs
+    e_valid = event_id[valid].to(torch.long)
+    order = torch.argsort(e_valid)
+    e_sorted = e_valid[order]
+    rows_sorted = torch.nonzero(valid, as_tuple=False).squeeze(1)[order]  # global row ids in sorted order
+    Rtot = rows_sorted.numel()
+
+    first = torch.ones_like(e_sorted, dtype=torch.bool)
+    first[1:] = e_sorted[1:] != e_sorted[:-1]
+    starts = torch.nonzero(first, as_tuple=False).squeeze(1)                  # [E]
+    lens = torch.diff(torch.cat([starts, e_sorted.new_tensor([Rtot])]))       # [E]
+    if starts.numel() == 0: return z.new_zeros(()), {"pairs": 0}
+
+    seg_id = torch.repeat_interleave(torch.arange(starts.numel(), device=device), lens)  # [Rtot]
+
+    K = int(min(pairs_per_batch, Rtot))
+    anchor_pos = torch.randint(Rtot, (K,), device=device)                  # [K]
+    ev_idx = seg_id[anchor_pos]                                                           # [K]
+    ev_start = starts[ev_idx]                                                             # [K]
+    ev_len = lens[ev_idx]                                                                 # [K]
+    offs = torch.randint(ev_len.max().item(), (K,), device=device) % ev_len
+    mate_pos = ev_start + offs
+    same = mate_pos == anchor_pos
+    mate_pos = torch.where(same, ev_start + ((offs + 1) % ev_len), mate_pos)
+
+    row_i = rows_sorted[anchor_pos]  # global row ids (in [0..N-1])
+    row_j = rows_sorted[mate_pos]
+
+    # compute top-T (class, weight) ONLY for rows used in pairs (fully vectorized)
+    rows_used = torch.unique(torch.cat([row_i, row_j], 0))                      # [M]
+    M = rows_used.numel()
+    if M == 0: return z.new_zeros(()), {"pairs": 0}
+    T = int(topk_T)
+
+    # per-row edge starts, lengths, and a padded edge-index grid
+    start_r = indptr[rows_used]                                                 # [M]
+    end_r   = indptr[rows_used + 1]
+    len_r   = end_r - start_r                                                   # [M]
+    Lmax = int(len_r.max().item())
+    if Lmax == 0: return z.new_zeros(()), {"pairs": 0}
+
+    ar = torch.arange(Lmax, device=device).unsqueeze(0)                         # [1, Lmax]
+    valid_cols = ar < len_r.unsqueeze(1)                                        # [M, Lmax]
+    edge_idx = (start_r.unsqueeze(1) + ar).clamp_max(indptr[-1] - 1)            # [M, Lmax]
+
+    # gather padded class ids & weights, masked where invalid
+    c_pad = torch.full((M, Lmax), -1, dtype=cls.dtype, device=device)
+    w_pad = torch.zeros((M, Lmax), dtype=w.dtype, device=device)
+    flat_sel = valid_cols.view(-1)
+    if flat_sel.any():
+        c_pad.view(-1)[flat_sel] = cls[edge_idx.view(-1)[flat_sel]]
+        w_pad.view(-1)[flat_sel] = w[edge_idx.view(-1)[flat_sel]]
+
+    # per-row topk by weight
+    k = min(T, Lmax)
+    topw = torch.zeros((M, T), dtype=w.dtype, device=device)
+    topc = torch.full((M, T), -1, dtype=cls.dtype, device=device)
+    if k > 0:
+        vals, idxs = torch.topk(w_pad, k=k, dim=1)
+        topw[:, :k] = vals
+        topc[:, :k] = torch.gather(c_pad, 1, idxs)
+    # renormalize per row
+    topw = topw / topw.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    # map global row id -> local used-row index
+    row2loc = torch.full((N,), -1, dtype=torch.long, device=device)
+    row2loc[rows_used] = torch.arange(M, device=device)
+    li = row2loc[row_i]                                                         # [K]
+    lj = row2loc[row_j]                                                         # [K]
+
+    ci = topc[li]                         # [K, T]
+    wi = topw[li]
+    cj = topc[lj]                         # [K, T]
+    wj = topw[lj]
+
+    # soft same-class target y_ij = sum_c p_i(c) * p_j(c)
+    vi = ci >= 0
+    vj = cj >= 0
+    eq = (ci.unsqueeze(2) == cj.unsqueeze(1)) & vi.unsqueeze(2) & vj.unsqueeze(1)   # [K, T, T]
+    y = (eq * (wi.unsqueeze(2) * wj.unsqueeze(1))).sum(dim=(1, 2))                  # [K], in [0,1]
+
+    # logits from cosine similarity
+    sims = (z[row_i] * z[row_j]).sum(-1)                                            # [K]
+    logits = sims * scale
+    loss = F.binary_cross_entropy_with_logits(logits, y)
+
+    stats = {
+        "target_mean": float(y.mean().detach()),
+        "sim_pos_mean": float(sims[y > 0.5].mean().detach()) if (y > 0).any() else 0.0,
+        "sim_neg_mean": float(sims[y < 0.1].mean().detach()) if (y == 0).any() else 0.0,
+    }
+
+    return loss.to(z.dtype), stats
+

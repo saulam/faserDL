@@ -6,14 +6,13 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 1: masked autoencoder.
 """
 
-import math
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import timm.optim as optim_factory
 from utils import (
-    arrange_input, arrange_truth, csr_keep_rows_torch,
-    contrastive_with_ghost_shared, reconstruction_losses_masked_simple,
+    arrange_input, arrange_truth, csr_keep_rows_torch, 
+    pair_soft_overlap_bce, soft_ce_with_logits_csr, reconstruction_losses_masked_simple,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
 
@@ -113,50 +112,26 @@ class MAEPreTrainer(pl.LightningModule):
         csr_pdg: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         event_id: torch.Tensor,          # [N] int64
         ghost_mask: torch.Tensor,        # [N] bool
-        normalize: bool = True,
-        pushaway_weight: float = 0.05,
-        per_event_mean: bool = False,
     ):
         """
-        Computes both losses (same-track, same-primary, same-pid) in one call.
-        Assumes inputs are already masked/aligned (no ghosts/invisible hits).
+        Computes losses (same-track, same-primary, same-pid) in one call.
         """
-        # track
-        loss_trk, loss_trk_ghost = contrastive_with_ghost_shared(
-            z_trk, event_id, ghost_mask, *csr_trk, num_neg=16, pool_mult=3,
-            normalize=normalize, per_event_mean=per_event_mean,
-            temperature=0.10, temperature_ghost=0.18,
-        )
-
-        # primary
-        loss_pri, loss_pri_ghost = contrastive_with_ghost_shared(
-            z_pri, event_id, ghost_mask, *csr_pri, num_neg=12, pool_mult=2,
-            normalize=normalize, per_event_mean=per_event_mean,
-            temperature=0.14, temperature_ghost=0.20,
-        )
-
-        # pid
-        pid_event_id = torch.zeros_like(event_id)  # trick: pid loss across events
-        loss_pid, loss_pid_ghost = contrastive_with_ghost_shared(
-            z_pid, pid_event_id, ghost_mask, *csr_pdg, num_neg=5, pool_mult=1,
-            normalize=normalize, per_event_mean=per_event_mean,
-            temperature=0.25, temperature_ghost=0.35,
-        )
-
-        loss_trk_all = loss_trk + pushaway_weight * loss_trk_ghost
-        loss_pri_all = loss_pri + pushaway_weight * loss_pri_ghost
-        loss_pid_all = loss_pid + pushaway_weight * loss_pid_ghost
-
+        loss_trk, stats_trk = pair_soft_overlap_bce(z_trk, event_id, *csr_trk, ghost_mask)
+        loss_pri, stats_pri = pair_soft_overlap_bce(z_pri, event_id, *csr_pri, ghost_mask)
+        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pdg, ghost_mask)  # ghosts only supervised here
+        
         part_losses_enc = {
-            "trk/total": loss_trk_all.detach(), "trk/pos": loss_trk.detach(), "trk/ghost": loss_trk_ghost.detach(),
-            "pri/total": loss_pri_all.detach(), "pri/pos": loss_pri.detach(), "pri/ghost": loss_pri_ghost.detach(),
-            "pid/total": loss_pid_all.detach(), "pid/pos": loss_pid.detach(), "pid/ghost": loss_pid_ghost.detach(),
+            "trk/total": loss_trk.detach(), "trk/pos_sim": stats_trk["sim_pos_mean"], 
+                "trk/neg_sim": stats_trk["sim_neg_mean"], "trk/target": stats_trk["target_mean"],
+            "pri/total": loss_pri.detach(), "pri/pos_sim": stats_pri["sim_pos_mean"], 
+                "pri/neg_sim": stats_pri["sim_neg_mean"], "pri/target": stats_pri["target_mean"],
+            "pid/total": loss_pid.detach(),
         }
 
-        return loss_trk_all, loss_pri_all, loss_pid_all, part_losses_enc
+        return loss_trk, loss_pri, loss_pid, part_losses_enc
     
 
-    def compute_contrastive_losses(
+    def compute_relational_losses(
         self,
         pred_trk: torch.Tensor,
         pred_pri: torch.Tensor,
@@ -181,7 +156,7 @@ class MAEPreTrainer(pl.LightningModule):
         ghost = ghost_mask[raw_idx]
 
         loss_trk, loss_pri, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
-            z_track, z_primary, z_pid, csr_trk, csr_pri, csr_pdg, evt, ghost, normalize=True,
+            z_track, z_primary, z_pid, csr_trk, csr_pri, csr_pdg, evt, ghost,
         )
 
         return loss_trk, loss_pri, loss_pid, part_losses_enc
@@ -208,16 +183,7 @@ class MAEPreTrainer(pl.LightningModule):
             patch_shape=(p_h, p_w, p_d),
             dataset=self.dataset,
             preprocessing_input=self.preprocessing_input,
-            label_smoothing=getattr(self, "label_smoothing", 0.0),
-            focal_gamma=getattr(self, "focal_gamma", 1.5),
-            focal_alpha=getattr(self, "focal_alpha", None),
-            occ_dilate=getattr(self, "occ_dilate", 2),
-            huber_delta=getattr(self, "huber_delta", 1.0),
-            reg_weight_lam=getattr(self, "reg_weight_lam", 1.0),
-            reg_weight_alpha=getattr(self, "reg_weight_alpha", 0.5),
-            reg_weight_q0=getattr(self, "reg_weight_q0", None),
-            reg_weight_wmax=getattr(self, "reg_weight_wmax", None),
-            occ_empty_beta=getattr(self, "occ_empty_beta", 0.5),
+            label_smoothing=self.label_smoothing,
             per_event_mean=per_event_mean,
         )
         return loss_occ, loss_reg, part_losses_dec
@@ -231,7 +197,7 @@ class MAEPreTrainer(pl.LightningModule):
         pred_occ: torch.Tensor,
         pred_reg: torch.Tensor,
         targ_reg: torch.Tensor,
-        con_idx_targets: torch.Tensor,
+        rel_idx_targets: torch.Tensor,
         rec_idx_targets: torch.Tensor,
         csr_trk: torch.Tensor,
         csr_pri: torch.Tensor,
@@ -239,8 +205,8 @@ class MAEPreTrainer(pl.LightningModule):
         hit_event_id: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
-        loss_trk, loss_pri, loss_pid, part_enc = self.compute_contrastive_losses(
-            pred_trk, pred_pri, pred_pid, con_idx_targets, csr_trk, csr_pri, csr_pdg, hit_event_id, ghost_mask,
+        loss_trk, loss_pri, loss_pid, part_enc = self.compute_relational_losses(
+            pred_trk, pred_pri, pred_pid, rel_idx_targets, csr_trk, csr_pri, csr_pdg, hit_event_id, ghost_mask,
         )
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
             targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
@@ -269,7 +235,7 @@ class MAEPreTrainer(pl.LightningModule):
         csr_trk, csr_pri, csr_pdg, ghost_mask, hit_event_id = labels
 
         # Forward pass
-        pred_trk, pred_pri, pred_pid, pred_occ, pred_reg, con_idx_targets, rec_idx_targets, _, _, = self.forward(
+        pred_trk, pred_pri, pred_pid, pred_occ, pred_reg, rel_idx_targets, rec_idx_targets, _, _, = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
@@ -279,7 +245,7 @@ class MAEPreTrainer(pl.LightningModule):
             pred_occ=pred_occ,
             pred_reg=pred_reg,
             targ_reg=batch_input.features,
-            con_idx_targets=con_idx_targets,
+            rel_idx_targets=rel_idx_targets,
             rec_idx_targets=rec_idx_targets,
             csr_trk=csr_trk,
             csr_pri=csr_pri,

@@ -34,6 +34,7 @@ class MinkMAEViT(nn.Module):
         num_heads=16,
         num_modes=(16, 8),
         contrastive_embed_dim=64,
+        num_pdg_classes=6,
         decoder_embed_dim=192,
         decoder_num_heads=16,
         mlp_ratio=4.0,
@@ -158,16 +159,16 @@ class MinkMAEViT(nn.Module):
         ])
         self.latent_norm = norm_layer(embed_dim)
 
-        # Perceiver-IO decoder for contrastive and reconstruction (queries -> latents)
+        # Perceiver-IO decoder for relational and reconstruction (queries -> latents)
         self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim) # frozen sin-cos
         self.module_embed_dec = nn.Embedding(self.num_modules, decoder_embed_dim)
         self.query_tokens = nn.ParameterDict({
             name: nn.Parameter(torch.zeros(1, decoder_embed_dim))
-            for name in ["con", "rec"]
+            for name in ["rel", "rec"]
         })
         self.latents_to_dec = nn.ModuleDict({
             name: nn.Linear(embed_dim, decoder_embed_dim)
-            for name in ["con", "rec"]
+            for name in ["rel", "rec"]
         })
         self.decode_xattn_blocks = nn.ModuleDict({
             name: nn.ModuleList([
@@ -178,7 +179,7 @@ class MinkMAEViT(nn.Module):
                 )
                 for _ in range(io_decode_depth)
             ])
-        for name in ["con", "rec"]
+        for name in ["rel", "rec"]
         })
 
         # Heads
@@ -188,7 +189,7 @@ class MinkMAEViT(nn.Module):
                 decoder_embed_dim, self.sep_basis, H=num_modes[i], 
                 norm_layer=norm_layer, post_norm=True
             )
-            for i, name in enumerate(["con", "rec"])
+            for i, name in enumerate(["rel", "rec"])
         })
         self.pre_heads_con = nn.Sequential(
             nn.Linear(num_modes[0], 3*contrastive_embed_dim),
@@ -198,7 +199,10 @@ class MinkMAEViT(nn.Module):
             name: (
                 nn.Sequential(
                     nn.Linear(contrastive_embed_dim, contrastive_embed_dim),
-                ) if name in {"trk", "pri", "pid"} else
+                ) if name in {"trk", "pri"} else
+                nn.Sequential(
+                    nn.Linear(num_modes[0], num_pdg_classes + 1),
+                ) if name == "pid" else
                 nn.Sequential(
                     nn.Linear(num_modes[1], self.in_chans if name=="reg" else 1),
                 )
@@ -566,7 +570,7 @@ class MinkMAEViT(nn.Module):
         return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
     
 
-    def forward_contrastive(self, latents, attn_mask_keep, ids_keep, idx_map):
+    def forward_relational(self, latents, attn_mask_keep, ids_keep, idx_map):
         """
         latents:        [B, K, Cenc]
         attn_mask_keep: [B, M, Lk]
@@ -589,7 +593,7 @@ class MinkMAEViT(nn.Module):
         # build queries for all selected positions
         q = ( self.decoder_intra_pos_embed(l_intra) +
               self.module_embed_dec(m_ids) +
-              self.query_tokens["con"] )                                   # [Nk, Cdec]
+              self.query_tokens["rel"] )                                   # [Nk, Cdec]
 
         # pack by batch into [B, max_n, Cdec] using one-hot cumsum trick
         within = self._compute_within_ranks(b_ids, Nk)
@@ -597,14 +601,14 @@ class MinkMAEViT(nn.Module):
         Q[b_ids, within] = q                                               # place queries by (b, rank)
 
         # decode with latents
-        KV = self.latents_to_dec["con"](latents)                           # [B, K, Cdec]
+        KV = self.latents_to_dec["rel"](latents)                           # [B, K, Cdec]
         X  = Q
-        for blk in self.decode_xattn_blocks["con"]:
+        for blk in self.decode_xattn_blocks["rel"]:
             X = blk(X, KV, attn_mask=None)
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
         # heads
-        shared              = self.shared_voxel_head["con"](out_flat)      # [Nk, P, H]
+        shared              = self.shared_voxel_head["rel"](out_flat)      # [Nk, P, H]
         shared              = self.pre_heads_con(shared)                   # [Nk, P, 3*E]
         h_trk, h_pri, h_pid = shared.chunk(3, dim=-1)
         pred_trk            = self.heads["trk"](h_trk)                     # [Nk, P, E]
@@ -669,11 +673,11 @@ class MinkMAEViT(nn.Module):
     def forward(self, x, x_glob, mask_ratio=0.75):
         idx_map = self.build_patch_occupancy_map(x)
 
-        # Contrastive path
+        # Relational path
         lat_full, _, _, attn_mask_full, ids_full = \
             self.forward_encoder(x, x_glob, mask_ratio=0.0)
-        pred_trk, pred_pri, pred_pid, con_idx_targets = \
-            self.forward_contrastive(lat_full, attn_mask_full, ids_full, idx_map)
+        pred_trk, pred_pri, pred_pid, rel_idx_targets = \
+            self.forward_relational(lat_full, attn_mask_full, ids_full, idx_map)
 
         # Reconstruction path
         lat_masked, rand_mask, attn_mask_masked, _, _ = \
@@ -683,7 +687,7 @@ class MinkMAEViT(nn.Module):
 
         return (
             pred_trk, pred_pri, pred_pid,
-            pred_occ, pred_reg, con_idx_targets, rec_idx_targets,
+            pred_occ, pred_reg, rel_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )
     
@@ -695,7 +699,7 @@ class MinkMAEViT(nn.Module):
         - intra_vit (pos-emb, module token/emb, blocks, norm)
         - perceiver_encoder (global encoder, global_mem, cross/self blocks, norm)
         - perceiver_decoder (dec pos-emb, module emb, query tokens, latents_to_dec, cross blocks)
-        - heads_contrastive
+        - heads_relational
         - heads_reconstruction
         - TOTAL
         """
@@ -774,14 +778,14 @@ class MinkMAEViT(nn.Module):
         if hasattr(self, "decode_xattn_blocks"):     dec_list.append(self.decode_xattn_blocks)
         groups["perceiver_decoder"] = dec_list
 
-        # --- Heads: contrastive ---
-        heads_con = []
-        if hasattr(self, "shared_voxel_head") and ("con" in getattr(self, "shared_voxel_head")):
-            heads_con.append(self.shared_voxel_head["con"])
-        if hasattr(self, "track_head"):    heads_con.append(self.track_head)
-        if hasattr(self, "primary_head"):  heads_con.append(self.primary_head)
-        if hasattr(self, "pid_head"):      heads_con.append(self.pid_head)
-        groups["heads_contrastive"] = [m for m in heads_con if m is not None]
+        # --- Heads: relational ---
+        heads_rel = []
+        if hasattr(self, "shared_voxel_head") and ("rel" in getattr(self, "shared_voxel_head")):
+            heads_rel.append(self.shared_voxel_head["rel"])
+        if hasattr(self, "track_head"):    heads_rel.append(self.track_head)
+        if hasattr(self, "primary_head"):  heads_rel.append(self.primary_head)
+        if hasattr(self, "pid_head"):      heads_rel.append(self.pid_head)
+        groups["heads_relational"] = [m for m in heads_rel if m is not None]
 
         # --- Heads: reconstruction ---
         heads_rec = []
