@@ -1348,7 +1348,7 @@ def pair_soft_overlap_bce(
         w_pad = torch.where(keep_edge, w_pad, torch.zeros_like(w_pad))
         c_pad = torch.where(keep_edge, c_pad, c_pad.new_full(c_pad.shape, -1))
 
-    # top-K and renorm
+    # top-K
     T = int(topk_T)
     k = min(T, Lmax)
     topw = torch.zeros((M, T), dtype=w.dtype, device=device)
@@ -1357,13 +1357,6 @@ def pair_soft_overlap_bce(
         vals, idxs = torch.topk(w_pad, k=k, dim=1)
         topw[:, :k] = vals
         topc[:, :k] = torch.gather(c_pad, 1, idxs)
-
-    # drop pairs where a row lost all mass after masking+Top-K
-    denom = topw.sum(dim=1, keepdim=True)
-    row_has_mass = (denom.squeeze(1) > 0)
-    if not row_has_mass.any():
-        return z.new_zeros(()), {"pairs": 0}
-    topw = topw / denom.clamp_min(1e-12)
 
     row2loc = torch.full((N,), -1, dtype=torch.long, device=device)
     row2loc[rows_used] = torch.arange(M, device=device)
@@ -1387,6 +1380,7 @@ def pair_soft_overlap_bce(
 
     # logits from cosine similarity (NO bias)
     sims = (z32[row_i] * z32[row_j]).sum(-1)
+
     logits = sims * logit_scale + logit_bias
 
     if rebalance:
@@ -1408,3 +1402,27 @@ def pair_soft_overlap_bce(
         "sim_neg_mean": float(sims[y < 0.1].mean().detach()) if (y < 0.1).any() else 0.0,
     }
     return loss.to(z.dtype), stats
+
+
+@torch.no_grad()
+def solve_bias_for_batch(sims, y, logit_scale=10.0, w_pair=None, iters=8):
+    # effective weights (normalize to mean 1 for stability)
+    if w_pair is None:
+        w = torch.ones_like(y)
+    else:
+        w = w_pair
+        w = w / w.mean().clamp_min(1e-12)
+
+    # good starting guess (your formula)
+    p = y.mean().clamp(1e-4, 1-1e-4)
+    s = sims  # already computed for the same pairs
+    b = torch.logit(p) - float(logit_scale) * s.mean()
+
+    # Newton iterations: solve E[w*(sigmoid(scale*s + b) - y)] = 0
+    for _ in range(iters):
+        z = logit_scale * s + b
+        p_hat = torch.sigmoid(z)
+        f = (w * (p_hat - y)).mean()                      # gradient wrt bias
+        g = (w * (p_hat * (1 - p_hat))).mean().clamp_min(1e-8)  # curvature
+        b = b - f / g
+    return b

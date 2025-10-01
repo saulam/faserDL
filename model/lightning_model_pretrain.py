@@ -49,8 +49,8 @@ class MAEPreTrainer(pl.LightningModule):
         }
 
         # Logit weights
-        self.logit_bias_trk = torch.nn.Parameter(torch.tensor(-4.846))
-        self.logit_bias_pri = torch.nn.Parameter(torch.tensor(-0.979))
+        self.logit_bias_trk = torch.nn.Parameter(torch.tensor(-3.0))
+        self.logit_bias_pri = torch.nn.Parameter(torch.tensor(-1.25))
         self.logit_scale_trk = torch.nn.Parameter(torch.tensor(10.0))
         self.logit_scale_pri = torch.nn.Parameter(torch.tensor(10.0))
         self._logit_params = {

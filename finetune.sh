@@ -34,7 +34,7 @@ save_top_k=1
 checkpoint_path="checkpoints_final"
 checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v39"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_clariden_final_v1/loss_total_val/epoch=116-step=42120.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_clariden_final_v1/loss_total_val/epoch=180-step=65160.ckpt"
 gpus=(0 1)
 
 python -m train.finetune \
