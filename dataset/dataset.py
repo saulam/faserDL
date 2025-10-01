@@ -398,7 +398,7 @@ class SparseFASERCALDataset(Dataset):
                 true_index=true_index,
                 link_weight=link_weight,
                 ghost_mask=ghost_mask,
-                weight_threshold=0.0,
+                weight_threshold=0.05,
             )
             csr_trk = csr["trk"][:3]
             csr_pri = csr["pri"][:3]

@@ -1239,71 +1239,114 @@ def soft_ce_with_logits_csr(
 
 
 def pair_soft_overlap_bce(
-    z,                                 # [N, D] embeddings (already aligned to CSR rows)
-    event_id,                          # [N] int64
-    indptr, cls, w,                    # CSR rows->classes with weights, len(indptr)=N+1
-    ghost_mask=None,                   # [N] bool (optional)
-    topk_T=4,                          # keep top-T classes per *used* row
-    pairs_per_batch=8192,              # number of intra-event pairs
+    z, event_id, indptr, cls, w,
+    ghost_mask=None,
+    topk_T=8,
+    pairs_per_batch=8192,
+    min_group_size=5,
     scale=10.0,
     normalize=True,
+    rebalance=True,
 ):
     device = z.device
     N, D = z.shape
-    if N == 0: return z.new_zeros(()), {"pairs": 0}
-    if normalize: z = F.normalize(z, dim=-1, eps=1e-6)
+    if N == 0:
+        return z.new_zeros(()), {"pairs": 0}
 
-    # valid rows (optionally drop ghosts)
-    valid = torch.ones(N, dtype=torch.bool, device=device)
-    if ghost_mask is not None: valid &= ~ghost_mask.bool()
-    if valid.sum() < 2: return z.new_zeros(()), {"pairs": 0}
+    # fp32 normalize for numeric stability
+    z32 = F.normalize(z.float(), dim=-1, eps=1e-6) if normalize else z.float()
 
-    # sort by event and sample intra-event pairs
-    e_valid = event_id[valid].to(torch.long)
-    order = torch.argsort(e_valid)
-    e_sorted = e_valid[order]
+    # keep only rows with labels (and non-ghost)
+    has_edge = (indptr[1:] > indptr[:-1])
+    valid = has_edge.clone()
+    if ghost_mask is not None:
+        valid &= ~ghost_mask.bool()
+
+    if min_group_size > 1 and has_edge.any():
+        # Build per-edge row id
+        row_ids = torch.arange(N, device=device)
+        nnz_per_row = (indptr[1:] - indptr[:-1])
+        edge_row = torch.repeat_interleave(row_ids, nnz_per_row)            # [L]
+        # Map each edge to its event and class
+        edge_event = event_id[edge_row].to(torch.long)                      # [L]
+        edge_cls   = cls.to(torch.long)                                     # [L]
+
+        # Count occurrences per (event, class)
+        pairs = torch.stack([edge_event, edge_cls], dim=1)                  # [L,2]
+        _, inverse, counts = torch.unique(pairs, dim=0,
+                                          return_inverse=True, return_counts=True)
+        edge_group_count = counts[inverse]                                  # [L]
+
+        # Mark rows that have ANY edge from a large-enough group
+        edge_is_large = (edge_group_count >= int(min_group_size)).to(torch.int32)
+        row_large_sum = torch.zeros(N, dtype=torch.int32, device=device)
+        row_large_sum.index_put_((edge_row,), edge_is_large, accumulate=True)
+        row_has_large = row_large_sum > 0
+        valid &= row_has_large
+
+    if valid.sum() < 2:
+        return z.new_zeros(()), {"pairs": 0}
+
+    # sort by event & build segments
+    e = event_id[valid].long()
+    order = torch.argsort(e)
+    e_sorted = e[order]
     rows_sorted = torch.nonzero(valid, as_tuple=False).squeeze(1)[order]  # global row ids in sorted order
     Rtot = rows_sorted.numel()
 
     first = torch.ones_like(e_sorted, dtype=torch.bool)
     first[1:] = e_sorted[1:] != e_sorted[:-1]
-    starts = torch.nonzero(first, as_tuple=False).squeeze(1)                  # [E]
-    lens = torch.diff(torch.cat([starts, e_sorted.new_tensor([Rtot])]))       # [E]
-    if starts.numel() == 0: return z.new_zeros(()), {"pairs": 0}
+    starts = torch.nonzero(first, as_tuple=False).squeeze(1)                 # [E]
+    if starts.numel() == 0:
+        return z.new_zeros(()), {"pairs": 0}
+    lens = torch.diff(torch.cat([starts, e_sorted.new_tensor([Rtot])]))      # [E]
 
+    # sample anchors only from events with >= 2 rows
     seg_id = torch.repeat_interleave(torch.arange(starts.numel(), device=device), lens)  # [Rtot]
+    good_ev = (lens >= 2)
+    if not good_ev.any():
+        return z.new_zeros(()), {"pairs": 0}
+    mask_rows_ok = good_ev[seg_id]
+    rows_ok = torch.nonzero(mask_rows_ok, as_tuple=False).squeeze(1)         # positions in rows_sorted
 
-    K = int(min(pairs_per_batch, Rtot))
-    anchor_pos = torch.randint(Rtot, (K,), device=device)                  # [K]
-    ev_idx = seg_id[anchor_pos]                                                           # [K]
-    ev_start = starts[ev_idx]                                                             # [K]
-    ev_len = lens[ev_idx]                                                                 # [K]
-    offs = torch.randint(ev_len.max().item(), (K,), device=device) % ev_len
-    mate_pos = ev_start + offs
-    same = mate_pos == anchor_pos
-    mate_pos = torch.where(same, ev_start + ((offs + 1) % ev_len), mate_pos)
+    K = int(min(int(pairs_per_batch), rows_ok.numel()))
+    if K == 0:
+        return z.new_zeros(()), {"pairs": 0}
 
-    row_i = rows_sorted[anchor_pos]  # global row ids (in [0..N-1])
-    row_j = rows_sorted[mate_pos]
+    perm = torch.randperm(rows_ok.numel(), device=device)[:K]
+    anchor_pos = rows_ok[perm]
 
-    # compute top-T (class, weight) ONLY for rows used in pairs (fully vectorized)
-    rows_used = torch.unique(torch.cat([row_i, row_j], 0))                      # [M]
+    ev_idx   = seg_id[anchor_pos]
+    ev_start = starts[ev_idx]                       # [K]
+    ev_len   = lens[ev_idx]                         # [K]  (>=2)
+
+    # unbiased, per-event mates; ensure mate != anchor
+    offs = torch.floor(torch.rand_like(ev_len.float()) * ev_len.float()).to(torch.long)  # [K]
+    anchor_rel = anchor_pos - ev_start                                                   # [K]
+    same = (offs == anchor_rel)
+    offs = (offs + same.long()) % ev_len
+    mate_pos = ev_start + offs                                                           # [K]
+
+    row_i = rows_sorted[anchor_pos]  # [K] global row ids
+    row_j = rows_sorted[mate_pos]    # [K] global row ids
+
+    # build Top-K per *used* row (classes, weights)
+    rows_used = torch.unique(torch.cat([row_i, row_j], 0))
     M = rows_used.numel()
-    if M == 0: return z.new_zeros(()), {"pairs": 0}
-    T = int(topk_T)
+    if M == 0:
+        return z.new_zeros(()), {"pairs": 0}
 
-    # per-row edge starts, lengths, and a padded edge-index grid
-    start_r = indptr[rows_used]                                                 # [M]
+    start_r = indptr[rows_used]
     end_r   = indptr[rows_used + 1]
-    len_r   = end_r - start_r                                                   # [M]
+    len_r   = end_r - start_r
     Lmax = int(len_r.max().item())
-    if Lmax == 0: return z.new_zeros(()), {"pairs": 0}
+    if Lmax == 0:
+        return z.new_zeros(()), {"pairs": 0}
 
-    ar = torch.arange(Lmax, device=device).unsqueeze(0)                         # [1, Lmax]
-    valid_cols = ar < len_r.unsqueeze(1)                                        # [M, Lmax]
-    edge_idx = (start_r.unsqueeze(1) + ar).clamp_max(indptr[-1] - 1)            # [M, Lmax]
+    ar = torch.arange(Lmax, device=device).unsqueeze(0)
+    valid_cols = ar < len_r.unsqueeze(1)
+    edge_idx = (start_r.unsqueeze(1) + ar).clamp_max(int(indptr[-1].item()) - 1)
 
-    # gather padded class ids & weights, masked where invalid
     c_pad = torch.full((M, Lmax), -1, dtype=cls.dtype, device=device)
     w_pad = torch.zeros((M, Lmax), dtype=w.dtype, device=device)
     flat_sel = valid_cols.view(-1)
@@ -1311,7 +1354,18 @@ def pair_soft_overlap_bce(
         c_pad.view(-1)[flat_sel] = cls[edge_idx.view(-1)[flat_sel]]
         w_pad.view(-1)[flat_sel] = w[edge_idx.view(-1)[flat_sel]]
 
-    # per-row topk by weight
+    if min_group_size > 1:
+        keep_edge = torch.zeros_like(valid_cols)
+        edge_counts_full = torch.zeros(int(indptr[-1].item()), dtype=torch.long, device=device)
+        # Only fill the edges that exist
+        edge_counts_full.index_copy_(0, torch.arange(edge_group_count.numel(), device=device), edge_group_count)
+        # keep if count >= threshold
+        keep_edge = valid_cols & (edge_counts_full[edge_idx] >= int(min_group_size))
+        # mask out small groups
+        w_pad = torch.where(keep_edge, w_pad, torch.zeros_like(w_pad))
+        c_pad = torch.where(keep_edge, c_pad, c_pad.new_full((), -1))
+
+    T = int(topk_T)
     k = min(T, Lmax)
     topw = torch.zeros((M, T), dtype=w.dtype, device=device)
     topc = torch.full((M, T), -1, dtype=cls.dtype, device=device)
@@ -1319,36 +1373,48 @@ def pair_soft_overlap_bce(
         vals, idxs = torch.topk(w_pad, k=k, dim=1)
         topw[:, :k] = vals
         topc[:, :k] = torch.gather(c_pad, 1, idxs)
-    # renormalize per row
-    topw = topw / topw.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+    # renormalize per row over the kept entries
+    denom = topw.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    topw = topw / denom
 
     # map global row id -> local used-row index
     row2loc = torch.full((N,), -1, dtype=torch.long, device=device)
     row2loc[rows_used] = torch.arange(M, device=device)
-    li = row2loc[row_i]                                                         # [K]
-    lj = row2loc[row_j]                                                         # [K]
-
-    ci = topc[li]                         # [K, T]
-    wi = topw[li]
-    cj = topc[lj]                         # [K, T]
-    wj = topw[lj]
+    li = row2loc[row_i]; lj = row2loc[row_j]
+    ci, wi = topc[li], topw[li]    # [K, T], [K, T]
+    cj, wj = topc[lj], topw[lj]    # [K, T], [K, T]
 
     # soft same-class target y_ij = sum_c p_i(c) * p_j(c)
-    vi = ci >= 0
-    vj = cj >= 0
+    vi, vj = (ci >= 0), (cj >= 0)
     eq = (ci.unsqueeze(2) == cj.unsqueeze(1)) & vi.unsqueeze(2) & vj.unsqueeze(1)   # [K, T, T]
-    y = (eq * (wi.unsqueeze(2) * wj.unsqueeze(1))).sum(dim=(1, 2))                  # [K], in [0,1]
+    y = (eq * (wi.unsqueeze(2) * wj.unsqueeze(1))).sum(dim=(1, 2)).float()          # [K] in [0,1]
 
-    # logits from cosine similarity
-    sims = (z[row_i] * z[row_j]).sum(-1)                                            # [K]
-    logits = sims * scale
-    loss = F.binary_cross_entropy_with_logits(logits, y)
+    # logits from cosine similarity (no bias; you asked to keep it simple)
+    sims = (z32[row_i] * z32[row_j]).sum(-1)                                        # [K]
+    logits = sims * float(scale)
+
+    # bias towards prior class freq
+    p_prior = y.detach().mean().clamp(1e-4, 1 - 1e-4)
+    bias = torch.log(p_prior / (1 - p_prior))
+    logits = logits - bias
+
+    if rebalance:
+        # class-weighting to counter skew: positives get weight ~ (1-p)/p
+        p = y.detach().mean().clamp_(1e-4, 1 - 1e-4)                                # scalar
+        pos_w = (1 - p) / p
+        w_pair = pos_w * y + (1 - y)                                                # soft weighting
+        w_pair = w_pair / (pos_w * p + (1 - p))                                     # keep mean weight ~ 1
+        bce = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
+        loss = (bce * w_pair).mean()
+
+    else:
+        loss = F.binary_cross_entropy_with_logits(logits, y)
 
     stats = {
+        "pairs": int(y.numel()),
         "target_mean": float(y.mean().detach()),
-        "sim_pos_mean": float(sims[y > 0.5].mean().detach()) if (y > 0).any() else 0.0,
-        "sim_neg_mean": float(sims[y < 0.1].mean().detach()) if (y == 0).any() else 0.0,
+        "sim_pos_mean": float(sims[y > 0.5].mean().detach()) if (y > 0.5).any() else 0.0,
+        "sim_neg_mean": float(sims[y < 0.1].mean().detach()) if (y < 0.1).any() else 0.0,
     }
-
     return loss.to(z.dtype), stats
-
