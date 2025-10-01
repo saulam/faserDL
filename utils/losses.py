@@ -7,7 +7,6 @@ Description:
     Custom loss functions.
 """
 
-import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -757,7 +756,6 @@ def contrastive_with_ghost_shared(
     normalize: bool = True,
     min_class_size: float = 10.0,
     temperature: float = 0.07,
-    per_event_mean: bool = False,
     detach_prototypes: bool = True,
 ):
     if z.numel() == 0 or num_neg <= 0:
@@ -845,13 +843,10 @@ def contrastive_with_ghost_shared(
     if normalize:
         P_mean = F.normalize(P_mean, dim=-1, eps=1e-6)
 
-    # ============================================================
-    # REAL LOSS (edge-weighted)
-    # ============================================================
     g_edge = inv_group_edge
     edge_ok = group_ok[g_edge] & (~ghost_mask.bool()[rows])
     if not torch.any(edge_ok):
-        loss_real = z.new_zeros(())
+        loss = z.new_zeros(())
     else:
         rows_e  = rows[edge_ok]                     # [M]
         gids_e  = g_edge[edge_ok]                   # [M]
@@ -864,7 +859,7 @@ def contrastive_with_ghost_shared(
             rows_e[valid_event], gids_e[valid_event], w_e[valid_event], eidx_e[valid_event], local_e[valid_event]
 
         if rows_e.numel() == 0:
-            loss_real = z.new_zeros(())
+            loss = z.new_zeros(())
         else:
             cnt_e = cnt_vec[gids_e].to(z.dtype)
             denom = (cnt_e - w_e).clamp_min(1e-12)
@@ -914,7 +909,7 @@ def contrastive_with_ghost_shared(
             allowed_count_max = int(allowed_count.max().item())
 
             if maxU == 0 or allowed_count_max == 0:
-                loss_real = z.new_zeros(())
+                loss = z.new_zeros(())
             elif allowed_count_max <= num_neg:
                 # ALL negatives (fast path). Clamp local indices per row to [0, Ue-1]
                 max_local = (Ue - 1).clamp_min(0).unsqueeze(1)            # [M,1]
@@ -965,19 +960,15 @@ def contrastive_with_ghost_shared(
                     reduction='none'
                 ) * w_e.to(logits32.dtype)
 
-            if per_event_mean:
-                E = int(Pidx["counts"].numel())
-                loss_real = _segment_mean_from_contiguous_idx_det(per_edge.to(z.dtype), eidx_e, E)
-            else:
-                # Average over anchors that contribute any edge
-                per_row_sum = torch.zeros(z.size(0), dtype=per_edge.dtype, device=device)
-                per_row_sum.index_add_(0, rows_e, per_edge)
-                row_mask = torch.zeros(z.size(0), dtype=torch.bool, device=device)
-                row_mask[rows_e] = True
-                denom_rows = row_mask.to(per_edge.dtype).sum().clamp_min(1)
-                loss_real = (per_row_sum[row_mask].sum() / denom_rows).to(z.dtype)
+            # Average over anchors that contribute any edge
+            per_row_sum = torch.zeros(z.size(0), dtype=per_edge.dtype, device=device)
+            per_row_sum.index_add_(0, rows_e, per_edge)
+            row_mask = torch.zeros(z.size(0), dtype=torch.bool, device=device)
+            row_mask[rows_e] = True
+            denom_rows = row_mask.to(per_edge.dtype).sum().clamp_min(1)
+            loss = (per_row_sum[row_mask].sum() / denom_rows).to(z.dtype)
 
-    return loss_real
+    return loss
 
 
 def occ_supervision_mask(
@@ -1244,9 +1235,10 @@ def pair_soft_overlap_bce(
     topk_T=8,
     pairs_per_batch=8192,
     min_group_size=5,
-    scale=10.0,
     normalize=True,
     rebalance=True,
+    logit_bias=0.0,
+    logit_scale=10.0,
 ):
     device = z.device
     N, D = z.shape
@@ -1395,7 +1387,7 @@ def pair_soft_overlap_bce(
 
     # logits from cosine similarity (NO bias)
     sims = (z32[row_i] * z32[row_j]).sum(-1)
-    logits = sims * float(scale)
+    logits = sims * logit_scale + logit_bias
 
     if rebalance:
         # class-weighting via batch prior

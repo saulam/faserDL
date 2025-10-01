@@ -48,6 +48,18 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": self.log_sigma_reg,
         }
 
+        # Logit weights
+        self.logit_bias_trk = torch.nn.Parameter(torch.tensor(-4.846))
+        self.logit_bias_pri = torch.nn.Parameter(torch.tensor(-0.979))
+        self.logit_scale_trk = torch.nn.Parameter(torch.tensor(10.0))
+        self.logit_scale_pri = torch.nn.Parameter(torch.tensor(10.0))
+        self._logit_params = {
+            "trk_bias": self.logit_bias_trk,
+            "pri_bias": self.logit_bias_pri,
+            "trk_scale": self.logit_scale_trk,
+            "pri_scale": self.logit_scale_pri,
+        }
+
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         return move_obj(batch, device)
@@ -116,8 +128,14 @@ class MAEPreTrainer(pl.LightningModule):
         """
         Computes losses (same-track, same-primary, same-pid) in one call.
         """
-        loss_trk, stats_trk = pair_soft_overlap_bce(z_trk, event_id, *csr_trk, ghost_mask)
-        loss_pri, stats_pri = pair_soft_overlap_bce(z_pri, event_id, *csr_pri, ghost_mask)
+        loss_trk, stats_trk = pair_soft_overlap_bce(
+            z_trk, event_id, *csr_trk, ghost_mask, 
+            logit_bias=self.logit_bias_trk, logit_scale=self.logit_scale_trk
+            )
+        loss_pri, stats_pri = pair_soft_overlap_bce(
+            z_pri, event_id, *csr_pri, ghost_mask, 
+            logit_bias=self.logit_bias_pri, logit_scale=self.logit_scale_pri
+        )
         loss_pid = soft_ce_with_logits_csr(z_pid, csr_pdg, ghost_mask)  # ghosts only supervised here
         
         part_losses_enc = {
@@ -293,6 +311,19 @@ class MAEPreTrainer(pl.LightningModule):
                 sync_dist=True
             )
 
+        # log the logit scales
+        for key, logit_param in self._logit_params.items():
+            logit_value = logit_param.detach()
+            self.log(
+                f'logit/{key}',
+                logit_value,
+                batch_size=batch_size,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True
+            )
+
         return loss
 
 
@@ -328,7 +359,7 @@ class MAEPreTrainer(pl.LightningModule):
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
-            'params': list(self._uncertainty_params.values()),
+            'params': list(self._uncertainty_params.values()) + list(self._logit_params.values()),
             'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })
