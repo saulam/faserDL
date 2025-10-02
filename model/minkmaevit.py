@@ -33,7 +33,6 @@ class MinkMAEViT(nn.Module):
         io_decode_depth=4,
         num_heads=16,
         num_modes=(16, 8),
-        relational_hidden_dim=64,
         num_pdg_classes=6,
         decoder_embed_dim=192,
         decoder_num_heads=16,
@@ -191,23 +190,19 @@ class MinkMAEViT(nn.Module):
             )
             for i, name in enumerate(["rel", "rec"])
         })
-        self.pre_heads_rel = nn.Sequential(
-            nn.Linear(num_modes[0], 3*relational_hidden_dim),
-            nn.GELU(),
-        )
         self.heads = nn.ModuleDict({
             name: (
                 nn.Sequential(
-                    nn.Linear(relational_hidden_dim, relational_hidden_dim),
-                ) if name in {"trk", "pri"} else
+                    nn.Linear(num_modes[0], 3),
+                ) if name in {"pri"} else
                 nn.Sequential(
-                    nn.Linear(relational_hidden_dim, num_pdg_classes + 1),
+                    nn.Linear(num_modes[0], num_pdg_classes + 1),
                 ) if name == "pid" else
                 nn.Sequential(
                     nn.Linear(num_modes[1], self.in_chans if name=="reg" else 1),
                 )
             )
-            for name in ["trk", "pri", "pid", "occ", "reg"]
+            for name in ["pri", "pid", "occ", "reg"]
         })
 
         self.initialize_weights()
@@ -609,16 +604,14 @@ class MinkMAEViT(nn.Module):
 
         # heads
         shared              = self.shared_voxel_head["rel"](out_flat)      # [Nk, P, H]
-        h_trk, h_pri, h_pid = self.pre_heads_rel(shared).chunk(3, dim=-1)  # [Nk, P, E] each
-        pred_trk            = self.heads["trk"](h_trk)                     # [Nk, P, E]
-        pred_pri            = self.heads["pri"](h_pri)                     # [Nk, P, E]
-        pred_pid            = self.heads["pid"](h_pid)                     # [Nk, P, E]
+        pred_pri            = self.heads["pri"](shared)                    # [Nk, P, E]
+        pred_pid            = self.heads["pid"](shared)                    # [Nk, P, E]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
         idx_targets_kept = idx_map[b_ids, patch_ids]                       # [Nk, P]
 
-        return pred_trk, pred_pri, pred_pid, idx_targets_kept
+        return pred_pri, pred_pid, idx_targets_kept
 
 
     def forward_reconstruction(self, latents, attn_mask_mod, rand_mask, idx_map):
@@ -675,7 +668,7 @@ class MinkMAEViT(nn.Module):
         # Relational path
         lat_full, _, _, attn_mask_full, ids_full = \
             self.forward_encoder(x, x_glob, mask_ratio=0.0)
-        pred_trk, pred_pri, pred_pid, rel_idx_targets = \
+        pred_pri, pred_pid, rel_idx_targets = \
             self.forward_relational(lat_full, attn_mask_full, ids_full, idx_map)
 
         # Reconstruction path
@@ -685,7 +678,7 @@ class MinkMAEViT(nn.Module):
             self.forward_reconstruction(lat_masked, attn_mask_masked, rand_mask, idx_map)
 
         return (
-            pred_trk, pred_pri, pred_pid,
+            pred_pri, pred_pid,
             pred_occ, pred_reg, rel_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )
@@ -719,7 +712,7 @@ class MinkMAEViT(nn.Module):
             if isinstance(obj, (list, tuple, set)):
                 for o in obj:
                     yield from _iter_params(o)
-                return
+                return 
             if isinstance(obj, dict):
                 for o in obj.values():
                     yield from _iter_params(o)
@@ -820,8 +813,7 @@ def mae_vit_tiny(**kwargs):
         embed_dim=528, patch_size=(12, 12, 10),
         depth=4, num_heads=12, num_global_tokens=1,
         io_depth=8, io_decode_depth=4, num_module_cls=2,
-        num_modes=(32, 8), relational_hidden_dim=32,
-        decoder_embed_dim=384, decoder_num_heads=12,
+        num_modes=(32, 8), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model
@@ -833,8 +825,7 @@ def mae_vit_base(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=4, num_heads=12, num_global_tokens=1,
         io_depth=8, io_decode_depth=5, num_module_cls=2,
-        num_modes=(48, 8), relational_hidden_dim=32,
-        decoder_embed_dim=528, decoder_num_heads=12,
+        num_modes=(48, 8), decoder_embed_dim=528, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model
@@ -846,8 +837,7 @@ def mae_vit_large(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=8, num_heads=12, num_global_tokens=2,
         io_depth=16, io_decode_depth=10, num_module_cls=4,
-        num_modes=(64, 12), relational_hidden_dim=64,
-        decoder_embed_dim=528, decoder_num_heads=16,
+        num_modes=(64, 12), decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model
@@ -859,8 +849,7 @@ def mae_vit_huge(**kwargs):
         embed_dim=768, patch_size=(16, 16, 4),
         depth=16, num_heads=12, num_global_tokens=4,
         io_depth=32, io_decode_depth=15, num_module_cls=4,
-        num_modes=(64, 16), relational_hidden_dim=128,
-        decoder_embed_dim=528, decoder_num_heads=16,
+        num_modes=(64, 16), decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     return model

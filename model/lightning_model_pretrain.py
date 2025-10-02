@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 import timm.optim as optim_factory
 from utils import (
     arrange_input, arrange_truth, csr_keep_rows_torch, 
-    pair_soft_overlap_bce, soft_ce_with_logits_csr, reconstruction_losses_masked_simple,
+    count_ce_loss, soft_ce_with_logits_csr, reconstruction_losses_masked_simple,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
 
@@ -35,29 +35,15 @@ class MAEPreTrainer(pl.LightningModule):
         self.label_smoothing = args.label_smoothing
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
-        self.log_sigma_trk = nn.Parameter(torch.zeros(()))
         self.log_sigma_pri = nn.Parameter(torch.zeros(()))
         self.log_sigma_pid = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
-            "trk": self.log_sigma_trk,
             "pri": self.log_sigma_pri,
             "pid": self.log_sigma_pid,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
-        }
-
-        # Logit weights
-        self.logit_bias_trk = torch.nn.Parameter(torch.tensor(-3.0))
-        self.logit_bias_pri = torch.nn.Parameter(torch.tensor(-1.25))
-        self.logit_scale_trk = torch.nn.Parameter(torch.tensor(10.0))
-        self.logit_scale_pri = torch.nn.Parameter(torch.tensor(10.0))
-        self._logit_params = {
-            "trk_bias": self.logit_bias_trk,
-            "pri_bias": self.logit_bias_pri,
-            "trk_scale": self.logit_scale_trk,
-            "pri_scale": self.logit_scale_pri,
         }
 
 
@@ -94,13 +80,12 @@ class MAEPreTrainer(pl.LightningModule):
     def _arrange_batch(self, batch):
         batch_input, *global_params = arrange_input(batch)
         labels = arrange_truth(batch)
-        csr_trk = labels['csr_trk_indptr'], labels['csr_trk_ids'], labels['csr_trk_weights']
         csr_pri = labels['csr_pri_indptr'], labels['csr_pri_ids'], labels['csr_pri_weights']
         csr_pdg = labels['csr_pdg_indptr'], labels['csr_pdg_ids'], labels['csr_pdg_weights']
         ghost_mask = labels['ghost_mask']
         hit_event_id = labels['hit_event_id']
 
-        return batch_input, *global_params, (csr_trk, csr_pri, csr_pdg, ghost_mask, hit_event_id)
+        return batch_input, *global_params, (csr_pri, csr_pdg, ghost_mask, hit_event_id)
 
 
     def mask_and_align_voxels(self, idx_targets):
@@ -116,68 +101,49 @@ class MAEPreTrainer(pl.LightningModule):
 
     def metric_losses_masked_simple(
         self,
-        z_trk: torch.Tensor,             # [N, Dt]
         z_pri: torch.Tensor,             # [N, Dp]
         z_pid: torch.Tensor,             # [N, Dp]
-        csr_trk: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         csr_pri: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         csr_pdg: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
-        event_id: torch.Tensor,          # [N] int64
         ghost_mask: torch.Tensor,        # [N] bool
     ):
         """
         Computes losses (same-track, same-primary, same-pid) in one call.
         """
-        loss_trk, stats_trk = pair_soft_overlap_bce(
-            z_trk, event_id, *csr_trk, ghost_mask, 
-            logit_bias=self.logit_bias_trk, logit_scale=self.logit_scale_trk
-            )
-        loss_pri, stats_pri = pair_soft_overlap_bce(
-            z_pri, event_id, *csr_pri, ghost_mask, 
-            logit_bias=self.logit_bias_pri, logit_scale=self.logit_scale_pri
-        )
-        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pdg, ghost_mask)  # ghosts only supervised here
+        loss_pri = count_ce_loss(z_pri, csr_pri[0], ghost_mask)
+        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pdg, ghost_mask)
         
         part_losses_enc = {
-            "trk/total": loss_trk.detach(), "trk/pos_sim": stats_trk["sim_pos_mean"], 
-                "trk/neg_sim": stats_trk["sim_neg_mean"], "trk/target": stats_trk["target_mean"],
-            "pri/total": loss_pri.detach(), "pri/pos_sim": stats_pri["sim_pos_mean"], 
-                "pri/neg_sim": stats_pri["sim_neg_mean"], "pri/target": stats_pri["target_mean"],
+            "pri/total": loss_pri.detach(),
             "pid/total": loss_pid.detach(),
         }
 
-        return loss_trk, loss_pri, loss_pid, part_losses_enc
+        return loss_pri, loss_pid, part_losses_enc
     
 
     def compute_relational_losses(
         self,
-        pred_trk: torch.Tensor,
         pred_pri: torch.Tensor,
         pred_pid: torch.Tensor,
         idx_targets: torch.Tensor,
-        csr_trk: torch.Tensor,
         csr_pri: torch.Tensor,
         csr_pdg: torch.Tensor,
-        hit_event_id: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
         raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(idx_targets)
 
         # Gather embeddings and labels
-        z_track = pred_trk[tok_row, sub_idx, :]               # [N_valid, D]
         z_primary = pred_pri[tok_row, sub_idx, :]             # [N_valid, D]
         z_pid = pred_pid[tok_row, sub_idx, :]                 # [N_valid, D]
-        csr_trk = csr_keep_rows_torch(*csr_trk, raw_idx)[:3]  # ([N+1], [L], [L])
         csr_pri = csr_keep_rows_torch(*csr_pri, raw_idx)[:3]  # ([N+1], [L], [L])
         csr_pdg = csr_keep_rows_torch(*csr_pdg, raw_idx)[:3]  # ([N+1], [L], [L])
-        evt = hit_event_id[raw_idx]
         ghost = ghost_mask[raw_idx]
 
-        loss_trk, loss_pri, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
-            z_track, z_primary, z_pid, csr_trk, csr_pri, csr_pdg, evt, ghost,
+        loss_pri, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
+            z_primary, z_pid, csr_pri, csr_pdg, ghost,
         )
 
-        return loss_trk, loss_pri, loss_pid, part_losses_enc
+        return loss_pri, loss_pid, part_losses_enc
 
 
     def compute_reconstruction_losses(
@@ -209,7 +175,6 @@ class MAEPreTrainer(pl.LightningModule):
 
     def compute_losses(
         self,
-        pred_trk: torch.Tensor,
         pred_pri: torch.Tensor,
         pred_pid: torch.Tensor,
         pred_occ: torch.Tensor,
@@ -217,14 +182,13 @@ class MAEPreTrainer(pl.LightningModule):
         targ_reg: torch.Tensor,
         rel_idx_targets: torch.Tensor,
         rec_idx_targets: torch.Tensor,
-        csr_trk: torch.Tensor,
         csr_pri: torch.Tensor,
         csr_pdg: torch.Tensor,
         hit_event_id: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
-        loss_trk, loss_pri, loss_pid, part_enc = self.compute_relational_losses(
-            pred_trk, pred_pri, pred_pid, rel_idx_targets, csr_trk, csr_pri, csr_pdg, hit_event_id, ghost_mask,
+        loss_pri, loss_pid, part_enc = self.compute_relational_losses(
+            pred_pri, pred_pid, rel_idx_targets, csr_pri, csr_pdg, ghost_mask,
         )
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
             targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
@@ -237,7 +201,6 @@ class MAEPreTrainer(pl.LightningModule):
             return weighted_loss(loss, ls, kind) if ls is not None else loss
 
         total_loss = (
-            _weight(loss_trk, "log_sigma_trk", kind="nce") +
             _weight(loss_pri, "log_sigma_pri", kind="nce") +
             _weight(loss_pid, "log_sigma_pid", kind="nce") +
             _weight(loss_occ, "log_sigma_occ", kind="ce")  +
@@ -250,14 +213,13 @@ class MAEPreTrainer(pl.LightningModule):
     def common_step(self, batch):
         batch_input, *batch_input_global, labels = self._arrange_batch(batch)
         batch_size = batch_input.batch_size
-        csr_trk, csr_pri, csr_pdg, ghost_mask, hit_event_id = labels
+        csr_pri, csr_pdg, ghost_mask, hit_event_id = labels
 
         # Forward pass
-        pred_trk, pred_pri, pred_pid, pred_occ, pred_reg, rel_idx_targets, rec_idx_targets, _, _, = self.forward(
+        pred_pri, pred_pid, pred_occ, pred_reg, rel_idx_targets, rec_idx_targets, _, _, = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
-            pred_trk=pred_trk,
             pred_pri=pred_pri,
             pred_pid=pred_pid,
             pred_occ=pred_occ,
@@ -265,7 +227,6 @@ class MAEPreTrainer(pl.LightningModule):
             targ_reg=batch_input.features,
             rel_idx_targets=rel_idx_targets,
             rec_idx_targets=rec_idx_targets,
-            csr_trk=csr_trk,
             csr_pri=csr_pri,
             csr_pdg=csr_pdg,
             hit_event_id=hit_event_id,
@@ -311,19 +272,6 @@ class MAEPreTrainer(pl.LightningModule):
                 sync_dist=True
             )
 
-        # log the logit scales
-        for key, logit_param in self._logit_params.items():
-            logit_value = logit_param.detach()
-            self.log(
-                f'logit/{key}',
-                logit_value,
-                batch_size=batch_size,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=True
-            )
-
         return loss
 
 
@@ -359,7 +307,7 @@ class MAEPreTrainer(pl.LightningModule):
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),
         )
         param_groups.append({
-            'params': list(self._uncertainty_params.values()) + list(self._logit_params.values()),
+            'params': list(self._uncertainty_params.values()),
             'lr': self.lr * 0.1,
             'weight_decay': 0.0,
         })

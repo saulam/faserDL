@@ -716,12 +716,6 @@ def _build_grouping_from_edges(event_id_rows: torch.Tensor,
     }
 
 
-def _sum_indices_deterministic(idx: torch.Tensor, val: torch.Tensor, size: int) -> torch.Tensor:
-    out = torch.zeros(size, dtype=val.dtype, device=val.device)
-    out.index_add_(0, idx, val)
-    return out
-
-
 def _segment_mean_from_contiguous_idx_det(values: torch.Tensor,
                                           idx: torch.Tensor,
                                           size: int,
@@ -1229,6 +1223,12 @@ def soft_ce_with_logits_csr(
     return loss
 
 
+def count_ce_loss(logits, indptr, ghost_mask, K_max=2):
+    target = (indptr[1:] - indptr[:-1]).clamp(0, K_max).to(torch.long)
+    target = torch.where(ghost_mask, torch.zeros_like(target), target)
+    return F.cross_entropy(logits, target)
+
+
 def pair_soft_overlap_bce(
     z, event_id, indptr, cls, w,
     ghost_mask=None,
@@ -1403,26 +1403,3 @@ def pair_soft_overlap_bce(
     }
     return loss.to(z.dtype), stats
 
-
-@torch.no_grad()
-def solve_bias_for_batch(sims, y, logit_scale=10.0, w_pair=None, iters=8):
-    # effective weights (normalize to mean 1 for stability)
-    if w_pair is None:
-        w = torch.ones_like(y)
-    else:
-        w = w_pair
-        w = w / w.mean().clamp_min(1e-12)
-
-    # good starting guess (your formula)
-    p = y.mean().clamp(1e-4, 1-1e-4)
-    s = sims  # already computed for the same pairs
-    b = torch.logit(p) - float(logit_scale) * s.mean()
-
-    # Newton iterations: solve E[w*(sigmoid(scale*s + b) - y)] = 0
-    for _ in range(iters):
-        z = logit_scale * s + b
-        p_hat = torch.sigmoid(z)
-        f = (w * (p_hat - y)).mean()                      # gradient wrt bias
-        g = (w * (p_hat * (1 - p_hat))).mean().clamp_min(1e-8)  # curvature
-        b = b - f / g
-    return b
