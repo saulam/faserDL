@@ -604,8 +604,8 @@ class MinkMAEViT(nn.Module):
 
         # heads
         shared              = self.shared_voxel_head["rel"](out_flat)      # [Nk, P, H]
-        pred_pri            = self.heads["pri"](shared)                    # [Nk, P, E]
-        pred_pid            = self.heads["pid"](shared)                    # [Nk, P, E]
+        pred_pri            = self.heads["pri"](shared)                    # [Nk, P, 3]
+        pred_pid            = self.heads["pid"](shared)                    # [Nk, P, num_pdg_classes+1]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]

@@ -117,7 +117,7 @@ class MinkViT(vit.VisionTransformer):
         self.register_buffer('module_token_indices', torch.stack(module_indices, 0))  # [M, Lm]
 
         # Encoder: hierarchical ViT
-        total_depth = depth + 2 * io_depth - 1
+        total_depth = depth + io_depth - 1
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
         for idx, blk in enumerate(self.blocks):
             if hasattr(blk.drop_path1, "drop_prob") and hasattr(blk.drop_path2, "drop_prob"):
@@ -235,7 +235,6 @@ class MinkViT(vit.VisionTransformer):
             'module_embed_enc.weight',
             'global_mem',
             'task_tokens',
-            'patch_embed.bias',
         }
             
 

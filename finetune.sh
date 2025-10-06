@@ -15,26 +15,26 @@ label_smoothing=0.02
 dropout=0.0
 attn_dropout=0.0
 drop_path_rate=0.1
-epochs=100
+epochs=50
 num_workers=16
 blr=5e-4
 layer_decay=0.65
 accum_grad_batches=1
 warmup_epochs=5
-cosine_annealing_epochs=95
+cosine_annealing_epochs=45
 weight_decay=0.05
 beta1=0.9
 beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v39"
+name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v42"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v39"
+checkpoint_name="finetune_v5.1b_dlnu_log_base_clariden_0_5_v42"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v5.1b_clariden_final_v1/loss_total_val/epoch=180-step=65160.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_clariden_final_v6/loss_total_val/last.ckpt"
 gpus=(0 1)
 
 python -m train.finetune \

@@ -33,7 +33,7 @@ save_top_k=1
 checkpoint_path="checkpoints_final"
 checkpoint_name="pretrain_v5.1b_dlnu_log_base_v19"
 early_stop_patience=200
-load_checkpoint="checkpoints_final/mae_v5.1b_noglob_v12/loss_val_total/last.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v19/loss_total_val/last.ckpt"
 gpus=(0 1)
 
 python -m train.pretrain \
@@ -70,5 +70,6 @@ python -m train.pretrain \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
+    --load_checkpoint $load_checkpoint \
     --gpus "${gpus[@]}"
 
