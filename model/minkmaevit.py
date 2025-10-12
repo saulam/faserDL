@@ -33,7 +33,7 @@ class MinkMAEViT(nn.Module):
         io_decode_depth=4,
         num_heads=16,
         num_modes=(16, 8),
-        num_pdg_classes=6,
+        num_pid_classes=3,
         decoder_embed_dim=192,
         decoder_num_heads=16,
         mlp_ratio=4.0,
@@ -193,16 +193,16 @@ class MinkMAEViT(nn.Module):
         self.heads = nn.ModuleDict({
             name: (
                 nn.Sequential(
-                    nn.Linear(num_modes[0], 3),
-                ) if name in {"pri"} else
+                    nn.Linear(num_modes[0], 4),
+                ) if name in {"hie", "dec"} else
                 nn.Sequential(
-                    nn.Linear(num_modes[0], num_pdg_classes + 1),
+                    nn.Linear(num_modes[0], num_pid_classes + 1),
                 ) if name == "pid" else
                 nn.Sequential(
                     nn.Linear(num_modes[1], self.in_chans if name=="reg" else 1),
                 )
             )
-            for name in ["pri", "pid", "occ", "reg"]
+            for name in ["hie", "dec", "pid", "occ", "reg"]
         })
 
         self.initialize_weights()
@@ -604,14 +604,15 @@ class MinkMAEViT(nn.Module):
 
         # heads
         shared              = self.shared_voxel_head["rel"](out_flat)      # [Nk, P, H]
-        pred_pri            = self.heads["pri"](shared)                    # [Nk, P, 3]
-        pred_pid            = self.heads["pid"](shared)                    # [Nk, P, num_pdg_classes+1]
+        pred_hie            = self.heads["hie"](shared)                    # [Nk, P, 4]
+        pred_dec            = self.heads["dec"](shared)                    # [Nk, P, 4]
+        pred_pid            = self.heads["pid"](shared)                    # [Nk, P, num_pid_classes+1]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
         idx_targets_kept = idx_map[b_ids, patch_ids]                       # [Nk, P]
 
-        return pred_pri, pred_pid, idx_targets_kept
+        return pred_hie, pred_dec, pred_pid, idx_targets_kept
 
 
     def forward_reconstruction(self, latents, attn_mask_mod, rand_mask, idx_map):
@@ -668,7 +669,7 @@ class MinkMAEViT(nn.Module):
         # Relational path
         lat_full, _, _, attn_mask_full, ids_full = \
             self.forward_encoder(x, x_glob, mask_ratio=0.0)
-        pred_pri, pred_pid, rel_idx_targets = \
+        pred_hie, pred_dec, pred_pid, rel_idx_targets = \
             self.forward_relational(lat_full, attn_mask_full, ids_full, idx_map)
 
         # Reconstruction path
@@ -678,7 +679,7 @@ class MinkMAEViT(nn.Module):
             self.forward_reconstruction(lat_masked, attn_mask_masked, rand_mask, idx_map)
 
         return (
-            pred_pri, pred_pid,
+            pred_hie, pred_dec, pred_pid,
             pred_occ, pred_reg, rel_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )

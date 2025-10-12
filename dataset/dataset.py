@@ -98,7 +98,7 @@ class SparseFASERCALDataset(Dataset):
         return 5
 
 
-    def charmdecay2label(self, charm, charm_decay):
+    def charmdecay2label(self, is_charmed, charm_decay):
         """Classifies charm decays based on decay products.
         
         Returns:
@@ -108,7 +108,7 @@ class SparseFASERCALDataset(Dataset):
             2 - charm -> mu
             3 - charm -> hadron (everything else)
         """
-        if not charm:
+        if not is_charmed:
             return 0  # no charm
         if any(pid in {13, -13} for pid in charm_decay):
             return 2  # charm -> mu
@@ -227,9 +227,9 @@ class SparseFASERCALDataset(Dataset):
     
     def build_per_hit_labels_from_csr(
         self,
-        true_track_id: np.ndarray,      # [T] int64
-        true_primary_id: np.ndarray,    # [T] int64
-        true_pdg: np.ndarray,           # [T] int64
+        true_hie: np.ndarray,           # [T] int64
+        true_dec: np.ndarray,           # [T] int64
+        true_pid: np.ndarray,           # [T] int64
         indptr: np.ndarray,             # [N+1] int64  CSR row ptr per hit
         true_index: np.ndarray,         # [E]   int64  edge -> true index
         link_weight: np.ndarray,        # [E]   float  contribution weight per edge (>=0)
@@ -250,9 +250,9 @@ class SparseFASERCALDataset(Dataset):
         indptr = indptr.astype(np.int64, copy=False)
         true_index = true_index.astype(np.int64, copy=False)
         w = link_weight.astype(np.float64, copy=False)    # float64 for stable sums
-        t_trk = true_track_id.astype(np.int64, copy=False)
-        t_pri = true_primary_id.astype(np.int64, copy=False)
-        t_pdg = true_pdg.astype(np.int64, copy=False)
+        t_hie = true_hie.astype(np.int64, copy=False)
+        t_dec = true_dec.astype(np.int64, copy=False)
+        t_pid = true_pid.astype(np.int64, copy=False)
 
         N = indptr.size - 1
         deg = np.diff(indptr)                 # [N]
@@ -268,9 +268,9 @@ class SparseFASERCALDataset(Dataset):
 
         # Edge -> per-field ids
         t_idx = true_index
-        edge_trk = t_trk[t_idx].astype(np.int64, copy=False)
-        edge_pri = t_pri[t_idx].astype(np.int64, copy=False)
-        edge_pdg = t_pdg[t_idx].astype(np.int64, copy=False)
+        edge_hie = t_hie[t_idx].astype(np.int64, copy=False)
+        edge_dec = t_dec[t_idx].astype(np.int64, copy=False)
+        edge_pid = t_pid[t_idx].astype(np.int64, copy=False)
 
         def _build_single(edge_ids: np.ndarray):
             """
@@ -336,14 +336,14 @@ class SparseFASERCALDataset(Dataset):
             return indptr_out, c_keep.astype(np.int64, copy=False), w_keep, row_has
 
         # Build all three CSRs
-        track_csr   = _build_single(edge_trk)
-        primary_csr = _build_single(edge_pri)
-        pdg_csr     = _build_single(edge_pdg)
+        hie_csr = _build_single(edge_hie)
+        dec_csr = _build_single(edge_dec)
+        pid_csr = _build_single(edge_pid)
 
         return {
-            "trk": track_csr,
-            "pri": primary_csr,
-            "pdg": pdg_csr,
+            "hie": hie_csr,
+            "dec": dec_csr,
+            "pid": pid_csr,
         }
 
 
@@ -355,9 +355,11 @@ class SparseFASERCALDataset(Dataset):
         run_number = data['run_number'].item()
         event_id = data['event_id'].item()
         true_hits = data['true_hits']                   # [T]
-        true_track_id = true_hits[:, 0]                 # [T]
-        true_primary_id = true_hits[:, 2]               # [T]
         true_pdg = true_hits[:, 3]                      # [T]
+        true_primary = true_hits[:, 9]                  # [T]
+        true_secondary = true_hits[:, 10]               # [T]
+        true_tau_decay = true_hits[:, 11]               # [T]
+        true_charm_decay = true_hits[:, 12]             # [T]
         reco_hits = data['reco_hits']                   # [N]
         indptr = data['indptr']                         # [N+1] CSR row pointers for reco->true contributions
         true_index = data['true_index']                 # [E] concatenated true-hit indices for each reco hit
@@ -373,8 +375,8 @@ class SparseFASERCALDataset(Dataset):
         jet_momentum = data['jet_momentum']
         tau_vis_momentum = data['tau_vis_momentum']
         tau_decay_mode = data['tau_decay_mode'].item()
-        charm = data['charm']
-        charm_decay = data['charmdecay']
+        is_charmed = data['is_charmed']
+        charm_decay = data['charm_decay']
         global_feats = {
             'faser_cal_energy':  data['faser_cal_energy'],
             'rear_cal_energy':   data['rear_cal_energy'],
@@ -387,22 +389,26 @@ class SparseFASERCALDataset(Dataset):
         if is_tau:
             assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"
 
-        csr_trk, csr_pri, csr_pdg = None, None, None
+        csr_hie, csr_dec, csr_pid = None, None, None
         if self.stage1:
-            true_pdg = cluster_labels_from_pdgs(true_pdg, tau_decay_mode)
+            true_hierarchy = true_primary.copy()
+            true_hierarchy[true_secondary > 0] = 2
+            true_decay = true_tau_decay.copy()
+            true_decay[true_charm_decay > 0] = 2
+            true_pid = cluster_labels_from_pdgs(true_pdg, tau_decay_mode)
             csr = self.build_per_hit_labels_from_csr(
-                true_track_id=true_track_id,
-                true_primary_id=true_primary_id,
-                true_pdg=true_pdg,
+                true_hie=true_hierarchy,
+                true_dec=true_decay,
+                true_pid=true_pid,
                 indptr=indptr,
                 true_index=true_index,
                 link_weight=link_weight,
                 ghost_mask=ghost_mask,
                 weight_threshold=0.0,
             )
-            csr_trk = csr["trk"][:3]
-            csr_pri = csr["pri"][:3]
-            csr_pdg = csr["pdg"][:3]
+            csr_hie = csr["hie"][:3]
+            csr_dec = csr["dec"][:3]
+            csr_pid = csr["pid"][:3]
 
         # initial transformations
         coords = reco_hits[:, :3]
@@ -410,7 +416,6 @@ class SparseFASERCALDataset(Dataset):
         module_idx = np.searchsorted(self.metadata['z'][:, 0], coords[:, 2])
         modules = self.metadata['z'][module_idx, 1]
         coords = self.voxelise(coords)
-        primary_vertex = self.voxelise(primary_vertex)
         if is_cc and is_tau:  
             # for CC tau events, replace the outgoing lepton momentum with the visible tau decay products
             out_lepton_momentum = tau_vis_momentum
@@ -418,14 +423,14 @@ class SparseFASERCALDataset(Dataset):
             # NC events don't have visible outgoing leptons
             out_lepton_momentum.fill(0)
         flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc, tau_decay_mode)])
-        charm_label = np.array([self.charmdecay2label(charm, charm_decay)])
+        charm_label = np.array([self.charmdecay2label(is_charmed, charm_decay['pdg'])])
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
-            coords, modules, q, (csr_trk, csr_pri, csr_pdg, ghost_mask), \
+            coords, modules, q, (csr_hie, csr_dec, csr_pid, ghost_mask), \
             (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
             global_feats, _ = augment(
-                coords, modules, q, (csr_trk, csr_pri, csr_pdg, ghost_mask), 
+                coords, modules, q, (csr_hie, csr_dec, csr_pid, ghost_mask), 
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
                 global_feats, primary_vertex, self.metadata, self.stage1
             )
@@ -443,9 +448,9 @@ class SparseFASERCALDataset(Dataset):
         return {
             'run_number': run_number,
             'event_id': event_id,
-            'csr_trk': csr_trk,
-            'csr_pri': csr_pri,
-            'csr_pdg': csr_pdg,
+            'csr_hie': csr_hie,
+            'csr_dec': csr_dec,
+            'csr_pid': csr_pid,
             'ghost_mask': ghost_mask,
             'coords': coords,
             'modules': modules,
@@ -470,6 +475,7 @@ class SparseFASERCALDataset(Dataset):
         # Preprocess features
         feats = self.preprocess(event['q'], 'q', self.preprocessing_input)
         event_hits = self.preprocess(len(event['q']), 'event_hits', self.preprocessing_input)
+
         feats_global = torch.cat([
             event_hits,
             self.preprocess(event['global_feats']['faser_cal_energy'], 'faser_cal_energy', self.preprocessing_input),
@@ -504,15 +510,15 @@ class SparseFASERCALDataset(Dataset):
         }
         if self.stage1:
             output.update({
-                'csr_trk_indptr': torch.from_numpy(event['csr_trk'][0]).long(),
-                'csr_trk_ids': torch.from_numpy(event['csr_trk'][1]).long(),
-                'csr_trk_weights': torch.from_numpy(event['csr_trk'][2]).float(),
-                'csr_pri_indptr': torch.from_numpy(event['csr_pri'][0]).long(),
-                'csr_pri_ids': torch.from_numpy(event['csr_pri'][1]).long(),
-                'csr_pri_weights': torch.from_numpy(event['csr_pri'][2]).float(),
-                'csr_pdg_indptr': torch.from_numpy(event['csr_pdg'][0]).long(),
-                'csr_pdg_ids': torch.from_numpy(event['csr_pdg'][1]).long(),
-                'csr_pdg_weights': torch.from_numpy(event['csr_pdg'][2]).float(),
+                'csr_hie_indptr': torch.from_numpy(event['csr_hie'][0]).long(),
+                'csr_hie_ids': torch.from_numpy(event['csr_hie'][1]).long(),
+                'csr_hie_weights': torch.from_numpy(event['csr_hie'][2]).float(),
+                'csr_dec_indptr': torch.from_numpy(event['csr_dec'][0]).long(),
+                'csr_dec_ids': torch.from_numpy(event['csr_dec'][1]).long(),
+                'csr_dec_weights': torch.from_numpy(event['csr_dec'][2]).float(),
+                'csr_pid_indptr': torch.from_numpy(event['csr_pid'][0]).long(),
+                'csr_pid_ids': torch.from_numpy(event['csr_pid'][1]).long(),
+                'csr_pid_weights': torch.from_numpy(event['csr_pid'][2]).float(),
                 'ghost_mask': torch.from_numpy(event['ghost_mask']).bool(),
             })
             
@@ -529,6 +535,7 @@ class SparseFASERCALDataset(Dataset):
                 'event_id': event['event_id'],
                 'in_neutrino_pdg': event['in_neutrino_pdg'],
                 'in_neutrino_energy': event['in_neutrino_energy'],
+                'primary_vertex': event['primary_vertex'],
             })
         return output
         

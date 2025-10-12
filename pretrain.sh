@@ -27,13 +27,13 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="pretrain_v5.1b_dlnu_log_base_v19"
+name="pretrain_v5.1b_dlnu_log_base_v20"
 log_every_n_steps=50
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v5.1b_dlnu_log_base_v19"
+checkpoint_name="pretrain_v5.1b_dlnu_log_base_v20"
 early_stop_patience=200
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v19/loss_total_val/last.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v20/loss_total_val/last.ckpt"
 gpus=(0 1)
 
 python -m train.pretrain \

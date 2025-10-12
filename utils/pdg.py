@@ -12,10 +12,7 @@ import numpy as np
 LABEL_NAMES = {
     0: "em_shower",
     1: "muon_mip",
-    2: "z1_hadron_ion",
-    3: "charged_hadron",
-    4: "neutral_hadron",
-    5: "ion_fragment",
+    2: "hadron",
 }
 
 # Signature groups
@@ -66,20 +63,20 @@ def cluster_labels_from_pdgs(
     tau_decay_mode codes:
       1=e -> 0 (em_shower)
       2=mu -> 1 (muon_mip)
-      3=1-prong -> 3 (charged_hadron)
-      4=rho -> 3 (charged_hadron)
-      5=3-prong -> 3 (charged_hadron)
-      6=other -> 3 (charged_hadron)
+      3=1-prong -> 2 (charged_hadron)
+      4=rho -> 2 (charged_hadron)
+      5=3-prong -> 2 (charged_hadron)
+      6=other -> 2 (charged_hadron)
 
     Notes:
       - Non-τ entries ignore tau_decay_mode.
-      - All previously covered PDGs still map into {0..5}.
+      - All previously covered PDGs still map into {0..2}.
     """
     pdgs = np.asarray(pdgs)
     abs_pdg = np.abs(pdgs)
 
     # Default to charged-hadron signature
-    out = np.full(pdgs.shape, 3, dtype=np.int32)
+    out = np.full(pdgs.shape, 2, dtype=np.int32)
 
     # EM-like
     out[np.isin(pdgs, tuple(EM))] = 0
@@ -93,19 +90,19 @@ def cluster_labels_from_pdgs(
         Z = np.zeros_like(abs_pdg)
         Z[is_nuc] = _nuclear_Z_vectorized(abs_pdg[is_nuc])
         out[(Z == 1) & is_nuc] = 2          # Z == 1  -> z1_hadron_ion
-        out[(Z >= 2) & is_nuc] = 5          # Z >= 2  -> ion_fragment
+        out[(Z >= 2) & is_nuc] = 2          # Z >= 2  -> ion_fragment
 
     # Non-nuclear protons / antiprotons
     out[np.isin(pdgs, tuple(PROTONS))] = 2
 
     # Light charged hadrons
-    out[np.isin(pdgs, tuple(LIGHT_CHARGED))] = 3
+    out[np.isin(pdgs, tuple(LIGHT_CHARGED))] = 2
 
     # Neutral hadrons
-    out[np.isin(pdgs, tuple(NEUTRAL_HADRONS))] = 4
+    out[np.isin(pdgs, tuple(NEUTRAL_HADRONS))] = 2
 
     # Charged short-lived hadrons -> charged_hadron
-    out[np.isin(pdgs, tuple(SHORT_LIVED_CHARGED))] = 3
+    out[np.isin(pdgs, tuple(SHORT_LIVED_CHARGED))] = 2
 
     # τ routing
     tau_mask = np.isin(pdgs, tuple(TAUS))
@@ -118,6 +115,6 @@ def cluster_labels_from_pdgs(
         elif mode == 2:
             out[tau_mask] = 1
         else:
-            out[tau_mask] = 3
+            out[tau_mask] = 2
 
     return (out, tau_mask) if return_tau_flag else out

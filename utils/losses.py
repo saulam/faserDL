@@ -123,6 +123,12 @@ class KinematicsMultiTaskLoss(nn.Module):
         denom = torch.maximum(x_true, torch.as_tensor(tau, dtype=x_true.dtype, device=x_true.device))
         r = (x_true - x_hat) / denom
         return self._huber(r, self.huber_delta)
+    
+    def _pt_loss_abs(self, p_true, p_hat, delta_pt):
+        x_true = p_true[...,:2].norm(dim=-1)
+        x_hat  = p_hat[...,:2].norm(dim=-1)
+        e = x_true - x_hat
+        return self._huber(e, delta_pt)
 
     # ---------- forward ----------
     def forward(
@@ -155,7 +161,8 @@ class KinematicsMultiTaskLoss(nn.Module):
             L_vis_geom = L_vis_geom + self.lam_dir_3d * self._cosine_dir_3d(p_vis_hat, p_vis_true)
         if vis_latents is not None and self.latent_prior_w > 0.0:
             L_vis_geom = L_vis_geom + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
-        L_vis_pt   = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_pt_vis, kind="pt")
+        #L_vis_pt   = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_pt_vis, kind="pt")
+        L_vis_pt   = self._pt_loss_abs(p_vis_true, p_vis_hat, self.huber_delta)
         L_vis_mag  = self._relative_residual_loss(p_vis_true, p_vis_hat, self.tau_mag_vis, kind="mag")
 
         # JET
@@ -166,7 +173,8 @@ class KinematicsMultiTaskLoss(nn.Module):
             L_jet_geom = L_jet_geom + self.lam_dir_3d * self._cosine_dir_3d(p_jet_hat, p_jet_true)
         if jet_latents is not None and self.latent_prior_w > 0.0:
             L_jet_geom = L_jet_geom + self.latent_prior_w * (jet_latents.pow(2).sum(-1))
-        L_jet_pt   = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_pt_jet, kind="pt")
+        #L_jet_pt   = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_pt_jet, kind="pt")
+        L_jet_pt   = self._pt_loss_abs(p_jet_true, p_jet_hat, self.huber_delta)
         L_jet_mag  = self._relative_residual_loss(p_jet_true, p_jet_hat, self.tau_mag_jet, kind="mag")
 
         # LEPTON (CC-only; use gated prediction).
@@ -176,7 +184,8 @@ class KinematicsMultiTaskLoss(nn.Module):
         if self.lam_dir_3d != 0.0:
             L_lep_geom = L_lep_geom + (self.lam_dir_3d * self._cosine_dir_3d(p_lep_hat, p_lep_true))
         L_lep_geom = L_lep_geom * m_cc
-        L_lep_pt   = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_pt_lep, kind="pt") * m_cc
+        #L_lep_pt   = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_pt_lep, kind="pt") * m_cc
+        L_lep_pt   = self._pt_loss_abs(p_lep_true, p_lep_hat, self.huber_delta) * m_cc
         L_lep_mag  = self._relative_residual_loss(p_lep_true, p_lep_hat, self.tau_mag_lep, kind="mag") * m_cc
 
         # NC zero-attractor (small) on RAW lepton
@@ -631,32 +640,56 @@ def soft_focal_bce_with_logits(
 
 
 def soft_focal_cross_entropy(
-    logits: torch.Tensor,              # [N, C]
-    target: torch.Tensor,              # [N, C] (soft labels; rows sum≈1)
+    logits: torch.Tensor,                      # [N, C]
+    target: torch.Tensor,                      # [N] (indices) or [N, C] (soft labels; rows sum≈1)
     gamma: float = 2.0,
-    alpha: Optional[Union[float, Sequence[float], torch.Tensor]] = None,
-    reduction: str = "mean",
-    eps: float = 1e-8,
+    alpha: Optional[Union[float, Sequence[float], torch.Tensor]] = None,  # scalar or [C]
+    reduction: str = "mean",                   # "mean" | "sum" | "none"
 ) -> torch.Tensor:
     """
     Focal cross-entropy that supports SOFT targets.
       loss_i = - sum_c t_ic * (1 - p_ic)^gamma * log p_ic * alpha_c
     """
-    logp = F.log_softmax(logits, dim=-1)
-    p    = logp.exp()
+    if logits.ndim != 2:
+        raise ValueError("logits must be [N, C]")
+    N, C = logits.shape
 
-    mod  = (1.0 - p).clamp_min(eps).pow(gamma)             # [N, C]
-    loss = -target * mod * logp                            # [N, C]
+    # convert to one-hot if needed
+    if target.ndim == 1:
+        target = F.one_hot(target.to(torch.long), num_classes=C).to(dtype=logits.dtype)
+    elif target.shape == logits.shape:
+        target = target.to(dtype=logits.dtype)
+    else:
+        raise ValueError("target must be shape [N] (indices) or [N, C] (soft labels)")
+
+    logp = F.log_softmax(logits, dim=-1)       # [N, C]
+    p    = logp.exp()
+    mod  = (1.0 - p).clamp_min(0.0).pow(gamma) # [N, C]
+    loss = -target * mod * logp                # [N, C]
 
     if alpha is not None:
-        if not torch.is_tensor(alpha):
-            alpha = logits.new_tensor(alpha, dtype=loss.dtype)
-        loss = loss * alpha.view(1, -1)                    # broadcast [1, C]
+        a = alpha
+        if not torch.is_tensor(a):
+            a = torch.tensor(a, dtype=loss.dtype, device=logits.device)
+        else:
+            a = a.to(dtype=loss.dtype, device=logits.device)
 
-    loss = loss.sum(dim=-1)                                # [N]
-    if reduction == "mean": return loss.mean()
-    if reduction == "sum":  return loss.sum()
-    return loss
+        if a.numel() == 1:
+            loss = loss * a
+        elif a.numel() == C:
+            loss = loss * a.view(1, C)
+        else:
+            raise ValueError(f"alpha must be a scalar or length-{C} tensor/sequence")
+
+    loss = loss.sum(dim=-1)                    # [N]
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none" or reduction is None:
+        return loss
+    else:
+        raise ValueError("reduction must be 'mean', 'sum', or 'none'")
 
 
 @torch.no_grad()
@@ -1216,8 +1249,11 @@ def soft_ce_with_logits_csr(
     logits: torch.Tensor,
     csr: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, w)
     ghost_mask: torch.Tensor = None,
+    num_classes: int = None,
 ):
-    N, num_classes = logits.shape
+    N, C = logits.shape
+    if num_classes is None:
+        num_classes = C
     soft_pid = build_soft_targets_from_csr(*csr, ghost_mask=ghost_mask, num_classes=num_classes, N=N)
     loss = -(soft_pid * torch.log_softmax(logits, dim=-1)).sum(dim=1).mean()
     return loss

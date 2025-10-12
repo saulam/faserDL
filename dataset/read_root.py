@@ -14,12 +14,13 @@ import glob
 import numpy as np
 import tqdm
 import argparse
+from typing import Optional, Tuple
 
 
 version = "5.1"
-version_reco = version# + "b"
-version = version + "_tau3"
-version_reco = version_reco + "_tau3"
+version_reco = version + "b"
+#version = version + "_tau"
+#version_reco = version_reco + "_tau"
 path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
 true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
 reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
@@ -44,6 +45,10 @@ Y_POS = 5
 Z_POS = 6
 MODULE = 7
 ENERGY = 8
+IS_PRIMARY = 9
+IS_SECONDARY = 10
+IS_TAU_DECAY = 11
+IS_CHARM_DECAY = 12
 
 MUONIC_PDGS = [-13, 13]
 ELECTROMAGNETIC_PDGS = [-11, 11, -15, 15, 22]
@@ -52,37 +57,106 @@ ELECTROMAGNETIC_PDGS = [-11, 11, -15, 15, 22]
 # -----------------------------
 # True hits
 # -----------------------------
-def get_true_hits(tcal_event):
+def get_true_hits(
+    tcal_event, 
+    po_event, 
+    is_tau: bool, 
+    is_charmed: bool
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
     """
-    Extracts true hit information from the tcal_event and filters valid hits.
+    Extract true hit information from the tcal_event and filter valid hits.
+
     Returns:
-        np.ndarray of shape (N_true, 9) with columns:
-        [TRACK_ID, PARENT_ID, PRIMARY_ID, PDG, X, Y, Z, MODULE, ENERGY]
-        or None if no valid hits.
+        (hits, hit_ids)
+        hits: np.ndarray of shape (N_true, 13) with columns:
+              [TRACK_ID, PARENT_ID, PRIMARY_ID, PDG, X, Y, Z, MODULE, ENERGY,
+               IS_PRIMARY, IS_SECONDARY, IS_TAU_DECAY, IS_CHARM_DECAY]  (float32)
+              or None if no valid hits.
+        hit_ids: np.ndarray of shape (N_true,) with channel IDs (int64). Empty if no valid hits.
     """
     rows = []
-    hit_ids = []
+    hit_ids_list = []
 
-    for track in tcal_event.getfTracks():
-        for hit_id, energy in zip(track.fhitIDs, track.fEnergyDeposits):                
-            if tcal_event.getChannelTypefromID(hit_id) != 0 or energy == 0:
+    # Particle objects and decay products
+    particles = po_event.POs              # vector of particle objects of the event
+    tau_decay = po_event.taudecay         # vector of the tau decay products
+    charm_decay = po_event.charmdecay     # vector of the charm hadrons decay products
+
+    # Build a set of GEANT track IDs for quick membership tests
+    po_geant_ids = {trk.geanttrackID for trk in particles}
+
+    # Resolve tau decay parent GEANT ID (or -1 if not applicable)
+    tau_decay_geant_id = -1
+    if is_tau:
+        tau_parent_ids = [trk.m_trackid_in_particle[0] for trk in tau_decay if trk.nparent == 1]
+        assert len(tau_parent_ids) > 0, "no tau decay products with exactly one parent found"
+        assert len(set(tau_parent_ids)) == 1, "multiple tau decay parents found"
+        tau_parent_id = tau_parent_ids[0]
+
+        tau_decay_geant_id = next(
+            (trk.geanttrackID for trk in particles
+             if getattr(trk, "nparent", None) == 1 and trk.m_trackid_in_particle[0] == tau_parent_id),
+            -1
+        )
+        assert tau_decay_geant_id >= 0, "tau track not found!"
+    else:
+        assert len(tau_decay) == 0, "tau decay tracks found in a non-nutau event!"
+
+    # Resolve charm decay parent GEANT ID (or sentinel -1 if not applicable)
+    charm_decay_geant_id = -1
+    if is_charmed:
+        charm_parent_ids = [trk.m_trackid_in_particle[0] for trk in charm_decay if trk.nparent == 1]
+        assert len(charm_parent_ids) > 0, "no charm decay products with exactly one parent found"
+        assert len(set(charm_parent_ids)) == 1, "multiple charm decay parents found"
+        charm_parent_id = charm_parent_ids[0]
+
+        charm_decay_geant_id = next(
+            (trk.geanttrackID for trk in particles if trk.m_track_id == charm_parent_id),
+            -1
+        )
+        assert charm_decay_geant_id >= 0, "charm parent not found!"
+    else:
+        assert len(charm_decay) == 0, "charm decay tracks found in a non-nutau event!"
+
+    # Iterate over simulated tracks and associated hits
+    for trk in tcal_event.getfTracks():
+        track_id = trk.ftrackID
+        parent_id = trk.fparentID
+        primary_id = trk.fprimaryID
+        pdg = trk.fPDG
+
+        for hid, energy in zip(trk.fhitIDs, trk.fEnergyDeposits):
+            # Keep only valid tracker channels with non-zero energy
+            if tcal_event.getChannelTypefromID(hid) != 0 or energy == 0:
                 continue
 
-            pos = tcal_event.getChannelXYZfromID(hit_id)
-            module = tcal_event.getChannelModulefromID(hit_id)
+            # Geometry / module
+            pos = tcal_event.getChannelXYZfromID(hid)
+            x, y, z = pos.x(), pos.y(), pos.z()
+            module = tcal_event.getChannelModulefromID(hid)
+
+            # Flags
+            is_primary_flag = (track_id == primary_id) and (parent_id == 0)
+            is_secondary_flag = parent_id in po_geant_ids
+            is_tau_decay_flag = parent_id == tau_decay_geant_id
+            is_charm_decay_flag = parent_id == charm_decay_geant_id
+
+            if is_primary_flag:
+                assert track_id in po_geant_ids, "primary track should be present in POs"
+            assert not (is_primary_flag and is_secondary_flag), "track cannot be both primary and secondary"
 
             rows.append([
-                track.ftrackID, track.fparentID, track.fprimaryID, track.fPDG,
-                pos.x(), pos.y(), pos.z(), module, energy,
+                track_id, parent_id, primary_id, pdg,
+                x, y, z, module, energy,
+                is_primary_flag, is_secondary_flag, is_tau_decay_flag, is_charm_decay_flag
             ])
-            hit_ids.append(hit_id)
+            hit_ids_list.append(hid)
 
     if not rows:
         return None, np.empty((0,), dtype=np.int64)
 
-    hits = np.asarray(rows, dtype=np.float32)          # (N, 9) float32
-    hit_ids = np.asarray(hit_ids, dtype=np.int64)    # (N,) int64
-
+    hits = np.asarray(rows, dtype=np.float32)             # (N, 13) float32
+    hit_ids = np.asarray(hit_ids_list, dtype=np.int64)    # (N,) int64
     return hits, hit_ids
 
 
@@ -285,6 +359,29 @@ def get_tracks(tktracks):
     return tracks
 
 
+def build_pair_array(objs, dtype=None):
+    """
+    Build a structured NumPy array with fields:
+      - g4_id
+      - track_id
+      - parent_id
+      - pdg
+    """
+    if dtype is None:
+        dtype = np.dtype([
+            ('g4_id',    np.int32),
+            ('track_id', np.int32),
+            ('parent_id',np.int32),
+            ('pdg',      np.int32),
+        ])
+
+    def row(o):
+        parent_id = o.m_trackid_in_particle[0] if o.nparent == 1 else -1
+        return (o.geanttrackID, o.m_track_id, parent_id, o.m_pdg_id)
+
+    return np.fromiter((row(o) for o in objs), dtype=dtype)
+
+
 def th2d_to_numpy(hist):
     root_array = hist.GetArray()
     n_bins_x = hist.GetNbinsX()
@@ -345,11 +442,14 @@ def generate_events(number, chunks, disable):
             geom_detector = tporeco_event.geom_detector
             
             run_number, event_id = po_event.run_number, po_event.event_id
-            charm = po_event.isCharmed()
-            charmdecay = np.array([x.m_pdg_id for x in po_event.charmdecay])
-            primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             is_cc = bool(po_event.isCC)
+            is_es = bool(po_event.isES)
             is_tau = bool(po_event.istau)
+            is_charmed = po_event.isCharmed()
+            po          = build_pair_array(po_event.POs)          # vector of particle objets of the event
+            tau_decay   = build_pair_array(po_event.taudecay)     # vector of the tau decay products
+            charm_decay = build_pair_array(po_event.charmdecay)   # vector of the charm hadrons decay products
+            primary_vertex = np.array([po_event.prim_vx.x(), po_event.prim_vx.y(), po_event.prim_vx.z()])
             e_vis = po_event.Evis
             sp_momentum = np.array([po_event.spx, po_event.spy, po_event.spz])
             vis_sp_momentum = np.array([po_event.vis_spx, po_event.vis_spy, po_event.vis_spz])
@@ -368,9 +468,9 @@ def generate_events(number, chunks, disable):
             tau_kink_angle = float(po_event.tauKinkAngle())
 
             # not process nutaus
-            #if is_cc and abs(in_neutrino_pdg) == 16:
-            #    print(f"Skipping tau neutrino event {event_id}")
-            #    continue
+            if is_cc and abs(in_neutrino_pdg) == 16 and 'tau' not in reco_file_path:
+                print(f"Skipping tau neutrino event {event_id}")
+                continue
             
             '''
             # Extract views
@@ -411,7 +511,7 @@ def generate_events(number, chunks, disable):
             tcal_event.Load_event(path, run_number, event_id, event_mask, po_event)
 
             # Extract true and reconstructed hits
-            true_hits, true_ids = get_true_hits(tcal_event)
+            true_hits, true_ids = get_true_hits(tcal_event, po_event, is_tau, is_charmed)
             reco_hits, true_index, indptr, ghost_mask, link_weight = get_reco_hits_and_csr_map(
                 tporeco_event, tcal_event, true_hits, true_ids
             )
@@ -428,13 +528,16 @@ def generate_events(number, chunks, disable):
             
             # Save event data
             np.savez_compressed(
-                f'{output_dir}/{run_number}_{event_id}',
+                f'{output_dir}/{run_number}_{event_id}_{"cc" if is_cc else "nc"}_{"es" if is_es else "is"}',
                 run_number=run_number,
                 event_id=event_id,
                 is_cc=is_cc,
+                is_es=is_es,
                 is_tau=is_tau,
-                charm=charm,
-                charmdecay=charmdecay,
+                is_charmed=is_charmed,
+                po=po,
+                tau_decay=tau_decay,
+                charm_decay=charm_decay,
                 e_vis=e_vis,
                 sp_momentum=sp_momentum,
                 vis_sp_momentum=vis_sp_momentum,

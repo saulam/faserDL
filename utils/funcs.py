@@ -196,7 +196,7 @@ def collate(
         return ret
     
     # CSRs: stack row-wise
-    for key in ["trk", "pri", "pdg"]:
+    for key in ["hie", "dec", "pid"]:
         if f"csr_{key}_indptr" in batch[0]:
             ret[f"csr_{key}_indptr"], ret[f"csr_{key}_ids"], ret[f"csr_{key}_weights"] = csr_stack_rows_torch(
                 [d[f"csr_{key}_indptr"] for d in batch],
@@ -286,9 +286,9 @@ def arrange_truth(data):
     output = {}
     
     optional_keys = [
-        'csr_trk_indptr', 'csr_trk_ids', 'csr_trk_weights',
-        'csr_pri_indptr', 'csr_pri_ids', 'csr_pri_weights',
-        'csr_pdg_indptr', 'csr_pdg_ids', 'csr_pdg_weights',
+        'csr_hie_indptr', 'csr_hie_ids', 'csr_hie_weights',
+        'csr_dec_indptr', 'csr_dec_ids', 'csr_dec_weights',
+        'csr_pid_indptr', 'csr_pid_ids', 'csr_pid_weights',
         'ghost_mask', 'hit_event_id',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
@@ -310,7 +310,7 @@ def csr_keep_rows_torch(label_indptr, label_ids, label_weight, raw_idx):
     Keep only the rows at integer indices `row_idx` from a CSR (label_indptr, label_ids, label_weight).
 
     Args:
-      label_indptr : [N+1] long, row pointers
+      label_indptr : [N+1]  long, row pointers
       label_ids    : [L]    long, column ids per nonzero
       label_weight : [L]    float/half, values per nonzero
       raw_idx      : [M]    long/int, row indices to keep (can be any order; duplicates allowed)

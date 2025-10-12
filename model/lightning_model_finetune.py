@@ -13,7 +13,7 @@ from typing import Any
 from torch_ema import ExponentialMovingAverage
 from utils import (
     param_groups_lrd, KinematicsMultiTaskLoss,
-    arrange_input, arrange_truth, 
+    arrange_input, arrange_truth, soft_focal_cross_entropy,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj
 )
 
@@ -168,6 +168,8 @@ class ViTFineTuner(pl.LightningModule):
         )
 
         # classification losses
+        #loss_flavour = self.loss_flavour(out_flavour, targ_flavour, gamma=2.0, alpha=0.25)
+        #loss_charm   = self.loss_charm(out_charm, targ_charm, gamma=2.0, alpha=0.25)
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm   = self.loss_charm(out_charm, targ_charm)
 
@@ -206,6 +208,7 @@ class ViTFineTuner(pl.LightningModule):
             weighted_loss(loss_lep_pt[cc_mask],   self.log_sigma_lep_pt,   kind="reg").mean() +
             weighted_loss(loss_lep_mag[cc_mask],  self.log_sigma_lep_mag,  kind="reg").mean()
         )
+
 
         # add NC zero-attractor OUTSIDE Kendall (normalised by NC fraction)
         #total_loss = total_loss + self.crit.lep_nc_zero_w * (loss_lep_zero_nc[nc_mask]).mean()
