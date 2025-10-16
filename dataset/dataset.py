@@ -238,9 +238,9 @@ class SparseFASERCALDataset(Dataset):
         normalize_rows: bool = True,
     ):
         """
-        Build compact per-hit soft-label CSRs for three label spaces: PDG, track, primary.
+        Build compact per-hit soft-label CSRs for three label spaces: HIE, DEC, PRIMARY.
 
-        Returns a dict with three entries: 'pdg', 'track', 'primary'.
+        Returns a dict with three entries: 'hie', 'dec', 'primary'.
         Each entry is a tuple:
             (label_indptr: [N+1] int64,
             label_ids:    [L]   int64,   deduped per row,

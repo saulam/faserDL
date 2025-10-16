@@ -1,25 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Define the maximum number of jobs to run in parallel
 MAX_JOBS=20
+CHUNKS=116  # number of reco files => indices 0..115
 
-# Function to wait if there are MAX_JOBS running
-function wait_for_jobs() {
-    while [ $(jobs -r | wc -l) -ge $MAX_JOBS ]; do
+wait_for_jobs() {
+    # count only running background jobs from this shell
+    while [ "$(jobs -pr | wc -l)" -ge "$MAX_JOBS" ]; do
         sleep 1
     done
 }
 
-# Loop
-for i in {0..116}; do
-    # Wait until there are fewer than MAX_JOBS running
+# Brace expansion can't use variables, so use seq (or a C-style for loop).
+for i in $(seq 0 $((CHUNKS-1))); do
     wait_for_jobs
-    
-    # Start a new process in the background
-    python read_root.py --number $i --chunks 116 --disable &
-
+    python read_root.py --number "$i" --chunks "$CHUNKS" --disable &
 done
 
-# Wait for all background jobs to finish before exiting the script
 wait
-

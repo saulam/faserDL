@@ -17,14 +17,14 @@ import argparse
 from typing import Optional, Tuple
 
 
+tau_sample = False
 version = "5.1"
-version_reco = version + "b"
-#version = version + "_tau"
-#version_reco = version_reco + "_tau"
-path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(version)
-true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(version))
-reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(version_reco))
-output_dir = '/scratch/salonso/sparse-nns/faser/events_new_v{}'.format(version_reco)
+suffix = version + "_tau" if tau_sample else version
+suffix_reco = version + "_tau" if tau_sample else version + "b"
+path = "/scratch2/salonso/faser/FASERCALDATA_v{}/".format(suffix)
+true_paths = glob.glob("/scratch2/salonso/faser/FASERCALDATA_v{}/*".format(suffix))
+reco_paths = glob.glob("/scratch2/salonso/faser/FASERCALRECODATA_v{}/*".format(suffix_reco))
+output_dir = '/scratch/salonso/sparse-nns/faser/events_v{}'.format(suffix_reco)
 os.makedirs(output_dir, exist_ok=True)
 ROOT.gSystem.Load("/scratch5/FASER/V3.1_15032025/FASER/Python_io/lib/ClassesDict.so")
 
@@ -442,10 +442,10 @@ def generate_events(number, chunks, disable):
             geom_detector = tporeco_event.geom_detector
             
             run_number, event_id = po_event.run_number, po_event.event_id
-            is_cc = bool(po_event.isCC)
-            is_es = bool(po_event.isES)
-            is_tau = bool(po_event.istau)
-            is_charmed = po_event.isCharmed()
+            is_cc       = bool(po_event.isCC)
+            is_es       = bool(po_event.isES())
+            is_tau      = bool(po_event.istau)
+            is_charmed  = bool(po_event.isCharmed())
             po          = build_pair_array(po_event.POs)          # vector of particle objets of the event
             tau_decay   = build_pair_array(po_event.taudecay)     # vector of the tau decay products
             charm_decay = build_pair_array(po_event.charmdecay)   # vector of the charm hadrons decay products

@@ -243,6 +243,7 @@ class VectorStatsLog1p:
     k_Z: float;  mu_uZ: float; sigma_uZ: float   # for uZ = log1p(pz/k_Z)
     # robust loss scales
     s_xyz: Tuple[float, float, float]            # MADN per component (px,py,pz)
+    s_pT: float                                  # MADN for pT
     s_mag: float                                 # MADN for ||p||
     # residual floors (for (true-reco)/max(true, tau))
     tau_pt: float
@@ -301,12 +302,15 @@ def compute_vector_stats_from_cartesian(
     # robust loss scales
     if use_robust:
         s_xyz = tuple(_madn(p_true, axis=0).astype(np.float64))
+        s_pT = float(_madn(pT))
         s_mag = float(_madn(mag))
     else:
         s_xyz = tuple((np.std(p_true, axis=0) + 1e-12).astype(np.float64))
+        s_pT = float(np.std(pT) + 1e-12)
         s_mag = float(np.std(mag) + 1e-12)
 
     s_xyz = tuple(max(float(v), 1e-8) for v in s_xyz)
+    s_pT = max(float(s_pT), 1e-8)
     s_mag = max(float(s_mag), 1e-8)
 
     # residual floors
@@ -316,7 +320,7 @@ def compute_vector_stats_from_cartesian(
     return VectorStatsLog1p(
         k_T=k_T, mu_uT=mu_uT, sigma_uT=sigma_uT,
         k_Z=k_Z, mu_uZ=mu_uZ, sigma_uZ=sigma_uZ,
-        s_xyz=s_xyz, s_mag=s_mag,
+        s_xyz=s_xyz, s_pT=s_pT, s_mag=s_mag,
         tau_pt=tau_pt, tau_mag=tau_mag,
     )
 

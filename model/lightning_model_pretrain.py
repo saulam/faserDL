@@ -11,7 +11,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 import timm.optim as optim_factory
 from utils import (
-    arrange_input, arrange_truth, csr_keep_rows_torch, 
+    arrange_input, arrange_truth, csr_keep_rows_torch, bce_for_decays_csr,
     soft_ce_with_logits_csr, reconstruction_losses_masked_simple,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
@@ -115,9 +115,9 @@ class MAEPreTrainer(pl.LightningModule):
         """
         Computes losses (same-track, same-primary, same-pid) in one call.
         """
-        loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask, num_classes=4)
-        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask, num_classes=4)
-        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask, num_classes=4)
+        loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask)
+        loss_dec = bce_for_decays_csr(z_dec, csr_dec, ghost_mask=ghost_mask)
+        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask)
 
         part_losses_enc = {
             "hie/total": loss_hie.detach(),
