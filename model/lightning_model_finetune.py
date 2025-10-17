@@ -13,7 +13,7 @@ from typing import Any
 from torch_ema import ExponentialMovingAverage
 from utils import (
     param_groups_lrd, KinematicsMultiTaskLoss,
-    arrange_input, arrange_truth, soft_focal_cross_entropy,
+    arrange_input, arrange_truth,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj
 )
 
@@ -22,7 +22,6 @@ class ViTFineTuner(pl.LightningModule):
     def __init__(self, model, args):
         super(ViTFineTuner, self).__init__()
         self.model = model
-        self.preprocessing_output = args.preprocessing_output
         stats = model.metadata
 
         def get_or(d: dict, key: str, default: Any) -> Any:
@@ -168,8 +167,6 @@ class ViTFineTuner(pl.LightningModule):
         )
 
         # classification losses
-        #loss_flavour = self.loss_flavour(out_flavour, targ_flavour, gamma=2.0, alpha=0.25)
-        #loss_charm   = self.loss_charm(out_charm, targ_charm, gamma=2.0, alpha=0.25)
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm   = self.loss_charm(out_charm, targ_charm)
 
@@ -183,44 +180,21 @@ class ViTFineTuner(pl.LightningModule):
         loss_lep_geom    = outs["loss_lep/geom"]
         loss_lep_pt      = outs["loss_lep/pt"]
         loss_lep_mag     = outs["loss_lep/mag"]
-        loss_lep_zero_nc = outs["loss_lep/zero_nc"]
-
-        def _safe_mean_mask(x, mask):
-            return (x[mask].mean() if mask.any() else torch.tensor(0.0, device=x.device))
-
-        # activity normalization (per batch)
-        cc_mask = (targ_iscc > 0.5)                 # bool [B]
-        nc_mask = ~cc_mask
-        cc_frac = cc_mask.float().mean().clamp_min(1e-6)
-        nc_frac = nc_mask.float().mean().clamp_min(1e-6)
 
         # Kendall-weighted total
         total_loss = (
-            weighted_loss(loss_flavour,           self.log_sigma_flavour,  kind="ce").mean()  +
-            weighted_loss(loss_charm,             self.log_sigma_charm,    kind="ce").mean()  +
-            weighted_loss(loss_vis_geom,          self.log_sigma_vis_geom, kind="reg").mean() +
-            weighted_loss(loss_vis_pt,            self.log_sigma_vis_pt,   kind="reg").mean() +
-            weighted_loss(loss_vis_mag,           self.log_sigma_vis_mag,  kind="reg").mean() +
-            weighted_loss(loss_jet_geom,          self.log_sigma_jet_geom, kind="reg").mean() +
-            weighted_loss(loss_jet_pt,            self.log_sigma_jet_pt,   kind="reg").mean() +
-            weighted_loss(loss_jet_mag,           self.log_sigma_jet_mag,  kind="reg").mean() +
-            weighted_loss(loss_lep_geom[cc_mask], self.log_sigma_lep_geom, kind="reg").mean() +  # normalise masked tasks
-            weighted_loss(loss_lep_pt[cc_mask],   self.log_sigma_lep_pt,   kind="reg").mean() +
-            weighted_loss(loss_lep_mag[cc_mask],  self.log_sigma_lep_mag,  kind="reg").mean()
+            weighted_loss(loss_flavour,  self.log_sigma_flavour,  kind="ce").mean()  +
+            weighted_loss(loss_charm,    self.log_sigma_charm,    kind="ce").mean()  +
+            weighted_loss(loss_vis_geom, self.log_sigma_vis_geom, kind="reg").mean() +
+            weighted_loss(loss_vis_pt,   self.log_sigma_vis_pt,   kind="reg").mean() +
+            weighted_loss(loss_vis_mag,  self.log_sigma_vis_mag,  kind="reg").mean() +
+            weighted_loss(loss_jet_geom, self.log_sigma_jet_geom, kind="reg").mean() +
+            weighted_loss(loss_jet_pt,   self.log_sigma_jet_pt,   kind="reg").mean() +
+            weighted_loss(loss_jet_mag,  self.log_sigma_jet_mag,  kind="reg").mean() +
+            weighted_loss(loss_lep_geom, self.log_sigma_lep_geom, kind="reg").mean() +
+            weighted_loss(loss_lep_pt,   self.log_sigma_lep_pt,   kind="reg").mean() +
+            weighted_loss(loss_lep_mag,  self.log_sigma_lep_mag,  kind="reg").mean()
         )
-
-
-        # add NC zero-attractor OUTSIDE Kendall (normalised by NC fraction)
-        #total_loss = total_loss + self.crit.lep_nc_zero_w * (loss_lep_zero_nc[nc_mask]).mean()
-
-        # (optional) tiny prior + clamp on sigmas each step
-        #reg = (
-        #    self.log_sigma_flavour**2 + self.log_sigma_charm**2 +
-        #    self.log_sigma_jet_geom**2 + self.log_sigma_jet_pt**2 + self.log_sigma_jet_mag**2 +
-        #    self.log_sigma_lep_geom**2 + self.log_sigma_lep_pt**2 + self.log_sigma_lep_mag**2
-        #    self.log_sigma_vis_geom**2 + self.log_sigma_vis_pt**2 + self.log_sigma_vis_mag**2 +
-        #)
-        #total_loss = total_loss + 1e-4 * reg
 
         part_losses = {
             # classification
@@ -234,14 +208,9 @@ class ViTFineTuner(pl.LightningModule):
             'loss_jet/geom':    loss_jet_geom.mean().detach().item(),
             'loss_jet/pt':      loss_jet_pt.mean().detach().item(),
             'loss_jet/mag':     loss_jet_mag.mean().detach().item(),
-            'loss_lep/geom_cc': _safe_mean_mask(loss_lep_geom, cc_mask).detach().item(),
-            'loss_lep/pt_cc':   _safe_mean_mask(loss_lep_pt, cc_mask).detach().item(),
-            'loss_lep/mag_cc':  _safe_mean_mask(loss_lep_mag, cc_mask).detach().item(),
-            'loss_lep/zero_nc': _safe_mean_mask(loss_lep_zero_nc, nc_mask).detach().item(),
-
-            # batch mix
-            'mix/cc_frac':      cc_frac.detach().item(),
-            'mix/nc_frac':      nc_frac.detach().item(),
+            'loss_lep/geom_cc': loss_lep_geom.mean().detach().item(),
+            'loss_lep/pt_cc':   loss_lep_pt.mean().detach().item(),
+            'loss_lep/mag_cc':  loss_lep_mag.mean().detach().item(),
         }
         
         return total_loss, part_losses

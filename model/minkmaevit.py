@@ -43,6 +43,7 @@ class MinkMAEViT(nn.Module):
         drop_rate_dec=0.,
         attn_drop_rate_dec=0.,
         norm_layer=nn.LayerNorm,
+        metadata=None,
     ):
         """
         Args:
@@ -52,6 +53,8 @@ class MinkMAEViT(nn.Module):
             args: Namespace with at least a `dataset_path` attribute.
         """
         super().__init__()
+
+        self.metadata = metadata
     
         # patch and grid setup
         H, W, D_img = img_size
@@ -186,15 +189,20 @@ class MinkMAEViT(nn.Module):
             for i, name in enumerate(["rel", "rec"])
         })
         self.head_channels = {
-            "hie": 4,
-            "dec": 2,
-            "pid": num_pid_classes + 1,
+            "vis": 2,
+            "gho": 1,
+            "hie": 3,
+            "dec": 3,
+            "pid": num_pid_classes,
             "occ": 1,
             "reg": in_chans,
         }
         self.heads = nn.ModuleDict({
-            name: nn.Linear(num_modes[0] if name in ["hie", "dec", "pid"] else num_modes[1], self.head_channels[name]) 
-            for name in ["hie", "dec", "pid", "occ", "reg"]
+            name: nn.Linear(num_modes[0] if name in ["gho", "hie", "dec", "pid"] 
+                            else num_modes[1] if name in ["occ", "reg"]
+                            else embed_dim,
+                            self.head_channels[name]) 
+            for name in self.head_channels.keys()
         })
 
         self.initialize_weights()
@@ -555,6 +563,16 @@ class MinkMAEViT(nn.Module):
         return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
     
 
+    def forward_global(self, latents):
+        """
+        latents: [B, M*CLS, Cenc]
+        """
+        outcome = latents.mean(dim=1)
+        preds = {}
+        preds["vis"] = self.heads["vis"](outcome)
+        return preds
+
+
     def forward_relational(self, latents, tok_keep, attn_mask_keep, ids_keep, idx_map):
         """
         latents:        [B, K, Cenc]
@@ -582,17 +600,19 @@ class MinkMAEViT(nn.Module):
         out_flat = X[b_ids, within]                                        # [Nk, Cdec]
 
         # heads
-        shared              = self.shared_voxel_head["rel"](out_flat)      # [Nk, P, H]
-        pred_hie            = self.heads["hie"](shared)                    # [Nk, P, 4]
-        pred_dec            = self.heads["dec"](shared)                    # [Nk, P, 4]
-        pred_pid            = self.heads["pid"](shared)                    # [Nk, P, num_pid_classes+1]
+        shared       = self.shared_voxel_head["rel"](out_flat)             # [Nk, P, H]
+        preds        = {}
+        preds["gho"] = self.heads["gho"](shared).squeeze(-1)               # [Nk, P]
+        preds["hie"] = self.heads["hie"](shared)                           # [Nk, P, 3]
+        preds["dec"] = self.heads["dec"](shared)                           # [Nk, P, 3]
+        preds["pid"] = self.heads["pid"](shared)                           # [Nk, P, num_pid_classes]
 
         # targets
         l_intra   = ids_keep[b_ids, m_ids, lk_ids]                         # [Nk]
         patch_ids = self.module_token_indices[m_ids, l_intra]              # [Nk]
         idx_targets_kept = idx_map[b_ids, patch_ids]                       # [Nk, P]
 
-        return pred_hie, pred_dec, pred_pid, idx_targets_kept
+        return preds, idx_targets_kept
 
 
     def forward_reconstruction(self, latents, attn_mask_mod, rand_mask, idx_map):
@@ -632,15 +652,16 @@ class MinkMAEViT(nn.Module):
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
         # heads
-        shared   = self.shared_voxel_head["rec"](out_flat)                   # [Nm, P, H]
-        pred_occ = self.heads["occ"](shared).squeeze(-1)                     # [Nm, P]
-        pred_reg = self.heads["reg"](shared)                                 # [Nm, P, in_chans]
+        shared       = self.shared_voxel_head["rec"](out_flat)               # [Nm, P, H]
+        preds        = {}
+        preds["occ"] = self.heads["occ"](shared).squeeze(-1)                 # [Nm, P]
+        preds["reg"] = self.heads["reg"](shared)                             # [Nm, P, in_chans]
 
         # targets
         patch_ids = self.module_token_indices[m_ids, l_ids]                  # [Nm]
         idx_targets = idx_map[b_ids, patch_ids]                              # [Nm, P]
 
-        return pred_occ, pred_reg, idx_targets, b_ids, patch_ids
+        return preds, idx_targets, b_ids, patch_ids
 
 
     def forward(self, x, x_glob, mask_ratio=0.75):
@@ -649,18 +670,20 @@ class MinkMAEViT(nn.Module):
         # Relational path
         lat_full, tok_full, _, _, attn_mask_full, ids_full = \
             self.forward_encoder(x, x_glob, mask_ratio=0.0)
-        pred_hie, pred_dec, pred_pid, rel_idx_targets = \
+        preds_glob = self.forward_global(lat_full)
+        preds_rel, rel_idx_targets = \
             self.forward_relational(lat_full, tok_full, attn_mask_full, ids_full, idx_map)
 
         # Reconstruction path
         lat_masked, _, rand_mask, attn_mask_masked, _, _ = \
             self.forward_encoder(x, x_glob, mask_ratio)
-        pred_occ, pred_reg, rec_idx_targets, row_event_ids, row_patch_ids = \
+        preds_rec, rec_idx_targets, row_event_ids, row_patch_ids = \
             self.forward_reconstruction(lat_masked, attn_mask_masked, rand_mask, idx_map)
+        
+        preds = {**preds_glob, **preds_rel, **preds_rec}
 
         return (
-            pred_hie, pred_dec, pred_pid,
-            pred_occ, pred_reg, rel_idx_targets, rec_idx_targets,
+            preds, rel_idx_targets, rec_idx_targets,
             row_event_ids, row_patch_ids
         )
     
@@ -795,7 +818,7 @@ def mae_vit_tiny(**kwargs):
         depth=4, num_heads=12, num_global_tokens=1,
         io_depth=8, io_decode_depth=3, num_module_cls=2,
         num_modes=(32, 8), decoder_embed_dim=384, decoder_num_heads=12,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
 
@@ -807,7 +830,7 @@ def mae_vit_base(**kwargs):
         depth=4, num_heads=12, num_global_tokens=1,
         io_depth=8, io_decode_depth=4, num_module_cls=2,
         num_modes=(48, 8), decoder_embed_dim=528, decoder_num_heads=12,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
     
@@ -819,7 +842,7 @@ def mae_vit_large(**kwargs):
         depth=8, num_heads=12, num_global_tokens=2,
         io_depth=16, io_decode_depth=6, num_module_cls=4,
         num_modes=(64, 12), decoder_embed_dim=528, decoder_num_heads=16,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
 
@@ -831,6 +854,6 @@ def mae_vit_huge(**kwargs):
         depth=16, num_heads=12, num_global_tokens=4,
         io_depth=32, io_decode_depth=8, num_module_cls=4,
         num_modes=(64, 16), decoder_embed_dim=528, decoder_num_heads=16,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model

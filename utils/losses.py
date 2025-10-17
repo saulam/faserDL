@@ -98,20 +98,22 @@ class KinematicsMultiTaskLoss(nn.Module):
         den = v_hat.norm(dim=-1) * v_true.norm(dim=-1)
         return 1.0 - num / (den + eps)
 
-    def _component_loss(self, p_hat, p_true, s_xyz, eps=1e-8):
+    @staticmethod
+    def _component_loss(p_hat, p_true, s_xyz, delta, decouple_radial=False, eps=1e-8):
         """
         If decouple_radial=True, remove the radial component so this term is
         purely angular in the native Cartesian basis (per-axis scaled).
         """
         e = p_hat - p_true
-        if self.decouple_radial:
+        if decouple_radial:
             tnorm2 = (p_true * p_true).sum(-1, keepdim=True).clamp_min(eps)
             e_rad = ((e * p_true).sum(-1, keepdim=True) / tnorm2) * p_true
             e = e - e_rad
-        z = e / s_xyz
-        return self._huber(z, self.huber_delta).sum(-1)
+        z = e / s_xyz[:, :e.shape[-1]]
+        return KinematicsMultiTaskLoss._huber(z, delta).sum(-1)
 
-    def _relative_residual_loss(self, p_true, p_hat, s, kind="mag"):
+    @staticmethod
+    def _huber_relative_residual_on_norm(p_true, p_hat, s, delta, kind="mag"):
         """
         Relative residual Huber on a scalar derived from vectors p_true/p_hat:
           kind="mag":  uses ||p||
@@ -127,9 +129,8 @@ class KinematicsMultiTaskLoss(nn.Module):
         else:
             raise ValueError(f"Unknown kind='{kind}'")
         r = (x_true - x_hat) / s
-        return self._huber(r, self.huber_delta)
+        return KinematicsMultiTaskLoss._huber(r, delta)
 
-    # ---------- forward ----------
     def forward(
         self,
         *,
@@ -148,48 +149,43 @@ class KinematicsMultiTaskLoss(nn.Module):
         # ----- predictions -----
         p_lep_hat = p_vis_hat - p_jet_hat
 
-        m_cc = is_cc.to(p_vis_hat.dtype).view(-1)      # (B,)
-        m_nc = 1.0 - m_cc
-
         # ----- vector losses -----
         # VIS
-        L_vis_comp  = self._component_loss(p_vis_hat, p_vis_true, self.s_vis_xyz)
+        L_vis_comp  = self._component_loss(
+            p_vis_hat, p_vis_true, self.s_vis_xyz, self.huber_delta, self.decouple_radial
+        )
         L_vis_dirxy = self._cosine_dir_xy(p_vis_hat, p_vis_true)
         L_vis_geom = L_vis_comp + self.lam_dir_xy * L_vis_dirxy
         if self.lam_dir_3d != 0.0:
             L_vis_geom = L_vis_geom + self.lam_dir_3d * self._cosine_dir_3d(p_vis_hat, p_vis_true)
         if vis_latents is not None and self.latent_prior_w > 0.0:
             L_vis_geom = L_vis_geom + self.latent_prior_w * (vis_latents.pow(2).sum(-1))
-        L_vis_pt   = self._relative_residual_loss(p_vis_true, p_vis_hat, self.s_vis_pT, kind="pt")
-        L_vis_mag  = self._relative_residual_loss(p_vis_true, p_vis_hat, self.s_vis_mag, kind="mag")
+        L_vis_pt   = self._huber_relative_residual_on_norm(p_vis_true, p_vis_hat, self.s_vis_pT,  self.huber_delta, kind="pt")
+        L_vis_mag  = self._huber_relative_residual_on_norm(p_vis_true, p_vis_hat, self.s_vis_mag, self.huber_delta, kind="mag")
 
         # JET
-        L_jet_comp  = self._component_loss(p_jet_hat, p_jet_true, self.s_jet_xyz)
+        L_jet_comp  = self._component_loss(
+            p_jet_hat, p_jet_true, self.s_jet_xyz, self.huber_delta, self.decouple_radial
+        )
         L_jet_dirxy = self._cosine_dir_xy(p_jet_hat, p_jet_true)
         L_jet_geom = L_jet_comp + self.lam_dir_xy * L_jet_dirxy
         if self.lam_dir_3d != 0.0:
             L_jet_geom = L_jet_geom + self.lam_dir_3d * self._cosine_dir_3d(p_jet_hat, p_jet_true)
         if jet_latents is not None and self.latent_prior_w > 0.0:
             L_jet_geom = L_jet_geom + self.latent_prior_w * (jet_latents.pow(2).sum(-1))
-        L_jet_pt   = self._relative_residual_loss(p_jet_true, p_jet_hat, self.s_jet_pT, kind="pt")
-        L_jet_mag  = self._relative_residual_loss(p_jet_true, p_jet_hat, self.s_jet_mag, kind="mag")
+        L_jet_pt   = self._huber_relative_residual_on_norm(p_jet_true, p_jet_hat, self.s_jet_pT,  self.huber_delta, kind="pt")
+        L_jet_mag  = self._huber_relative_residual_on_norm(p_jet_true, p_jet_hat, self.s_jet_mag, self.huber_delta, kind="mag")
 
-        # LEPTON (CC-only; use gated prediction).
-        L_lep_comp  = self._component_loss(p_lep_hat, p_lep_true, self.s_lep_xyz)
+        # LEPTON
+        L_lep_comp  = self._component_loss(
+            p_lep_hat, p_lep_true, self.s_lep_xyz, self.huber_delta, self.decouple_radial
+        )
         L_lep_dirxy = self._cosine_dir_xy(p_lep_hat, p_lep_true)
         L_lep_geom = L_lep_comp + self.lam_dir_xy * L_lep_dirxy
         if self.lam_dir_3d != 0.0:
-            L_lep_geom = L_lep_geom + (self.lam_dir_3d * self._cosine_dir_3d(p_lep_hat, p_lep_true))
-        L_lep_geom = L_lep_geom * m_cc
-        L_lep_pt   = self._relative_residual_loss(p_lep_true, p_lep_hat, self.s_lep_pT, kind="pt") * m_cc
-        L_lep_mag  = self._relative_residual_loss(p_lep_true, p_lep_hat, self.s_lep_mag, kind="mag") * m_cc
-
-        # NC zero-attractor (small) on RAW lepton
-        if self.lep_nc_zero_w > 0.0:
-            z_nc = (p_lep_hat / self.s_lep_xyz) * m_nc.view(-1,1)
-            L_lep_zero_nc = self._huber(z_nc, self.huber_delta).sum(-1)
-        else:
-            L_lep_zero_nc = torch.zeros_like(m_cc)
+            L_lep_geom = L_lep_geom + self.lam_dir_3d * self._cosine_dir_3d(p_lep_hat, p_lep_true)
+        L_lep_pt   = self._huber_relative_residual_on_norm(p_lep_true, p_lep_hat, self.s_lep_pT,  self.huber_delta, kind="pt")
+        L_lep_mag  = self._huber_relative_residual_on_norm(p_lep_true, p_lep_hat, self.s_lep_mag, self.huber_delta, kind="mag")
 
         losses = {
             # vis
@@ -204,8 +200,6 @@ class KinematicsMultiTaskLoss(nn.Module):
             'loss_lep/geom': L_lep_geom,
             'loss_lep/pt':   L_lep_pt,
             'loss_lep/mag':  L_lep_mag,
-            # NC prior
-            'loss_lep/zero_nc': L_lep_zero_nc,
         }
 
         return losses
@@ -1456,9 +1450,20 @@ def soft_ce_with_logits_csr(
     ghost_mask: torch.Tensor = None,
 ):
     N, num_classes = logits.shape
-    soft_labels = build_soft_targets_from_csr(*csr, num_classes=num_classes, N=N, ghost_mask=ghost_mask)
-    loss = -(soft_labels * torch.log_softmax(logits, dim=-1)).sum(dim=1).mean()
-    return loss
+
+    # Always build without a ghost column
+    soft_labels = build_soft_targets_from_csr(
+        *csr, num_classes=num_classes, N=N, ghost_mask=None
+    )
+    per_row_loss = -(soft_labels * torch.log_softmax(logits, dim=-1)).sum(dim=1)
+
+    if ghost_mask is not None:
+        mask = ~ghost_mask.to(dtype=torch.bool, device=logits.device)
+        if mask.any():
+            return per_row_loss[mask].mean()
+        return per_row_loss.new_tensor(0.0)
+
+    return per_row_loss.mean()
 
 
 def bce_for_decays_csr(

@@ -507,6 +507,10 @@ class SparseFASERCALDataset(Dataset):
             'rear_hcal_modules': rear_hcal_mod.float(),
             'flavour_label': torch.from_numpy(event['flavour_label']),
             'charm_label': torch.from_numpy(event['charm_label']),
+            'vis_sp_momentum': vis_sp_momentum.float(),
+            'out_lepton_momentum': out_lepton_momentum.float(),
+            'jet_momentum': jet_momentum.float(),
+            'is_cc': torch.tensor(event['is_cc']).reshape(1,).float(),
         }
         if self.stage1:
             output.update({
@@ -520,14 +524,6 @@ class SparseFASERCALDataset(Dataset):
                 'csr_pid_ids': torch.from_numpy(event['csr_pid'][1]).long(),
                 'csr_pid_weights': torch.from_numpy(event['csr_pid'][2]).float(),
                 'ghost_mask': torch.from_numpy(event['ghost_mask']).bool(),
-            })
-            
-        if not self.train or not self.stage1:
-            output.update({
-                'vis_sp_momentum': vis_sp_momentum.float(),
-                'out_lepton_momentum': out_lepton_momentum.float(),
-                'jet_momentum': jet_momentum.float(),
-                'is_cc': torch.tensor(event['is_cc']).reshape(1,).float(),
             })
         if not self.train:
             output.update({

@@ -83,6 +83,7 @@ def main():
         )
         train_loader = create_loader(train_set, shuffle=False, drop_last=True, args=args)
         valid_loader = create_loader(val_set, shuffle=False, drop_last=True, args=args)
+        metadata = train_set.metadata
         nb_batches_train = len(train_set) // args.batch_size
         nb_batches_val = len(val_set) // args.batch_size
         dataset = train_set
@@ -93,6 +94,7 @@ def main():
         train_loader, valid_loader, _ = split_dataset(
             dataset, args, splits=[0.85, 0.05, 0.1],
         )
+        metadata = dataset.metadata
         nb_batches_train = len(train_loader)
         nb_batches_val = len(valid_loader)
 
@@ -117,7 +119,7 @@ def main():
         drop_path_rate = args.drop_path_rate,
         drop_rate_dec = args.dropout_dec,
         attn_drop_rate_dec = args.attn_dropout_dec,
-        drop_path_rate_dec = args.drop_path_rate_dec,
+        metadata = metadata,
     )
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
