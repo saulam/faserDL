@@ -1448,6 +1448,7 @@ def soft_ce_with_logits_csr(
     logits: torch.Tensor,
     csr: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, w)
     ghost_mask: torch.Tensor = None,
+    label_smoothing: float = 0.0,
 ):
     N, num_classes = logits.shape
 
@@ -1455,6 +1456,14 @@ def soft_ce_with_logits_csr(
     soft_labels = build_soft_targets_from_csr(
         *csr, num_classes=num_classes, N=N, ghost_mask=None
     )
+
+    # Apply label smoothing if requested
+    eps = float(label_smoothing)
+    if eps > 0.0:
+        eps = max(0.0, min(1.0, eps))
+        eps_t = torch.as_tensor(eps, dtype=soft_labels.dtype, device=soft_labels.device)
+        soft_labels = soft_labels.mul(1.0 - eps_t).add(eps_t / num_classes)
+
     per_row_loss = -(soft_labels * torch.log_softmax(logits, dim=-1)).sum(dim=1)
 
     if ghost_mask is not None:
@@ -1466,18 +1475,32 @@ def soft_ce_with_logits_csr(
     return per_row_loss.mean()
 
 
-def bce_for_decays_csr(
-    logits: torch.Tensor,
-    csr: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, w)
-    ghost_mask: torch.Tensor = None,
-):
-    N, num_classes = logits.shape
-    soft_labels = build_soft_targets_from_csr(*csr, num_classes=num_classes+1, N=N, ghost_mask=None)
-    hard_labels = (soft_labels[:, 1:num_classes+1] > 0).to(dtype=soft_labels.dtype)
-    if ghost_mask is not None:
-        hard_labels = torch.where(ghost_mask.unsqueeze(1), torch.zeros_like(hard_labels), hard_labels)
-    loss = F.binary_cross_entropy_with_logits(logits, hard_labels, reduction='mean')
-    return loss
+def bce_with_logits_label_smoothing(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    label_smoothing: float = 0.0,
+    weight: Optional[torch.Tensor] = None,
+    pos_weight: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    BCEWithLogits with label smoothing.
+
+    For y ∈ {0,1}, smoothing maps:
+      y=1 -> 1 - ε
+      y=0 -> ε
+    which matches standard K=2 label smoothing.
+
+    Args mirror torch.nn.functional.binary_cross_entropy_with_logits.
+    """
+    if label_smoothing > 0.0:
+        target = target.to(dtype=input.dtype)
+        target = target * (1 - label_smoothing) + (1 - target) * label_smoothing
+        
+    return F.binary_cross_entropy_with_logits(
+        input, target, weight=weight, pos_weight=pos_weight, reduction=reduction
+    )
 
 
 def count_ce_loss(logits, indptr, ghost_mask, K_max=2):

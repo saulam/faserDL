@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 import timm.optim as optim_factory
 from torch.nn import functional as F
 from utils import (
-    arrange_input, arrange_truth, csr_keep_rows_torch, KinematicsMultiTaskLoss,
+    arrange_input, arrange_truth, csr_keep_rows_torch, bce_with_logits_label_smoothing,
     soft_ce_with_logits_csr, reconstruction_losses_masked_simple,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
@@ -24,11 +24,6 @@ class MAEPreTrainer(pl.LightningModule):
 
         self.model = model
         stats = model.metadata
-        self.register_buffer("s_vis_xyz", torch.tensor(stats["vis"]["s_xyz"][:2], dtype=torch.float32).view(1,2))
-        self.s_vis_pT = float(stats["vis"]["s_pT"])
-        self.s_vis_mag = float(stats["vis"]["s_mag"])
-        self.huber_delta = 1.0
-        self.lam_dir_xy = 1.0
         self.mask_ratio = args.mask_ratio
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
@@ -127,10 +122,10 @@ class MAEPreTrainer(pl.LightningModule):
         """
         Computes losses (same-track, same-primary, same-pid) in one call.
         """
-        loss_gho = F.binary_cross_entropy_with_logits(z_gho, ghost_mask.to(z_gho.dtype), reduction='mean')
-        loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask)
-        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask)
-        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask)
+        loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), label_smoothing=self.label_smoothing)
+        loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
+        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
+        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
 
         part_losses_enc = {
             "gho/total": loss_gho.detach(),
@@ -140,31 +135,6 @@ class MAEPreTrainer(pl.LightningModule):
         }
 
         return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
-    
-
-    def compute_global_losses(
-        self,
-        pred_vis: torch.Tensor,
-        targ_vis: torch.Tensor,
-    ):          
-        targ_vis = targ_vis[:, :2]
-        L_vis_comp  = KinematicsMultiTaskLoss._component_loss(
-            pred_vis, targ_vis, self.s_vis_xyz, delta=self.huber_delta
-        )
-        L_vis_dirxy = KinematicsMultiTaskLoss._cosine_dir_xy(pred_vis, targ_vis)
-        L_vis_geom = L_vis_comp + self.lam_dir_xy * L_vis_dirxy
-        L_vis_pt   = KinematicsMultiTaskLoss._huber_relative_residual_on_norm(
-            pred_vis, targ_vis, self.s_vis_pT, delta=self.huber_delta, kind="pt"
-        )
-
-        part_losses = {
-            'loss_vis/geom': L_vis_geom.mean().detach().item(),
-            'loss_vis/pt':   L_vis_pt.mean().detach().item(),
-        }
-
-        loss = (L_vis_geom + L_vis_pt).mean()
-
-        return loss, part_losses
 
 
     def compute_relational_losses(
@@ -233,23 +203,18 @@ class MAEPreTrainer(pl.LightningModule):
         rec_idx_targets: torch.Tensor,
         labels: dict,
     ):
-        pred_vis=preds["vis"]
         pred_gho=preds["gho"]
         pred_hie=preds["hie"]
         pred_dec=preds["dec"]
         pred_pid=preds["pid"]
         pred_occ=preds["occ"]
         pred_reg=preds["reg"]
-        targ_vis=labels['vis_sp_momentum']
         csr_hie=labels['csr_hie']
         csr_dec=labels['csr_dec']
         csr_pid=labels['csr_pid']
         ghost_mask=labels['ghost_mask']
         hit_event_id=labels['hit_event_id']
 
-        loss_vis, part_vis = self.compute_global_losses(
-            pred_vis=pred_vis, targ_vis=targ_vis,
-        )
         loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses(
             pred_gho, pred_hie, pred_dec, pred_pid, rel_idx_targets, csr_hie, csr_dec, csr_pid, ghost_mask,
         )
@@ -258,13 +223,12 @@ class MAEPreTrainer(pl.LightningModule):
         )
 
         # Kendall et al. aggregation
-        part_losses = {**part_vis, **part_enc, **part_dec}
+        part_losses = {**part_enc, **part_dec}
         def _weight(loss, attr, kind):
             ls = getattr(self, attr, None)
             return weighted_loss(loss, ls, kind) if ls is not None else loss
 
         total_loss = (
-            0.01 * loss_vis +
             _weight(loss_gho, "log_sigma_gho", kind="ce")  +
             _weight(loss_hie, "log_sigma_hie", kind="ce")  +
             _weight(loss_dec, "log_sigma_dec", kind="ce")  +

@@ -202,15 +202,15 @@ class ViTFineTuner(pl.LightningModule):
             'loss_cls/charm':   loss_charm.mean().detach().item(),
 
             # regression (unmasked/batch means)
-            'loss_vis/geom':    loss_vis_geom.mean().detach().item(),
-            'loss_vis/pt':      loss_vis_pt.mean().detach().item(),
-            'loss_vis/mag':     loss_vis_mag.mean().detach().item(),
-            'loss_jet/geom':    loss_jet_geom.mean().detach().item(),
-            'loss_jet/pt':      loss_jet_pt.mean().detach().item(),
-            'loss_jet/mag':     loss_jet_mag.mean().detach().item(),
-            'loss_lep/geom_cc': loss_lep_geom.mean().detach().item(),
-            'loss_lep/pt_cc':   loss_lep_pt.mean().detach().item(),
-            'loss_lep/mag_cc':  loss_lep_mag.mean().detach().item(),
+            'loss_vis/geom': loss_vis_geom.mean().detach().item(),
+            'loss_vis/pt':   loss_vis_pt.mean().detach().item(),
+            'loss_vis/mag':  loss_vis_mag.mean().detach().item(),
+            'loss_jet/geom': loss_jet_geom.mean().detach().item(),
+            'loss_jet/pt':   loss_jet_pt.mean().detach().item(),
+            'loss_jet/mag':  loss_jet_mag.mean().detach().item(),
+            'loss_lep/geom': loss_lep_geom.mean().detach().item(),
+            'loss_lep/pt':   loss_lep_pt.mean().detach().item(),
+            'loss_lep/mag':  loss_lep_mag.mean().detach().item(),
         }
         
         return total_loss, part_losses
