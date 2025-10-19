@@ -197,9 +197,16 @@ class MinkMAEViT(nn.Module):
             "reg": in_chans,
         }
         self.heads = nn.ModuleDict({
-            name: nn.Linear(num_modes[0] if name in ["gho", "hie", "dec", "pid"] 
-                            else num_modes[1],
-                            self.head_channels[name]) 
+            name: (
+                nn.Sequential(
+                    nn.Dropout(p=0.1),  # it tends to overfit
+                    nn.Linear(num_modes[0], self.head_channels[name]),
+                ) if name == "dec" else
+                nn.Linear(
+                    num_modes[0] if name in ["gho", "hie", "pid"] else num_modes[1],
+                    self.head_channels[name]
+                )
+            )
             for name in self.head_channels.keys()
         })
 

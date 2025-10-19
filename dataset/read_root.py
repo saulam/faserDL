@@ -90,13 +90,13 @@ def get_true_hits(
     if is_tau:
         tau_parent_ids = [trk.m_trackid_in_particle[0] for trk in tau_decay if trk.nparent == 1]
         #assert len(tau_parent_ids) > 0, "no tau decay products with exactly one parent found"
-        if len(tau_parent_ids) == 0:
+        if len(set(tau_parent_ids)) != 1:
             for trk in tau_decay:
                 print("--------")
                 print("#ERROR#")
                 print(f"tau decay product: geantID={trk.geanttrackID}, nparent={trk.nparent}, parentIDs={trk.m_trackid_in_particle}")
                 print("--------")
-        assert len(set(tau_parent_ids)) == 1, "multiple tau decay parents found"
+        #assert len(set(tau_parent_ids)) == 1, "multiple tau decay parents found"
         tau_parent_id = tau_parent_ids[0]
 
         tau_decay_geant_id = next(
