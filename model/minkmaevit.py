@@ -149,7 +149,7 @@ class MinkMAEViT(nn.Module):
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per patch
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index for intra-attn
         self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
-        self.kv_src_embed = nn.Embedding(3, embed_dim)
+        self.kv_src_embed = nn.Embedding(2, embed_dim)
 
         # Intra-module transformer blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.intra_depth)]
@@ -583,18 +583,16 @@ class MinkMAEViT(nn.Module):
         ah_tokens = ah_tokens + self.ahcal_pos_embed(ah_idx) \
                                + self.kv_src_embed.weight[0].view(1, 1, -1)               # tag as AHCAL
 
-        # ecal embedding
+        # ecal + muon spec as a single token
         ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
-        ecal_emb = ecal_emb + self.kv_src_embed.weight[1].view(1, 1, -1)                  # tag as ECal
-
-        # muon spectrometer cross-attention
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                # [B, N_muspec, C]
         muon_spec_emb = self.muon_spec_xattn(
             self.muon_spec_token.expand(B, -1, -1),
             muon_spec_emb,
             attn_mask=muspec_attn_mask
         )                                                                                 # [B, 1, C]
-        muon_spec_emb = muon_spec_emb + self.kv_src_embed.weight[2].view(1, 1, -1)        # tag as MuSpec
+        global_emb = ecal_emb + muon_spec_emb + \
+            self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
 
         # pack kept tokens for cross-attention
         kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
@@ -605,9 +603,9 @@ class MinkMAEViT(nn.Module):
         kv_keep   = torch.cat([kv_keep, ah_mask], dim=1)                                  # [B, Nmax + Na]
 
         # append global tokens as real KV
-        kv_tokens = torch.cat([kv_tokens, ecal_emb, muon_spec_emb], dim=1)                # [B, Nk+2, C]
+        kv_tokens = torch.cat([kv_tokens, global_emb], dim=1)                             # [B, Nmax + Na + 1, C]
         kv_keep   = torch.cat([kv_keep, torch.ones(
-            B, 2, dtype=torch.bool, device=kv_keep.device)], dim=1)                       # [B, Nk+2]
+            B, 1, dtype=torch.bool, device=kv_keep.device)], dim=1)                       # [B, Nmax + Na + 1]
 
         # prepare queries and masks
         queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]

@@ -99,7 +99,7 @@ def main():
         nb_batches_val = len(valid_loader)
 
     # Calculate arguments for scheduler
-    denom = args.accum_grad_batches * nb_gpus
+    denom = args.accum_grad_batches * nb_gpus * args.nb_nodes
     if args.blr is not None:
         # overwrite lr by linearly-scaled blr if args.blr is defined
         args.lr = args.blr * (args.batch_size * denom) / 256.
