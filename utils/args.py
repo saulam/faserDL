@@ -70,6 +70,7 @@ def ini_argparse(
     parser.add_argument("--checkpoint_path", type=str, default="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints", help="Checkpoint path")
     parser.add_argument("--checkpoint_name", type=str, default="v1", help="checkpoint name")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="name of the checkpoint to load")
+    parser.add_argument("--nb_nodes", type=int, default=1, help="number of nodes")
     parser.add_argument('--gpus', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
                         default=[0],  # Default list
                         help='list of GPUs to use (more than 1 GPU will run the training in parallel)'

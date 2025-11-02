@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_new_v5.1*"
-metadata_path="/scratch/salonso/sparse-nns/faser/events_new_v5.1b/metadata_stats.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v6.0*"
+metadata_path="/scratch/salonso/sparse-nns/faser/events_v6.0_301b/metadata_stats.pkl"
 shardshuffle=200
 shuffle=4000
 model="tiny"
@@ -27,13 +27,13 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="pretrain_v5.1b_dlnu_log_base_v20"
+name="pretrain_v6.0_dlnu_log_base_v1"
 log_every_n_steps=50
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v5.1b_dlnu_log_base_v20"
+checkpoint_name="pretrain_v6.0_dlnu_log_v1"
 early_stop_patience=200
-load_checkpoint="checkpoints_final/pretrain_v5.1b_dlnu_log_base_v20/loss_total_val/last.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_base_v1/loss_total_val/last.ckpt"
 gpus=(0 1)
 
 python -m train.pretrain \

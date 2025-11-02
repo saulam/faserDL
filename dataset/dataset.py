@@ -6,16 +6,20 @@ Date: 07.25
 Description: Dataset file.
 """
 
+import os
 import io
 import pickle as pk
 import numpy as np
 import torch
 import webdataset as wds
 from glob import glob
+from itertools import chain
 from torch.utils.data import Dataset, IterableDataset
 from utils.augmentations import augment, smooth_labels
 from utils.pdg import cluster_labels_from_pdgs
 
+
+AHCAL_SHAPE = np.array([18, 18, 40], dtype=np.int32)
 
 class SparseFASERCALDataset(Dataset):
     """
@@ -36,13 +40,16 @@ class SparseFASERCALDataset(Dataset):
         self.epoch = 0
 
         # Load metadata
-        with open(args.metadata_path, "rb") as fd:
-            self.metadata = pk.load(fd)
-            for key in ['x', 'y', 'z']:
-                self.metadata[key] = np.array(self.metadata[key])
+        if args.metadata_path is not None:
+            with open(args.metadata_path, "rb") as fd:
+                self.metadata = pk.load(fd)
+                for key in ['x', 'y', 'z']:
+                    self.metadata[key] = np.array(self.metadata[key])
 
-        self.module_size = int((self.metadata['z'][:, 1] == 0).sum())
-        self.num_modules = int(self.metadata['z'][:, 1].max() + 1)
+                self.module_size = int((self.metadata['z'][:, 1] == 0).sum())
+                self.num_modules = int(self.metadata['z'][:, 1].max() + 1)
+        else:
+            print("Warning: No metadata path provided; some functionalities may be limited.")
 
     
     def voxelise(self, coords, reverse=False):
@@ -224,6 +231,19 @@ class SparseFASERCALDataset(Dataset):
 
         return x
     
+
+    def process_muspec(self, muspec):
+        ntracks = 0
+        tracks = []
+        for i in range(muspec.shape[1]):
+            info = muspec[:, i]
+            charge, npoints, px, py, pz, p, chi2, ndof, pval, fperr, fiperr = info
+            if npoints > 10 and chi2 > 0:
+                ntracks += 1
+                tracks.append([charge, px, py, pz, chi2])
+                
+        return ntracks, np.array(tracks).reshape(ntracks, 5)
+    
     
     def build_per_hit_labels_from_csr(
         self,
@@ -377,15 +397,27 @@ class SparseFASERCALDataset(Dataset):
         tau_decay_mode = data['tau_decay_mode'].item()
         is_charmed = data['is_charmed']
         charm_decay = data['charm_decay']
+        muspec_info = data['muspec_info']
+        nb_muspec_tracks, muspec_tracks = self.process_muspec(muspec_info)
         global_feats = {
-            'faser_cal_energy':  data['faser_cal_energy'],
-            'rear_cal_energy':   data['rear_cal_energy'],
-            'rear_hcal_energy':  data['rear_hcal_energy'],
-            'rear_mucal_energy': data['rear_mucal_energy'],
-            'faser_cal_modules': data['faser_cal_modules'],
-            'rear_cal_modules':  data['rear_cal_modules'],
-            'rear_hcal_modules': data['rear_hcal_modules'],
+            'ecal_hits':        data['ecal_hits'],
+            'ahcal_hits':       data['ahcal_hits'],
+            'nb_muspec_tracks': nb_muspec_tracks,
+            'muspec_q':         muspec_tracks[:, 0],
+            'muspec_p':         muspec_tracks[:, 1:4],
+            'muspec_chi2':      muspec_tracks[:, 4],
         }
+        # ensure we have at least 1 AHCAL hit
+        if global_feats["ahcal_hits"].size == 0:
+            # random xyz in the 18x18x40 box, charge = 0
+            xyz = np.array([
+                np.random.randint(0, AHCAL_SHAPE[0]),
+                np.random.randint(0, AHCAL_SHAPE[1]),
+                np.random.randint(0, AHCAL_SHAPE[2]),
+            ], dtype=float)
+            ahcal_hits = np.array([[xyz[0], xyz[1], xyz[2], 0.0]], dtype=float)
+            global_feats["ahcal_hits"] = ahcal_hits
+
         if is_tau:
             assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"
 
@@ -473,20 +505,23 @@ class SparseFASERCALDataset(Dataset):
         Applies preprocessing and converts arrays into the final torch tensors output.
         """
         # Preprocess features
-        feats = self.preprocess(event['q'], 'q', self.preprocessing_input)
+        feats = self.preprocess(event['q'] * 10, 'q', self.preprocessing_input)
         event_hits = self.preprocess(len(event['q']), 'event_hits', self.preprocessing_input)
 
-        feats_global = torch.cat([
-            event_hits,
-            self.preprocess(event['global_feats']['faser_cal_energy'], 'faser_cal_energy', self.preprocessing_input),
-            self.preprocess(event['global_feats']['rear_cal_energy'], 'rear_cal_energy', self.preprocessing_input),
-            self.preprocess(event['global_feats']['rear_hcal_energy'], 'rear_hcal_energy', self.preprocessing_input),
-            self.preprocess(event['global_feats']['rear_mucal_energy'], 'rear_mucal_energy', self.preprocessing_input)
-        ])
-        faser_mod = self.preprocess(event['global_feats']['faser_cal_modules'], 'faser_cal_modules', self.preprocessing_input)
-        rear_cal_mod = self.preprocess(event['global_feats']['rear_cal_modules'], 'rear_cal_modules', self.preprocessing_input)
-        rear_hcal_mod = self.preprocess(event['global_feats']['rear_hcal_modules'], 'rear_hcal_modules', self.preprocessing_input)
-
+        ahcal_hits_coords = event['global_feats']['ahcal_hits'][:, :3]
+        ahcal_hits_feats = self.preprocess(event['global_feats']['ahcal_hits'][:, 3] * 10, 'ahcal_hits', self.preprocessing_input)
+        ecal_hits = self.preprocess(event['global_feats']['ecal_hits'], 'ecal_hits', self.preprocessing_input)
+        nb_muspec_tracks = self.preprocess(event['global_feats']['nb_muspec_tracks'], 'nb_muspec_tracks', self.preprocessing_input)
+        muspec_p = event['global_feats']['muspec_p']
+        muspec_p[:, 0] = self.preprocess(muspec_p[:, 0], 'muspec_px', "identity")
+        muspec_p[:, 1] = self.preprocess(muspec_p[:, 1], 'muspec_py', "identity")
+        muspec_p[:, 2] = self.preprocess(muspec_p[:, 2], 'muspec_pz', "identity")
+        muspec_info = torch.cat([
+            self.preprocess(event['global_feats']['muspec_q'], 'muspec_q').reshape(-1, 1),
+            torch.from_numpy(muspec_p).reshape(-1, 3),
+            self.preprocess(event['global_feats']['muspec_chi2'], 'muspec_chi2', self.preprocessing_input).reshape(-1, 1),
+        ], dim=1)
+        
         vis_sp_momentum = event['vis_sp_momentum']
         out_lepton_momentum = event['out_lepton_momentum']
         jet_momentum = event['jet_momentum']
@@ -501,10 +536,11 @@ class SparseFASERCALDataset(Dataset):
             'coords': torch.from_numpy(event['coords']).float(),
             'modules': torch.from_numpy(event['modules']).long(),
             'feats': feats.float(),
-            'feats_global': feats_global.float(),
-            'faser_cal_modules': faser_mod.float(),
-            'rear_cal_modules': rear_cal_mod.float(),
-            'rear_hcal_modules': rear_hcal_mod.float(),
+            'ahcal_hits_coords': torch.from_numpy(ahcal_hits_coords).float(),
+            'ahcal_hits_feats': ahcal_hits_feats.float().reshape(-1, 1),
+            'ecal_hits': ecal_hits.float(),
+            'nb_muspec_tracks': nb_muspec_tracks.float(),
+            'muspec_info': muspec_info.float(),
             'flavour_label': torch.from_numpy(event['flavour_label']),
             'charm_label': torch.from_numpy(event['charm_label']),
             'vis_sp_momentum': vis_sp_momentum.float(),
@@ -545,7 +581,13 @@ class SparseFASERCALMapDataset(SparseFASERCALDataset, Dataset):
     def __init__(self, args):
         super().__init__(args)
         self.root = args.dataset_path
-        self.data_files = sorted(glob(f'{self.root}/*.npz'), key=lambda x: x.lower())
+        self.data_files = sorted(
+            chain(
+                glob(os.path.join(self.root, "*.npz")),
+                glob(os.path.join(self.root, "*", "*.npz")),
+            ),
+            key=str.lower,
+        )
 
     def __len__(self):
         """Returns the total number of samples in the dataset."""

@@ -10,6 +10,7 @@ Description:
 import math
 import copy
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from spconv.pytorch import SparseConvTensor
 from functools import partial
 from torch.utils.data import random_split, DataLoader
@@ -130,6 +131,36 @@ def _make_spconv_tensor(
     return x_sp, spatial_shape
 
 
+def pack_muspec(nb_muspec_tracks, muspec_info):
+    """
+    nb_muspec_tracks: tensor (B, 1)
+        value to put in the *prepended* token for each sequence
+    muspec_info: list of length B
+        each element is a tensor of shape (K_i, 5)
+    returns:
+        feats: (B, K_max + 1, 5)
+        attn_mask: (B, K_max + 1)  # True = keep, False = pad
+    """
+    # pad_sequence expects (seq_len, *) so we tell it batch_first=True
+    feats = pad_sequence(muspec_info, batch_first=True, padding_value=0.0)  # (B, K_max, 5)
+    B, K_max, D = feats.shape
+
+    # build attention mask
+    lengths = torch.tensor([t.size(0) for t in muspec_info], device=feats.device)  # (B,)
+    idxs = torch.arange(K_max, device=feats.device).unsqueeze(0).expand(B, -1)
+    base_mask = idxs < lengths.unsqueeze(1)  # True where real token
+
+    muspec_vals = nb_muspec_tracks.squeeze(-1)  # (B,)
+    muspec_token = torch.zeros((B, 1, D), device=feats.device, dtype=feats.dtype)
+    muspec_token[:, 0, 0] = muspec_vals
+
+    feats = torch.cat([muspec_token, feats], dim=1)  # (B, K_max + 1, 5)
+    muspec_mask = torch.ones((B, 1), device=feats.device, dtype=torch.bool)
+    attn_mask = torch.cat([muspec_mask, base_mask], dim=1)  # (B, K_max + 1)
+
+    return feats, attn_mask
+
+
 def collate(
     batch,
     test: bool = True,
@@ -137,6 +168,7 @@ def collate(
     axis_order: str = "XYZ",
     device = None,
     spatial_shape = (48, 48, 200),  # set (X, Y, Z) if fixed grid
+    ahcal_spatial_shape = (18, 18, 40),
 ):
     """
     Collate that returns a spconv-ready dict.
@@ -149,6 +181,8 @@ def collate(
     batch = [d for d in batch if len(d["coords"]) > 0]
     coords_list = [d["coords"] for d in batch]
     feats_list  = [d["feats"]  for d in batch]
+    ahcal_coords_list = [d["ahcal_hits_coords"] for d in batch]
+    ahcal_feats_list  = [d["ahcal_hits_feats"]  for d in batch]
 
     # Build hit_event_id exactly like your current collate
     num_hits = torch.tensor([len(x) for x in feats_list], dtype=torch.long)
@@ -158,19 +192,28 @@ def collate(
     x_sp, spatial_shape_out = _make_spconv_tensor(
         feats_cat, coords_list, device=device, axis_order=axis_order, spatial_shape=spatial_shape
     )
+    # AHCAL hits spconv tensor
+    ahcal_feats_cat = torch.cat(ahcal_feats_list, dim=0)
+    ahcal_x_sp, ahcal_spatial_shape = _make_spconv_tensor(
+        ahcal_feats_cat, ahcal_coords_list, device=device, axis_order=axis_order, spatial_shape=ahcal_spatial_shape
+    )
 
     ret = {
         "x_sp": x_sp,
         "spatial_shape": spatial_shape_out,
         "batch_size": len(coords_list),
         "hit_event_id": hit_event_id,
+        "ahcal_x_sp": ahcal_x_sp,
+        "ahcal_spatial_shape": ahcal_spatial_shape,
     }
 
-    # Keep your existing extras 1:1
-    ret["f_glob"] = torch.stack([d["feats_global"] for d in batch])
-    ret["faser_cal_modules"] = torch.stack([d["faser_cal_modules"] for d in batch])
-    ret["rear_cal_modules"] = torch.stack([d["rear_cal_modules"] for d in batch])
-    ret["rear_hcal_modules"] = torch.stack([d["rear_hcal_modules"] for d in batch])
+    ret["ecal_hits"] = torch.stack([d["ecal_hits"] for d in batch])
+    nb_muspec_tracks = torch.stack([d["nb_muspec_tracks"] for d in batch])
+    muspec_info = [d["muspec_info"] for d in batch]    
+
+    muspec_feats, muspec_attn_mask = pack_muspec(nb_muspec_tracks, muspec_info)
+    ret["muspec_feats"] = muspec_feats
+    ret["muspec_attn_mask"] = muspec_attn_mask
 
     if mode == "test":
         optional_keys = [
@@ -274,12 +317,12 @@ def csr_stack_rows_torch(indptr_list, class_list, weight_list):
 
 def arrange_input(data):
     x_sp = data['x_sp']
-    faser_cal = data['faser_cal_modules']
-    rear_cal = data['rear_cal_modules']
-    rear_hcal = data['rear_hcal_modules']
-    tensor_global = data['f_glob']
+    ahcal_x_sp = data['ahcal_x_sp']
+    ecal_hits = data['ecal_hits']
+    muspec_feats = data['muspec_feats']
+    muspec_attn_mask = data['muspec_attn_mask']
 
-    return x_sp, faser_cal, rear_cal, rear_hcal, tensor_global
+    return x_sp, ahcal_x_sp, ecal_hits, muspec_feats, muspec_attn_mask
 
 
 def arrange_truth(data):

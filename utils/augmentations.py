@@ -11,6 +11,9 @@ import numpy as np
 from typing import Dict
 
 
+AHCAL_SHAPE = np.array([18, 18, 40], dtype=np.int32)
+AHCAL_VOXEL_FACTOR = 4
+
 ROTATIONS = {
     'x': {0: np.eye(3),
          90: np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]]),
@@ -41,32 +44,35 @@ def augment(
 ):
     """
     Performs augmentations.
-    """      
+    """
+
+    ecal_hits  = global_feats.get("ecal_hits", None)
+    ahcal_hits = global_feats.get("ahcal_hits", None)
+    muspec_p   = global_feats.get("muspec_p", None)
+
     # Mirror
     if np.random.random() < aug_prob:
-        coords, modules, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = mirror(
-            coords, modules, momenta, global_feats['rear_cal_modules'], 
+        coords, modules, momenta, ecal_hits, ahcal_hits, muspec_p, primary_vertex, _ = mirror(
+            coords, modules, momenta, ecal_hits, ahcal_hits, muspec_p,
             primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['x', 'y'],
         )   
 
     # Rotation
     if np.random.random() < aug_prob:
-        coords, momenta, global_feats['rear_cal_modules'], primary_vertex, _ = rotate_90(
-            coords, momenta, global_feats['rear_cal_modules'], 
+        coords, momenta, ecal_hits, ahcal_hits, muspec_p, primary_vertex, _ = rotate_90(
+            coords, momenta, ecal_hits, ahcal_hits, muspec_p,
             primary_vertex, metadata, selected_axes=['x', 'y', 'z'] if stage1 else ['z'],
         )
-
     # Translation
     if np.random.random() < aug_prob:
-        coords, modules, global_feats['rear_cal_modules'], primary_vertex, _ = translate(
-            coords, modules, global_feats['rear_cal_modules'], 
+        coords, modules, ecal_hits, ahcal_hits, primary_vertex, _ = translate(
+            coords, modules, ecal_hits, ahcal_hits,
             primary_vertex, metadata, selected_axes=['x', 'y'],
         )
-
     # Global features multiplicative jitter
     if np.random.random() < aug_prob:
         global_feats = module_multiplicative_jitter(
-            global_feats, log_sigma=dict(faser=0.1, rear_cal=0.1, rear_hcal=0.1, rear_mucal=0.1),
+            global_feats, log_sigma=0.1,
         )
 
     # Scaling
@@ -89,9 +95,17 @@ def augment(
 
     # Voxel dropping
     if np.random.random() < aug_prob:
-        coords, modules, feats, labels = drop_hits(
-            coords, modules, feats, labels, max_drop=0.05, min_hits=5,
+        coords, modules, feats, labels, ahcal_hits = drop_hits(
+            coords, modules, feats, labels, ahcal_hits, max_drop=0.05, min_hits=5,
         )
+
+    # Re-store possibly modified extras
+    if ecal_hits is not None:
+        global_feats["ecal_hits"] = ecal_hits
+    if ahcal_hits is not None:
+        global_feats["ahcal_hits"] = ahcal_hits
+    if muspec_p is not None:
+        global_feats["muspec_p"] = muspec_p
 
     return coords, modules, feats, labels, momenta, global_feats, primary_vertex
 
@@ -100,7 +114,9 @@ def mirror(
     coords,
     modules,
     dirs,
-    rear_cal_modules,
+    ecal_hits,
+    ahcal_hits,
+    muspec_p,
     primary_vertex,
     metadata,
     selected_axes=None
@@ -127,25 +143,32 @@ def mirror(
             # flip direction vectors
             for d in dirs:
                 d[axis_idx] *= -1
+            muspec_p[:, axis_idx] *= -1
 
             if axis_idx == 2:
                 # assume modules is a 1D array of module‐IDs in [0..n_mod-1]
                 n_mod = metadata['z'][:, 1].max() + 1
                 modules = (n_mod - 1) - modules
             else:
-                # flip the 2D rear_cal_modules in XY plane
+                # flip the 2D ecal_hits in XY plane
                 flip_axis = 1 - axis_idx  # x => 1 (cols), y => 0 (rows)
-                rear_cal_modules = np.flip(rear_cal_modules, axis=flip_axis).copy()
+                ecal_hits = np.flip(ecal_hits, axis=flip_axis).copy()
+
+            # flip the AHCAL cloud in its own grid
+            ah_L = AHCAL_SHAPE[axis_idx]
+            ahcal_hits[:, axis_idx] = (ah_L - 1) - ahcal_hits[:, axis_idx]
 
             flipped.append(ax)
 
-    return coords, modules, dirs, rear_cal_modules, primary_vertex, flipped
+    return coords, modules, dirs, ecal_hits, ahcal_hits, muspec_p, primary_vertex, flipped
 
 
 def rotate_90(
     coords,
     dirs,
-    rear_cal_modules,
+    ecal_hits,
+    ahcal_hits,
+    muspec_p,
     primary_vertex,
     metadata,
     selected_axes=None
@@ -169,7 +192,7 @@ def rotate_90(
             R_final = R_final @ ROTATIONS[ax][angle]
 
     # rotate the RearCal image only if z‑axis turned
-    rear_rot = rear_cal_modules
+    rear_rot = ecal_hits
     if chosen_angles.get('x', 0) == 180:
         rear_rot = np.flip(rear_rot, axis=0).copy()
     if chosen_angles.get('y', 0) == 180:
@@ -177,6 +200,14 @@ def rotate_90(
     if chosen_angles.get('z', 0) != 0:
         k = chosen_angles['z'] // 90
         rear_rot = np.rot90(rear_rot, k).copy()
+
+    # rotate AHCAL cloud around the centre of its own grid
+    if ahcal_hits.size > 0:
+        ah_center = (AHCAL_SHAPE - 1) / 2.0  # (3,)
+        ah_xyz = ahcal_hits[:, :3]
+        ah_xyz_rot = (ah_xyz - ah_center) @ R_final + ah_center
+        ahcal_hits = ahcal_hits.copy()
+        ahcal_hits[:, :3] = ah_xyz_rot
 
     # apply to coords and vertex about the true centre
     center = np.array([
@@ -189,14 +220,16 @@ def rotate_90(
 
     # rotate the direction vectors
     dirs_rot = [(d @ R_final) for d in dirs]
+    muspec_p = (muspec_p @ R_final)
 
-    return pts, dirs_rot, rear_rot, vert, chosen_angles
+    return pts, dirs_rot, rear_rot, ahcal_hits, muspec_p, vert, chosen_angles
 
 
 def translate(
     coords,
     modules,
-    rear_cal_modules,
+    ecal_hits,
+    ahcal_hits,
     primary_vertex,
     metadata,
     selected_axes=None,
@@ -219,7 +252,8 @@ def translate(
     coords = coords.copy()
     modules = modules.copy()
     primary_vertex = primary_vertex.copy()
-    rear = rear_cal_modules.copy()
+    rear = ecal_hits.copy()
+    ahcal = ahcal_hits.copy()
     shifts: Dict[str,int] = {}
 
     # helpers
@@ -259,6 +293,12 @@ def translate(
             # compute pixel shift
             ps = int(round(s * rear.shape[1-idx] / L))
             rear = _shift_image(rear, ps, axis=1-idx)
+
+            ah_shift = int(np.round(s / float(AHCAL_VOXEL_FACTOR)))
+            if ah_shift != 0 and ahcal.size > 0:
+                ah_ax_len = AHCAL_SHAPE[idx]
+                ahcal[:, idx] += ah_shift
+                ahcal[:, idx] = np.clip(ahcal[:, idx], 0, ah_ax_len - 1)
                 
     # Z
     if 'z' in selected_axes:
@@ -271,11 +311,19 @@ def translate(
         if valid_s:
             s_mod = np.random.choice(valid_s)
             modules += s_mod
-            coords[:, 2]       += s_mod * module_size
-            primary_vertex[2]  += s_mod * module_size
-            shifts['z'] = s_mod * module_size
+            dz = s_mod * module_size
+            coords[:, 2]       += dz
+            primary_vertex[2]  += dz
+            shifts['z'] = dz
 
-    return coords, modules, rear, primary_vertex, shifts
+            if ahcal.size > 0:
+                ah_shift_z = int(np.round(dz / float(AHCAL_VOXEL_FACTOR)))
+                if ah_shift_z != 0:
+                    ah_z_len = AHCAL_SHAPE[2]
+                    ahcal[:, 2] += ah_shift_z
+                    ahcal[:, 2] = np.clip(ahcal[:, 2], 0, ah_z_len - 1)
+
+    return coords, modules, rear, ahcal, primary_vertex, shifts
 
 
 def drop_hits(
@@ -283,6 +331,7 @@ def drop_hits(
     modules,
     feats,
     labels,
+    ahcal_hits,
     max_drop=0.05,
     min_hits=5,
 ):
@@ -295,8 +344,9 @@ def drop_hits(
 
     # don’t drop if under min_hits
     if mask.sum() < min_hits:
-        return coords, modules, feats, labels
-    
+        ahcal_hits = _drop_ahcal_hits(ahcal_hits, max_drop, min_hits=min_hits)
+        return coords, modules, feats, labels, ahcal_hits
+
     labels_masked = []
     for label in labels:
         if label is None:
@@ -307,39 +357,85 @@ def drop_hits(
             csr = csr_keep_rows_numpy(*label, mask)
             labels_masked.append(csr)
 
-    return coords[mask], modules[mask], feats[mask], labels_masked
+    coords = coords[mask]
+    modules = modules[mask]
+    feats = feats[mask]
+    labels = labels_masked
+    ahcal_hits = _drop_ahcal_hits(ahcal_hits, max_drop, min_hits=min_hits)
+
+    return coords, modules, feats, labels, ahcal_hits
 
 
-def scale_all_by_global_shift(feats, momentums, global_feats, std_dev=0.1):
+def _drop_ahcal_hits(ahcal_hits, max_drop, min_hits=2):
+    """Helper: randomly drop some AHCAL hits as well."""
+    M = len(ahcal_hits)
+    if M == 0:
+        return ahcal_hits
+    p_ah = np.random.rand() * max_drop
+    mask_ah = np.random.rand(M) > p_ah
+    if mask_ah.sum() < min_hits:
+        return ahcal_hits
+    return ahcal_hits[mask_ah]
+
+
+def scale_all_by_global_shift_lognormal(
+    feats,
+    global_feats,
+    momenta=None,
+    log_sigma=0.1,
+):
     """
-    Apply a global multiplicative energy/momentum scale shift to all relevant features.
-    
-    Parameters:
-    - feats: np.ndarray, typically (N_hits,) or (N_hits, D), representing hit charges or features in MeV.
-    - momentums: list of np.ndarray, each of shape (3,) representing a 3D momentum vector (in MeV/c)
-    - global_feats: dict[str, np.ndarray], global calorimeter features, etc., values in MeV or GeV.
-    - std_dev: float, standard deviation for Gaussian noise on shift factor (centered at 1.0)
-
-    Returns:
-    - scaled_feats: np.ndarray
-    - scaled_momentums: list of np.ndarray
-    - scaled_global_feats: dict[str, np.ndarray]
-    - shift: float, the applied scalar shift factor
+    Global multiplicative scale (lognormal, mean≈1).
     """
-    shift = 1 - np.random.randn() * std_dev
+    # draw shift
+    shift = np.exp(np.random.randn() * log_sigma)
+    shift /= np.exp(0.5 * log_sigma**2)   # center around 1.0
 
-    # Scale hits
-    scaled_feats = feats * shift
+    # scale hit feats
+    feats = feats * shift
 
-    # Scale each 3D momentum vector
-    scaled_momentums = [p * shift for p in momentums]
+    # scale momenta list if provided
+    if momenta is not None:
+        momenta = [p * shift for p in momenta]
 
-    # Scale each global feature (array or scalar)
-    scaled_global_feats = {
-        k: v * shift for k, v in global_feats.items()
-    }
+    # scale existing scalar/array globals (simple heuristic: just multiply)
+    scaled_global_feats = {}
+    for k, v in global_feats.items():
+        # we will handle the special ones below
+        if k in ("ahcal_hits", "muspec_p", "muspec_q", "muspec_chi2"):
+            scaled_global_feats[k] = v
+        else:
+            try:
+                scaled_global_feats[k] = v * shift
+            except Exception:
+                # non-numeric, keep as is
+                scaled_global_feats[k] = v
 
-    return scaled_feats, scaled_momentums, scaled_global_feats, shift
+    # AHCAL charges
+    if "ahcal_hits" in global_feats and global_feats["ahcal_hits"] is not None:
+        ah = np.asarray(global_feats["ahcal_hits"], dtype=float).copy()
+        if ah.size > 0:
+            ah[:, 3] = ah[:, 3] * shift
+        scaled_global_feats["ahcal_hits"] = ah
+
+    # mu-spec momenta
+    if "muspec_p" in global_feats and global_feats["muspec_p"] is not None:
+        mp = np.asarray(global_feats["muspec_p"], dtype=float).copy()
+        if mp.size > 0:
+            mp = mp * shift
+        scaled_global_feats["muspec_p"] = mp
+
+    # mu-spec q
+    if "muspec_q" in global_feats and global_feats["muspec_q"] is not None:
+        mq = np.asarray(global_feats["muspec_q"], dtype=float).copy()
+        scaled_global_feats["muspec_q"] = mq * shift
+
+    # mu-spec chi2
+    if "muspec_chi2" in global_feats and global_feats["muspec_chi2"] is not None:
+        mc = np.asarray(global_feats["muspec_chi2"], dtype=float).copy()
+        scaled_global_feats["muspec_chi2"] = mc * shift
+
+    return feats, scaled_global_feats, momenta, shift
 
 
 def scale_all_by_global_shift_lognormal(feats, global_feats, momenta=None, log_sigma=0.1):
@@ -431,45 +527,49 @@ def smooth_labels(targets, smoothing: float, num_classes: int = None):
         raise ValueError(f"Unsupported target shape {targets.shape}, must be 1-D or 2-D.")
 
 
-def _sync_totals_from_modules(global_feats, eps=1e-9):
-    """Make totals equal the sum of their module arrays (when present)."""
-    if 'faser_cal_modules' in global_feats:
-        s = float(np.clip(np.sum(global_feats['faser_cal_modules']), 0.0, None))
-        global_feats['faser_cal_energy'] = max(s, eps)
-    if 'rear_cal_modules' in global_feats:
-        s = float(np.clip(np.sum(global_feats['rear_cal_modules'] / 1000.), 0.0, None))   # correction to GeV
-        global_feats['rear_cal_energy'] = max(s, eps)
-    if 'rear_hcal_modules' in global_feats:
-        s = float(np.clip(np.sum(global_feats['rear_hcal_modules']) / 1000., 0.0, None))  # correction to GeV
-        global_feats['rear_hcal_energy'] = max(s, eps)
-    # mucal has no module map; ensure strictly positive:
-    if 'rear_mucal_energy' in global_feats:
-        global_feats['rear_mucal_energy'] = max(float(global_feats['rear_mucal_energy']), eps)
+def module_multiplicative_jitter(global_feats, log_sigma=0.1):
+    """
+    Apply independent multiplicative lognormal jitter (mean≈1) to the physics-y
+    pieces of global_feats:
+    """
+    def _lognormal(shape, s):
+        mult = np.exp(np.random.randn(*shape) * s)
+        mult /= np.exp(0.5 * s * s)
+        return mult
+
+    # AHCAL charges
+    if "ahcal_hits" in global_feats and global_feats["ahcal_hits"] is not None:
+        ah = np.asarray(global_feats["ahcal_hits"], dtype=float).copy()
+        if ah.size > 0:
+            # jitter only the charge channel
+            charge = ah[:, 3]
+            mult = _lognormal(charge.shape, log_sigma)
+            ah[:, 3] = np.maximum(charge * mult, 0.0)
+        global_feats["ahcal_hits"] = ah
+
+    # mu-spec momenta (vectors)
+    if "muspec_p" in global_feats and global_feats["muspec_p"] is not None:
+        mp = np.asarray(global_feats["muspec_p"], dtype=float).copy()
+        if mp.size > 0:
+            # one multiplier per vector, then broadcast to 3 components
+            nvec = mp.shape[0]
+            mult = _lognormal((nvec, 1), log_sigma)
+            mp = mp * mult
+        global_feats["muspec_p"] = mp
+
+    # mu-spec charges
+    if "muspec_q" in global_feats and global_feats["muspec_q"] is not None:
+        mq = np.asarray(global_feats["muspec_q"], dtype=float).copy()
+        mult = _lognormal(mq.shape, log_sigma)
+        global_feats["muspec_q"] = mq * mult
+
+    # mu-spec chi2
+    if "muspec_chi2" in global_feats and global_feats["muspec_chi2"] is not None:
+        mc = np.asarray(global_feats["muspec_chi2"], dtype=float).copy()
+        mult = _lognormal(mc.shape, log_sigma)
+        global_feats["muspec_chi2"] = mc * mult
+
     return global_feats
-
-
-def module_multiplicative_jitter(global_feats, log_sigma=dict(faser=0.1, rear_cal=0.1, rear_hcal=0.1, rear_mucal=0.1)):
-    """
-    Independent per-cell multiplicative jitter (mean≈1), then sync totals.
-    """
-    gf = global_feats
-    def _per_cell(a, s):
-        mult = np.exp(np.random.randn(*a.shape) * s) / np.exp(0.5 * s * s)
-        return np.maximum(a * mult, 0.0)
-
-    if 'faser_cal_modules' in gf:
-        gf['faser_cal_modules'] = _per_cell(np.asarray(gf['faser_cal_modules'], dtype=float),
-                                            log_sigma.get('faser', 0.1))
-    if 'rear_cal_modules' in gf:
-        gf['rear_cal_modules'] = _per_cell(np.asarray(gf['rear_cal_modules'], dtype=float),
-                                           log_sigma.get('rear_cal', 0.1))
-    if 'rear_hcal_modules' in gf:
-        gf['rear_hcal_modules'] = _per_cell(np.asarray(gf['rear_hcal_modules'], dtype=float),
-                                            log_sigma.get('rear_hcal', 0.1))
-    if 'rear_mucal_energy' in gf:
-        gf['rear_mucal_energy'] = _per_cell(np.asarray(gf['rear_mucal_energy'], dtype=float),
-                                            log_sigma.get('rear_mucal', 0.1))
-    return _sync_totals_from_modules(gf)
 
 
 def csr_keep_rows_numpy(label_indptr, label_ids, label_weight, mask):

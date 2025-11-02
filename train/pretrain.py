@@ -178,6 +178,7 @@ def main():
         gradient_clip_algorithm="norm",
         callbacks=callbacks,
         accelerator="gpu",
+        num_nodes=args.nb_nodes,
         devices=nb_gpus,
         precision="bf16-mixed" if pl_major >= 2 else 32,
         strategy=DDPStrategy(
