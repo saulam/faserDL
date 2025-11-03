@@ -69,6 +69,15 @@ def augment(
             coords, modules, ecal_hits, ahcal_hits,
             primary_vertex, metadata, selected_axes=['x', 'y'],
         )
+
+    # Re-store possibly modified extras
+    if ecal_hits is not None:
+        global_feats["ecal_hits"] = ecal_hits
+    if ahcal_hits is not None:
+        global_feats["ahcal_hits"] = ahcal_hits
+    if muspec_p is not None:
+        global_feats["muspec_p"] = muspec_p
+
     # Global features multiplicative jitter
     if np.random.random() < aug_prob:
         global_feats = module_multiplicative_jitter(
@@ -80,6 +89,11 @@ def augment(
         feats, global_feats, _, _ = scale_all_by_global_shift_lognormal(
             feats, global_feats, log_sigma=0.1
         )
+
+    # After jitter + scaling, refresh locals from global_feats so we use
+    ecal_hits  = global_feats.get("ecal_hits", ecal_hits)
+    ahcal_hits = global_feats.get("ahcal_hits", ahcal_hits)
+    muspec_p   = global_feats.get("muspec_p", muspec_p)
 
     # Jitter per-hit multiplicative
     if np.random.random() < aug_prob:
@@ -98,14 +112,7 @@ def augment(
         coords, modules, feats, labels, ahcal_hits = drop_hits(
             coords, modules, feats, labels, ahcal_hits, max_drop=0.05, min_hits=5,
         )
-
-    # Re-store possibly modified extras
-    if ecal_hits is not None:
-        global_feats["ecal_hits"] = ecal_hits
-    if ahcal_hits is not None:
         global_feats["ahcal_hits"] = ahcal_hits
-    if muspec_p is not None:
-        global_feats["muspec_p"] = muspec_p
 
     return coords, modules, feats, labels, momenta, global_feats, primary_vertex
 
@@ -436,15 +443,6 @@ def scale_all_by_global_shift_lognormal(
         scaled_global_feats["muspec_chi2"] = mc * shift
 
     return feats, scaled_global_feats, momenta, shift
-
-
-def scale_all_by_global_shift_lognormal(feats, global_feats, momenta=None, log_sigma=0.1):
-    # shift ~ LogNormal(mean=0, sigma=log_sigma) so E[shift]≈exp(0.5*log_sigma^2)
-    # If you want mean≈1 exactly, divide by that factor.
-    shift = np.exp(np.random.randn() * log_sigma)
-    shift /= np.exp(0.5 * log_sigma**2)   # center around 1.0
-    momenta = [p * shift for p in momenta] if momenta is not None else None
-    return feats * shift, {k: v * shift for k, v in global_feats.items()}, momenta, shift
 
 
 def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):

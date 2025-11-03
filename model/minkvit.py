@@ -167,7 +167,7 @@ class MinkViT(vit.VisionTransformer):
         self.muon_spec_xattn = CrossAttnBlock(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                     qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                    drop_path=0., norm_layer=norm_layer
+                    drop_path=dpr[depth], norm_layer=norm_layer
                 )
         self.xattn_blocks = nn.ModuleDict({
             name: nn.ModuleList([
