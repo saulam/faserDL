@@ -50,6 +50,7 @@ def augment(
     ahcal_hits = global_feats.get("ahcal_hits", None)
     muspec_p   = global_feats.get("muspec_p", None)
 
+    '''
     # Mirror
     if np.random.random() < aug_prob:
         coords, modules, momenta, ecal_hits, ahcal_hits, muspec_p, primary_vertex, _ = mirror(
@@ -69,7 +70,7 @@ def augment(
             coords, modules, ecal_hits, ahcal_hits,
             primary_vertex, metadata, selected_axes=['x', 'y'],
         )
-
+    '''
     # Re-store possibly modified extras
     if ecal_hits is not None:
         global_feats["ecal_hits"] = ecal_hits
@@ -91,9 +92,7 @@ def augment(
         )
 
     # After jitter + scaling, refresh locals from global_feats so we use
-    ecal_hits  = global_feats.get("ecal_hits", ecal_hits)
     ahcal_hits = global_feats.get("ahcal_hits", ahcal_hits)
-    muspec_p   = global_feats.get("muspec_p", muspec_p)
 
     # Jitter per-hit multiplicative
     if np.random.random() < aug_prob:
@@ -534,38 +533,46 @@ def module_multiplicative_jitter(global_feats, log_sigma=0.1):
         mult = np.exp(np.random.randn(*shape) * s)
         mult /= np.exp(0.5 * s * s)
         return mult
+    
+    # ECAL
+    ec = np.asarray(global_feats["ecal_hits"], dtype=float).copy()
+    if ec.size > 0:
+        mult = _lognormal(ec.shape, log_sigma)
+        ec = np.maximum(ec * mult, 0.0)
+    global_feats["ecal_hits"] = ec
 
     # AHCAL charges
-    if "ahcal_hits" in global_feats and global_feats["ahcal_hits"] is not None:
-        ah = np.asarray(global_feats["ahcal_hits"], dtype=float).copy()
-        if ah.size > 0:
-            # jitter only the charge channel
-            charge = ah[:, 3]
-            mult = _lognormal(charge.shape, log_sigma)
-            ah[:, 3] = np.maximum(charge * mult, 0.0)
-        global_feats["ahcal_hits"] = ah
+    ah = np.asarray(global_feats["ahcal_hits"], dtype=float).copy()
+    if ah.size > 0:
+        # jitter only the charge channel
+        charge = ah[:, 3]
+        mult = _lognormal(charge.shape, log_sigma)
+        ah[:, 3] = np.maximum(charge * mult, 0.0)
+    global_feats["ahcal_hits"] = ah
+
+    # nb mu-spec tracks
+    nm = np.asarray(global_feats["nb_muspec_tracks"], dtype=float).copy()
+    mult = _lognormal(nm.shape, log_sigma)
+    global_feats["nb_muspec_tracks"] = np.maximum(nm * mult, 0.0)
 
     # mu-spec momenta (vectors)
-    if "muspec_p" in global_feats and global_feats["muspec_p"] is not None:
-        mp = np.asarray(global_feats["muspec_p"], dtype=float).copy()
-        if mp.size > 0:
-            # one multiplier per vector, then broadcast to 3 components
-            nvec = mp.shape[0]
-            mult = _lognormal((nvec, 1), log_sigma)
-            mp = mp * mult
-        global_feats["muspec_p"] = mp
+    mp = np.asarray(global_feats["muspec_p"], dtype=float).copy()
+    if mp.size > 0:
+        # one multiplier per vector, then broadcast to 3 components
+        nvec = mp.shape[0]
+        mult = _lognormal((nvec, 1), log_sigma)
+        mp = mp * mult
+    global_feats["muspec_p"] = mp
 
     # mu-spec charges
-    if "muspec_q" in global_feats and global_feats["muspec_q"] is not None:
-        mq = np.asarray(global_feats["muspec_q"], dtype=float).copy()
-        mult = _lognormal(mq.shape, log_sigma)
-        global_feats["muspec_q"] = mq * mult
+    mq = np.asarray(global_feats["muspec_q"], dtype=float).copy()
+    mult = _lognormal(mq.shape, log_sigma)
+    global_feats["muspec_q"] = np.maximum(mq * mult, 0.0)
 
     # mu-spec chi2
-    if "muspec_chi2" in global_feats and global_feats["muspec_chi2"] is not None:
-        mc = np.asarray(global_feats["muspec_chi2"], dtype=float).copy()
-        mult = _lognormal(mc.shape, log_sigma)
-        global_feats["muspec_chi2"] = mc * mult
+    mc = np.asarray(global_feats["muspec_chi2"], dtype=float).copy()
+    mult = _lognormal(mc.shape, log_sigma)
+    global_feats["muspec_chi2"] = np.maximum(mc * mult, 0.0)
 
     return global_feats
 

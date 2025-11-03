@@ -511,7 +511,7 @@ class SparseFASERCALDataset(Dataset):
         ahcal_hits_coords = event['global_feats']['ahcal_hits'][:, :3]
         ahcal_hits_feats = self.preprocess(event['global_feats']['ahcal_hits'][:, 3] * 10, 'ahcal_hits', self.preprocessing_input)
         ecal_hits = self.preprocess(event['global_feats']['ecal_hits'], 'ecal_hits', self.preprocessing_input)
-        nb_muspec_tracks = self.preprocess(event['global_feats']['nb_muspec_tracks'], 'nb_muspec_tracks', self.preprocessing_input)
+        nb_muspec_tracks = self.preprocess(event['global_feats']['nb_muspec_tracks'], 'nb_muspec_tracks')
         muspec_p = event['global_feats']['muspec_p']
         muspec_p[:, 0] = self.preprocess(muspec_p[:, 0], 'muspec_px', "identity")
         muspec_p[:, 1] = self.preprocess(muspec_p[:, 1], 'muspec_py', "identity")
