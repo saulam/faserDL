@@ -225,7 +225,7 @@ class MinkMAEViT(nn.Module):
         self.head_channels = {
             "gho": 1,
             "hie": 3,
-            #"dec": 3,
+            "dec": 3,
             "pid": num_pid_classes,
             "occ": 1,
             "reg": in_chans,
@@ -666,7 +666,7 @@ class MinkMAEViT(nn.Module):
         preds        = {}
         preds["gho"] = self.heads["gho"](shared).squeeze(-1)                 # [Nk, P]
         preds["hie"] = self.heads["hie"](shared)                             # [Nk, P, 3]
-        #preds["dec"] = self.heads["dec"](shared)                             # [Nk, P, 3]
+        preds["dec"] = self.heads["dec"](shared)                             # [Nk, P, 3]
         preds["pid"] = self.heads["pid"](shared)                             # [Nk, P, num_pid]
 
         # targets identical to your current logic

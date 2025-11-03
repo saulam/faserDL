@@ -69,14 +69,14 @@ def get_layer_id_for_vit(name, num_intra_layers, num_xattn_layers, num_self_laye
     Assign a parameter with its layer id
     Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L33
     """
-    if name.startswith(("patch_embed", "module_cls_token", "intra_pos_embed")):
+    if name.startswith(("patch_embed", "module_cls_token", "intra_pos_embed", "ahcal_patch_embed",
+                        "ahcal_pos_embed", "ecal_embed", "muon_spec_token", "muon_spec_embed", "kv_src_embed")):
         return 0
     elif name.startswith('blocks'):
         return int(name.split('.')[1]) + 1
     elif name.startswith('norm'):
         return num_intra_layers
-    elif name.startswith(("module_embed_enc", "muon_spec_xattn", "ahcal_patch_embed", "ahcal_pos_embed",
-                           "ecal_embed", "muon_spec_token", "muon_spec_embed", "kv_src_embed")):
+    elif name.startswith(("module_embed_enc", "muon_spec_xattn")):
         return num_intra_layers + 1
     elif name.startswith("xattn_blocks."):
         parts = name.split(".")

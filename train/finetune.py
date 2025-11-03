@@ -119,9 +119,11 @@ def main():
         head_init = args.head_init,
         metadata = metadata,
     )
-    assert args.load_checkpoint is not None, "checkpoint not given as argument"
-    checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
-    load_mae_encoder(model, checkpoint)
+    if args.load_checkpoint is not None:
+        checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
+        load_mae_encoder(model, checkpoint)
+    else:
+        print("Training from scratch!")
 
     # define the list of losses to monitor
     monitor_losses = [
