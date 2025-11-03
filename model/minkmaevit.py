@@ -115,6 +115,11 @@ class MinkMAEViT(nn.Module):
                 nn.GELU(),
                 SparseConv3d(mid, embed_dim, kernel_size=k2, stride=k2, padding=0, bias=True)
             )
+        else:
+            self.ahcal_patch_embed = SparseConv3d(
+                in_chans, embed_dim, kernel_size=ahcal_patch_size, stride=ahcal_patch_size, 
+                padding=0, bias=True,
+            )
 
         # Precompute dense patch templates
         mh = torch.arange(G_h)
@@ -149,7 +154,7 @@ class MinkMAEViT(nn.Module):
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per patch
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index for intra-attn
         self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
-        self.kv_src_embed = nn.Embedding(2, embed_dim)
+        self.kv_src_embed = nn.Embedding(2, embed_dim)                                   # identity embedding for AHCAL / ecal+spec
 
         # Intra-module transformer blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.intra_depth)]
@@ -220,7 +225,7 @@ class MinkMAEViT(nn.Module):
         self.head_channels = {
             "gho": 1,
             "hie": 3,
-            "dec": 3,
+            #"dec": 3,
             "pid": num_pid_classes,
             "occ": 1,
             "reg": in_chans,
@@ -273,10 +278,10 @@ class MinkMAEViT(nn.Module):
 
         # init tokens
         with torch.no_grad():
-            nn.init.normal_(self.kv_src_embed.weight, std=0.02)
-            nn.init.normal_(self.muon_spec_token, std=0.02)
             nn.init.normal_(self.module_cls_token, std=.02)
+            nn.init.normal_(self.muon_spec_token, std=0.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
+            nn.init.normal_(self.kv_src_embed.weight, std=0.02)
             nn.init.normal_(self.module_embed_dec.weight, std=0.02)
             nn.init.normal_(self.query_tokens, std=0.02)
 
@@ -301,9 +306,10 @@ class MinkMAEViT(nn.Module):
 
     def no_weight_decay(self):
         return {
-            'kv_src_embed.weight',
             'module_cls_token',
+            'muon_spec_token',
             'module_embed_enc.weight',
+            'kv_src_embed.weight',
             'module_embed_dec.weight',
             'query_tokens',
         }
@@ -660,7 +666,7 @@ class MinkMAEViT(nn.Module):
         preds        = {}
         preds["gho"] = self.heads["gho"](shared).squeeze(-1)                 # [Nk, P]
         preds["hie"] = self.heads["hie"](shared)                             # [Nk, P, 3]
-        preds["dec"] = self.heads["dec"](shared)                             # [Nk, P, 3]
+        #preds["dec"] = self.heads["dec"](shared)                             # [Nk, P, 3]
         preds["pid"] = self.heads["pid"](shared)                             # [Nk, P, num_pid]
 
         # targets identical to your current logic

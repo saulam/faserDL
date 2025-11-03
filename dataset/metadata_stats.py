@@ -449,7 +449,7 @@ class SparseFASERCALDataset(Dataset):
             ),
             key=str.lower,
         )
-        #self.data_files = self.data_files[:100]
+        self.data_files = [x for x in self.data_files if np.random.rand() < 0.10]
         self.train = False
         self.total_events = self.__len__
 

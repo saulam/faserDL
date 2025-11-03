@@ -13,7 +13,7 @@ from spconv.pytorch import SparseConv3d, SparseSequential
 from functools import partial
 from timm.layers import trunc_normal_
 from .utils import (
-    get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, GlobalFeatureEncoderSimple, 
+    get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, 
     CrossAttnBlock, CrossAttention, CylindricalHeadNormalized
 )
 
@@ -28,8 +28,8 @@ class MinkViT(vit.VisionTransformer):
         D=3,
         img_size=(48, 48, 200),
         module_depth_voxels=20,
+        ahcal_patch_size=(9, 9, 10),
         num_module_cls=1,
-        num_global_tokens=1,
         io_depth=4,
         head_init=2e-5,
         global_pool=False,
@@ -60,6 +60,7 @@ class MinkViT(vit.VisionTransformer):
         self.num_patches = (self.grid_size[0] * self.grid_size[1] * self.grid_size[2])
         self.patch_voxels = p_h * p_w * p_d
         self.register_buffer('patch_size', torch.tensor(patch_size, dtype=torch.long))
+        self.register_buffer('ahcal_patch_size', torch.tensor(ahcal_patch_size, dtype=torch.long))
 
         # module slicing along Z
         assert module_depth_voxels % p_d == 0, "module_depth_voxels must be divisible by patch depth"
@@ -70,6 +71,16 @@ class MinkViT(vit.VisionTransformer):
         self.num_modules = G_d // self.module_depth_patches
         self.intra_grid_size = (G_h, G_w, self.module_depth_patches)     # H×W×(depth within module)
         self.num_intra_positions = G_h * G_w * self.module_depth_patches
+
+        # AHCAL grid bookkeeping (post-embedding grid)
+        Ah, Aw, Ad = (18, 18, 40)
+        ap_h, ap_w, ap_d = self.ahcal_patch_size.tolist()
+        assert Ah % ap_h == 0 and Aw % ap_w == 0 and Ad % ap_d == 0, \
+            "AHCAL grid must be divisible by ahcal_patch_size"
+        self.ahcal_grid_size = (Ah // ap_h, Aw // ap_w, Ad // ap_d)  # e.g., (2,2,4)
+        self.num_ahcal_positions = (
+            self.ahcal_grid_size[0] * self.ahcal_grid_size[1] * self.ahcal_grid_size[2]
+        )
 
         # patch embedding
         del self.cls_token, self.patch_embed, self.pos_embed, self.norm_pre, self.fc_norm, self.head
@@ -86,6 +97,22 @@ class MinkViT(vit.VisionTransformer):
         else:
             self.patch_embed = SparseConv3d(
                 in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
+                padding=0, bias=True,
+            )
+
+        if self.ahcal_patch_size.prod().item() > 512:
+            # too large -> use two-step conv
+            mid = embed_dim // 4
+            k1, k2 = choose_k1_k2(ahcal_patch_size)
+            self.ahcal_patch_embed = SparseSequential(
+                SparseConv3d(in_chans, mid, kernel_size=k1, stride=k1, padding=0, bias=False),
+                norm_layer(mid),
+                nn.GELU(),
+                SparseConv3d(mid, embed_dim, kernel_size=k2, stride=k2, padding=0, bias=True)
+            )
+        else:
+            self.ahcal_patch_embed = SparseConv3d(
+                in_chans, embed_dim, kernel_size=ahcal_patch_size, stride=ahcal_patch_size, 
                 padding=0, bias=True,
             )
 
@@ -130,11 +157,18 @@ class MinkViT(vit.VisionTransformer):
         self.module_cls_token = nn.Parameter(torch.zeros(1, num_module_cls, embed_dim))  # per-module CLS (shared weights)
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per-module
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index
+        self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
+        self.kv_src_embed = nn.Embedding(2, embed_dim)                                   # identity embedding for AHCAL / ecal+spec
 
         # Perceiver-IO bottleneck
-        self.num_global_tokens = num_global_tokens
-        self.global_feats_encoder = GlobalFeatureEncoderSimple(embed_dim, dropout=drop_rate)
-        self.global_mem = nn.Parameter(torch.zeros(1, self.num_global_tokens, embed_dim))
+        self.ecal_embed = nn.Linear(25, embed_dim)
+        self.muon_spec_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.muon_spec_embed = nn.Linear(5, embed_dim)
+        self.muon_spec_xattn = CrossAttnBlock(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                    qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                    drop_path=0., norm_layer=norm_layer
+                )
         self.xattn_blocks = nn.ModuleDict({
             name: nn.ModuleList([
                 CrossAttnBlock(
@@ -198,11 +232,21 @@ class MinkViT(vit.VisionTransformer):
             self.intra_pos_embed.weight.copy_(torch.from_numpy(enc_pos).float())
             self.intra_pos_embed.weight.requires_grad_(False)
 
+        ahcal_pos = get_3d_sincos_pos_embed(
+            self.ahcal_pos_embed.weight.shape[-1],
+            self.ahcal_grid_size,
+            cls_token=False
+        )
+        with torch.no_grad():
+            self.ahcal_pos_embed.weight.copy_(torch.from_numpy(ahcal_pos).float())
+            self.ahcal_pos_embed.weight.requires_grad_(False)
+
         # init tokens
         with torch.no_grad():
-            nn.init.normal_(self.global_mem, std=.02)
             nn.init.normal_(self.module_cls_token, std=.02)
+            nn.init.normal_(self.muon_spec_token, std=0.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
+            nn.init.normal_(self.kv_src_embed.weight, std=0.02)
             if not self.global_pool:
                 nn.init.normal_(self.task_tokens, std=.02)
 
@@ -237,8 +281,9 @@ class MinkViT(vit.VisionTransformer):
     def no_weight_decay(self):
         return {
             'module_cls_token',
+            'muon_spec_token',
             'module_embed_enc.weight',
-            'global_mem',
+            'kv_src_embed.weight',
             'task_tokens',
         }
             
@@ -276,6 +321,23 @@ class MinkViT(vit.VisionTransformer):
         attn_mask = occ.view(B, -1)  # H->W->D order matches the permute above
 
         intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
+        return dense_tokens, attn_mask, intra_idx
+
+    
+    def densify_patches_generic(self, x_sp):
+        # For AHCAL (or any non-main grid)
+        B = x_sp.batch_size
+        C = x_sp.features.size(1)
+        X, Y, Z = x_sp.spatial_shape
+        Np = X * Y * Z
+        x_dense = x_sp.dense()
+        dense_tokens = x_dense.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
+        idx = x_sp.indices.long()
+        b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
+        occ = torch.zeros((B, X, Y, Z), dtype=torch.bool, device=x_sp.features.device)
+        occ[b, h, w, d] = True
+        attn_mask = occ.view(B, -1)
+        intra_idx = torch.arange(Np, device=x_sp.features.device).view(1, -1).expand(B, -1)
         return dense_tokens, attn_mask, intra_idx
     
 
@@ -364,6 +426,9 @@ class MinkViT(vit.VisionTransformer):
 
     
     def forward_features(self, x_sparse, x_glob):
+        # retrieve global features
+        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask = x_glob
+
         # patchify
         x_sparse = self.patch_embed(x_sparse)
         x, attn_mask, intra_idx = self.densify_patches(x_sparse)
@@ -393,19 +458,35 @@ class MinkViT(vit.VisionTransformer):
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
 
-        # global context
-        g_enc   = self.global_feats_encoder(x_glob)                                       # [B, C]
-        g_tokens = (g_enc.unsqueeze(1) + self.global_mem).to(tok_mod.dtype)               # [B, G, C]
+        # ahcal embedding
+        ahcal_sparse = self.ahcal_patch_embed(ahcal_sparse)
+        ah_tokens, ah_mask, ah_idx = self.densify_patches_generic(ahcal_sparse)           # [B, Na, C], [B, Na], [B, Na]
+        ah_tokens = ah_tokens + self.ahcal_pos_embed(ah_idx) \
+                               + self.kv_src_embed.weight[0].view(1, 1, -1)               # tag as AHCAL
+
+        # ecal + muon spec as a single token
+        ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
+        muon_spec_emb = self.muon_spec_embed(muspec_feats)                                # [B, N_muspec, C]
+        muon_spec_emb = self.muon_spec_xattn(
+            self.muon_spec_token.expand(B, -1, -1),
+            muon_spec_emb,
+            attn_mask=muspec_attn_mask
+        )                                                                                 # [B, 1, C]
+        global_emb = ecal_emb + muon_spec_emb + \
+            self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
 
         # pack kept tokens for cross-attention
         kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
-            self._pack_by_mask(tok_mod, attn_mask_mod)                                    # [B,N_max,C], [B,N_max]
+            self._pack_by_mask(tok_mod, attn_mask_mod)                                    # [B, N_max, C], [B, N_max]
 
-        # append global tokens to kv
-        kv_tokens = torch.cat([kv_tokens, g_tokens], dim=1)                               # [B, N+G, C]
-        kv_keep  = torch.cat([kv_keep, torch.ones(
-            kv_keep.size(0), self.num_global_tokens, 
-            dtype=torch.bool, device=kv_keep.device)], dim=1)                             # [B, N+G]
+        # append AHCAL tokens as additional real KVs (respect their mask)
+        kv_tokens = torch.cat([kv_tokens, ah_tokens], dim=1)                              # [B, Nmax + Na, C]
+        kv_keep   = torch.cat([kv_keep, ah_mask], dim=1)                                  # [B, Nmax + Na]
+
+        # append global tokens as real KV
+        kv_tokens = torch.cat([kv_tokens, global_emb], dim=1)                             # [B, Nmax + Na + 1, C]
+        kv_keep   = torch.cat([kv_keep, torch.ones(
+            B, 1, dtype=torch.bool, device=kv_keep.device)], dim=1)                       # [B, Nmax + Na + 1]
         
         # prepare queries and masks
         queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]
@@ -452,7 +533,7 @@ def vit_tiny(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=528, patch_size=(12, 12, 10),
-        depth=4, num_heads=12, num_global_tokens=1,
+        depth=4, num_heads=12,
         io_depth=3, num_module_cls=1,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
@@ -464,7 +545,7 @@ def vit_base(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=768, patch_size=(16, 16, 4),
-        depth=4, num_heads=12, num_global_tokens=1,
+        depth=4, num_heads=12,
         io_depth=4, num_module_cls=2,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
@@ -476,7 +557,7 @@ def vit_large(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=1008, patch_size=(48, 48, 2),
-        depth=8, num_heads=12, num_global_tokens=2,
+        depth=8, num_heads=12,
         io_depth=8, num_module_cls=4,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
@@ -488,7 +569,7 @@ def vit_huge(**kwargs):
     model = MinkViT(
         in_chans=1, D=3, img_size=(48, 48, 200),
         embed_dim=1296, patch_size=(48, 48, 2),
-        depth=16, num_heads=12, num_global_tokens=4,
+        depth=16, num_heads=12,
         io_depth=16, num_module_cls=4,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,

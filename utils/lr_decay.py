@@ -59,7 +59,7 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
         param_group_names[group_name]["params"].append(n)
         param_groups[group_name]["params"].append(p)
     
-    print("parameter groups: \n%s" % json.dumps(param_group_names, indent=2))
+    #print("parameter groups: \n%s" % json.dumps(param_group_names, indent=2))
 
     return list(param_groups.values())
 
@@ -75,7 +75,8 @@ def get_layer_id_for_vit(name, num_intra_layers, num_xattn_layers, num_self_laye
         return int(name.split('.')[1]) + 1
     elif name.startswith('norm'):
         return num_intra_layers
-    elif name.startswith(("module_embed_enc", "global_feats_encoder", "global_mem")):
+    elif name.startswith(("module_embed_enc", "muon_spec_xattn", "ahcal_patch_embed", "ahcal_pos_embed",
+                           "ecal_embed", "muon_spec_token", "muon_spec_embed", "kv_src_embed")):
         return num_intra_layers + 1
     elif name.startswith("xattn_blocks."):
         parts = name.split(".")

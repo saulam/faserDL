@@ -39,14 +39,14 @@ class MAEPreTrainer(pl.LightningModule):
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_gho = nn.Parameter(torch.zeros(()))
         self.log_sigma_hie = nn.Parameter(torch.zeros(()))
-        self.log_sigma_dec = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_dec = nn.Parameter(torch.zeros(()))
         self.log_sigma_pid = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
             "gho": self.log_sigma_gho,
             "hie": self.log_sigma_hie,
-            "dec": self.log_sigma_dec,
+            #"dec": self.log_sigma_dec,
             "pid": self.log_sigma_pid,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
@@ -89,7 +89,7 @@ class MAEPreTrainer(pl.LightningModule):
         targets = {}
         targets['vis_sp_momentum'] = labels['vis_sp_momentum']
         targets['csr_hie'] = labels['csr_hie_indptr'], labels['csr_hie_ids'], labels['csr_hie_weights']
-        targets['csr_dec'] = labels['csr_dec_indptr'], labels['csr_dec_ids'], labels['csr_dec_weights']
+        #targets['csr_dec'] = labels['csr_dec_indptr'], labels['csr_dec_ids'], labels['csr_dec_weights']
         targets['csr_pid'] = labels['csr_pid_indptr'], labels['csr_pid_ids'], labels['csr_pid_weights']
         targets['ghost_mask'] = labels['ghost_mask']
         targets['hit_event_id'] = labels['hit_event_id']
@@ -112,10 +112,10 @@ class MAEPreTrainer(pl.LightningModule):
         self,
         z_gho: torch.Tensor,             # [N]
         z_hie: torch.Tensor,             # [N, Dp]
-        z_dec: torch.Tensor,             # [N, Dp]
+        #z_dec: torch.Tensor,             # [N, Dp]
         z_pid: torch.Tensor,             # [N, Dp]
         csr_hie: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
-        csr_dec: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
+        #csr_dec: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         csr_pid: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         ghost_mask: torch.Tensor,        # [N] bool
     ):
@@ -124,28 +124,30 @@ class MAEPreTrainer(pl.LightningModule):
         """
         loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), label_smoothing=self.label_smoothing)
         loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
-        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
+        #loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
         loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
 
         part_losses_enc = {
             "gho/total": loss_gho.detach(),
             "hie/total": loss_hie.detach(),
-            "dec/total": loss_dec.detach(),
+            #"dec/total": loss_dec.detach(),
             "pid/total": loss_pid.detach(),
         }
 
-        return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
+        #return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
+        return loss_gho, loss_hie, loss_pid, part_losses_enc
+
 
 
     def compute_relational_losses(
         self,
         pred_gho: torch.Tensor,
         pred_hie: torch.Tensor,
-        pred_dec: torch.Tensor,
+        #pred_dec: torch.Tensor,
         pred_pid: torch.Tensor,
         idx_targets: torch.Tensor,
         csr_hie: torch.Tensor,
-        csr_dec: torch.Tensor,
+        #csr_dec: torch.Tensor,
         csr_pid: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
@@ -154,18 +156,22 @@ class MAEPreTrainer(pl.LightningModule):
         # Gather embeddings and labels
         z_gho = pred_gho[tok_row, sub_idx]                    # [N_valid]
         z_hie = pred_hie[tok_row, sub_idx, :]                 # [N_valid, D]
-        z_dec = pred_dec[tok_row, sub_idx, :]                 # [N_valid, D]
+        #z_dec = pred_dec[tok_row, sub_idx, :]                 # [N_valid, D]
         z_pid = pred_pid[tok_row, sub_idx, :]                 # [N_valid, D]
         csr_hie = csr_keep_rows_torch(*csr_hie, raw_idx)[:3]  # ([N+1], [L], [L])
-        csr_dec = csr_keep_rows_torch(*csr_dec, raw_idx)[:3]  # ([N+1], [L], [L])
+        #csr_dec = csr_keep_rows_torch(*csr_dec, raw_idx)[:3]  # ([N+1], [L], [L])
         csr_pid = csr_keep_rows_torch(*csr_pid, raw_idx)[:3]  # ([N+1], [L], [L])
         ghost = ghost_mask[raw_idx]
 
-        loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
-            z_gho, z_hie, z_dec, z_pid, csr_hie, csr_dec, csr_pid, ghost,
+        #loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
+        #    z_gho, z_hie, z_dec, z_pid, csr_hie, csr_dec, csr_pid, ghost,
+        #)
+        loss_gho, loss_hie, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
+            z_gho, z_hie, z_pid, csr_hie, csr_pid, ghost,
         )
 
-        return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
+        #return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
+        return loss_gho, loss_hie, loss_pid, part_losses_enc
 
 
     def compute_reconstruction_losses(
@@ -205,18 +211,21 @@ class MAEPreTrainer(pl.LightningModule):
     ):
         pred_gho=preds["gho"]
         pred_hie=preds["hie"]
-        pred_dec=preds["dec"]
+        #pred_dec=preds["dec"]
         pred_pid=preds["pid"]
         pred_occ=preds["occ"]
         pred_reg=preds["reg"]
         csr_hie=labels['csr_hie']
-        csr_dec=labels['csr_dec']
+        #csr_dec=labels['csr_dec']
         csr_pid=labels['csr_pid']
         ghost_mask=labels['ghost_mask']
         hit_event_id=labels['hit_event_id']
 
-        loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses(
-            pred_gho, pred_hie, pred_dec, pred_pid, rel_idx_targets, csr_hie, csr_dec, csr_pid, ghost_mask,
+        #loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses(
+        #    pred_gho, pred_hie, pred_dec, pred_pid, rel_idx_targets, csr_hie, csr_dec, csr_pid, ghost_mask,
+        #)
+        loss_gho, loss_hie, loss_pid, part_enc = self.compute_relational_losses(
+            pred_gho, pred_hie, pred_pid, rel_idx_targets, csr_hie, csr_pid, ghost_mask,
         )
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
             targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
@@ -231,7 +240,7 @@ class MAEPreTrainer(pl.LightningModule):
         total_loss = (
             _weight(loss_gho, "log_sigma_gho", kind="ce")  +
             _weight(loss_hie, "log_sigma_hie", kind="ce")  +
-            _weight(loss_dec, "log_sigma_dec", kind="ce")  +
+            #_weight(loss_dec, "log_sigma_dec", kind="ce")  +
             _weight(loss_pid, "log_sigma_pid", kind="ce")  +
             _weight(loss_occ, "log_sigma_occ", kind="ce")  +
             _weight(loss_reg, "log_sigma_reg", kind="huber")
