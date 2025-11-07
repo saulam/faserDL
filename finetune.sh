@@ -19,7 +19,7 @@ epochs=10
 num_workers=16
 blr=5e-4
 layer_decay=0.65
-accum_grad_batches=1
+accum_grad_batches=2
 warmup_epochs=1
 cosine_annealing_epochs=9
 weight_decay=0.05
@@ -28,14 +28,14 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v6.0_dlnu_log_base_clariden_v3"
+name="finetune_v6.0_dlnu_log_base_clariden_v8"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v6.0_dlnu_log_base_clariden_v3"
+checkpoint_name="finetune_v6.0_dlnu_log_base_clariden_v8"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v6.0_clariden_final_v1/loss_total_val/epoch=41-step=27174.ckpt"
-gpus=(0 1)
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v6.0_clariden_final_v4/loss_total_val/epoch=61-step=40114.ckpt"
+gpus=(1)
 
 python -m train.finetune \
     --train \

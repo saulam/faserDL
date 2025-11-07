@@ -562,12 +562,12 @@ class CylindricalHeadNormalized(nn.Module):
         # pT via log1p/expm1
         uT = self.mu_uT + self.sigma_uT * zT
         pT = self.k_T * torch.expm1(uT)
-        pT = torch.clamp(pT, min=0.0)
+        #pT = torch.clamp(pT, min=0.0)
 
         # pz via log1p/expm1
         uZ = self.mu_uZ + self.sigma_uZ * zz
         pz = self.k_Z * torch.expm1(uZ)
-        pz = torch.clamp(pz, min=0.0)
+        #pz = torch.clamp(pz, min=0.0)
 
         px, py = pT * cos_phi, pT * sin_phi
         p_cart = torch.stack([px, py, pz], dim=-1)

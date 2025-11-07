@@ -23,7 +23,6 @@ class MAEPreTrainer(pl.LightningModule):
         super(MAEPreTrainer, self).__init__()
 
         self.model = model
-        stats = model.metadata
         self.mask_ratio = args.mask_ratio
         self.warmup_steps = args.warmup_steps
         self.start_cosine_step = args.start_cosine_step
@@ -43,6 +42,8 @@ class MAEPreTrainer(pl.LightningModule):
         self.log_sigma_pid = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
+        self.log_sigma_occ_ah = nn.Parameter(torch.zeros(()))
+        self.log_sigma_reg_ah = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
             "gho": self.log_sigma_gho,
             "hie": self.log_sigma_hie,
@@ -50,6 +51,8 @@ class MAEPreTrainer(pl.LightningModule):
             "pid": self.log_sigma_pid,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
+            "occ_ah": self.log_sigma_occ_ah,
+            "reg_ah": self.log_sigma_reg_ah,
         }
 
 
@@ -93,6 +96,7 @@ class MAEPreTrainer(pl.LightningModule):
         targets['csr_pid'] = labels['csr_pid_indptr'], labels['csr_pid_ids'], labels['csr_pid_weights']
         targets['ghost_mask'] = labels['ghost_mask']
         targets['hit_event_id'] = labels['hit_event_id']
+        targets['hit_event_id_ahcal'] = labels['hit_event_id_ahcal']
 
         return batch_input, *global_params, targets
 
@@ -177,9 +181,11 @@ class MAEPreTrainer(pl.LightningModule):
         idx_targets: torch.Tensor,      # [M, P]
         hit_event_id: torch.Tensor,     # [N_hits]
         ghost_mask: torch.Tensor,       # [N_hits]
+        patch_shape,                    # (p_h, p_w, p_d)
+        name_prefix: str = "",          # optional prefix for metrics
         per_event_mean: bool = False,
     ):
-        p_h, p_w, p_d = self.model.patch_size.tolist()
+        p_h, p_w, p_d = patch_shape
         loss_occ, loss_reg, part_losses_dec = reconstruction_losses_masked_simple(
             targ_reg=targ_reg,
             pred_occ=pred_occ,
@@ -193,6 +199,8 @@ class MAEPreTrainer(pl.LightningModule):
             label_smoothing=self.label_smoothing,
             per_event_mean=per_event_mean,
         )
+        if name_prefix:
+            part_losses_dec = {f"{name_prefix}{k}": v for k, v in part_losses_dec.items()}
         return loss_occ, loss_reg, part_losses_dec
 
 
@@ -200,42 +208,61 @@ class MAEPreTrainer(pl.LightningModule):
         self,
         preds: dict,
         targ_reg: torch.Tensor,
+        targ_reg_ahcal: torch.Tensor,
         rel_idx_targets: torch.Tensor,
         rec_idx_targets: torch.Tensor,
+        rec_idx_targets_ahcal: torch.Tensor,
         labels: dict,
     ):
+        # FASERCal predictions
         pred_gho=preds["gho"]
         pred_hie=preds["hie"]
         pred_dec=preds["dec"]
         pred_pid=preds["pid"]
         pred_occ=preds["occ"]
         pred_reg=preds["reg"]
+
+        # AHCAL predictions
+        pred_occ_ah = preds["occ_ah"]
+        pred_reg_ah = preds["reg_ah"]
+
         csr_hie=labels['csr_hie']
         csr_dec=labels['csr_dec']
         csr_pid=labels['csr_pid']
         ghost_mask=labels['ghost_mask']
         hit_event_id=labels['hit_event_id']
+        hit_event_id_ah=labels['hit_event_id_ahcal']
+        ghost_mask_ah = torch.zeros_like(hit_event_id_ah, dtype=torch.bool)
 
         loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses(
             pred_gho, pred_hie, pred_dec, pred_pid, rel_idx_targets, csr_hie, csr_dec, csr_pid, ghost_mask,
         )
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
             targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
+            patch_shape=tuple(self.model.patch_size.tolist()),
+            name_prefix="",    # keep original metric names
+        )
+        loss_occ_ah, loss_reg_ah, part_dec_ah = self.compute_reconstruction_losses(
+            targ_reg_ahcal, pred_occ_ah, pred_reg_ah, rec_idx_targets_ahcal, hit_event_id_ah, ghost_mask=ghost_mask_ah,
+            patch_shape=tuple(self.model.ahcal_patch_size.tolist()),
+            name_prefix="ahcal_",   # metrics logged as ahcal_occ/..., ahcal_reg/...
         )
 
         # Kendall et al. aggregation
-        part_losses = {**part_enc, **part_dec}
+        part_losses = {**part_enc, **part_dec, **part_dec_ah}
         def _weight(loss, attr, kind):
             ls = getattr(self, attr, None)
             return weighted_loss(loss, ls, kind) if ls is not None else loss
 
         total_loss = (
-            _weight(loss_gho, "log_sigma_gho", kind="ce")  +
-            _weight(loss_hie, "log_sigma_hie", kind="ce")  +
-            _weight(loss_dec, "log_sigma_dec", kind="ce")  +
-            _weight(loss_pid, "log_sigma_pid", kind="ce")  +
-            _weight(loss_occ, "log_sigma_occ", kind="ce")  +
-            _weight(loss_reg, "log_sigma_reg", kind="huber")
+            _weight(loss_gho, "log_sigma_gho", kind="ce")       +
+            _weight(loss_hie, "log_sigma_hie", kind="ce")       +
+            _weight(loss_dec, "log_sigma_dec", kind="ce")       +
+            _weight(loss_pid, "log_sigma_pid", kind="ce")       +
+            _weight(loss_occ, "log_sigma_occ", kind="ce")       +
+            _weight(loss_reg, "log_sigma_reg", kind="huber")    +
+            _weight(loss_occ_ah, "log_sigma_occ_ah", kind="ce") +
+            _weight(loss_reg_ah, "log_sigma_reg_ah", kind="huber")
         )
 
         return total_loss, part_losses
@@ -243,17 +270,29 @@ class MAEPreTrainer(pl.LightningModule):
 
     def common_step(self, batch):
         batch_input, *batch_input_global, labels = self._arrange_batch(batch)
+        ahcal_sparse = batch_input_global[0]
         batch_size = batch_input.batch_size
 
         # Forward pass
-        preds, rel_idx_targets, rec_idx_targets, _, _, = self.forward(
+        (
+            preds,
+            rel_idx_targets,
+            rec_idx_targets_fas,
+            _row_evt_fas,
+            _row_patch_fas,
+            rec_idx_targets_ah,
+            _row_evt_ah,
+            _row_patch_ah,
+        ) = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
         loss, part_losses = self.compute_losses(
             preds=preds,
             targ_reg=batch_input.features,
+            targ_reg_ahcal=ahcal_sparse.features,
             rel_idx_targets=rel_idx_targets,
-            rec_idx_targets=rec_idx_targets,
+            rec_idx_targets=rec_idx_targets_fas,
+            rec_idx_targets_ahcal=rec_idx_targets_ah,
             labels=labels,
         )
 

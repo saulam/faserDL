@@ -4,65 +4,65 @@
 dataset_path="/scratch/salonso/sparse-nns/faser/events_v6.0*"
 metadata_path="/scratch/salonso/sparse-nns/faser/events_v6.0_301b/metadata_stats.pkl"
 shardshuffle=200
-shuffle=4000
+shuffle=2000
 model="tiny"
 eps=1e-8
-batch_size=32
+batch_size=512
+mixup_alpha=0.0
 preprocessing_input="log"
+preprocessing_output="log"
 label_smoothing=0.02
 dropout=0.0
 attn_dropout=0.0
 drop_path_rate=0.0
-dropout_dec=0.0
-attn_dropout_dec=0.0
-drop_path_rate_dec=0.0
-mask_ratio=0.75
-epochs=400
+epochs=10
 num_workers=16
-blr=1.5e-4
+blr=5e-4
+layer_decay=1.0
 accum_grad_batches=2
-warmup_epochs=40
-cosine_annealing_epochs=360
+warmup_epochs=1
+cosine_annealing_epochs=9
 weight_decay=0.05
 beta1=0.9
-beta2=0.95
+beta2=0.999
+ema_decay=0.9999
+head_init=2e-5
 save_dir="logs_final"
-name="pretrain_v6.0_dlnu_log_base_v2"
-log_every_n_steps=50
+name="scratch_v6.0_dlnu_v1"
+log_every_n_steps=10
 save_top_k=1
-checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v6.0_dlnu_log_v2"
-early_stop_patience=200
-load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_base_v1/loss_total_val/last.ckpt"
-gpus=(0 1)
+checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
+checkpoint_name="scratch_v6.0_dlnu_v1"
+early_stop_patience=10
+gpus=(1)
 
-python -m train.pretrain \
+python -m train.finetune \
     --train \
-    --stage1 \
+    --stage2 \
     --augmentations_enabled \
     --dataset_path "$dataset_path" \
     --metadata_path $metadata_path \
     --model $model \
     --eps $eps \
+    --mixup_alpha $mixup_alpha \
     --batch_size $batch_size \
     --preprocessing_input $preprocessing_input \
+    --preprocessing_output $preprocessing_output \
     --label_smoothing $label_smoothing \
     --dropout $dropout \
-    --attn_dropout $attn_dropout \
     --drop_path_rate $drop_path_rate \
-    --dropout_dec $dropout_dec \
-    --attn_dropout_dec $attn_dropout_dec \
-    --drop_path_rate_dec $drop_path_rate_dec \
-    --mask_ratio $mask_ratio \
     --epochs $epochs \
     --num_workers $num_workers \
     --blr $blr \
+    --layer_decay $layer_decay \
     --accum_grad_batches $accum_grad_batches \
     --warmup_epochs $warmup_epochs \
     --cosine_annealing_epochs $cosine_annealing_epochs \
     --weight_decay $weight_decay \
     --beta1 $beta1 \
     --beta2 $beta2 \
+    --ema_decay $ema_decay \
+    --head_init $head_init \
     --save_dir $save_dir \
     --name $name \
     --log_every_n_steps $log_every_n_steps \
@@ -70,6 +70,5 @@ python -m train.pretrain \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
-    --load_checkpoint $load_checkpoint \
     --gpus "${gpus[@]}"
 

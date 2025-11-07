@@ -26,6 +26,7 @@ class MinkMAEViT(nn.Module):
         module_depth_voxels=20,
         embed_dim=384,
         patch_size=(16, 16, 4),
+        ahcal_size=(18, 18, 40),
         ahcal_patch_size=(9, 9, 10),
         num_module_cls=1,
         depth=8,
@@ -79,7 +80,7 @@ class MinkMAEViT(nn.Module):
         self.num_intra_positions = G_h * G_w * self.module_depth_patches
 
         # AHCAL grid bookkeeping (post-embedding grid)
-        Ah, Aw, Ad = (18, 18, 40)
+        Ah, Aw, Ad = ahcal_size
         ap_h, ap_w, ap_d = self.ahcal_patch_size.tolist()
         assert Ah % ap_h == 0 and Aw % ap_w == 0 and Ad % ap_d == 0, \
             "AHCAL grid must be divisible by ahcal_patch_size"
@@ -212,16 +213,25 @@ class MinkMAEViT(nn.Module):
             )
             for _ in range(io_decode_depth)
         ])
+        self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim) # not sure needed
+        self.ahcal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
 
         # Heads
-        self.sep_basis = SeparableDCT3D(self.patch_size.tolist(), alphas=(0.4, 0.4, 0.6))
-        self.shared_voxel_head = nn.ModuleDict({
+        self.fasercal_sep_basis = SeparableDCT3D(self.patch_size.tolist(), alphas=(0.4, 0.4, 0.6))
+        self.fasercal_shared_voxel_head = nn.ModuleDict({
             name: SharedLatentVoxelHead(
-                decoder_embed_dim, self.sep_basis, H=num_modes[i], 
+                decoder_embed_dim, self.fasercal_sep_basis, H=num_modes[i],
                 norm_layer=norm_layer, post_norm=True
             )
             for i, name in enumerate(["rel", "rec"])
         })
+        self.ahcal_sep_basis = SeparableDCT3D(
+            self.ahcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6)
+        )
+        self.ahcal_voxel_head = SharedLatentVoxelHead(
+            decoder_embed_dim, self.ahcal_sep_basis, H=num_modes[1], # same H as FASERCal reconstruction
+            norm_layer=norm_layer, post_norm=True,
+        )
         self.head_channels = {
             "gho": 1,
             "hie": 3,
@@ -229,15 +239,13 @@ class MinkMAEViT(nn.Module):
             "pid": num_pid_classes,
             "occ": 1,
             "reg": in_chans,
+            "occ_ahcal": 1,
+            "reg_ahcal": in_chans,
         }
         self.heads = nn.ModuleDict({
             name: (
-                nn.Sequential(
-                    nn.Dropout(p=0.1),  # it tends to overfit
-                    nn.Linear(num_modes[0], self.head_channels[name]),
-                ) if name == "dec" else
                 nn.Linear(
-                    num_modes[0] if name in ["gho", "hie", "pid"] else num_modes[1],
+                    num_modes[0] if name in ["gho", "hie", "pid", "dec"] else num_modes[1],
                     self.head_channels[name]
                 )
             )
@@ -276,6 +284,15 @@ class MinkMAEViT(nn.Module):
             self.decoder_intra_pos_embed.weight.copy_(torch.from_numpy(dec_pos).float())
             self.decoder_intra_pos_embed.weight.requires_grad_(False)
 
+        dec_ah_pos = get_3d_sincos_pos_embed(
+            self.decoder_ahcal_pos_embed.weight.shape[-1],
+            self.ahcal_grid_size,
+            cls_token=False
+        )
+        with torch.no_grad():
+            self.decoder_ahcal_pos_embed.weight.copy_(torch.from_numpy(dec_ah_pos).float())
+            self.decoder_ahcal_pos_embed.weight.requires_grad_(False)
+
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.module_cls_token, std=.02)
@@ -284,6 +301,7 @@ class MinkMAEViT(nn.Module):
             nn.init.normal_(self.kv_src_embed.weight, std=0.02)
             nn.init.normal_(self.module_embed_dec.weight, std=0.02)
             nn.init.normal_(self.query_tokens, std=0.02)
+            nn.init.normal_(self.ahcal_query_tokens, std=0.02)
 
         self.apply(self._init_weights)
 
@@ -374,6 +392,34 @@ class MinkMAEViT(nn.Module):
         order = torch.argsort(key)                                                          # [N]
         sorted_keys   = key[order].contiguous()
         sorted_to_raw = order.contiguous()    # raw hit ids (0..N-1)
+
+        return LazyIdxMap(
+            sorted_keys=sorted_keys,
+            sorted_to_raw=sorted_to_raw,
+            patches_per_evt=Np,
+            voxels_per_patch=P,
+        )
+    
+
+    def build_ahcal_patch_occupancy_map(self, x):
+        """
+        Same logic as build_patch_occupancy_map, but for AHCAL sparse tensor.
+        """
+        idx = x.indices.long()  # [N, 4] = [b, x, y, z]
+        b, h, w, d = idx.unbind(-1)
+
+        p_h, p_w, p_d = self.ahcal_patch_size.tolist()
+        Gh, Gw, Gd    = self.ahcal_grid_size
+        P             = p_h * p_w * p_d
+        Np            = self.num_ahcal_positions
+
+        patch_idx = (h // p_h) * (Gw * Gd) + (w // p_w) * Gd + (d // p_d)
+        sub_idx   = (h %  p_h) * (p_w * p_d) + (w %  p_w) * p_d + (d %  p_d)
+
+        key   = (b * (Np * P)) + (patch_idx.to(torch.int64) * P) + sub_idx.to(torch.int64)
+        order = torch.argsort(key)
+        sorted_keys   = key[order].contiguous()
+        sorted_to_raw = order.contiguous()
 
         return LazyIdxMap(
             sorted_keys=sorted_keys,
@@ -588,6 +634,15 @@ class MinkMAEViT(nn.Module):
         ah_tokens, ah_mask, ah_idx = self.densify_patches_generic(ahcal_sparse)           # [B, Na, C], [B, Na], [B, Na]
         ah_tokens = ah_tokens + self.ahcal_pos_embed(ah_idx) \
                                + self.kv_src_embed.weight[0].view(1, 1, -1)               # tag as AHCAL
+        ah_tokens_mod = ah_tokens.unsqueeze(1)        # [B, 1, Na, C]
+        ah_mask_mod   = ah_mask.unsqueeze(1)          # [B, 1, Na]
+        ah_keep_mod, ah_attn_keep_mod, ah_rand_mask_mod, ah_ids_keep_mod, _ = \
+            self._module_random_masking(ah_tokens_mod, ah_mask_mod, mask_ratio,
+        )
+        ah_tokens_keep = ah_keep_mod.squeeze(1)       # [B, Lk_ah, C]
+        ah_attn_keep   = ah_attn_keep_mod.squeeze(1)  # [B, Lk_ah]  (bool)
+        ah_rand_mask   = ah_rand_mask_mod.squeeze(1)  # [B, Na]     (bool, True = masked real position)
+        ah_ids_keep    = ah_ids_keep_mod.squeeze(1)   # [B, Lk_ah]  indices in [0..Na-1]
 
         # ecal + muon spec as a single token
         ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
@@ -599,19 +654,21 @@ class MinkMAEViT(nn.Module):
         )                                                                                 # [B, 1, C]
         global_emb = ecal_emb + muon_spec_emb + \
             self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
+        keep_global = (torch.rand(B, device=global_emb.device) > mask_ratio)  # [B]
+        global_rand_mask = ~keep_global
+        global_kv_mask = keep_global.view(B, 1)  # [B, 1]
 
-        # pack kept tokens for cross-attention
+        # pack kept FASERCal tokens for cross-attention
         kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
             self._pack_by_mask(tok_mod, attn_mask_keep)                                   # [B, N_max,C], [B, N_max]
         
-        # append AHCAL tokens as additional real KVs (respect their mask)
-        kv_tokens = torch.cat([kv_tokens, ah_tokens], dim=1)                              # [B, Nmax + Na, C]
-        kv_keep   = torch.cat([kv_keep, ah_mask], dim=1)                                  # [B, Nmax + Na]
+        # append kept AHCal tokens as additional KVs
+        kv_tokens = torch.cat([kv_tokens, ah_tokens_keep], dim=1)                         # [B, Nmax + Na_k, C]
+        kv_keep   = torch.cat([kv_keep, ah_attn_keep], dim=1)                             # [B, Nmax + Na_k]
 
-        # append global tokens as real KV
-        kv_tokens = torch.cat([kv_tokens, global_emb], dim=1)                             # [B, Nmax + Na + 1, C]
-        kv_keep   = torch.cat([kv_keep, torch.ones(
-            B, 1, dtype=torch.bool, device=kv_keep.device)], dim=1)                       # [B, Nmax + Na + 1]
+        # append global token (ECal+spectrometer)
+        kv_tokens = torch.cat([kv_tokens, global_emb], dim=1)                             # [B, Nmax + Na_k + 1, C]
+        kv_keep   = torch.cat([kv_keep, global_kv_mask], dim=1)                           # [B, Nmax + Na_k + 1]
 
         # prepare queries and masks
         queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]
@@ -627,14 +684,36 @@ class MinkMAEViT(nn.Module):
 
         kv_tokens = self.tokens_norm(kv_tokens)                                           # [B, N_max + G, C]
 
-        tok_enriched = self._unpack_to_modules(
-            kv_tokens[:, :N_max, :],  # drop AHCAL + global rows
+        # FASERcal: unpack back into [B, M, Lk, C]
+        tok_enriched_fasercal = self._unpack_to_modules(
+            kv_tokens[:, :N_max, :],  # FASERCal region
             b_ids, m_ids, lk_ids, within,
             out_shape=torch.Size([B, M, Lk, C])
         )
 
+        # AHCAL: the slice after FASERcal, before global
+        start_ah = N_max
+        end_ah   = N_max + ah_tokens_keep.size(1)
+        tok_enriched_ahcal = kv_tokens[:, start_ah:end_ah, :]      # [B, Lk_ah, C]
+
+        # Global (ECal + spectrometer): last slot
+        global_enriched = kv_tokens[:, end_ah:, :]              # [B, 1, C]
+
         return (
-            tok_enriched, rand_mask, attn_mask_mod, attn_mask_keep, ids_keep
+            tok_enriched_fasercal, # [B, M, Lk, C]
+            rand_mask,             # [B, M, Lm]   FASERcal masked real positions
+            attn_mask_mod,         # [B, M, Lm]   FASERcal real positions
+            attn_mask_keep,        # [B, M, Lk]   FASERcal kept positions
+            ids_keep,              # [B, M, Lk]   FASERcal kept intra indices
+
+            tok_enriched_ahcal,    # [B, Lk_ah, C]
+            ah_mask,               # [B, Na]      AHCAL real positions
+            ah_attn_keep,          # [B, Lk_ah]   AHCAL kept positions
+            ah_rand_mask,          # [B, Na]      AHCAL masked real positions
+            ah_ids_keep,           # [B, Lk_ah]   AHCAL kept indices in [0..Na-1]
+
+            global_enriched,       # [B, 1, C]
+            global_rand_mask,      # [B]          True if global token was masked
         )
         
 
@@ -662,14 +741,13 @@ class MinkMAEViT(nn.Module):
         out_flat_dec = self.enc_to_dec(out_flat)
 
         # voxel head (+ heads)
-        shared       = self.shared_voxel_head["rel"](out_flat_dec)           # [Nk, P, H]
+        shared       = self.fasercal_shared_voxel_head["rel"](out_flat_dec)           # [Nk, P, H]
         preds        = {}
         preds["gho"] = self.heads["gho"](shared).squeeze(-1)                 # [Nk, P]
         preds["hie"] = self.heads["hie"](shared)                             # [Nk, P, 3]
         preds["dec"] = self.heads["dec"](shared)                             # [Nk, P, 3]
         preds["pid"] = self.heads["pid"](shared)                             # [Nk, P, num_pid]
 
-        # targets identical to your current logic
         l_intra   = ids_keep[b_ids, m_ids, lk_ids]                           # [Nk]
         patch_ids = self.module_token_indices[m_ids, l_intra]                # [Nk]
         idx_targets_kept = idx_map[b_ids, patch_ids]                         # [Nk, P]
@@ -719,7 +797,7 @@ class MinkMAEViT(nn.Module):
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
         # heads
-        shared       = self.shared_voxel_head["rec"](out_flat)               # [Nm, P, H]
+        shared       = self.fasercal_shared_voxel_head["rec"](out_flat)      # [Nm, P, H]
         preds        = {}
         preds["occ"] = self.heads["occ"](shared).squeeze(-1)                 # [Nm, P]
         preds["reg"] = self.heads["reg"](shared)                             # [Nm, P, in_chans]
@@ -731,24 +809,132 @@ class MinkMAEViT(nn.Module):
         return preds, idx_targets, b_ids, patch_ids
     
 
+    def forward_reconstruction_ahcal(
+        self,
+        tok_enriched_ah,   # [B, Lk_ah, Cenc]  enriched kept AHCAL tokens
+        ah_mask,           # [B, Na]          True = real AHCAL patch
+        ah_attn_keep,      # [B, Lk_ah]       True = kept AHCAL token
+        ah_rand_mask,      # [B, Na]          True = masked real AHCAL patch
+        ah_idx_map: LazyIdxMap,
+    ):
+        """
+        AHCAL MAE-style reconstruction (symmetric to FASERcal).
+        """
+        B, Lk_ah, Cenc = tok_enriched_ah.shape
+        Cdec = self.decoder_ahcal_pos_embed.weight.shape[-1]
+
+        # Which AHCAL patches to predict: masked real ones
+        prediction_mask = ah_rand_mask & ah_mask             # [B, Na]
+        counts = prediction_mask.sum(dim=-1)
+        max_n = int(counts.max().item()) if B > 0 else 0
+
+        # indices for masked AHCAL patches
+        b_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)  # [Nm]
+        Nm = b_ids.numel()
+
+        # build queries in decoder dim for these masked AHCAL positions
+        within = self._compute_within_ranks(b_ids, Nm)                # [Nm]
+        Q = tok_enriched_ah.new_zeros(B, max_n, Cdec)                 # [B, max_n, Cdec]
+        q = self.decoder_ahcal_pos_embed(l_ids) + self.ahcal_query_tokens  # [Nm, Cdec]
+        Q[b_ids, within] = q
+
+        # KV: enriched kept AHCAL tokens, packed
+        ah_tokens_mod = tok_enriched_ah.unsqueeze(1)        # [B, 1, Lk_ah, Cenc]
+        ah_keep_mod   = ah_attn_keep.unsqueeze(1)          # [B, 1, Lk_ah]
+        kv_tokens, kv_keep, *_ = self._pack_by_mask(
+            ah_tokens_mod, ah_keep_mod
+        )                                                  # [B, Nk_max_ah, Cenc], [B, Nk_max_ah]
+        KV = self.enc_to_dec(kv_tokens)                    # [B, Nk_max_ah, Cdec]
+
+        # Perceiver-IO decode: masked AHCAL queries attend to kept AHCAL tokens
+        X = Q
+        for blk in self.decode_xattn_blocks:
+            X = blk(X, KV, attn_mask=kv_keep)
+
+        out_flat = X[b_ids, within]                        # [Nm, Cdec]
+
+        # AHCAL voxel head (+ heads)
+        shared_ah       = self.ahcal_voxel_head(out_flat)  # [Nm, P_ah, H]
+        preds_ah        = {}
+        preds_ah["occ_ah"] = self.heads["occ_ahcal"](shared_ah).squeeze(-1)          # [Nm, P_ah]
+        preds_ah["reg_ah"] = self.heads["reg_ahcal"](shared_ah)                      # [Nm, P_ah, in_chans]
+
+        # targets: patch id is just l_ids (no modules here)
+        patch_ids_ah = l_ids                                                   # [Nm]
+        idx_targets_ah = ah_idx_map[b_ids, patch_ids_ah]                       # [Nm, P_ah]
+
+        return preds_ah, idx_targets_ah, b_ids, patch_ids_ah
+    
+
     def forward(self, x, x_glob, mask_ratio=0.75):
-        idx_map = self.build_patch_occupancy_map(x)
+        """
+        Single encoder pass with masking (mask_ratio), then:
+          - relational decoder on kept FASERcal tokens,
+          - FASERcal reconstruction decoder (masked patches),
+          - AHCAL reconstruction decoder (masked patches).
+        """
+        # occupancy maps
+        idx_map = self.build_patch_occupancy_map(x)          # FASERcal
+        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask = x_glob
+        ah_idx_map = self.build_ahcal_patch_occupancy_map(ahcal_sparse)
 
-        # Relational path: no masking
-        tok_enriched_rel, _, _, attn_mask_rel, ids_rel = \
-            self.forward_encoder(x, x_glob, mask_ratio=0.0)
-        preds_rel, rel_idx_targets = \
-            self.forward_relational(tok_enriched_rel, attn_mask_rel, ids_rel, idx_map)
+        # single encoder pass
+        (tok_enriched_fas,    # [B, M, Lk_fas, C]
+         rand_mask,           # [B, M, Lm_fas]   True = masked real FASERcal pos
+         attn_mask_mod,       # [B, M, Lm_fas]   True = real FASERcal pos
+         attn_mask_keep,      # [B, M, Lk_fas]   True = kept FASERcal token
+         ids_keep,            # [B, M, Lk_fas]   FASERcal intra indices of kept slots
 
-        # Reconstruction path: with masking
-        tok_enriched_rec, rand_mask, attn_mask_rec, attn_keep_rec, _ = \
-            self.forward_encoder(x, x_glob, mask_ratio)
-        preds_rec, rec_idx_targets, row_event_ids, row_patch_ids = \
-            self.forward_reconstruction(tok_enriched_rec, attn_mask_rec, attn_keep_rec, rand_mask, idx_map)
+         tok_enriched_ah,     # [B, Lk_ah, C]
+         ah_mask,             # [B, Na]          True = real AHCAL patch
+         ah_attn_keep,        # [B, Lk_ah]       True = kept AHCAL token
+         ah_rand_mask,        # [B, Na]          True = masked real AHCAL patch
+         ah_ids_keep,         # [B, Lk_ah]       AHCAL kept indices in [0..Na-1]
 
-        preds = {**preds_rel, **preds_rec}
-        return (preds, rel_idx_targets, rec_idx_targets, row_event_ids, row_patch_ids)
+         global_enriched,     # [B, 1, C]
+         global_rand_mask) = self.forward_encoder(x, x_glob, mask_ratio)
 
+        # relational decoder
+        preds_rel, rel_idx_targets = self.forward_relational(
+            tok_enriched_fas,      # [B, M, Lk_fas, C]
+            attn_mask_keep,        # [B, M, Lk_fas] (kept tokens)
+            ids_keep,              # [B, M, Lk_fas]
+            idx_map,
+        )
+
+        # FASERcal reconstruction (MAE)
+        preds_rec_fas, rec_idx_targets, row_event_ids, row_patch_ids = \
+            self.forward_reconstruction(
+                tok_enriched_fas,   # [B, M, Lk_fas, Cenc], enriched kept FASERcal tokens
+                attn_mask_mod,      # [B, M, Lm_fas], real positions (full intra space)
+                attn_mask_keep,     # [B, M, Lk_fas], kept tokens (for KV)
+                rand_mask,          # [B, M, Lm_fas], masked real positions
+                idx_map,
+            )
+
+        # AHCAL reconstruction
+        preds_rec_ah, rec_idx_targets_ah, row_event_ids_ah, row_patch_ids_ah = \
+            self.forward_reconstruction_ahcal(
+                tok_enriched_ah,    # [B, Lk_ah, Cenc], enriched kept AHCAL tokens
+                ah_mask,            # [B, Na], real AHCAL positions
+                ah_attn_keep,       # [B, Lk_ah], kept AHCAL tokens (for KV)
+                ah_rand_mask,       # [B, Na], masked real AHCAL positions
+                ah_idx_map,
+            )
+
+        # merge all predictions
+        preds = {**preds_rel, **preds_rec_fas, **preds_rec_ah}
+
+        return (
+            preds,
+            rel_idx_targets,        # relational (FASERcal) idx_targets
+            rec_idx_targets,        # FASERcal reconstruction idx_targets
+            row_event_ids,
+            row_patch_ids,
+            rec_idx_targets_ah,     # AHCAL reconstruction idx_targets
+            row_event_ids_ah,
+            row_patch_ids_ah,
+        )
 
 
     def print_param_report(self):

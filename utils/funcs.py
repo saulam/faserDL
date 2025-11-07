@@ -53,6 +53,11 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     val_set.data_files   = extract_files(val_split.indices)
     test_set.data_files  = extract_files(test_split.indices)
 
+    # remove files that have "308b" in the name from all sets
+    #train_set.data_files = [f for f in train_set.data_files if "308b" not in f]
+    #val_set.data_files   = [f for f in val_set.data_files if "308b" not in f]
+    #test_set.data_files  = [f for f in test_set.data_files if "308b" not in f]
+
     if args.train and args.augmentations_enabled and not args.stage1 and args.mixup_alpha > 0:
         train_set.calc_primary_vertices()
 
@@ -198,6 +203,10 @@ def collate(
         ahcal_feats_cat, ahcal_coords_list, device=device, axis_order=axis_order, spatial_shape=ahcal_spatial_shape
     )
 
+    # Build hit_event_id_ahcal exactly like your current collate
+    num_ahcal_hits = torch.tensor([len(x) for x in ahcal_feats_list], dtype=torch.long)
+    hit_event_id_ahcal = torch.arange(len(ahcal_feats_list), dtype=torch.long).repeat_interleave(num_ahcal_hits)
+
     ret = {
         "x_sp": x_sp,
         "spatial_shape": spatial_shape_out,
@@ -205,6 +214,7 @@ def collate(
         "hit_event_id": hit_event_id,
         "ahcal_x_sp": ahcal_x_sp,
         "ahcal_spatial_shape": ahcal_spatial_shape,
+        "hit_event_id_ahcal": hit_event_id_ahcal,
     }
 
     ret["ecal_hits"] = torch.stack([d["ecal_hits"] for d in batch])
@@ -332,7 +342,7 @@ def arrange_truth(data):
         'csr_hie_indptr', 'csr_hie_ids', 'csr_hie_weights',
         'csr_dec_indptr', 'csr_dec_ids', 'csr_dec_weights',
         'csr_pid_indptr', 'csr_pid_ids', 'csr_pid_weights',
-        'ghost_mask', 'hit_event_id',
+        'ghost_mask', 'hit_event_id', 'hit_event_id_ahcal',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
         'charm_label', 'e_vis', 'pt_miss', 

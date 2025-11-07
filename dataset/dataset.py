@@ -82,7 +82,7 @@ class SparseFASERCALDataset(Dataset):
         return mapped
 
     
-    def pdg2label(self, pdg, is_cc, tau_decay_mode):
+    def pdg2label(self, pdg, is_cc, tau_decay_mode, split_tau=False):
         """Converts PDG ID to a classification label (0-5).
 
         Returns:
@@ -98,14 +98,17 @@ class SparseFASERCALDataset(Dataset):
             if pdg in {-12, 12}: return 0           # CC nue
             if pdg in {-14, 14}: return 1           # CC numu
             if pdg in {-16, 16}:                    # CC nutau
-                assert tau_decay_mode > 0, "Tau events must have a valid decay mode"
-                if tau_decay_mode == 1:   return 2  # tau -> e
-                elif tau_decay_mode == 2: return 3  # tau -> mu
-                else:                     return 4  # tau -> hadrons
-        return 5
+                if split_tau:
+                    assert tau_decay_mode > 0, "Tau events must have a valid decay mode"
+                    if tau_decay_mode == 1:   return 2  # tau -> e
+                    elif tau_decay_mode == 2: return 3  # tau -> mu
+                    else:                     return 4  # tau -> hadrons
+                else:
+                    return 2  # all CC nutau together
+        return 5 if split_tau else 3  # NC
 
 
-    def charmdecay2label(self, is_charmed, charm_decay):
+    def charmdecay2label(self, is_charmed, charm_decay, split_charm=False):
         """Classifies charm decays based on decay products.
         
         Returns:
@@ -117,11 +120,13 @@ class SparseFASERCALDataset(Dataset):
         """
         if not is_charmed:
             return 0  # no charm
-        if any(pid in {13, -13} for pid in charm_decay):
-            return 2  # charm -> mu
-        elif any(pid in {11, -11} for pid in charm_decay):
-            return 1  # charm -> e
-        return 3      # charm -> hadron
+        if split_charm:
+            if any(pid in {13, -13} for pid in charm_decay):
+                return 2  # charm -> mu
+            elif any(pid in {11, -11} for pid in charm_decay):
+                return 1  # charm -> e
+            return 3      # charm -> hadron
+        return 1  # all charm decays together
 
 
     def decompose_momentum(self, momentum):
@@ -454,8 +459,9 @@ class SparseFASERCALDataset(Dataset):
         if not is_cc:
             # NC events don't have visible outgoing leptons
             out_lepton_momentum.fill(0)
-        flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc, tau_decay_mode)])
-        charm_label = np.array([self.charmdecay2label(is_charmed, charm_decay['pdg'])])
+        split_tau, split_charm = True, True
+        flavour_label = np.array([self.pdg2label(in_neutrino_pdg, is_cc, tau_decay_mode, split_tau=split_tau)])
+        charm_label = np.array([self.charmdecay2label(is_charmed, charm_decay['pdg'], split_charm=split_charm)])
 
         # augmentations (if applicable)
         if self.train and self.augmentations_enabled:
@@ -469,12 +475,12 @@ class SparseFASERCALDataset(Dataset):
             charm_label = smooth_labels(
                 charm_label, 
                 smoothing=self.label_smoothing,
-                num_classes=4
+                num_classes=4 if split_charm else 2
             )
             flavour_label = smooth_labels(
                 flavour_label,
                 smoothing=self.label_smoothing,
-                num_classes=6
+                num_classes=6 if split_tau else 4
             )
 
         return {

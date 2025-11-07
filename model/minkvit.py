@@ -28,6 +28,7 @@ class MinkViT(vit.VisionTransformer):
         D=3,
         img_size=(48, 48, 200),
         module_depth_voxels=20,
+        ahcal_size=(18, 18, 40),
         ahcal_patch_size=(9, 9, 10),
         num_module_cls=1,
         io_depth=4,

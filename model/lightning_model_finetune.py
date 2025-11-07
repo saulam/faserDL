@@ -243,9 +243,6 @@ class ViTFineTuner(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss, part_losses, batch_size = self.common_step(batch)
 
-        if torch.isnan(loss):
-            return None
-
         self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
             self.log("{}/train".format(key), value, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
