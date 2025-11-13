@@ -239,8 +239,8 @@ class MAEPreTrainer(pl.LightningModule):
         )
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
             targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
-            patch_shape=tuple(self.model.patch_size.tolist()),
-            name_prefix="",    # keep original metric names
+            patch_shape=tuple(self.model.fcal_patch_size.tolist()),
+            name_prefix="",        # keep original metric names
         )
         loss_occ_ah, loss_reg_ah, part_dec_ah = self.compute_reconstruction_losses(
             targ_reg_ahcal, pred_occ_ah, pred_reg_ah, rec_idx_targets_ahcal, hit_event_id_ah, ghost_mask=ghost_mask_ah,

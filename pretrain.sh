@@ -7,7 +7,7 @@ shardshuffle=200
 shuffle=4000
 model="tiny"
 eps=1e-8
-batch_size=32
+batch_size=256
 preprocessing_input="log"
 label_smoothing=0.02
 dropout=0.0
@@ -33,7 +33,7 @@ save_top_k=1
 checkpoint_path="checkpoints_final"
 checkpoint_name="pretrain_v6.0_dlnu_log_v2"
 early_stop_patience=200
-load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_base_v1/loss_total_val/last.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_v2/loss_total_val/last.ckpt"
 gpus=(0 1)
 
 python -m train.pretrain \
@@ -70,6 +70,5 @@ python -m train.pretrain \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
-    --load_checkpoint $load_checkpoint \
     --gpus "${gpus[@]}"
 

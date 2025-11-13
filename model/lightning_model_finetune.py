@@ -41,26 +41,26 @@ class ViTFineTuner(pl.LightningModule):
         self.log_sigma_flavour   = nn.Parameter(torch.zeros(()))
         self.log_sigma_charm     = nn.Parameter(torch.zeros(()))
         self.log_sigma_vis_geom  = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis_pt    = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis_mag   = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_vis_pt    = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_vis_mag   = nn.Parameter(torch.zeros(()))
         self.log_sigma_jet_geom  = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_pt    = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_mag   = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_jet_pt    = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_jet_mag   = nn.Parameter(torch.zeros(()))
         self.log_sigma_lep_geom  = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep_pt    = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep_mag   = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_lep_pt    = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_lep_mag   = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
             "flavour":     self.log_sigma_flavour,
             "charm":       self.log_sigma_charm,
             "vis_geom":    self.log_sigma_vis_geom,
-            "vis_pt":      self.log_sigma_vis_pt,
-            "vis_mag":     self.log_sigma_vis_mag,
+            #"vis_pt":      self.log_sigma_vis_pt,
+            #"vis_mag":     self.log_sigma_vis_mag,
             "jet_geom":    self.log_sigma_jet_geom,
-            "jet_pt":      self.log_sigma_jet_pt,
-            "jet_mag":     self.log_sigma_jet_mag,
+            #"jet_pt":      self.log_sigma_jet_pt,
+            #"jet_mag":     self.log_sigma_jet_mag,
             "lep_geom":    self.log_sigma_lep_geom,
-            "lep_pt":      self.log_sigma_lep_pt,
-            "lep_mag":     self.log_sigma_lep_mag,
+            #"lep_pt":      self.log_sigma_lep_pt,
+            #"lep_mag":     self.log_sigma_lep_mag,
         }
         
         self.warmup_steps = args.warmup_steps
@@ -172,28 +172,28 @@ class ViTFineTuner(pl.LightningModule):
 
         # regression per-sample tensors from the criterion
         loss_vis_geom    = outs["loss_vis/geom"]
-        loss_vis_pt      = outs["loss_vis/pt"]
-        loss_vis_mag     = outs["loss_vis/mag"]
+        #loss_vis_pt      = outs["loss_vis/pt"]
+        #loss_vis_mag     = outs["loss_vis/mag"]
         loss_jet_geom    = outs["loss_jet/geom"]
-        loss_jet_pt      = outs["loss_jet/pt"]
-        loss_jet_mag     = outs["loss_jet/mag"]
+        #loss_jet_pt      = outs["loss_jet/pt"]
+        #loss_jet_mag     = outs["loss_jet/mag"]
         loss_lep_geom    = outs["loss_lep/geom"]
-        loss_lep_pt      = outs["loss_lep/pt"]
-        loss_lep_mag     = outs["loss_lep/mag"]
+        #loss_lep_pt      = outs["loss_lep/pt"]
+        #loss_lep_mag     = outs["loss_lep/mag"]
 
         # Kendall-weighted total
         total_loss = (
             weighted_loss(loss_flavour,  self.log_sigma_flavour,  kind="ce").mean()  +
             weighted_loss(loss_charm,    self.log_sigma_charm,    kind="ce").mean()  +
             weighted_loss(loss_vis_geom, self.log_sigma_vis_geom, kind="reg").mean() +
-            weighted_loss(loss_vis_pt,   self.log_sigma_vis_pt,   kind="reg").mean() +
-            weighted_loss(loss_vis_mag,  self.log_sigma_vis_mag,  kind="reg").mean() +
+            #weighted_loss(loss_vis_pt,   self.log_sigma_vis_pt,   kind="reg").mean() +
+            #weighted_loss(loss_vis_mag,  self.log_sigma_vis_mag,  kind="reg").mean() +
             weighted_loss(loss_jet_geom, self.log_sigma_jet_geom, kind="reg").mean() +
-            weighted_loss(loss_jet_pt,   self.log_sigma_jet_pt,   kind="reg").mean() +
-            weighted_loss(loss_jet_mag,  self.log_sigma_jet_mag,  kind="reg").mean() +
-            weighted_loss(loss_lep_geom, self.log_sigma_lep_geom, kind="reg").mean() +
-            weighted_loss(loss_lep_pt,   self.log_sigma_lep_pt,   kind="reg").mean() +
-            weighted_loss(loss_lep_mag,  self.log_sigma_lep_mag,  kind="reg").mean()
+            #weighted_loss(loss_jet_pt,   self.log_sigma_jet_pt,   kind="reg").mean() +
+            #weighted_loss(loss_jet_mag,  self.log_sigma_jet_mag,  kind="reg").mean() +
+            weighted_loss(loss_lep_geom, self.log_sigma_lep_geom, kind="reg").mean() #+
+            #weighted_loss(loss_lep_pt,   self.log_sigma_lep_pt,   kind="reg").mean() +
+            #weighted_loss(loss_lep_mag,  self.log_sigma_lep_mag,  kind="reg").mean()
         )
 
         part_losses = {
@@ -203,14 +203,14 @@ class ViTFineTuner(pl.LightningModule):
 
             # regression (unmasked/batch means)
             'loss_vis/geom': loss_vis_geom.mean().detach().item(),
-            'loss_vis/pt':   loss_vis_pt.mean().detach().item(),
-            'loss_vis/mag':  loss_vis_mag.mean().detach().item(),
+            #'loss_vis/pt':   loss_vis_pt.mean().detach().item(),
+            #'loss_vis/mag':  loss_vis_mag.mean().detach().item(),
             'loss_jet/geom': loss_jet_geom.mean().detach().item(),
-            'loss_jet/pt':   loss_jet_pt.mean().detach().item(),
-            'loss_jet/mag':  loss_jet_mag.mean().detach().item(),
+            #'loss_jet/pt':   loss_jet_pt.mean().detach().item(),
+            #'loss_jet/mag':  loss_jet_mag.mean().detach().item(),
             'loss_lep/geom': loss_lep_geom.mean().detach().item(),
-            'loss_lep/pt':   loss_lep_pt.mean().detach().item(),
-            'loss_lep/mag':  loss_lep_mag.mean().detach().item(),
+            #'loss_lep/pt':   loss_lep_pt.mean().detach().item(),
+            #'loss_lep/mag':  loss_lep_mag.mean().detach().item(),
         }
         
         return total_loss, part_losses
