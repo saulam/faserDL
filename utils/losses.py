@@ -1613,6 +1613,7 @@ def soft_ce_with_logits_csr(
     csr: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, w)
     ghost_mask: torch.Tensor = None,
     label_smoothing: float = 0.0,
+    label_shuffle: float = 0.0,
 ):
     N, num_classes = logits.shape
 
@@ -1627,6 +1628,33 @@ def soft_ce_with_logits_csr(
         eps = max(0.0, min(1.0, eps))
         eps_t = torch.as_tensor(eps, dtype=soft_labels.dtype, device=soft_labels.device)
         soft_labels = soft_labels.mul(1.0 - eps_t).add(eps_t / num_classes)
+
+    # Apply label shuffling if requested
+    p = float(label_shuffle)
+    if p > 0.0:
+        p = max(0.0, min(1.0, p))
+
+        # Determine which rows are "valid" for shuffling (non-ghost)
+        if ghost_mask is not None:
+            valid = ~ghost_mask.to(dtype=torch.bool, device=logits.device)
+            valid_indices = valid.nonzero(as_tuple=False).squeeze(1)
+        else:
+            valid_indices = torch.arange(N, device=logits.device)
+
+        num_valid = valid_indices.numel()
+        if num_valid > 1:
+            num_shuffled = int(p * num_valid)
+            if num_shuffled > 0:
+                # Choose a random subset of valid rows
+                perm_valid = torch.randperm(num_valid, device=logits.device)
+                chosen = valid_indices[perm_valid[:num_shuffled]]
+
+                # Permute those chosen rows among themselves
+                perm_within = torch.randperm(chosen.numel(), device=logits.device)
+                permuted = chosen[perm_within]
+
+                # Reassign their targets: soft_labels[chosen] <- soft_labels[permuted]
+                soft_labels[chosen] = soft_labels[permuted]
 
     per_row_loss = -(soft_labels * torch.log_softmax(logits, dim=-1)).sum(dim=1)
 

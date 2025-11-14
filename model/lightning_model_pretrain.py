@@ -126,10 +126,14 @@ class MAEPreTrainer(pl.LightningModule):
         """
         Computes losses (same-track, same-primary, same-pid) in one call.
         """
-        loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), label_smoothing=self.label_smoothing)
-        loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
-        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
-        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask, label_smoothing=self.label_smoothing)
+        loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), 
+                                                   label_smoothing=self.label_smoothing)
+        loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask, 
+                                           label_smoothing=self.label_smoothing, label_shuffle=0.01)
+        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, 
+                                           label_smoothing=self.label_smoothing, label_shuffle=0.05)
+        loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask, 
+                                           label_smoothing=self.label_smoothing, label_shuffle=0.01)
 
         part_losses_enc = {
             "gho/total": loss_gho.detach(),
