@@ -22,7 +22,7 @@ class MinkMAEViT(nn.Module):
         self,
         in_chans=1,
         D=3,
-        img_size=(48, 48, 200),
+        fcal_size=(48, 48, 200),
         module_depth_voxels=20,
         embed_dim=384,
         fcal_patch_size=(16, 16, 4),
@@ -46,22 +46,15 @@ class MinkMAEViT(nn.Module):
         norm_layer=nn.LayerNorm,
         metadata=None,
     ):
-        """
-        Args:
-            in_chans (int): Number of input channels.
-            D (int): Spatial dimension for Minkowski layers.
-            img_size (tuple): Input image size (H, W, D).
-            args: Namespace with at least a `dataset_path` attribute.
-        """
         super().__init__()
 
         self.metadata = metadata
     
         # patch and grid setup
-        H, W, D_img = img_size
+        H, W, D_img = fcal_size
         p_h, p_w, p_d = fcal_patch_size
         assert H % p_h == 0 and W % p_w == 0 and D_img % p_d == 0, \
-            "img_size must be divisible by patch_size"
+            "fcal_size must be divisible by fcal_patch_size"
         self.in_chans = in_chans
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
         self.num_patches = (self.grid_size[0] * self.grid_size[1] * self.grid_size[2])
@@ -633,9 +626,9 @@ class MinkMAEViT(nn.Module):
         )                                                                                 # [B, 1, C]
         global_emb = ecal_emb + muon_spec_emb + \
             self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
-        keep_global = (torch.rand(B, device=global_emb.device) > mask_ratio)  # [B]
+        keep_global = (torch.rand(B, device=global_emb.device) > mask_ratio)              # [B]
         global_rand_mask = ~keep_global
-        global_kv_mask = keep_global.view(B, 1)  # [B, 1]
+        global_kv_mask = keep_global.view(B, 1)                                           # [B, 1]
 
         # pack kept FASERCal tokens for cross-attention
         kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
@@ -918,19 +911,24 @@ class MinkMAEViT(nn.Module):
 
     def print_param_report(self):
         """
-        Prints parameter counts by component:
-        - patch_embed
-        - intra_vit (pos-emb, module token/emb, blocks, norm)
-        - perceiver_encoder (global encoder, global_mem, cross/self blocks, norm)
-        - perceiver_decoder (dec pos-emb, module emb, query tokens, latents_to_dec, cross blocks)
-        - heads_relational
-        - heads_reconstruction
-        - TOTAL
+        Prints parameter counts grouped by logical component:
+
+        - patch_embed          : FASERCal + AHCAL sparse patch embeddings
+        - intra_vit            : module CLS token/emb, intra-module pos emb, encoder blocks, norm
+        - perceiver_encoder    : AHCAL and global (ECal + spectrometer) streams, cross/self-attn, norm
+        - perceiver_decoder    : decoder pos embeddings, module embeddings, query tokens,
+                                 enc->dec projection, Perceiver-IO cross-attn blocks
+        - heads_relational     : FASERCal relational voxel head + relational heads (gho/hie/dec/pid)
+        - heads_reconstruction : FASERCal and AHCAL MAE-style reconstruction heads
+        - ALL (sanity) / SUM(groups)
         """
         from collections import OrderedDict
 
         def _iter_params(obj):
-            """Yield parameters from nn.Modules, nn.Parameters, and containers (list/tuple/dict/ModuleList/etc.)."""
+            """
+            Yield parameters from nn.Modules, nn.Parameters, and containers
+            (list/tuple/dict/etc.).
+            """
             if obj is None:
                 return
             if isinstance(obj, nn.Parameter):
@@ -940,24 +938,18 @@ class MinkMAEViT(nn.Module):
                 for p in obj.parameters(recurse=True):
                     yield p
                 return
-            # Common Python containers
+            # Python containers
             if isinstance(obj, (list, tuple, set)):
                 for o in obj:
                     yield from _iter_params(o)
-                return 
+                return
             if isinstance(obj, dict):
                 for o in obj.values():
                     yield from _iter_params(o)
                 return
-            # Torch container types
-            if isinstance(obj, (nn.ModuleList, nn.Sequential, nn.ParameterList, nn.ParameterDict)):
-                for o in obj:
-                    yield from _iter_params(o)
-                return
-            # Ignore everything else (buffers / plain tensors that aren't parameters)
 
         def _count(objs):
-            # Collect and de-duplicate by id in case something shows up twice in a group
+            # Collect and de-duplicate by id within a group
             ps = list(_iter_params(objs))
             seen = set()
             uniq = []
@@ -972,57 +964,95 @@ class MinkMAEViT(nn.Module):
 
         groups = OrderedDict()
 
-        # --- Patch embed ---
-        groups["patch_embed"] = [self.patch_embed] if hasattr(self, "patch_embed") else []
+        # Patch embeddings
+        patch_list = []
+        if hasattr(self, "fcal_patch_embed"):
+            patch_list.append(self.fcal_patch_embed)
+        if hasattr(self, "ahcal_patch_embed"):
+            patch_list.append(self.ahcal_patch_embed)
+        groups["patch_embed"] = patch_list
 
-        # --- Intra ViT ---
+        # Intra ViT (per-module transformer)
         intra_list = []
-        if hasattr(self, "intra_pos_embed"):   intra_list.append(self.intra_pos_embed)
-        if hasattr(self, "module_cls_token"):  intra_list.append(self.module_cls_token)
-        if hasattr(self, "module_embed_enc"):  intra_list.append(self.module_embed_enc)
-        if hasattr(self, "blocks"):            intra_list.append(self.blocks)   # ModuleList (let Module handle recurse)
-        if hasattr(self, "norm"):              intra_list.append(self.norm)
+        if hasattr(self, "intra_pos_embed"):
+            intra_list.append(self.intra_pos_embed)
+        if hasattr(self, "module_cls_token"):
+            intra_list.append(self.module_cls_token)
+        if hasattr(self, "module_embed_enc"):
+            intra_list.append(self.module_embed_enc)
+        if hasattr(self, "blocks"):
+            intra_list.append(self.blocks)
+        if hasattr(self, "norm"):
+            intra_list.append(self.norm)
         groups["intra_vit"] = intra_list
 
-        # --- Perceiver encoder ---
+        # Perceiver-style encoder (global + AHCAL + latent cross/self)
         enc_list = []
-        if hasattr(self, "global_feats_encoder"): enc_list.append(self.global_feats_encoder)
-        if hasattr(self, "global_mem"):           enc_list.append(self.global_mem)     # nn.Parameter
-        if hasattr(self, "latent_xattn_blocks"):  enc_list.append(self.latent_xattn_blocks)  # ModuleList
-        if hasattr(self, "latent_self_blocks"):   enc_list.append(self.latent_self_blocks)   # ModuleList
-        if hasattr(self, "latent_norm"):          enc_list.append(self.latent_norm)
+        if hasattr(self, "ahcal_pos_embed"):
+            enc_list.append(self.ahcal_pos_embed)
+        if hasattr(self, "kv_src_embed"):
+            enc_list.append(self.kv_src_embed)
+        if hasattr(self, "ecal_embed"):
+            enc_list.append(self.ecal_embed)
+        if hasattr(self, "muon_spec_token"):
+            enc_list.append(self.muon_spec_token)
+        if hasattr(self, "muon_spec_embed"):
+            enc_list.append(self.muon_spec_embed)
+        if hasattr(self, "muon_spec_xattn"):
+            enc_list.append(self.muon_spec_xattn)
+        if hasattr(self, "xattn_blocks"):
+            enc_list.append(self.xattn_blocks)
+        if hasattr(self, "latent_self_blocks"):
+            enc_list.append(self.latent_self_blocks)
+        if hasattr(self, "tokens_norm"):
+            enc_list.append(self.tokens_norm)
         groups["perceiver_encoder"] = enc_list
 
-        # --- Perceiver decoders ---
+        # Perceiver-style decoders (FASERCal + AHCAL)
         dec_list = []
-        if hasattr(self, "decoder_intra_pos_embed"): dec_list.append(self.decoder_intra_pos_embed)
-        if hasattr(self, "module_embed_dec"):        dec_list.append(self.module_embed_dec)
-        if hasattr(self, "query_tokens"):            dec_list.append(self.query_tokens)
-        if hasattr(self, "latents_to_dec"):          dec_list.append(self.latents_to_dec)
-        if hasattr(self, "decode_xattn_blocks"):     dec_list.append(self.decode_xattn_blocks)
+        if hasattr(self, "decoder_intra_pos_embed"):
+            dec_list.append(self.decoder_intra_pos_embed)
+        if hasattr(self, "decoder_ahcal_pos_embed"):
+            dec_list.append(self.decoder_ahcal_pos_embed)
+        if hasattr(self, "module_embed_dec"):
+            dec_list.append(self.module_embed_dec)
+        if hasattr(self, "query_tokens"):
+            dec_list.append(self.query_tokens)
+        if hasattr(self, "ahcal_query_tokens"):
+            dec_list.append(self.ahcal_query_tokens)
+        if hasattr(self, "enc_to_dec"):
+            dec_list.append(self.enc_to_dec)
+        if hasattr(self, "decode_xattn_blocks"):
+            dec_list.append(self.decode_xattn_blocks)
         groups["perceiver_decoder"] = dec_list
 
-        # --- Heads: relational ---
+        # Heads: relational (FASERCal relational voxel + gho/hie/dec/pid)
         heads_rel = []
-        if hasattr(self, "shared_voxel_head") and ("rel" in getattr(self, "shared_voxel_head")):
-            heads_rel.append(self.shared_voxel_head["rel"])
-        if hasattr(self, "track_head"):    heads_rel.append(self.track_head)
-        if hasattr(self, "primary_head"):  heads_rel.append(self.primary_head)
-        if hasattr(self, "pid_head"):      heads_rel.append(self.pid_head)
-        groups["heads_relational"] = [m for m in heads_rel if m is not None]
+        if hasattr(self, "fasercal_shared_voxel_head"):
+            if isinstance(self.fasercal_shared_voxel_head, nn.ModuleDict):
+                if "rel" in self.fasercal_shared_voxel_head:
+                    heads_rel.append(self.fasercal_shared_voxel_head["rel"])
+        if hasattr(self, "heads"):
+            for key in ["gho", "hie", "dec", "pid"]:
+                if key in self.heads:
+                    heads_rel.append(self.heads[key])
+        groups["heads_relational"] = heads_rel
 
-        # --- Heads: reconstruction ---
+        # Heads: reconstruction (FASERCal + AHCAL MAE)
         heads_rec = []
-        if hasattr(self, "shared_voxel_head") and ("rec" in getattr(self, "shared_voxel_head")):
-            heads_rec.append(self.shared_voxel_head["rec"])
-        if hasattr(self, "occ_head"):      heads_rec.append(self.occ_head)
-        if hasattr(self, "reg_head"):      heads_rec.append(self.reg_head)
-        groups["heads_reconstruction"] = [m for m in heads_rec if m is not None]
+        if hasattr(self, "fasercal_shared_voxel_head"):
+            if isinstance(self.fasercal_shared_voxel_head, nn.ModuleDict):
+                if "rec" in self.fasercal_shared_voxel_head:
+                    heads_rec.append(self.fasercal_shared_voxel_head["rec"])
+        if hasattr(self, "ahcal_voxel_head"):
+            heads_rec.append(self.ahcal_voxel_head)
+        if hasattr(self, "heads"):
+            for key in ["occ", "reg", "occ_ahcal", "reg_ahcal"]:
+                if key in self.heads:
+                    heads_rec.append(self.heads[key])
+        groups["heads_reconstruction"] = heads_rec
 
-        # Optional classifier (kept for finetune variants)
-        if getattr(self, "classifier", None) is not None:
-            groups["classifier"] = [self.classifier]
-
+        # Print report
         grand_total = grand_train = 0
         print("=== Parameter report ===")
         for name, objs in groups.items():
@@ -1041,10 +1071,10 @@ class MinkMAEViT(nn.Module):
 
 def mae_vit_tiny(**kwargs):
     model = MinkMAEViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=528, fcal_patch_size=(12, 12, 10),
-        depth=4, num_heads=12,
-        io_depth=3, io_decode_depth=2, num_module_cls=1,
+        in_chans=1, D=3, embed_dim=528, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
+        depth=4, num_heads=12, io_depth=3, io_decode_depth=2, num_module_cls=1,
         num_modes=(32, 8), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
@@ -1053,10 +1083,10 @@ def mae_vit_tiny(**kwargs):
 
 def mae_vit_base(**kwargs):
     model = MinkMAEViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=768, fcal_patch_size=(16, 16, 4),
-        depth=4, num_heads=12,
-        io_depth=8, io_decode_depth=4, num_module_cls=2,
+        in_chans=1, D=3, embed_dim=768, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
+        depth=4, num_heads=12, io_depth=8, io_decode_depth=4, num_module_cls=2,
         num_modes=(48, 8), decoder_embed_dim=528, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
@@ -1065,10 +1095,10 @@ def mae_vit_base(**kwargs):
 
 def mae_vit_large(**kwargs):
     model = MinkMAEViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=768, fcal_patch_size=(16, 16, 4),
-        depth=8, num_heads=12,
-        io_depth=16, io_decode_depth=6, num_module_cls=4,
+        in_chans=1, D=3, embed_dim=768, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
+        depth=8, num_heads=12, io_depth=16, io_decode_depth=6, num_module_cls=4,
         num_modes=(64, 12), decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
@@ -1077,10 +1107,10 @@ def mae_vit_large(**kwargs):
 
 def mae_vit_huge(**kwargs):
     model = MinkMAEViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=768, fcal_patch_size=(16, 16, 4),
-        depth=16, num_heads=12,
-        io_depth=32, io_decode_depth=8, num_module_cls=4,
+        in_chans=1, D=3, embed_dim=768, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
+        depth=16, num_heads=12, io_depth=32, io_decode_depth=8, num_module_cls=4,
         num_modes=(64, 16), decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )

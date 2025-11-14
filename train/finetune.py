@@ -119,7 +119,7 @@ def main():
         head_init = args.head_init,
         metadata = metadata,
     )
-    if args.load_checkpoint is not None:
+    if args.load_checkpoint is not None and os.path.exists(args.load_checkpoint):
         checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
         load_mae_encoder(model, checkpoint)
     else:

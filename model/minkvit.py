@@ -26,8 +26,9 @@ class MinkViT(vit.VisionTransformer):
     def __init__(
         self,
         D=3,
-        img_size=(48, 48, 200),
+        fcal_size=(48, 48, 200),
         module_depth_voxels=20,
+        fcal_patch_size=(16, 16, 4),
         ahcal_size=(18, 18, 40),
         ahcal_patch_size=(9, 9, 10),
         num_module_cls=1,
@@ -50,17 +51,16 @@ class MinkViT(vit.VisionTransformer):
         in_chans = kwargs['in_chans']
         drop_rate = kwargs['drop_rate']
         embed_dim = kwargs['embed_dim']
-        patch_size = kwargs['patch_size']
 
         # patch and grid setup
-        H, W, D_img = img_size
-        p_h, p_w, p_d = patch_size
+        H, W, D_img = fcal_size
+        p_h, p_w, p_d = fcal_patch_size
         assert H % p_h == 0 and W % p_w == 0 and D_img % p_d == 0, \
-            "img_size must be divisible by patch_size"
+            "fcal_size must be divisible by fcal_patch_size"
         self.grid_size = (H // p_h, W // p_w, D_img // p_d)
         self.num_patches = (self.grid_size[0] * self.grid_size[1] * self.grid_size[2])
         self.patch_voxels = p_h * p_w * p_d
-        self.register_buffer('patch_size', torch.tensor(patch_size, dtype=torch.long))
+        self.register_buffer('fcal_patch_size', torch.tensor(fcal_patch_size, dtype=torch.long))
         self.register_buffer('ahcal_patch_size', torch.tensor(ahcal_patch_size, dtype=torch.long))
 
         # module slicing along Z
@@ -74,7 +74,7 @@ class MinkViT(vit.VisionTransformer):
         self.num_intra_positions = G_h * G_w * self.module_depth_patches
 
         # AHCAL grid bookkeeping (post-embedding grid)
-        Ah, Aw, Ad = (18, 18, 40)
+        Ah, Aw, Ad = ahcal_size
         ap_h, ap_w, ap_d = self.ahcal_patch_size.tolist()
         assert Ah % ap_h == 0 and Aw % ap_w == 0 and Ad % ap_d == 0, \
             "AHCAL grid must be divisible by ahcal_patch_size"
@@ -85,10 +85,10 @@ class MinkViT(vit.VisionTransformer):
 
         # patch embedding
         del self.cls_token, self.patch_embed, self.pos_embed, self.norm_pre, self.fc_norm, self.head
-        if self.patch_size.prod().item() > 512:
+        if self.fcal_patch_size.prod().item() > 512:
             # too large -> use two-step conv
             mid = embed_dim // 4
-            k1, k2 = choose_k1_k2(patch_size)
+            k1, k2 = choose_k1_k2(fcal_patch_size)
             self.patch_embed = SparseSequential(
                 SparseConv3d(in_chans, mid, kernel_size=k1, stride=k1, padding=0, bias=False),
                 norm_layer(mid),
@@ -97,7 +97,7 @@ class MinkViT(vit.VisionTransformer):
             )
         else:
             self.patch_embed = SparseConv3d(
-                in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, 
+                in_chans, embed_dim, kernel_size=fcal_patch_size, stride=fcal_patch_size, 
                 padding=0, bias=True,
             )
 
@@ -464,6 +464,11 @@ class MinkViT(vit.VisionTransformer):
         ah_tokens, ah_mask, ah_idx = self.densify_patches_generic(ahcal_sparse)           # [B, Na, C], [B, Na], [B, Na]
         ah_tokens = ah_tokens + self.ahcal_pos_embed(ah_idx) \
                                + self.kv_src_embed.weight[0].view(1, 1, -1)               # tag as AHCAL
+        ah_counts = ah_mask.sum(dim=1)                                                    # [B]
+        degenerate = ah_counts < 2                                                        # [B]
+        if degenerate.any():
+            # ignore AHCAL for events with too few non-empty patches
+            ah_mask[degenerate] = False
 
         # ecal + muon spec as a single token
         ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
@@ -532,8 +537,9 @@ class MinkViT(vit.VisionTransformer):
 
 def vit_tiny(**kwargs):
     model = MinkViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=528, patch_size=(12, 12, 10),
+        in_chans=1, D=3, embed_dim=528,
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=4, num_heads=12,
         io_depth=3, num_module_cls=1,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
@@ -544,8 +550,9 @@ def vit_tiny(**kwargs):
 
 def vit_base(**kwargs):
     model = MinkViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=768, patch_size=(16, 16, 4),
+        in_chans=1, D=3, embed_dim=768, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=4, num_heads=12,
         io_depth=4, num_module_cls=2,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
@@ -556,8 +563,9 @@ def vit_base(**kwargs):
 
 def vit_large(**kwargs):
     model = MinkViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=1008, patch_size=(48, 48, 2),
+        in_chans=1, D=3, embed_dim=1008, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=8, num_heads=12,
         io_depth=8, num_module_cls=4,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
@@ -568,8 +576,9 @@ def vit_large(**kwargs):
 
 def vit_huge(**kwargs):
     model = MinkViT(
-        in_chans=1, D=3, img_size=(48, 48, 200),
-        embed_dim=1296, patch_size=(48, 48, 2),
+        in_chans=1, D=3, embed_dim=1296, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=16, num_heads=12,
         io_depth=16, num_module_cls=4,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,

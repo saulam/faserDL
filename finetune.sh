@@ -34,7 +34,7 @@ save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
 checkpoint_name="finetune_v6.0_dlnu_log_base_clariden_v11"
 early_stop_patience=10
-load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_v2/loss_total_val/epoch=81-step=106272.ckpt"
+load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_v2/loss_total_val/epoch=82-step=106272.ckpt"
 gpus=(1)
 
 python -m train.finetune \
