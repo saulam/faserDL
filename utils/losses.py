@@ -1608,12 +1608,21 @@ def build_soft_targets_from_csr(indptr, cls, w, num_classes, N, ghost_mask=None)
     return torch.cat([probs, ghost_col], dim=1)
 
 
+def confidence_penalty(logits: torch.Tensor, lambda_cp: float = 1e-3):
+    if lambda_cp <= 0.0:
+        return logits.new_tensor(0.0)
+    probs = torch.softmax(logits, dim=-1)              # [N, K]
+    cp = (probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()
+    return lambda_cp * cp
+
+
 def soft_ce_with_logits_csr(
     logits: torch.Tensor,
     csr: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, w)
     ghost_mask: torch.Tensor = None,
     label_smoothing: float = 0.0,
     label_shuffle: float = 0.0,
+    lambda_cp: float = 0.0,
 ):
     N, num_classes = logits.shape
 
@@ -1658,13 +1667,35 @@ def soft_ce_with_logits_csr(
 
     per_row_loss = -(soft_labels * torch.log_softmax(logits, dim=-1)).sum(dim=1)
 
+    # Determine which rows actually contribute (respect ghost_mask)
     if ghost_mask is not None:
         mask = ~ghost_mask.to(dtype=torch.bool, device=logits.device)
-        if mask.any():
-            return per_row_loss[mask].mean()
-        return per_row_loss.new_tensor(0.0)
+        if not mask.any():
+            base_loss = per_row_loss.new_tensor(0.0)
+        else:
+            base_loss = per_row_loss[mask].mean()
+    else:
+        mask = None
+        base_loss = per_row_loss.mean()
 
-    return per_row_loss.mean()
+    # Optional confidence penalty (ONLY on non-ghost rows)
+    if lambda_cp > 0.0:
+        if mask is not None:
+            if mask.any():
+                logits_used = logits[mask]
+            else:
+                return base_loss
+        else:
+            logits_used = logits
+
+        probs = torch.softmax(logits_used, dim=-1)              # [N_used, C]
+        # This is proportional to KL(p || uniform); more negative for uniform,
+        # closer to 0 for peaked predictions.
+        cp = (probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()
+        # pushes distributions towards uniform (higher entropy).
+        return base_loss + lambda_cp * cp
+
+    return base_loss
 
 
 def bce_with_logits_label_smoothing(

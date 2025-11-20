@@ -89,14 +89,14 @@ class MinkViT(vit.VisionTransformer):
             # too large -> use two-step conv
             mid = embed_dim // 4
             k1, k2 = choose_k1_k2(fcal_patch_size)
-            self.patch_embed = SparseSequential(
+            self.fcal_patch_embed = SparseSequential(
                 SparseConv3d(in_chans, mid, kernel_size=k1, stride=k1, padding=0, bias=False),
                 norm_layer(mid),
                 nn.GELU(),
                 SparseConv3d(mid, embed_dim, kernel_size=k2, stride=k2, padding=0, bias=True)
             )
         else:
-            self.patch_embed = SparseConv3d(
+            self.fcal_patch_embed = SparseConv3d(
                 in_chans, embed_dim, kernel_size=fcal_patch_size, stride=fcal_patch_size, 
                 padding=0, bias=True,
             )
@@ -431,7 +431,7 @@ class MinkViT(vit.VisionTransformer):
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask = x_glob
 
         # patchify
-        x_sparse = self.patch_embed(x_sparse)
+        x_sparse = self.fcal_patch_embed(x_sparse)
         x, attn_mask, intra_idx = self.densify_patches(x_sparse)
 
         # add positional embeddings

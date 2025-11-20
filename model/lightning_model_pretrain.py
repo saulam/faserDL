@@ -129,11 +129,11 @@ class MAEPreTrainer(pl.LightningModule):
         loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), 
                                                    label_smoothing=self.label_smoothing)
         loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask, 
-                                           label_smoothing=self.label_smoothing, label_shuffle=0.01)
+                                           label_smoothing=self.label_smoothing, lambda_cp=1e-3)
         loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, 
-                                           label_smoothing=self.label_smoothing, label_shuffle=0.05)
+                                           label_smoothing=self.label_smoothing, lambda_cp=1e-3)
         loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask, 
-                                           label_smoothing=self.label_smoothing, label_shuffle=0.01)
+                                           label_smoothing=self.label_smoothing, lambda_cp=1e-3)
 
         part_losses_enc = {
             "gho/total": loss_gho.detach(),
