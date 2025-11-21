@@ -37,18 +37,18 @@ class MAEPreTrainer(pl.LightningModule):
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_gho = nn.Parameter(torch.zeros(()))
-        self.log_sigma_hie = nn.Parameter(torch.zeros(()))
-        self.log_sigma_dec = nn.Parameter(torch.zeros(()))
-        self.log_sigma_pid = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_hie = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_dec = nn.Parameter(torch.zeros(()))
+        #self.log_sigma_pid = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ_ah = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg_ah = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
             "gho": self.log_sigma_gho,
-            "hie": self.log_sigma_hie,
-            "dec": self.log_sigma_dec,
-            "pid": self.log_sigma_pid,
+            #"hie": self.log_sigma_hie,
+            #"dec": self.log_sigma_dec,
+            #"pid": self.log_sigma_pid,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
             "occ_ah": self.log_sigma_occ_ah,
@@ -260,9 +260,12 @@ class MAEPreTrainer(pl.LightningModule):
 
         total_loss = (
             _weight(loss_gho, "log_sigma_gho", kind="ce")       +
-            _weight(loss_hie, "log_sigma_hie", kind="ce")       +
-            _weight(loss_dec, "log_sigma_dec", kind="ce")       +
-            _weight(loss_pid, "log_sigma_pid", kind="ce")       +
+            0.25 * loss_hie +
+            0.25 * loss_dec +
+            0.5  * loss_pid +
+            #_weight(loss_hie, "log_sigma_hie", kind="ce")       +
+            #_weight(loss_dec, "log_sigma_dec", kind="ce")       +
+            #_weight(loss_pid, "log_sigma_pid", kind="ce")       +
             _weight(loss_occ, "log_sigma_occ", kind="ce")       +
             _weight(loss_reg, "log_sigma_reg", kind="huber")    +
             _weight(loss_occ_ah, "log_sigma_occ_ah", kind="ce") +
