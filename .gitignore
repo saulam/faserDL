@@ -52,6 +52,7 @@ checkpoint*/
 *.parquet
 dataset/faser/
 dataset/output*.txt
+*.txt
 
 # VS Code
 .vscode/

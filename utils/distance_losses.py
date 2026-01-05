@@ -253,12 +253,16 @@ def distance_weighted_regression_loss(
         metrics: Dictionary of diagnostic metrics
     """
     device = pred_reg.device
-    M, P_times_C = pred_reg.shape
     C_in = targ_reg.shape[1]
-    P = M * P_times_C // M // C_in
+    M, P = idx_targets.shape
     p_h, p_w, p_d = patch_shape
     
-    pred_reg_flat = pred_reg.view(-1, C_in)  # [M*P, C_in]
+    # Handle both [M, P*C_in] and [M, P, C_in] formats
+    if pred_reg.dim() == 2:
+        pred_reg_flat = pred_reg.view(-1, C_in)  # [M*P, C_in]
+    else:  # dim == 3: [M, P, C_in]
+        pred_reg_flat = pred_reg.view(-1, C_in)  # [M*P, C_in]
+    
     idx_flat = idx_targets.view(-1)          # [M*P]
     dist_flat = distance_map.view(-1)        # [M*P]
     
@@ -588,7 +592,7 @@ def distance_aware_semantic_segmentation_loss(
     
     # Build soft targets from CSR for valid voxels
     indptr, cls_ids, weights = csr_labels
-    from utils.losses import csr_keep_rows_torch
+    from utils.funcs import csr_keep_rows_torch
     csr_valid = csr_keep_rows_torch(indptr, cls_ids, weights, idx_valid)[:3]
     
     N_valid = pred_valid.shape[0]
@@ -690,7 +694,7 @@ def combined_distance_aware_segmentation_loss(
     
     # Filter CSR labels for valid voxels
     indptr, cls_ids, weights = csr_labels
-    from utils.losses import csr_keep_rows_torch
+    from utils.funcs import csr_keep_rows_torch
     csr_valid = csr_keep_rows_torch(indptr, cls_ids, weights, idx_valid)[:3]
     
     # Compute standard soft CE loss
