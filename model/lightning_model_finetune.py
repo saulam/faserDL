@@ -181,6 +181,40 @@ class ViTFineTuner(pl.LightningModule):
         #loss_lep_pt      = outs["loss_lep/pt"]
         #loss_lep_mag     = outs["loss_lep/mag"]
 
+        # Create nutau weight mask
+        if targ_flavour.dim() == 1:
+            # Hard labels (validation/test): shape (batch_size,) - discrete class indices
+            # num_classes = 6: nutau classes are 2, 3, 4
+            # num_classes = 4: nutau class is 2
+            max_class = targ_flavour.max().item()
+            if max_class > 3:
+                # split_tau=True (6 classes): nutau classes are 2, 3, 4
+                nutau_mask = (targ_flavour == 2) | (targ_flavour == 3) | (targ_flavour == 4)
+            else:
+                # split_tau=False (4 classes): nutau class is 2
+                nutau_mask = (targ_flavour == 2)
+        else:
+            # Soft labels (training with label smoothing): shape (batch_size, num_classes)
+            num_classes = targ_flavour.shape[-1]
+            if num_classes > 4:
+                # split_tau=True: nutau classes are 2, 3, 4
+                nutau_mask = (targ_flavour[:, 2] + targ_flavour[:, 3] + targ_flavour[:, 4]) > 0.5
+            else:
+                # split_tau=False: nutau class is 2
+                nutau_mask = targ_flavour[:, 2] > 0.5
+        
+        # Apply 0.1 weight to nutau samples, 1.0 to others
+        sample_weights = torch.where(nutau_mask, 
+                                     torch.tensor(0.5, device=targ_flavour.device), 
+                                     torch.tensor(1.0, device=targ_flavour.device))
+
+        # Apply sample weights to all per-sample losses
+        loss_flavour = loss_flavour * sample_weights
+        loss_charm = loss_charm * sample_weights
+        loss_vis_geom = loss_vis_geom * sample_weights
+        loss_jet_geom = loss_jet_geom * sample_weights
+        loss_lep_geom = loss_lep_geom * sample_weights
+
         # Kendall-weighted total
         total_loss = (
             weighted_loss(loss_flavour,  self.log_sigma_flavour,  kind="ce").mean()  +

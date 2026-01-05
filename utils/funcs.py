@@ -53,11 +53,6 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
     val_set.data_files   = extract_files(val_split.indices)
     test_set.data_files  = extract_files(test_split.indices)
 
-    # remove files that have "308b" in the name from all sets
-    #train_set.data_files = [f for f in train_set.data_files if "308b" not in f]
-    #val_set.data_files   = [f for f in val_set.data_files if "308b" not in f]
-    #test_set.data_files  = [f for f in test_set.data_files if "308b" not in f]
-
     if args.train and args.augmentations_enabled and not args.stage1 and args.mixup_alpha > 0:
         train_set.calc_primary_vertices()
 

@@ -1,9 +1,10 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 07.25
+Date: 01.25
 
-Description: fine-tuning script.
+Description: Pre-training script with distance-aware losses.
+             Uses balanced parameters for complete training with spatial awareness.
 """
 
 import json
@@ -11,34 +12,35 @@ import os
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
-from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger, load_mae_encoder
+from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
 from dataset import *
 from model import *
+from model.lightning_model_pretrain_distance import MAEPreTrainerDistance
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import CSVLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
 
 
 torch.backends.cudnn.allow_tf32=True
 torch.set_float32_matmul_precision("high")
 pl_major = int(pl.__version__.split(".")[0])
 MODEL_FACTORIES = {
-    'tiny':  vit_tiny,
-    'base':  vit_base,
-    'large': vit_large,
-    'huge':  vit_huge,
+    'tiny':  mae_vit_tiny,
+    'base':  mae_vit_base,
+    'large': mae_vit_large,
+    'huge':  mae_vit_huge,
 }
 
 
 class CustomProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):
         bar = super().init_train_tqdm()
-        bar.ascii = True
+        bar.ascii = True  # Ensure ASCII characters are used
         return bar
 
     def init_validation_tqdm(self):
         bar = super().init_validation_tqdm()
-        bar.ascii = True
+        bar.ascii = True  # Ensure ASCII characters are used for validation
         return bar
 
 
@@ -57,15 +59,45 @@ def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
+    
+    # Set distance-aware defaults if not explicitly provided via command line
+    # Balanced configuration for complete training
+    if args.distance_loss_mode == 'standard' and '--distance_loss_mode' not in ' '.join(os.sys.argv):
+        print("\n⚠️  Setting balanced distance-aware defaults (override with explicit flags)")
+        args.distance_loss_mode = 'hybrid'
+        args.chamfer_weight = 0.3
+        args.distance_reg_weight = 0.3
+        args.max_distance = 5.0
+        args.gamma_distance = 2.0
+        args.temperature_chamfer = 1.0
+        args.use_distance_semantic = True
+        args.semantic_distance_weight = 0.3
+        args.semantic_max_distance = 3.0
+    
     print("\n- Arguments:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
+    
+    # Verify distance-aware configuration
+    if args.distance_loss_mode != 'standard':
+        print("\n✓ Distance-aware losses enabled:")
+        print(f"  Reconstruction mode: {args.distance_loss_mode}")
+        print(f"  Chamfer weight: {args.chamfer_weight}")
+        print(f"  Distance reg weight: {args.distance_reg_weight}")
+        print(f"  Max distance: {args.max_distance} voxels")
+        print(f"  Gamma: {args.gamma_distance}")
+        if args.use_distance_semantic:
+            print(f"  Semantic distance: ENABLED")
+            print(f"  Semantic weight: {args.semantic_distance_weight}")
+            print(f"  Semantic max dist: {args.semantic_max_distance} voxels")
+        else:
+            print(f"  Semantic distance: DISABLED")
 
     # GPU setup
     nb_gpus = len(args.gpus)
-    gpus = ','.join(map(str, args.gpus)) if nb_gpus > 1 else str(args.gpus[0])
-    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-    os.environ['CUDA_VISIBLE_DEVICES'] = gpus
+    gpus = ', '.join(args.gpus) if nb_gpus > 1 else str(args.gpus[0])
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
     # Dataset
     if args.web_dataset_path is not None:
@@ -86,6 +118,7 @@ def main():
         metadata = train_set.metadata
         nb_batches_train = len(train_set) // args.batch_size
         nb_batches_val = len(val_set) // args.batch_size
+        dataset = train_set
     else:
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
@@ -111,56 +144,47 @@ def main():
     print(f"start_cosine_step = {args.start_cosine_step}")
     print(f"eff. batch size   = {args.batch_size * denom}")
 
-    # Transfer weights from pre-trained model
+    # Initialise the model
     model = args.model(
         drop_rate = args.dropout,
         attn_drop_rate = args.attn_dropout,
         drop_path_rate = args.drop_path_rate,
-        head_init = args.head_init,
+        drop_rate_dec = args.dropout_dec,
+        attn_drop_rate_dec = args.attn_dropout_dec,
         metadata = metadata,
     )
-    if args.load_checkpoint is not None and os.path.exists(args.load_checkpoint):
-        checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
-        load_mae_encoder(model, checkpoint)
-    else:
-        print("Training from scratch!")
-
-    # define the list of losses to monitor
-    monitor_losses = [
-        "loss_total/val",
-        #"loss/val_flavour",
-        #"loss/val_charm",
-        #"loss/val_vis_sp_momentum_mag",
-        #"loss/val_vis_sp_momentum_dir",
-        #"loss/val_lepton_momentum_mag",
-        #"loss/val_lepton_momentum_dir",
-        #"loss/val_e_vis",
-        #"loss/val_pt_miss",
-        #"loss/val_jet_momentum_dir",
-        #"loss/val_jet_momentum_mag",
-        #"loss/val_lepton_momentum_dir",
-        #"loss/val_lepton_momentum_mag",
-    ]
+    #print(model)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Total trainable params model (total): {}".format(total_params))
     
-    # helper to build a fresh checkpoint callback list
-    def make_callbacks():
-        cbs = []
-        for loss in monitor_losses:
-            cbs.append(
-                ModelCheckpoint(
-                    dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss.replace('/', '_')}",
-                    save_top_k=args.save_top_k,
-                    monitor=loss,
-                    mode="min",
-                    save_last=True,
-                )
-            )
-        progress_bar = CustomProgressBar()
-        cbs.append(progress_bar)
-        return cbs
+    # Checkpoint
+    callbacks = []
+    monitored_losses = [
+            'loss_total/val',
+    ]
+    for loss_name in monitored_losses:
+        checkpoint = ModelCheckpoint(
+            dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss_name.replace('/', '_')}",
+            save_top_k=args.save_top_k,
+            monitor=loss_name,
+            mode="min",
+            save_last=True if "total" in loss_name else False 
+        )
+        callbacks.append(checkpoint)    
 
     # Rest of callbacks
-    logger    = CSVLogger(save_dir=f"{args.save_dir}/logs", name=f"{args.name}")
+    progress_bar = CustomProgressBar()
+    callbacks.append(progress_bar)
+    if args.early_stop_patience > 0:
+        early_stop_callback = EarlyStopping(
+            monitor='loss_total/val',
+            patience=args.early_stop_patience,
+            verbose=True,
+            mode='min' 
+        )
+        callbacks.append(early_stop_callback)
+
+    logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
     tb_logger = SplitTensorBoardLogger(   
         save_dir=f"{args.save_dir}/tb_logs",
         name=f"{args.name}",
@@ -168,13 +192,15 @@ def main():
         strip_suffix=True,
         val_suffix = "_epoch",
     )
-    callbacks = make_callbacks()
     logger.log_hyperparams(vars(args))
     tb_logger.log_hyperparams(vars(args))
 
-    # Lightning model
-    lightning_model = ViTFineTuner(model=model, args=args)
-
+    # Lightning model with distance-aware losses
+    lightning_model = MAEPreTrainerDistance(
+        model=model,
+        dataset=dataset,
+        args=args)
+ 
     # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(
         limit_train_batches=nb_batches_train//nb_gpus if args.web_dataset_path else None,
@@ -184,6 +210,7 @@ def main():
         gradient_clip_algorithm="norm",
         callbacks=callbacks,
         accelerator="gpu",
+        num_nodes=args.nb_nodes,
         devices=nb_gpus,
         precision="bf16-mixed" if pl_major >= 2 else 32,
         strategy=DDPStrategy(
@@ -198,12 +225,14 @@ def main():
     )
 
     # Train and validate the model
+    ckpt_path = args.load_checkpoint if args.load_checkpoint and os.path.exists(args.load_checkpoint) else None
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=valid_loader,
+        ckpt_path=ckpt_path,
     )
-        
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

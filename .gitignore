@@ -1,15 +1,96 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebooks
 .ipynb_checkpoints/
+notebooks/
+notebooks_mae/
+*.ipynb
+
+# Logs and Training outputs
 log*/
+logs/
+logs_final/
 tb_logs/
 lightning_logs/
-core
-.vscode*
-out*
-notebook*
+*.log
+
+# Checkpoints and model outputs
 checkpoint*/
-*db
-INSTALL
+*.ckpt
+*.pth
+*.pt
+*.h5
+*.pkl
+
+# Data files
+*.db
+*.sqlite
+*.csv
+*.parquet
+dataset/faser/
+dataset/output*.txt
+
+# VS Code
+.vscode/
+.vscode*
+
+# Testing and temporary files
+scratch.sh
+*scratch*
+*test*.py
+*example*.py
+output*
+out*
+core
+*.tmp
+*.bak
 *bak*
 *copy*
-*bak*
+*.swp
+*.swo
+*~
+
+# Visualization and analysis scripts
+*visualize*.py
+*viz*.py
+*plot*.py
+*.html
+
+# Documentation (except README.md)
+*.md
+!README.md
+
+# Shell scripts (testing/backup scripts)
+pretrainbak.sh
+train_scratch.sh
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.iml

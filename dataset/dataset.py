@@ -240,6 +240,8 @@ class SparseFASERCALDataset(Dataset):
     def process_muspec(self, muspec):
         ntracks = 0
         tracks = []
+        if len(muspec) == 0:
+            muspec = np.zeros((11, 0))
         for i in range(muspec.shape[1]):
             info = muspec[:, i]
             charge, npoints, px, py, pz, p, chi2, ndof, pval, fperr, fiperr = info

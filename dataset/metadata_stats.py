@@ -43,6 +43,8 @@ def _transform_lookup(name: str):
 def _process_muspec(muspec):
     ntracks = 0
     tracks = []
+    if len(muspec) == 0:
+        muspec = np.zeros((11, 0))
     for i in range(muspec.shape[1]):
         info = muspec[:, i]
         charge, npoints, px, py, pz, p, chi2, ndof, pval, fperr, fiperr = info
@@ -551,7 +553,7 @@ class SparseFASERCALDataset(Dataset):
                 "event_hits": event_hits,
                }
 
-dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v6.0*")
+dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v7.0*")
 
 def collate(batch):
     pdg = np.unique(np.concatenate([x['pdg'] for x in batch]))
@@ -717,7 +719,7 @@ metadata.update({
 metadata = {**metadata, **stats}  # for Python < 3.9 compatibility
 
 # save metadata
-with open("/scratch/salonso/sparse-nns/faser/events_v6.0_301b/metadata_stats.pkl", "wb") as fd:
+with open("/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl", "wb") as fd:
     pk.dump(metadata, fd)
 
 print("Metadata saved.")

@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v6.0*"
-metadata_path="/scratch/salonso/sparse-nns/faser/events_v6.0_301b/metadata_stats.pkl"
+dataset_path="/scratch/salonso/sparse-nns/faser/events_v7.0*"
+metadata_path="/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl"
 shardshuffle=200
 shuffle=2000
 model="tiny"
@@ -19,7 +19,7 @@ epochs=10
 num_workers=16
 blr=5e-4
 layer_decay=0.65
-accum_grad_batches=2
+accum_grad_batches=1
 warmup_epochs=1
 cosine_annealing_epochs=9
 weight_decay=0.05
@@ -28,13 +28,13 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v6.0_dlnu_log_base_clariden_v12"
+name="finetune_v7.0_clariden_v5"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v6.0_dlnu_log_base_clariden_v12"
+checkpoint_name="finetune_v7.0_clariden_v5"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v6.0_clariden_final_v6/loss_total_val/epoch=123-step=80228.ckpt"
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_v3/loss_total_val/epoch=163-step=83312.ckpt"
 gpus=(1)
 
 python -m train.finetune \

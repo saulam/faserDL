@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 MAX_JOBS=30
-CHUNKS=1520  # number of reco files => indices 0..115
+CHUNKS=83  # number of reco files => indices 0..N-1
 
 wait_for_jobs() {
     # count only running background jobs from this shell
@@ -10,10 +10,9 @@ wait_for_jobs() {
     done
 }
 
-# Brace expansion can't use variables, so use seq (or a C-style for loop).
 for i in $(seq 0 $((CHUNKS-1))); do
     wait_for_jobs
-    python read_root_v6.py --number "$i" --chunks "$CHUNKS" --disable &
+    python read_root_v7.py --number "$i" --chunks "$CHUNKS" --disable &
 done
 
 wait

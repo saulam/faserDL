@@ -75,6 +75,29 @@ def ini_argparse(
                         default=[0],  # Default list
                         help='list of GPUs to use (more than 1 GPU will run the training in parallel)'
                         )
+    
+    # Distance-aware loss arguments (reconstruction - masked patches)
+    parser.add_argument("--distance_loss_mode", type=str, default='standard', 
+                        choices=['standard', 'hybrid', 'distance_only', 'focal_dt'],
+                        help="Loss mode: standard (no distance), hybrid (standard + distance), distance_only, focal_dt")
+    parser.add_argument("--chamfer_weight", type=float, default=0.3, 
+                        help="Weight for soft chamfer loss component (occupancy)")
+    parser.add_argument("--distance_reg_weight", type=float, default=0.3, 
+                        help="Weight for distance-weighted regression loss (charge/energy)")
+    parser.add_argument("--max_distance", type=float, default=5.0, 
+                        help="Maximum distance (in voxels) for spatial forgiveness")
+    parser.add_argument("--gamma_distance", type=float, default=2.0, 
+                        help="Distance decay exponent (controls smoothness)")
+    parser.add_argument("--temperature_chamfer", type=float, default=1.0, 
+                        help="Temperature for soft chamfer matching")
+    
+    # Distance-aware loss arguments (semantic segmentation - kept patches)
+    parser.add_argument("--use_distance_semantic", action="store_true", default=False,
+                        help="Enable distance-aware losses for semantic segmentation (hie, dec, pid)")
+    parser.add_argument("--semantic_distance_weight", type=float, default=0.3,
+                        help="Weight for semantic distance-aware component")
+    parser.add_argument("--semantic_max_distance", type=float, default=3.0,
+                        help="Maximum distance for semantic segmentation (typically smaller than reconstruction)")
 
     return parser
 
