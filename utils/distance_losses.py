@@ -549,14 +549,10 @@ def distance_aware_semantic_segmentation_loss(
     """
     Distance-aware soft cross-entropy loss for semantic segmentation.
     
-    For kept patches, the model predicts semantic labels (e.g, primary/secondary, PDG).
-    Standard voxel-level CE is too harsh: if model predicts "primary particle" 
-    1 voxel off from true position, it should get partial credit.
-    
-    This loss:
-    1. Computes standard soft CE at aligned voxels (full supervision)
-    2. For nearby voxels, propagates soft labels based on distance
-    3. Weights the loss contribution by spatial proximity
+    Uses per-class distance transforms to provide spatial context:
+    - For each class, compute distance to nearest voxel with that class
+    - Weight cross-entropy by proximity to correct class
+    - Encourages spatial coherence and smoothness in predictions
     
     Args:
         pred_logits: Predicted class logits [M, P, num_classes]
@@ -564,7 +560,7 @@ def distance_aware_semantic_segmentation_loss(
         csr_labels: CSR format labels (indptr, cls_ids, weights)
         ghost_mask: Ghost particle mask [N_hits]
         patch_shape: (p_h, p_w, p_d)
-        max_distance: Maximum distance for label propagation
+        max_distance: Maximum distance for spatial weighting
         gamma_distance: Distance decay exponent
         label_smoothing: Label smoothing factor
         lambda_cp: Confidence penalty weight
@@ -588,9 +584,9 @@ def distance_aware_semantic_segmentation_loss(
     # Extract valid predictions and indices
     valid_flat = valid_mask.view(-1)  # [M*P]
     pred_valid = pred_logits.view(-1, num_classes)[valid_flat]  # [N_valid, num_classes]
-    idx_valid = idx_targets.view(-1)[valid_flat]  # [N_valid] raw hit indices
+    idx_valid = idx_targets.view(-1)[valid_flat]  # [N_valid]
     
-    # Build soft targets from CSR for valid voxels
+    # Build soft targets from CSR
     indptr, cls_ids, weights = csr_labels
     from utils.funcs import csr_keep_rows_torch
     csr_valid = csr_keep_rows_torch(indptr, cls_ids, weights, idx_valid)[:3]
@@ -605,17 +601,65 @@ def distance_aware_semantic_segmentation_loss(
         eps = float(label_smoothing)
         soft_targets = soft_targets * (1.0 - eps) + eps / num_classes
     
-    # Compute distance transform from valid voxels
-    valid_spatial = valid_mask.float().view(M, p_h, p_w, p_d)
-    distance_map = compute_distance_transform_conv3d(
-        valid_spatial, patch_shape, max_iterations=int(max_distance), normalize=False
-    )
-    distance_map = distance_map.view(M, P)[valid_mask]  # [N_valid]
+    # Compute per-class distance transforms
+    # For each class, compute distance from each voxel to nearest voxel with that class
+    valid_spatial = valid_mask.view(M, p_h, p_w, p_d)  # [M, p_h, p_w, p_d]
     
-    # Distance weighting: voxels at exact positions get full weight
-    # Nearby voxels get reduced weight
-    dist_weight = torch.exp(-distance_map ** gamma_distance / (max_distance ** gamma_distance))
-    dist_weight = torch.clamp(dist_weight, min=0.1)  # Minimum weight to maintain some gradient
+    # Get spatial indices of valid voxels for building per-class masks
+    valid_indices = valid_mask.nonzero(as_tuple=False)  # [N_valid, 2] = (patch_idx, flat_pos)
+    
+    # Convert flat positions to spatial coords
+    patch_indices = valid_indices[:, 0]  # [N_valid]
+    flat_positions = valid_indices[:, 1]  # [N_valid]
+    z_coords = flat_positions // (p_w * p_d)
+    y_coords = (flat_positions % (p_w * p_d)) // p_d
+    x_coords = flat_positions % p_d
+    
+    # Compute per-class distance transforms for soft labels
+    # For each class, build mask weighted by soft label probabilities
+    # Then compute minimum weighted distance to target class distribution
+    
+    min_weighted_distances = torch.zeros(N_valid, device=device)
+    class_threshold = 0.1  # Threshold for considering a class present
+    
+    for c in range(num_classes):
+        # Get soft probabilities for class c
+        class_prob = soft_targets[:, c]  # [N_valid]
+        has_class_c = class_prob > class_threshold  # [N_valid]
+        
+        if not has_class_c.any():
+            continue
+        
+        # Build spatial mask for this class (binarized: present vs absent)
+        class_mask_spatial = torch.zeros((M, p_h, p_w, p_d), device=device)
+        class_mask_spatial[patch_indices[has_class_c], 
+                          z_coords[has_class_c], 
+                          y_coords[has_class_c], 
+                          x_coords[has_class_c]] = 1.0
+        
+        # Compute distance transform from class c regions
+        dt_class = compute_distance_transform_conv3d(
+            class_mask_spatial, patch_shape, 
+            max_iterations=int(max_distance), normalize=False
+        )  # [M, p_h, p_w, p_d]
+        
+        # Extract distances for all voxels
+        distances_c = dt_class[patch_indices, z_coords, y_coords, x_coords]  # [N_valid]
+        
+        # Weight distances by target probability for this class
+        # If voxel should be class c with prob p, distance matters proportional to p
+        weighted_dist_c = distances_c * class_prob
+        
+        # Accumulate probability-weighted distances
+        min_weighted_distances += weighted_dist_c
+    
+    # Normalize by total probability mass
+    total_prob = soft_targets.sum(dim=-1).clamp(min=1e-6)  # [N_valid]
+    min_weighted_distances = min_weighted_distances / total_prob
+    
+    # Distance weighting: voxels close to their target class distribution get higher weight
+    dist_weight = torch.exp(-min_weighted_distances ** gamma_distance / (max_distance ** gamma_distance))
+    dist_weight = torch.clamp(dist_weight, min=0.05)  # Minimum weight
     
     # Standard cross-entropy loss
     log_probs = F.log_softmax(pred_valid, dim=-1)  # [N_valid, num_classes]
@@ -632,9 +676,10 @@ def distance_aware_semantic_segmentation_loss(
     
     metrics = {
         'semantic_dist/loss': loss.detach(),
-        'semantic_dist/mean_distance': distance_map.mean().detach(),
+        'semantic_dist/mean_distance': min_weighted_distances.mean().detach(),
         'semantic_dist/mean_weight': dist_weight.mean().detach(),
         'semantic_dist/ce_unweighted': ce_loss.mean().detach(),
+        'semantic_dist/max_distance': min_weighted_distances.max().detach() if min_weighted_distances.numel() > 0 else torch.tensor(0., device=device),
     }
     
     return loss, metrics

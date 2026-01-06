@@ -74,6 +74,9 @@ class MAEPreTrainerDistance(pl.LightningModule):
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_gho = nn.Parameter(torch.zeros(()))
+        self.log_sigma_hie = nn.Parameter(torch.zeros(()))
+        self.log_sigma_dec = nn.Parameter(torch.zeros(()))
+        self.log_sigma_pid = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ_ah = nn.Parameter(torch.zeros(()))
@@ -81,6 +84,9 @@ class MAEPreTrainerDistance(pl.LightningModule):
         
         self._uncertainty_params = {
             "gho": self.log_sigma_gho,
+            "hie": self.log_sigma_hie,
+            "dec": self.log_sigma_dec,
+            "pid": self.log_sigma_pid,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
             "occ_ah": self.log_sigma_occ_ah,
