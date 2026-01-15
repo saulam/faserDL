@@ -245,7 +245,7 @@ class SparseFASERCALDataset(Dataset):
         for i in range(muspec.shape[1]):
             info = muspec[:, i]
             charge, npoints, px, py, pz, p, chi2, ndof, pval, fperr, fiperr = info
-            if npoints > 10 and chi2 > 0:
+            if npoints >= 3 and chi2 > 0:
                 ntracks += 1
                 tracks.append([charge, px, py, pz, chi2])
                 

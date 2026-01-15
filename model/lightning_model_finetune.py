@@ -205,7 +205,7 @@ class ViTFineTuner(pl.LightningModule):
         
         # Apply 0.1 weight to nutau samples, 1.0 to others
         sample_weights = torch.where(nutau_mask, 
-                                     torch.tensor(0.5, device=targ_flavour.device), 
+                                     torch.tensor(1.0, device=targ_flavour.device), 
                                      torch.tensor(1.0, device=targ_flavour.device))
 
         # Apply sample weights to all per-sample losses

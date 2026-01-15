@@ -620,7 +620,7 @@ def distance_aware_semantic_segmentation_loss(
     # Then compute minimum weighted distance to target class distribution
     
     min_weighted_distances = torch.zeros(N_valid, device=device)
-    class_threshold = 0.1  # Threshold for considering a class present
+    class_threshold = 0.05  # Lower threshold for soft labels (was 0.1)
     
     for c in range(num_classes):
         # Get soft probabilities for class c

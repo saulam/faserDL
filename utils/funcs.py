@@ -134,31 +134,23 @@ def _make_spconv_tensor(
 def pack_muspec(nb_muspec_tracks, muspec_info):
     """
     nb_muspec_tracks: tensor (B, 1)
-        value to put in the *prepended* token for each sequence
     muspec_info: list of length B
         each element is a tensor of shape (K_i, 5)
     returns:
         feats: (B, K_max + 1, 5)
         attn_mask: (B, K_max + 1)  # True = keep, False = pad
+        counts: (B, 1)  # number of tracks per batch element
     """
     # pad_sequence expects (seq_len, *) so we tell it batch_first=True
     feats = pad_sequence(muspec_info, batch_first=True, padding_value=0.0)  # (B, K_max, 5)
     B, K_max, D = feats.shape
 
-    # build attention mask
-    lengths = torch.tensor([t.size(0) for t in muspec_info], device=feats.device)  # (B,)
+    lengths = torch.tensor([t.size(0) for t in muspec_info], device=feats.device)
     idxs = torch.arange(K_max, device=feats.device).unsqueeze(0).expand(B, -1)
-    base_mask = idxs < lengths.unsqueeze(1)  # True where real token
+    attn_mask = idxs < lengths.unsqueeze(1)
 
-    muspec_vals = nb_muspec_tracks.squeeze(-1)  # (B,)
-    muspec_token = torch.zeros((B, 1, D), device=feats.device, dtype=feats.dtype)
-    muspec_token[:, 0, 0] = muspec_vals
-
-    feats = torch.cat([muspec_token, feats], dim=1)  # (B, K_max + 1, 5)
-    muspec_mask = torch.ones((B, 1), device=feats.device, dtype=torch.bool)
-    attn_mask = torch.cat([muspec_mask, base_mask], dim=1)  # (B, K_max + 1)
-
-    return feats, attn_mask
+    # Return feats (B, K_max, 5), mask (B, K_max), and the counts (B, 1)
+    return feats, attn_mask, nb_muspec_tracks
 
 
 def collate(
@@ -216,9 +208,10 @@ def collate(
     nb_muspec_tracks = torch.stack([d["nb_muspec_tracks"] for d in batch])
     muspec_info = [d["muspec_info"] for d in batch]    
 
-    muspec_feats, muspec_attn_mask = pack_muspec(nb_muspec_tracks, muspec_info)
+    muspec_feats, muspec_attn_mask, muspec_counts = pack_muspec(nb_muspec_tracks, muspec_info)
     ret["muspec_feats"] = muspec_feats
     ret["muspec_attn_mask"] = muspec_attn_mask
+    ret["muspec_counts"] = muspec_counts
 
     if mode == "test":
         optional_keys = [
@@ -326,8 +319,9 @@ def arrange_input(data):
     ecal_hits = data['ecal_hits']
     muspec_feats = data['muspec_feats']
     muspec_attn_mask = data['muspec_attn_mask']
+    muspec_counts = data['muspec_counts']
 
-    return x_sp, ahcal_x_sp, ecal_hits, muspec_feats, muspec_attn_mask
+    return x_sp, ahcal_x_sp, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts
 
 
 def arrange_truth(data):
