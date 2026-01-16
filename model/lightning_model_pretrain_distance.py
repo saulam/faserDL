@@ -223,10 +223,10 @@ class MAEPreTrainerDistance(pl.LightningModule):
             M, P = idx_targets.shape
             
             # For each semantic task
-            for name, pred, csr, lambda_cp, ls_mult in [
-                ('hie', pred_hie, csr_hie, 5e-3, 2.5),
-                ('dec', pred_dec, csr_dec, 5e-3, 2.5),
-                ('pid', pred_pid, csr_pid, 1e-3, 1.0),
+            for name, pred, csr, lambda_cp, class_threshold in [
+                ('hie', pred_hie, csr_hie, 5e-3, 0.01),
+                ('dec', pred_dec, csr_dec, 5e-3, 0.005),
+                ('pid', pred_pid, csr_pid, 1e-3, 0.005),
             ]:
                 loss_semantic, metrics_semantic = combined_distance_aware_segmentation_loss(
                     pred_logits=pred,  # [M, P, num_classes]
@@ -238,8 +238,10 @@ class MAEPreTrainerDistance(pl.LightningModule):
                     distance_weight=self.semantic_distance_weight,
                     max_distance=self.semantic_max_distance,
                     gamma_distance=self.gamma_distance,
-                    label_smoothing=self.label_smoothing * ls_mult,
+                    label_smoothing=0.0,
                     lambda_cp=lambda_cp,
+                    class_threshold=class_threshold,
+                    exclude_classes_from_dt=None if name == 'pid' else 0,  # exclude "none" class for hie/dec
                 )
                 
                 # Store loss
@@ -265,15 +267,17 @@ class MAEPreTrainerDistance(pl.LightningModule):
             csr_pid_valid = csr_keep_rows_torch(*csr_pid, raw_idx)[:3]
             
             loss_hie = soft_ce_with_logits_csr(
-                z_hie, csr_hie_valid, ghost_mask=ghost, 
+                z_hie, csr_hie_valid, ghost_mask=ghost, none_index=0, none_row_weight=0.3,
+                class_weights=torch.tensor([0.3, 1.0, 1.0], device=z_hie.device),
                 label_smoothing=self.label_smoothing*2.5, lambda_cp=5e-3
             )
             loss_dec = soft_ce_with_logits_csr(
-                z_dec, csr_dec_valid, ghost_mask=ghost, 
+                z_dec, csr_dec_valid, ghost_mask=ghost, none_index=0, none_row_weight=0.3,
+                class_weights=torch.tensor([0.3, 1.0, 1.0], device=z_hie.device),
                 label_smoothing=self.label_smoothing*2.5, lambda_cp=5e-3
             )
             loss_pid = soft_ce_with_logits_csr(
-                z_pid, csr_pid_valid, ghost_mask=ghost, 
+                z_pid, csr_pid_valid, ghost_mask=ghost,
                 label_smoothing=self.label_smoothing, lambda_cp=1e-3
             )
             

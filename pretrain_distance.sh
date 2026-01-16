@@ -7,7 +7,7 @@ shardshuffle=200
 shuffle=4000
 model="tiny"
 eps=1e-8
-batch_size=256
+batch_size=32
 preprocessing_input="log"
 label_smoothing=0.02
 dropout=0.0
@@ -34,15 +34,15 @@ checkpoint_path="checkpoints_final"
 checkpoint_name="pretrain_v7.0_distance_v1"
 early_stop_patience=200
 load_checkpoint=""
-gpus=(0 1)
+gpus=(0)
 distance_loss_mode="hybrid"
 max_distance=5.0
 gamma_distance=2.0
-chamfer_weight=0.3
-distance_reg_weight=0.3
+chamfer_weight=0.2
+distance_reg_weight=0.2
 temperature_chamfer=1.0
-semantic_distance_weight=0.3
-semantic_max_distance=3.0
+semantic_distance_weight=0.2
+semantic_max_distance=5.0
 
 python -m train.pretrain_distance \
     --train \

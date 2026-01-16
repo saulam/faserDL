@@ -1623,27 +1623,33 @@ def soft_ce_with_logits_csr(
     label_smoothing: float = 0.0,
     label_shuffle: float = 0.0,
     lambda_cp: float = 0.0,
+    class_weights: Optional[torch.Tensor] = None,   # [C] or None
+    none_index: Optional[int] = None,               # e.g. 0 for your decay/PS heads
+    none_row_weight: float = 1.0,                   # e.g. 0.2 to downweight all-none rows
+    pos_mass_threshold: float = 1e-6,               # row is "all-none" if pos_mass <= threshold
 ):
+    """
+    Soft CE for CSR targets with optional:
+      - per-class weighting (downweight frequent "none" class)
+      - per-row weighting (downweight rows with essentially no positive mass)
+    """
     N, num_classes = logits.shape
 
-    # Always build without a ghost column
     soft_labels = build_soft_targets_from_csr(
         *csr, num_classes=num_classes, N=N, ghost_mask=None
-    )
+    )  # [N,C], sums to 1 per row
 
-    # Apply label smoothing if requested
+    # Label smoothing
     eps = float(label_smoothing)
     if eps > 0.0:
         eps = max(0.0, min(1.0, eps))
         eps_t = torch.as_tensor(eps, dtype=soft_labels.dtype, device=soft_labels.device)
         soft_labels = soft_labels.mul(1.0 - eps_t).add(eps_t / num_classes)
 
-    # Apply label shuffling if requested
+    # Label shuffling (unchanged from your version)
     p = float(label_shuffle)
     if p > 0.0:
         p = max(0.0, min(1.0, p))
-
-        # Determine which rows are "valid" for shuffling (non-ghost)
         if ghost_mask is not None:
             valid = ~ghost_mask.to(dtype=torch.bool, device=logits.device)
             valid_indices = valid.nonzero(as_tuple=False).squeeze(1)
@@ -1654,45 +1660,63 @@ def soft_ce_with_logits_csr(
         if num_valid > 1:
             num_shuffled = int(p * num_valid)
             if num_shuffled > 0:
-                # Choose a random subset of valid rows
                 perm_valid = torch.randperm(num_valid, device=logits.device)
                 chosen = valid_indices[perm_valid[:num_shuffled]]
-
-                # Permute those chosen rows among themselves
                 perm_within = torch.randperm(chosen.numel(), device=logits.device)
                 permuted = chosen[perm_within]
-
-                # Reassign their targets: soft_labels[chosen] <- soft_labels[permuted]
                 soft_labels[chosen] = soft_labels[permuted]
 
-    per_row_loss = -(soft_labels * torch.log_softmax(logits, dim=-1)).sum(dim=1)
+    logp = torch.log_softmax(logits, dim=-1)  # [N,C]
 
-    # Determine which rows actually contribute (respect ghost_mask)
+    # ----- Per-class weighting (important for none-dominant heads) -----
+    if class_weights is not None:
+        cw = class_weights.to(device=logits.device, dtype=soft_labels.dtype).view(1, -1)  # [1,C]
+        y_w = soft_labels * cw
+        norm = y_w.sum(dim=-1).clamp_min(1e-12)  # keep loss scale comparable
+        per_row_loss = -(y_w * logp).sum(dim=-1) / norm
+    else:
+        per_row_loss = -(soft_labels * logp).sum(dim=-1)
+
+    # ----- Per-row downweighting for all-none rows -----
+    row_w = None
+    if (none_index is not None) and (none_row_weight < 1.0):
+        # positive mass = 1 - mass(none)
+        pos_mass = 1.0 - soft_labels[:, int(none_index)]
+        is_all_none = pos_mass <= float(pos_mass_threshold)
+        row_w = torch.ones_like(per_row_loss)
+        row_w[is_all_none] = float(none_row_weight)
+        per_row_loss = per_row_loss * row_w
+
+    # Mask ghosts if provided
     if ghost_mask is not None:
         mask = ~ghost_mask.to(dtype=torch.bool, device=logits.device)
         if not mask.any():
             base_loss = per_row_loss.new_tensor(0.0)
         else:
-            base_loss = per_row_loss[mask].mean()
-    else:
-        mask = None
-        base_loss = per_row_loss.mean()
-
-    # Optional confidence penalty (ONLY on non-ghost rows)
-    if lambda_cp > 0.0:
-        if mask is not None:
-            if mask.any():
-                logits_used = logits[mask]
+            if row_w is None:
+                base_loss = per_row_loss[mask].mean()
             else:
+                w_used = row_w[mask].clamp_min(1e-12)
+                base_loss = per_row_loss[mask].sum() / w_used.sum()
+    else:
+        if row_w is None:
+            base_loss = per_row_loss.mean()
+        else:
+            w_used = row_w.clamp_min(1e-12)
+            base_loss = per_row_loss.sum() / w_used.sum()
+
+    # Confidence penalty (unchanged)
+    if lambda_cp > 0.0:
+        if ghost_mask is not None:
+            mask = ~ghost_mask.to(dtype=torch.bool, device=logits.device)
+            if not mask.any():
                 return base_loss
+            logits_used = logits[mask]
         else:
             logits_used = logits
 
-        probs = torch.softmax(logits_used, dim=-1)              # [N_used, C]
-        # This is proportional to KL(p || uniform); more negative for uniform,
-        # closer to 0 for peaked predictions.
+        probs = torch.softmax(logits_used, dim=-1)
         cp = (probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()
-        # pushes distributions towards uniform (higher entropy).
         return base_loss + lambda_cp * cp
 
     return base_loss

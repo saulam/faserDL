@@ -10,7 +10,6 @@ Description:
 """
 
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 from typing import Dict, Tuple, Optional
 from scipy.ndimage import distance_transform_edt
@@ -25,7 +24,7 @@ def compute_distance_transform_3d(
 ) -> torch.Tensor:
     """
     Compute 3D Euclidean Distance Transform for each patch.
-    For each empty voxel, computes distance to nearest occupied voxel.
+    For each voxel, computes distance to nearest occupied voxel (occupied voxels have distance 0).
     
     Args:
         occupancy_mask: Binary mask [M, P] or [M, p_h, p_w, p_d]
@@ -37,7 +36,6 @@ def compute_distance_transform_3d(
         distance_map: [M, P] or [M, p_h, p_w, p_d] with distances
     """
     device = occupancy_mask.device
-    dtype = occupancy_mask.dtype
     
     p_h, p_w, p_d = patch_shape
     P = p_h * p_w * p_d
@@ -56,8 +54,8 @@ def compute_distance_transform_3d(
     # Compute distance transform for each patch
     distance_maps = []
     for i in range(M):
-        # Distance transform on binary mask (True = occupied)
-        # Returns distance to nearest True voxel
+        # distance_transform_edt returns distance to nearest zero (False) element.
+        # We want distance to nearest occupied voxel => provide input that is 0 at occupied voxels.
         dt = distance_transform_edt(~occ_np[i].astype(bool))
         distance_maps.append(dt)
     
@@ -83,10 +81,8 @@ def compute_distance_transform_conv3d(
     normalize: bool = True,
 ) -> torch.Tensor:
     """
-    Differentiable approximation of distance transform using iterative max pooling.
-    This is faster than scipy and maintains gradients for training.
-    
-    Uses the chamfer-style approach: iteratively propagate distances outward.
+    Fast DT-like approximation using iterative neighborhood propagation.
+    This approximates a chamfer/Chebyshev-style distance (NOT exact Euclidean EDT).
     
     Args:
         occupancy_mask: Binary mask [M, p_h, p_w, p_d]
@@ -98,38 +94,74 @@ def compute_distance_transform_conv3d(
         distance_map: [M, p_h, p_w, p_d] with approximate distances
     """
     device = occupancy_mask.device
-    p_h, p_w, p_d = patch_shape
-    M = occupancy_mask.shape[0]
-    
-    # Initialize: occupied voxels = 0, empty voxels = large value
-    dist = torch.where(
-        occupancy_mask > 0.5,
-        torch.zeros_like(occupancy_mask, dtype=torch.float32),
-        torch.full_like(occupancy_mask, float(max_iterations), dtype=torch.float32)
-    )
-    
-    # Iteratively propagate minimum distances
+    occ = (occupancy_mask > 0.5)
+
+    # float distance field: occupied=0, empty=max_iterations
+    dist = torch.full(occ.shape, float(max_iterations), device=device, dtype=torch.float32)
+    dist = torch.where(occ, torch.zeros_like(dist), dist)
+
     dist = dist.unsqueeze(1)  # [M, 1, p_h, p_w, p_d]
-    
-    for iteration in range(max_iterations):
-        # 3x3x3 max pool with padding to propagate distances
-        # Use negative pooling to get minimum
-        padded = F.pad(dist, (1, 1, 1, 1, 1, 1), mode='replicate')
-        neighbors = F.max_pool3d(-padded, kernel_size=3, stride=1, padding=0)
-        neighbors = -neighbors  # Convert back to min
+
+    for _ in range(max_iterations):
+        padded = F.pad(dist, (1, 1, 1, 1, 1, 1), mode="replicate")
         
-        # Increment distances by 1 for non-occupied voxels
+        # min over 3x3x3 neighbors via max-pool on negative
+        neighbors = -F.max_pool3d(-padded, kernel_size=3, stride=1, padding=0)
+
+        # one-step relaxation (occupied stays 0)
         dist = torch.where(
-            occupancy_mask.unsqueeze(1) > 0.5,
+            occ.unsqueeze(1),
             torch.zeros_like(dist),
             torch.minimum(dist, neighbors + 1.0)
         )
-    
-    dist = dist.squeeze(1)  # [M, p_h, p_w, p_d]
-    
+
+    dist = dist.squeeze(1)
     if normalize:
         dist = dist / float(max_iterations)
-    
+
+    return dist    
+
+
+def soft_distance_transform_conv3d(
+    source_prob: torch.Tensor,  # [M, p_h, p_w, p_d] in [0,1]
+    patch_shape: Tuple[int, int, int],
+    max_iterations: int = 5,
+    normalize: bool = False,
+) -> torch.Tensor:
+    """
+    Differentiable DT-like approximation from a soft occupancy field.
+    Uses iterative max-pool "coverage" expansion and accumulates expected distance:
+        dist ≈ sum_{t=0..T-1} (1 - coverage_t)
+    where coverage_0 = source_prob, coverage_{t+1} = dilate(coverage_t).
+
+    Properties:
+    - If source_prob is binary and dilation is ideal, this matches distance in steps (Chebyshev-ish).
+    - For soft source_prob, gradients propagate without any hard thresholding.
+
+    Args:
+        source_prob: [M, p_h, p_w, p_d] probabilities in [0,1]
+        patch_shape: kept for compatibility
+        max_iterations: max distance in steps
+        normalize: if True, divide by max_iterations
+
+    Returns:
+        dist: [M, p_h, p_w, p_d] in [0, max_iterations]
+    """
+
+    device = source_prob.device
+    cov = source_prob.clamp(0.0, 1.0).to(dtype=torch.float32).unsqueeze(1)  # [M,1,H,W,D]
+    dist = torch.zeros_like(cov)
+
+    for _ in range(max_iterations):
+        dist = dist + (1.0 - cov)  # adds 0 where coverage=1, adds 1 where coverage=0
+        padded = F.pad(cov, (1, 1, 1, 1, 1, 1), mode="replicate")
+        cov = F.max_pool3d(padded, kernel_size=3, stride=1, padding=0)
+
+    dist = dist.squeeze(1)  # [M,H,W,D]
+
+    if normalize:
+        dist = dist / float(max_iterations)
+
     return dist
 
 
@@ -144,164 +176,161 @@ def soft_chamfer_loss_patches(
     use_conv_dt: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Soft Chamfer-style loss for occupancy prediction.
-    Instead of hard voxel-to-voxel matching, considers spatial proximity.
-    
-    For each predicted occupied voxel, find weighted distance to nearest true occupied voxel.
-    For each true occupied voxel, find weighted distance to nearest predicted occupied voxel.
-    
-    Args:
-        pred_occ: Predicted occupancy logits [M, P]
-        idx_targets: Ground truth hit indices [M, P], -1 for empty sub-voxels
-        ghost_mask: Ghost particle mask [N_hits]
-        patch_shape: (p_h, p_w, p_d)
-        temperature: Softmax temperature for soft matching
-        max_distance: Maximum distance penalty
-        gamma_distance: Exponent for distance weighting (higher = steeper penalty)
-        use_conv_dt: Use conv-based (differentiable) distance transform
-    
-    Returns:
-        loss: Scalar soft chamfer loss
-        metrics: Dictionary of diagnostic metrics
+    Trainable symmetric Chamfer-style occupancy loss.
+
+    Fixes vs original:
+    - dt_from_pred is now differentiable (no pred_prob > 0.5 threshold).
+    - avoids the “true->pred term doesn’t backprop” issue.
+
+    Distance penalty uses:
+        w(d) = exp(-(d^g)/(max_d^g))
+        penalty(d) = 1 - w(d)
     """
     device = pred_occ.device
     M, P = pred_occ.shape
     p_h, p_w, p_d = patch_shape
-    
-    # Get true occupancy (non-ghost hits)
+    max_d = float(max_distance)
+    eps = 1e-6
+
+    ghost_mask = ghost_mask.to(device=device)
+
+    # true occupancy (non-ghost)
     is_occ = (idx_targets >= 0)
     is_ghost = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
-    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]]
-    true_occ = (is_occ & ~is_ghost).float().view(M, p_h, p_w, p_d)
-    
-    # Get predicted occupancy probabilities
-    pred_prob = torch.sigmoid(pred_occ / temperature).view(M, p_h, p_w, p_d)
-    
-    # Compute distance transforms
+    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]].to(dtype=torch.bool)
+    true_occ = (is_occ & ~is_ghost).to(dtype=torch.float32).view(M, p_h, p_w, p_d)
+
+    # predicted occupancy probability
+    pred_prob = torch.sigmoid(pred_occ / max(temperature, 1e-6)).view(M, p_h, p_w, p_d)
+
+    # DT from true (constant w.r.t. pred) and DT from pred (differentiable)
     if use_conv_dt:
-        # Differentiable approximation
         dt_from_true = compute_distance_transform_conv3d(
-            true_occ, patch_shape, max_iterations=int(max_distance), normalize=False
+            true_occ, patch_shape,
+            max_iterations=int(max_d),
+            normalize=False,
         )
-        dt_from_pred = compute_distance_transform_conv3d(
-            pred_prob > 0.5, patch_shape, max_iterations=int(max_distance), normalize=False
+        dt_from_pred = soft_distance_transform_conv3d(
+            pred_prob, patch_shape,
+            max_iterations=int(max_d),
+            normalize=False,
         )
     else:
-        # Exact but non-differentiable (for evaluation)
+        # exact EDT on CPU (non-differentiable); dt_from_pred will still be non-differentiable here
         dt_from_true = compute_distance_transform_3d(
-            true_occ, patch_shape, max_distance=max_distance, normalize=False
+            true_occ, patch_shape, max_distance=max_d, normalize=False
         )
         dt_from_pred = compute_distance_transform_3d(
-            pred_prob > 0.5, patch_shape, max_distance=max_distance, normalize=False
+            (pred_prob > 0.5).to(true_occ.dtype), patch_shape, max_distance=max_d, normalize=False
         )
-    
-    # Distance-weighted losses
-    # For predicted voxels: weight by distance to nearest true voxel
-    pred_to_true_dist = dt_from_true.view(M, P)
-    dist_weight_pred = torch.exp(-pred_to_true_dist ** gamma_distance / (max_distance ** gamma_distance))
-    loss_pred = (pred_prob.view(M, P) * (1.0 - dist_weight_pred)).sum() / (pred_prob.sum() + 1e-6)
-    
-    # For true voxels: weight by distance to nearest predicted voxel  
-    true_to_pred_dist = dt_from_pred.view(M, P)
+
+    pred_prob_flat = pred_prob.view(M, P)
     true_occ_flat = true_occ.view(M, P)
-    dist_weight_true = torch.exp(-true_to_pred_dist ** gamma_distance / (max_distance ** gamma_distance))
-    loss_true = (true_occ_flat * (1.0 - dist_weight_true)).sum() / (true_occ_flat.sum() + 1e-6)
-    
-    # Symmetric chamfer loss
+
+    # pred -> true
+    d_pt = dt_from_true.view(M, P).clamp(0.0, max_d)
+    w_pt = torch.exp(-(d_pt ** gamma_distance) / (max_d ** gamma_distance + eps))
+    loss_pred = (pred_prob_flat * (1.0 - w_pt)).sum() / (pred_prob_flat.sum() + eps)
+
+    # true -> pred (trainable if dt_from_pred is differentiable)
+    d_tp = dt_from_pred.view(M, P).clamp(0.0, max_d)
+    w_tp = torch.exp(-(d_tp ** gamma_distance) / (max_d ** gamma_distance + eps))
+    loss_true = (true_occ_flat * (1.0 - w_tp)).sum() / (true_occ_flat.sum() + eps)
+
     loss = 0.5 * (loss_pred + loss_true)
-    
+
+    pred_hard = (pred_prob_flat > 0.5)
     metrics = {
-        'chamfer/pred_to_true': loss_pred.detach(),
-        'chamfer/true_to_pred': loss_true.detach(),
-        'chamfer/mean_pred_dist': pred_to_true_dist[pred_prob.view(M, P) > 0.5].mean().detach() if (pred_prob.view(M, P) > 0.5).any() else torch.tensor(0., device=device),
-        'chamfer/mean_true_dist': true_to_pred_dist[true_occ_flat > 0.5].mean().detach() if (true_occ_flat > 0.5).any() else torch.tensor(0., device=device),
+        "chamfer/pred_to_true": loss_pred.detach(),
+        "chamfer/true_to_pred": loss_true.detach(),
+        "chamfer/mean_pred_dist": d_pt[pred_hard].mean().detach() if pred_hard.any() else torch.tensor(0.0, device=device),
+        "chamfer/mean_true_dist": d_tp[true_occ_flat > 0.5].mean().detach() if (true_occ_flat > 0.5).any() else torch.tensor(0.0, device=device),
     }
-    
     return loss, metrics
 
 
 def distance_weighted_regression_loss(
-    pred_reg: torch.Tensor,         # [M, P*C_in]
+    pred_reg: torch.Tensor,         # [M, P*C_in] or [M,P,C_in]
     targ_reg: torch.Tensor,         # [N_hits, C_in]
-    idx_targets: torch.Tensor,      # [M, P] hit indices
+    idx_targets: torch.Tensor,      # [M, P]
     ghost_mask: torch.Tensor,       # [N_hits]
-    distance_map: torch.Tensor,     # [M, P] precomputed distances
+    distance_map: torch.Tensor,     # [M, P] distances to nearest true hit
     patch_shape: Tuple[int, int, int],
     max_distance: float = 5.0,
     gamma: float = 2.0,
     huber_delta: float = 1.0,
     reg_empty: Optional[torch.Tensor] = None,
+    min_neg_weight: float = 0.0,    # small >0 if you want *some* pressure near hits
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Distance-weighted regression loss for charge/energy prediction.
-    Voxels that are spatially close to true hits get lower penalties.
-    
-    Args:
-        pred_reg: Predicted regression values [M, P*C_in]
-        targ_reg: True regression targets [N_hits, C_in]
-        idx_targets: Ground truth hit indices [M, P]
-        ghost_mask: Ghost particle mask [N_hits]
-        distance_map: Precomputed distance transform [M, P]
-        patch_shape: (p_h, p_w, p_d)
-        max_distance: Maximum distance for weighting
-        gamma: Exponent for distance weighting
-        huber_delta: Huber loss delta
-        reg_empty: Representative "empty" value (if None, use min of targets)
-    
-    Returns:
-        loss: Weighted regression loss
-        metrics: Dictionary of diagnostic metrics
+    Distance-weighted regression loss.
+
+    Fix vs original:
+    - Now matches the stated intent: EMPTY voxels close to hits get LOWER penalty.
+      (occupied voxels still get full weight 1.)
+
+    Weighting:
+      w_pos = 1
+      w_neg = clamp(d/max_d, 0..1)^gamma  (0 near hits, 1 far away)
     """
     device = pred_reg.device
+    ghost_mask = ghost_mask.to(device=device)
+
     C_in = targ_reg.shape[1]
     M, P = idx_targets.shape
-    p_h, p_w, p_d = patch_shape
-    
-    # Handle both [M, P*C_in] and [M, P, C_in] formats
+    max_d = float(max_distance)
+    eps = 1e-6
+
+    # flatten preds
     if pred_reg.dim() == 2:
         pred_reg_flat = pred_reg.view(-1, C_in)  # [M*P, C_in]
-    else:  # dim == 3: [M, P, C_in]
-        pred_reg_flat = pred_reg.view(-1, C_in)  # [M*P, C_in]
-    
-    idx_flat = idx_targets.view(-1)          # [M*P]
-    dist_flat = distance_map.view(-1)        # [M*P]
-    
-    # Identify occupied voxels (non-ghost)
+    else:
+        pred_reg_flat = pred_reg.reshape(-1, C_in)
+
+    idx_flat = idx_targets.reshape(-1)
+    dist_flat = distance_map.reshape(-1).to(device=device, dtype=torch.float32)
+
+    # occupied voxels (non-ghost)
     is_occ = (idx_flat >= 0)
-    is_ghost = torch.zeros_like(idx_flat, dtype=torch.bool)
-    is_ghost[is_occ] = ghost_mask[idx_flat[is_occ]]
+    is_ghost = torch.zeros_like(idx_flat, dtype=torch.bool, device=device)
+    is_ghost[is_occ] = ghost_mask[idx_flat[is_occ]].to(dtype=torch.bool)
     pos_mask = is_occ & ~is_ghost
-    
-    # Gather targets
+
+    # reg_empty
     if reg_empty is None:
         reg_empty = targ_reg.amin(dim=0)
-    
+    reg_empty = reg_empty.to(device=device, dtype=pred_reg_flat.dtype)
+
+    # targets per voxel
     targ_reg_flat = reg_empty.unsqueeze(0).expand(M * P, -1).clone()
-    targ_reg_flat[pos_mask] = targ_reg[idx_flat[pos_mask]]
-    
-    # Compute element-wise Huber loss
+    if pos_mask.any():
+        targ_reg_flat[pos_mask] = targ_reg[idx_flat[pos_mask]].to(device=device, dtype=pred_reg_flat.dtype)
+
+    # elementwise huber
     reg_elem = F.smooth_l1_loss(
-        pred_reg_flat, targ_reg_flat, beta=huber_delta, reduction='none'
+        pred_reg_flat, targ_reg_flat,
+        beta=float(huber_delta),
+        reduction="none"
     )  # [M*P, C_in]
     reg_row = reg_elem.sum(dim=1)  # [M*P]
-    
-    # Distance-based weighting: closer predictions get more weight
-    # For occupied voxels, use distance=0 (exact match expected)
-    # For empty voxels, use distance to nearest true voxel
-    effective_dist = torch.where(pos_mask, torch.zeros_like(dist_flat), dist_flat)
-    dist_weight = torch.exp(-effective_dist ** gamma / (max_distance ** gamma))
-    
-    # Apply weights
-    weighted_loss = reg_row * dist_weight
-    loss = weighted_loss.sum() / (dist_weight.sum() + 1e-6)
-    
+
+    # weights: pos=1, neg=(d/max_d)^gamma
+    d_norm = (dist_flat / max(max_d, eps)).clamp(0.0, 1.0)
+    w_neg = d_norm ** float(gamma)
+    if min_neg_weight > 0:
+        w_neg = w_neg.clamp(min=float(min_neg_weight))
+
+    weights = torch.where(pos_mask, torch.ones_like(w_neg), w_neg)
+
+    weighted = reg_row * weights
+    loss = weighted.sum() / (weights.sum() + eps)
+
     metrics = {
-        'reg_dist/total': loss.detach(),
-        'reg_dist/pos': weighted_loss[pos_mask].mean().detach() if pos_mask.any() else torch.tensor(0., device=device),
-        'reg_dist/neg': weighted_loss[~pos_mask].mean().detach() if (~pos_mask).any() else torch.tensor(0., device=device),
-        'reg_dist/mean_weight': dist_weight.mean().detach(),
+        "reg_dist/total": loss.detach(),
+        "reg_dist/pos": weighted[pos_mask].mean().detach() if pos_mask.any() else torch.tensor(0.0, device=device),
+        "reg_dist/neg": weighted[~pos_mask].mean().detach() if (~pos_mask).any() else torch.tensor(0.0, device=device),
+        "reg_dist/mean_weight": weights.mean().detach(),
     }
-    
     return loss, metrics
 
 
@@ -536,7 +565,7 @@ def focal_distance_transform_loss(
 
 
 def distance_aware_semantic_segmentation_loss(
-    pred_logits: torch.Tensor,      # [M, P, num_classes] predictions
+    pred_logits: torch.Tensor,      # [M, P, C]
     idx_targets: torch.Tensor,      # [M, P] hit indices
     csr_labels: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (indptr, cls, weights)
     ghost_mask: torch.Tensor,       # [N_hits]
@@ -545,151 +574,165 @@ def distance_aware_semantic_segmentation_loss(
     gamma_distance: float = 2.0,
     label_smoothing: float = 0.0,
     lambda_cp: float = 1e-3,
+    class_threshold: float = 0.01,
+    min_weight: float = 0.05,
+    exclude_classes_from_dt: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Distance-aware soft cross-entropy loss for semantic segmentation.
-    
-    Uses per-class distance transforms to provide spatial context:
-    - For each class, compute distance to nearest voxel with that class
-    - Weight cross-entropy by proximity to correct class
-    - Encourages spatial coherence and smoothness in predictions
-    
-    Args:
-        pred_logits: Predicted class logits [M, P, num_classes]
-        idx_targets: Ground truth hit indices [M, P], -1 for empty
-        csr_labels: CSR format labels (indptr, cls_ids, weights)
-        ghost_mask: Ghost particle mask [N_hits]
-        patch_shape: (p_h, p_w, p_d)
-        max_distance: Maximum distance for spatial weighting
-        gamma_distance: Distance decay exponent
-        label_smoothing: Label smoothing factor
-        lambda_cp: Confidence penalty weight
-    
-    Returns:
-        loss: Distance-aware semantic segmentation loss
-        metrics: Diagnostics
+    Distance-aware soft CE for semantic segmentation using *soft* (energy-fraction) targets in CSR.
+
+    This loss does NOT do spatial matching between prediction and target.
+    Instead, it reweights CE on a voxel by how close that voxel is to the spatial support
+    of its target class mixture (encourages spatial coherence, downweights ambiguous/boundary voxels).
+
+    Improvements vs your original:
+      - configurable lower class_threshold to preserve overlaps (important for energy-fraction labels)
+      - optional exclusion of a "none" class from DT weighting (prevents it dominating)
+      - handles N_valid == 0 safely
+      - clearer naming: expected_distance (not "min")
     """
     from utils.losses import build_soft_targets_from_csr, confidence_penalty
-    
+    from utils.funcs import csr_keep_rows_torch
+
     device = pred_logits.device
+    ghost_mask = ghost_mask.to(device=device)
+
     M, P, num_classes = pred_logits.shape
     p_h, p_w, p_d = patch_shape
-    
-    # Get valid (non-empty, non-ghost) voxels
+    max_d = float(max_distance)
+    eps = 1e-6
+
+    def _dt(mask_spatial: torch.Tensor) -> torch.Tensor:
+        return compute_distance_transform_conv3d(
+            mask_spatial, patch_shape,
+            max_iterations=int(max_d), normalize=False,
+        )
+
+    # Valid voxels (non-empty and non-ghost)
     is_occ = (idx_targets >= 0)
     is_ghost = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
-    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]]
+    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]].to(dtype=torch.bool)
     valid_mask = is_occ & ~is_ghost  # [M, P]
-    
-    # Extract valid predictions and indices
-    valid_flat = valid_mask.view(-1)  # [M*P]
-    pred_valid = pred_logits.view(-1, num_classes)[valid_flat]  # [N_valid, num_classes]
-    idx_valid = idx_targets.view(-1)[valid_flat]  # [N_valid]
-    
-    # Build soft targets from CSR
+
+    valid_flat = valid_mask.view(-1)
+    N_valid = int(valid_flat.sum().item())
+
+    if N_valid == 0:
+        zero = pred_logits.sum() * 0.0
+        metrics = {
+            "semantic_dist/loss": zero.detach(),
+            "semantic_dist/mean_distance": torch.tensor(0.0, device=device),
+            "semantic_dist/mean_weight": torch.tensor(0.0, device=device),
+            "semantic_dist/ce_unweighted": torch.tensor(0.0, device=device),
+            "semantic_dist/max_distance": torch.tensor(0.0, device=device),
+        }
+        return zero, metrics
+
+    pred_valid = pred_logits.view(-1, num_classes)[valid_flat]  # [N_valid, C]
+    idx_valid = idx_targets.view(-1)[valid_flat]                # [N_valid]
+
+    # Build soft targets from CSR (for these valid voxels)
     indptr, cls_ids, weights = csr_labels
-    from utils.funcs import csr_keep_rows_torch
     csr_valid = csr_keep_rows_torch(indptr, cls_ids, weights, idx_valid)[:3]
-    
-    N_valid = pred_valid.shape[0]
     soft_targets = build_soft_targets_from_csr(
         *csr_valid, num_classes=num_classes, N=N_valid, ghost_mask=None
-    )  # [N_valid, num_classes]
-    
-    # Apply label smoothing
+    )  # [N_valid, C]
+
+    # Optional label smoothing (still OK with soft labels; use small eps)
     if label_smoothing > 0:
-        eps = float(label_smoothing)
-        soft_targets = soft_targets * (1.0 - eps) + eps / num_classes
-    
-    # Compute per-class distance transforms
-    # For each class, compute distance from each voxel to nearest voxel with that class
-    valid_spatial = valid_mask.view(M, p_h, p_w, p_d)  # [M, p_h, p_w, p_d]
-    
-    # Get spatial indices of valid voxels for building per-class masks
+        eps_ls = float(label_smoothing)
+        soft_targets = soft_targets * (1.0 - eps_ls) + eps_ls / float(num_classes)
+
+    # Spatial coords for valid voxels
     valid_indices = valid_mask.nonzero(as_tuple=False)  # [N_valid, 2] = (patch_idx, flat_pos)
-    
-    # Convert flat positions to spatial coords
-    patch_indices = valid_indices[:, 0]  # [N_valid]
-    flat_positions = valid_indices[:, 1]  # [N_valid]
-    z_coords = flat_positions // (p_w * p_d)
-    y_coords = (flat_positions % (p_w * p_d)) // p_d
-    x_coords = flat_positions % p_d
-    
-    # Compute per-class distance transforms for soft labels
-    # For each class, build mask weighted by soft label probabilities
-    # Then compute minimum weighted distance to target class distribution
-    
-    min_weighted_distances = torch.zeros(N_valid, device=device)
-    class_threshold = 0.05  # Lower threshold for soft labels (was 0.1)
-    
-    for c in range(num_classes):
-        # Get soft probabilities for class c
+    patch_indices = valid_indices[:, 0]
+    flat_pos = valid_indices[:, 1]
+
+    z = flat_pos // (p_w * p_d)
+    y = (flat_pos % (p_w * p_d)) // p_d
+    x = flat_pos % p_d
+
+    # Which classes participate in DT weighting?
+    excluded = set(exclude_classes_from_dt or ())
+    included_classes = [c for c in range(num_classes) if c not in excluded]
+
+    # If everything excluded, fall back to plain soft CE
+    if len(included_classes) == 0:
+        log_probs = F.log_softmax(pred_valid, dim=-1)
+        ce = -(soft_targets * log_probs).sum(dim=-1).mean()
+        if lambda_cp > 0:
+            ce = ce + confidence_penalty(pred_valid, lambda_cp)
+        return ce, {
+            "semantic_dist/loss": ce.detach(),
+            "semantic_dist/mean_distance": torch.tensor(0.0, device=device),
+            "semantic_dist/mean_weight": torch.tensor(1.0, device=device),
+            "semantic_dist/ce_unweighted": ce.detach(),
+            "semantic_dist/max_distance": torch.tensor(0.0, device=device),
+        }
+
+    # Expected distance to the spatial support of the target mixture (over included classes)
+    expected_distance = torch.zeros(N_valid, device=device, dtype=torch.float32)
+
+    # Renormalize probabilities over included classes so "none" doesn't dominate the weighting
+    included_prob = soft_targets[:, included_classes].sum(dim=-1)  # [N_valid]
+    included_prob_safe = included_prob.clamp(min=eps)
+
+    for c in included_classes:
         class_prob = soft_targets[:, c]  # [N_valid]
-        has_class_c = class_prob > class_threshold  # [N_valid]
-        
-        if not has_class_c.any():
+        has_class = class_prob > float(class_threshold)
+        if not has_class.any():
             continue
-        
-        # Build spatial mask for this class (binarized: present vs absent)
-        class_mask_spatial = torch.zeros((M, p_h, p_w, p_d), device=device)
-        class_mask_spatial[patch_indices[has_class_c], 
-                          z_coords[has_class_c], 
-                          y_coords[has_class_c], 
-                          x_coords[has_class_c]] = 1.0
-        
-        # Compute distance transform from class c regions
-        dt_class = compute_distance_transform_conv3d(
-            class_mask_spatial, patch_shape, 
-            max_iterations=int(max_distance), normalize=False
-        )  # [M, p_h, p_w, p_d]
-        
-        # Extract distances for all voxels
-        distances_c = dt_class[patch_indices, z_coords, y_coords, x_coords]  # [N_valid]
-        
-        # Weight distances by target probability for this class
-        # If voxel should be class c with prob p, distance matters proportional to p
-        weighted_dist_c = distances_c * class_prob
-        
-        # Accumulate probability-weighted distances
-        min_weighted_distances += weighted_dist_c
-    
-    # Normalize by total probability mass
-    total_prob = soft_targets.sum(dim=-1).clamp(min=1e-6)  # [N_valid]
-    min_weighted_distances = min_weighted_distances / total_prob
-    
-    # Distance weighting: voxels close to their target class distribution get higher weight
-    dist_weight = torch.exp(-min_weighted_distances ** gamma_distance / (max_distance ** gamma_distance))
-    dist_weight = torch.clamp(dist_weight, min=0.05)  # Minimum weight
-    
-    # Standard cross-entropy loss
-    log_probs = F.log_softmax(pred_valid, dim=-1)  # [N_valid, num_classes]
-    ce_loss = -(soft_targets * log_probs).sum(dim=-1)  # [N_valid]
-    
-    # Apply distance weighting
-    weighted_ce = ce_loss * dist_weight
-    loss = weighted_ce.mean()
-    
-    # Confidence penalty (optional)
+
+        # Build binary support for class c in spatial grid
+        class_mask_spatial = torch.zeros((M, p_h, p_w, p_d), device=device, dtype=torch.float32)
+        class_mask_spatial[
+            patch_indices[has_class],
+            z[has_class],
+            y[has_class],
+            x[has_class],
+        ] = 1.0
+
+        dt_c = _dt(class_mask_spatial)  # [M, p_h, p_w, p_d]
+        d_c = dt_c[patch_indices, z, y, x]  # [N_valid]
+
+        # Accumulate prob-weighted distances
+        expected_distance += d_c * class_prob.to(dtype=torch.float32)
+
+    # Normalize over included mass; if included_prob is ~0 (pure "none"), set distance 0
+    expected_distance = torch.where(
+        included_prob > eps,
+        expected_distance / included_prob_safe,
+        torch.zeros_like(expected_distance)
+    )
+
+    # Weight CE: close to target support -> weight ~1, far -> downweight
+    dist_weight = torch.exp(-(expected_distance ** float(gamma_distance)) / (max_d ** float(gamma_distance) + eps))
+    dist_weight = dist_weight.clamp(min=float(min_weight))
+
+    # Soft CE
+    log_probs = F.log_softmax(pred_valid, dim=-1)
+    ce_vec = -(soft_targets * log_probs).sum(dim=-1)  # [N_valid]
+    loss = (ce_vec * dist_weight).mean()
+
     if lambda_cp > 0:
-        cp = confidence_penalty(pred_valid, lambda_cp)
-        loss = loss + cp
-    
+        loss = loss + confidence_penalty(pred_valid, lambda_cp)
+
     metrics = {
-        'semantic_dist/loss': loss.detach(),
-        'semantic_dist/mean_distance': min_weighted_distances.mean().detach(),
-        'semantic_dist/mean_weight': dist_weight.mean().detach(),
-        'semantic_dist/ce_unweighted': ce_loss.mean().detach(),
-        'semantic_dist/max_distance': min_weighted_distances.max().detach() if min_weighted_distances.numel() > 0 else torch.tensor(0., device=device),
+        "semantic_dist/loss": loss.detach(),
+        "semantic_dist/mean_distance": expected_distance.mean().detach(),
+        "semantic_dist/mean_weight": dist_weight.mean().detach(),
+        "semantic_dist/ce_unweighted": ce_vec.mean().detach(),
+        "semantic_dist/max_distance": expected_distance.max().detach() if expected_distance.numel() > 0 else torch.tensor(0.0, device=device),
+        "semantic_dist/included_prob_mean": included_prob.mean().detach(),
     }
-    
     return loss, metrics
 
 
 def combined_distance_aware_segmentation_loss(
-    pred_logits: torch.Tensor,
-    idx_targets: torch.Tensor,
+    pred_logits: torch.Tensor,  # [M, P, C]
+    idx_targets: torch.Tensor,  # [M, P]
     csr_labels: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ghost_mask: torch.Tensor,
+    ghost_mask: torch.Tensor,   # [N_hits]
     patch_shape: Tuple[int, int, int],
     use_distance_weighting: bool = True,
     distance_weight: float = 0.3,
@@ -697,66 +740,59 @@ def combined_distance_aware_segmentation_loss(
     gamma_distance: float = 2.0,
     label_smoothing: float = 0.0,
     lambda_cp: float = 1e-3,
+    class_threshold: float = 0.01,
+    min_weight: float = 0.05,
+    exclude_classes_from_dt: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Hybrid semantic segmentation loss: standard + distance-aware.
-    
-    Loss = standard_ce + distance_weight × distance_aware_ce
-    
-    This allows gradual transition from pure voxel-level to spatially-aware.
-    
-    Args:
-        pred_logits: [M, P, num_classes]
-        idx_targets: [M, P]
-        csr_labels: CSR format (indptr, cls, weights)
-        ghost_mask: [N_hits]
-        patch_shape: (p_h, p_w, p_d)
-        use_distance_weighting: Enable distance component
-        distance_weight: Weight for distance-aware component
-        max_distance: Spatial weighting range
-        gamma_distance: Distance decay exponent
-        label_smoothing: Label smoothing factor
-        lambda_cp: Confidence penalty
-    
-    Returns:
-        loss: Combined loss
-        metrics: Diagnostics
+    Hybrid loss = standard soft CE (CSR) + distance_weight * distance-aware reweighted soft CE.
+    Suitable for energy-fraction soft labels (multi-particle overlaps).
     """
     from utils.losses import soft_ce_with_logits_csr
-    
+    from utils.funcs import csr_keep_rows_torch
+
     device = pred_logits.device
+    ghost_mask = ghost_mask.to(device=device)
+
     M, P, num_classes = pred_logits.shape
-    
-    # Reshape predictions for standard loss (expects [N_valid, num_classes])
+
+    # Valid voxels
     is_occ = (idx_targets >= 0)
     is_ghost = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
-    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]]
+    is_ghost[is_occ] = ghost_mask[idx_targets[is_occ]].to(dtype=torch.bool)
     valid_mask = is_occ & ~is_ghost
-    
+
     valid_flat = valid_mask.view(-1)
+    N_valid = int(valid_flat.sum().item())
+
+    if N_valid == 0:
+        zero = pred_logits.sum() * 0.0
+        return zero, {"semantic/standard": zero.detach(), "semantic/total": zero.detach()}
+
     pred_valid = pred_logits.view(-1, num_classes)[valid_flat]
     idx_valid = idx_targets.view(-1)[valid_flat]
-    
-    # Filter CSR labels for valid voxels
+
+    # Filter CSR labels to valid voxels
     indptr, cls_ids, weights = csr_labels
-    from utils.funcs import csr_keep_rows_torch
     csr_valid = csr_keep_rows_torch(indptr, cls_ids, weights, idx_valid)[:3]
-    
-    # Compute standard soft CE loss
+
+    # Standard CSR soft CE
     loss_standard = soft_ce_with_logits_csr(
         pred_valid, csr_valid, ghost_mask=None,
-        label_smoothing=label_smoothing, lambda_cp=lambda_cp
+        label_smoothing=label_smoothing,
+        lambda_cp=lambda_cp,
+        class_weights=torch.ones(num_classes, device=pred_logits.device).\
+            scatter_(0, torch.tensor(exclude_classes_from_dt, device=pred_logits.device), 0.3)\
+            if exclude_classes_from_dt is not None else None,
+        none_index=exclude_classes_from_dt,
+        none_row_weight=0.3 if exclude_classes_from_dt is not None else None,
     )
-    
-    metrics = {
-        'semantic/standard': loss_standard.detach(),
-    }
-    
+
+    metrics = {"semantic/standard": loss_standard.detach()}
     loss_total = loss_standard
-    
-    # Add distance-aware component if enabled
+
     if use_distance_weighting and distance_weight > 0:
-        loss_distance, dist_metrics = distance_aware_semantic_segmentation_loss(
+        loss_dist, dist_metrics = distance_aware_semantic_segmentation_loss(
             pred_logits=pred_logits,
             idx_targets=idx_targets,
             csr_labels=csr_labels,
@@ -765,13 +801,15 @@ def combined_distance_aware_segmentation_loss(
             max_distance=max_distance,
             gamma_distance=gamma_distance,
             label_smoothing=label_smoothing,
-            lambda_cp=lambda_cp,
+            lambda_cp=0.0,  # CP disabled here to avoid double-counting
+            class_threshold=class_threshold,
+            min_weight=min_weight,
+            exclude_classes_from_dt=exclude_classes_from_dt,
         )
-        
-        loss_total = loss_total + distance_weight * loss_distance
+        loss_total = loss_total + float(distance_weight) * loss_dist
         metrics.update(dist_metrics)
-        metrics['semantic/distance_component'] = (distance_weight * loss_distance).detach()
-    
-    metrics['semantic/total'] = loss_total.detach()
-    
+        metrics["semantic/distance_component"] = (float(distance_weight) * loss_dist).detach()
+
+    metrics["semantic/total"] = loss_total.detach()
     return loss_total, metrics
+
