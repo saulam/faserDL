@@ -163,12 +163,12 @@ class MinkViT(vit.VisionTransformer):
 
         # Perceiver-IO bottleneck
         self.ecal_embed = nn.Linear(25, embed_dim)
-        self.muon_spec_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
         self.muon_spec_xattn = CrossAttnBlock(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                     qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                    drop_path=dpr[depth], norm_layer=norm_layer
+                    drop_path=0., norm_layer=norm_layer
                 )
         self.xattn_blocks = nn.ModuleDict({
             name: nn.ModuleList([
@@ -245,7 +245,6 @@ class MinkViT(vit.VisionTransformer):
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.module_cls_token, std=.02)
-            nn.init.normal_(self.muon_spec_token, std=0.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
             nn.init.normal_(self.kv_src_embed.weight, std=0.02)
             if not self.global_pool:
@@ -282,7 +281,6 @@ class MinkViT(vit.VisionTransformer):
     def no_weight_decay(self):
         return {
             'module_cls_token',
-            'muon_spec_token',
             'module_embed_enc.weight',
             'kv_src_embed.weight',
             'task_tokens',
@@ -428,7 +426,7 @@ class MinkViT(vit.VisionTransformer):
     
     def forward_features(self, x_sparse, x_glob):
         # retrieve global features
-        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask = x_glob
+        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
 
         # patchify
         x_sparse = self.fcal_patch_embed(x_sparse)
@@ -472,12 +470,17 @@ class MinkViT(vit.VisionTransformer):
 
         # ecal + muon spec as a single token
         ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
+        muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)       # [B, 1, C]
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                # [B, N_muspec, C]
+        has_tracks = (muspec_counts > 0)                                                  # [B, 1] bool
+        safe_mask = muspec_attn_mask.clone()
+        safe_mask[~has_tracks.squeeze(-1), 0] = True  # avoid all-false rows
         muon_spec_emb = self.muon_spec_xattn(
-            self.muon_spec_token.expand(B, -1, -1),
+            muspec_count_emb,
             muon_spec_emb,
-            attn_mask=muspec_attn_mask
+            attn_mask=safe_mask
         )                                                                                 # [B, 1, C]
+        muon_spec_emb = muon_spec_emb * has_tracks.view(B, 1, 1).float()                  # [B, 1, C]
         global_emb = ecal_emb + muon_spec_emb + \
             self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
 

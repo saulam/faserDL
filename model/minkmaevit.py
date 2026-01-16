@@ -626,7 +626,7 @@ class MinkMAEViT(nn.Module):
             muon_spec_emb,
             attn_mask=safe_mask
         )                                                                                 # [B, 1, C]
-        muon_spec_emb = muon_spec_emb * has_tracks.view(B, 1, 1).float()                  
+        muon_spec_emb = muon_spec_emb * has_tracks.view(B, 1, 1).float()                  # [B, 1, C]
         global_emb = ecal_emb + muon_spec_emb + \
             self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
         keep_global = (torch.rand(B, device=global_emb.device) > mask_ratio)              # [B]
