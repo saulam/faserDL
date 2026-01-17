@@ -82,6 +82,30 @@ class SparseFASERCALDataset(Dataset):
         return mapped
 
     
+    def standardize_vertex(self, vertex, reverse=False):
+        """
+        Standardises or unstandardizes primary vertex coordinates using z-score normalization.
+        
+        Args:
+            vertex: array-like of shape (..., 3) with (x, y, z) coordinates
+            reverse: if True, unstandardizes back to physical coords
+        
+        Returns:
+            Standardized/unstandardized vertex coordinates
+        """
+        # Statistics from training data
+        mean = np.array([174.26, 109.02, -66.38], dtype=np.float32)
+        std = np.array([135.14, 125.34, 652.16], dtype=np.float32)
+        
+        if not isinstance(vertex, np.ndarray):
+            vertex = np.array(vertex, dtype=np.float32)
+        
+        if reverse:
+            return vertex * std + mean
+        else:
+            return (vertex - mean) / std
+
+    
     def pdg2label(self, pdg, is_cc, tau_decay_mode, split_tau=False):
         """Converts PDG ID to a classification label (0-5).
 
@@ -539,6 +563,9 @@ class SparseFASERCALDataset(Dataset):
         out_lepton_momentum = self.preprocess(out_lepton_momentum, 'out_lepton_momentum')
         jet_momentum = self.preprocess(jet_momentum, 'jet_momentum')
 
+        # Standardise primary vertex
+        primary_vertex_standardised = self.standardize_vertex(event['primary_vertex'], reverse=False)
+
         # Assemble output
         output = {
             'coords': torch.from_numpy(event['coords']).float(),
@@ -555,6 +582,7 @@ class SparseFASERCALDataset(Dataset):
             'out_lepton_momentum': out_lepton_momentum.float(),
             'jet_momentum': jet_momentum.float(),
             'is_cc': torch.tensor(event['is_cc']).reshape(1,).float(),
+            'primary_vertex': torch.from_numpy(primary_vertex_standardised).float(),
         }
         if self.stage1:
             output.update({
@@ -575,7 +603,7 @@ class SparseFASERCALDataset(Dataset):
                 'event_id': event['event_id'],
                 'in_neutrino_pdg': event['in_neutrino_pdg'],
                 'in_neutrino_energy': event['in_neutrino_energy'],
-                'primary_vertex': event['primary_vertex'],
+                'primary_vertex_raw': event['primary_vertex'],  # Keep raw for reference
             })
         return output
         

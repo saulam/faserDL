@@ -198,6 +198,7 @@ class MinkViT(vit.VisionTransformer):
             "charm": 4,
             "vis": 3,
             "jet": 3,
+            "vertex": 3,
         }
         self.num_tasks = len(self.head_channels)
         if not self.global_pool:

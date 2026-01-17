@@ -49,6 +49,7 @@ class ViTFineTuner(pl.LightningModule):
         self.log_sigma_lep_geom  = nn.Parameter(torch.zeros(()))
         #self.log_sigma_lep_pt    = nn.Parameter(torch.zeros(()))
         #self.log_sigma_lep_mag   = nn.Parameter(torch.zeros(()))
+        self.log_sigma_vertex    = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
             "flavour":     self.log_sigma_flavour,
             "charm":       self.log_sigma_charm,
@@ -61,6 +62,7 @@ class ViTFineTuner(pl.LightningModule):
             "lep_geom":    self.log_sigma_lep_geom,
             #"lep_pt":      self.log_sigma_lep_pt,
             #"lep_mag":     self.log_sigma_lep_mag,
+            "vertex":      self.log_sigma_vertex,
         }
         
         self.warmup_steps = args.warmup_steps
@@ -148,6 +150,7 @@ class ViTFineTuner(pl.LightningModule):
         out_charm   = batch_output['out_charm']
         out_vis     = batch_output['out_vis']
         out_jet     = batch_output['out_jet']
+        out_vertex  = batch_output['out_vertex']
 
         # true outputs
         targ_iscc            = target['is_cc']
@@ -155,6 +158,7 @@ class ViTFineTuner(pl.LightningModule):
         targ_charm           = target['charm_label']
         targ_vis_sp_momentum = target['vis_sp_momentum']
         targ_jet_momentum    = target['jet_momentum']
+        targ_primary_vertex  = target['primary_vertex']
 
         outs = self.crit(
             p_vis_hat=out_vis["p_cart"],
@@ -180,6 +184,9 @@ class ViTFineTuner(pl.LightningModule):
         loss_lep_geom    = outs["loss_lep/geom"]
         #loss_lep_pt      = outs["loss_lep/pt"]
         #loss_lep_mag     = outs["loss_lep/mag"]
+        
+        # vertex reconstruction loss (MSE)
+        loss_vertex = torch.nn.functional.mse_loss(out_vertex, targ_primary_vertex, reduction='none').mean(dim=1)
 
         # Create nutau weight mask
         if targ_flavour.dim() == 1:
@@ -214,6 +221,7 @@ class ViTFineTuner(pl.LightningModule):
         loss_vis_geom = loss_vis_geom * sample_weights
         loss_jet_geom = loss_jet_geom * sample_weights
         loss_lep_geom = loss_lep_geom * sample_weights
+        loss_vertex = loss_vertex * sample_weights
 
         # Kendall-weighted total
         total_loss = (
@@ -225,9 +233,10 @@ class ViTFineTuner(pl.LightningModule):
             weighted_loss(loss_jet_geom, self.log_sigma_jet_geom, kind="reg").mean() +
             #weighted_loss(loss_jet_pt,   self.log_sigma_jet_pt,   kind="reg").mean() +
             #weighted_loss(loss_jet_mag,  self.log_sigma_jet_mag,  kind="reg").mean() +
-            weighted_loss(loss_lep_geom, self.log_sigma_lep_geom, kind="reg").mean() #+
+            weighted_loss(loss_lep_geom, self.log_sigma_lep_geom, kind="reg").mean() +
             #weighted_loss(loss_lep_pt,   self.log_sigma_lep_pt,   kind="reg").mean() +
-            #weighted_loss(loss_lep_mag,  self.log_sigma_lep_mag,  kind="reg").mean()
+            #weighted_loss(loss_lep_mag,  self.log_sigma_lep_mag,  kind="reg").mean() +
+            weighted_loss(loss_vertex,   self.log_sigma_vertex,   kind="reg").mean()
         )
 
         part_losses = {
@@ -245,6 +254,7 @@ class ViTFineTuner(pl.LightningModule):
             'loss_lep/geom': loss_lep_geom.mean().detach().item(),
             #'loss_lep/pt':   loss_lep_pt.mean().detach().item(),
             #'loss_lep/mag':  loss_lep_mag.mean().detach().item(),
+            'loss_vertex':   loss_vertex.mean().detach().item(),
         }
         
         return total_loss, part_losses

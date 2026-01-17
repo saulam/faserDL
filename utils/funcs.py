@@ -252,6 +252,7 @@ def collate(
         "vis_sp_momentum_mag", "vis_sp_momentum_dir",
         "out_lepton_momentum_mag", "out_lepton_momentum_dir",
         "jet_momentum", "jet_momentum_mag", "jet_momentum_dir",
+        "primary_vertex",
     }
     cat_keys = {
         "ghost_mask", "primlepton_labels", "seg_labels", "is_cc", 
@@ -261,6 +262,7 @@ def collate(
     stack_keys = {
         "vis_sp_momentum", "out_lepton_momentum", "jet_momentum",
         "vis_sp_momentum_dir", "out_lepton_momentum_dir", "jet_momentum_dir",
+        "primary_vertex",
     }
 
     for key in opt_all:

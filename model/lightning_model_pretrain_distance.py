@@ -238,7 +238,7 @@ class MAEPreTrainerDistance(pl.LightningModule):
                     distance_weight=self.semantic_distance_weight,
                     max_distance=self.semantic_max_distance,
                     gamma_distance=self.gamma_distance,
-                    label_smoothing=0.0,
+                    label_smoothing=self.label_smoothing,
                     lambda_cp=lambda_cp,
                     class_threshold=class_threshold,
                     exclude_classes_from_dt=None if name == 'pid' else 0,  # exclude "none" class for hie/dec
@@ -380,7 +380,7 @@ class MAEPreTrainerDistance(pl.LightningModule):
                 temperature_chamfer=self.temperature_chamfer,
                 label_smoothing=self.label_smoothing,
                 focal_gamma=1.5,
-                focal_alpha=None,
+                focal_alpha=0.25,
                 occ_dilate=2,
                 huber_delta=1.0,
                 reg_weight_lam=1.0,

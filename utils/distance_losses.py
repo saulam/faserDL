@@ -260,7 +260,7 @@ def distance_weighted_regression_loss(
     gamma: float = 2.0,
     huber_delta: float = 1.0,
     reg_empty: Optional[torch.Tensor] = None,
-    min_neg_weight: float = 0.0,    # small >0 if you want *some* pressure near hits
+    min_neg_weight: float = 0.05,    # small >0 if you want *some* pressure near hits
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Distance-weighted regression loss.
@@ -782,7 +782,7 @@ def combined_distance_aware_segmentation_loss(
         label_smoothing=label_smoothing,
         lambda_cp=lambda_cp,
         class_weights=torch.ones(num_classes, device=pred_logits.device).\
-            scatter_(0, torch.tensor(exclude_classes_from_dt, device=pred_logits.device), 0.3)\
+            scatter_(0, torch.tensor(exclude_classes_from_dt, device=pred_logits.device), 0.5)\
             if exclude_classes_from_dt is not None else None,
         none_index=exclude_classes_from_dt,
         none_row_weight=0.3 if exclude_classes_from_dt is not None else None,
