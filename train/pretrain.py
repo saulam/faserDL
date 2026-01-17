@@ -3,7 +3,8 @@ Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
 Date: 01.25
 
-Description: pre-training script.
+Description: Pre-training script with distance-aware losses.
+             Uses balanced parameters for complete training with spatial awareness.
 """
 
 import json
@@ -14,6 +15,7 @@ from pathlib import Path
 from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
 from dataset import *
 from model import *
+from model.lightning_model_pretrain import MAEPreTrainer
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
@@ -57,6 +59,7 @@ def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
+    
     print("\n- Arguments:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
@@ -163,7 +166,7 @@ def main():
     logger.log_hyperparams(vars(args))
     tb_logger.log_hyperparams(vars(args))
 
-    # Lightning model
+    # Lightning model with distance-aware losses
     lightning_model = MAEPreTrainer(
         model=model,
         dataset=dataset,

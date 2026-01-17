@@ -1,9 +1,13 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 01.25
+Date: 01.26
 
-Description: PyTorch Lightning model - stage 1: masked autoencoder.
+Description: PyTorch Lightning model - stage 1: masked autoencoder with distance-aware losses.
+             
+This variant addresses the issue of voxel-level losses heavily penalizing spatially close
+but misaligned predictions. Uses distance transforms and soft chamfer losses to provide
+smoother gradients for near-miss predictions.
 """
 
 import torch
@@ -13,12 +17,30 @@ import timm.optim as optim_factory
 from torch.nn import functional as F
 from utils import (
     arrange_input, arrange_truth, csr_keep_rows_torch, bce_with_logits_label_smoothing,
-    soft_ce_with_logits_csr, reconstruction_losses_masked_simple,
+    soft_ce_with_logits_csr,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
+)
+from utils.distance_losses import (
+    unified_reconstruction_loss,
+    unified_semantic_segmentation_loss,
 )
 
 
 class MAEPreTrainer(pl.LightningModule):
+    """
+    MAE PreTrainer with distance-aware reconstruction losses.
+    
+    Key differences from standard MAEPreTrainer:
+    1. Uses soft chamfer loss for occupancy (considers spatial proximity)
+    2. Uses distance-weighted regression loss (nearby mispredictions penalized less)
+    3. Optional focal distance transform loss for smoother gradients
+    
+    Loss modes:
+    - 'hybrid': Combines standard voxel-level + distance-aware losses (recommended for transition)
+    - 'distance_only': Uses only distance-aware losses
+    - 'focal_dt': Uses focal distance transform for occupancy
+    """
+    
     def __init__(self, model, dataset, args):
         super(MAEPreTrainer, self).__init__()
 
@@ -35,20 +57,34 @@ class MAEPreTrainer(pl.LightningModule):
         self.preprocessing_input = args.preprocessing_input
         self.label_smoothing = args.label_smoothing
 
+        # Reconstruction distance-aware loss parameters
+        self.reconstruction_loss_mode = args.reconstruction_loss_mode
+        self.reconstruction_chamfer_weight = args.reconstruction_chamfer_weight
+        self.reconstruction_distance_reg_weight = args.reconstruction_distance_reg_weight
+        self.reconstruction_max_distance = args.reconstruction_max_distance
+        self.reconstruction_gamma_distance = args.reconstruction_gamma_distance
+        
+        # Semantic segmentation distance-aware parameters
+        self.semantic_loss_mode = args.semantic_loss_mode
+        self.semantic_distance_weight = args.semantic_distance_weight
+        self.semantic_max_distance = args.semantic_max_distance
+        self.semantic_gamma_distance = args.semantic_gamma_distance
+
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_gho = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_hie = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_dec = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_pid = nn.Parameter(torch.zeros(()))
+        self.log_sigma_hie = nn.Parameter(torch.zeros(()))
+        self.log_sigma_dec = nn.Parameter(torch.zeros(()))
+        self.log_sigma_pid = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ_ah = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg_ah = nn.Parameter(torch.zeros(()))
+        
         self._uncertainty_params = {
             "gho": self.log_sigma_gho,
-            #"hie": self.log_sigma_hie,
-            #"dec": self.log_sigma_dec,
-            #"pid": self.log_sigma_pid,
+            "hie": self.log_sigma_hie,
+            "dec": self.log_sigma_dec,
+            "pid": self.log_sigma_pid,
             "occ": self.log_sigma_occ,
             "reg": self.log_sigma_reg,
             "occ_ah": self.log_sigma_occ_ah,
@@ -125,6 +161,7 @@ class MAEPreTrainer(pl.LightningModule):
     ):
         """
         Computes losses (same-track, same-primary, same-pid) in one call.
+        Standard voxel-level version (kept for ghost loss).
         """
         loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), 
                                                    label_smoothing=self.label_smoothing)
@@ -143,41 +180,81 @@ class MAEPreTrainer(pl.LightningModule):
         }
 
         return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
-        
 
 
-    def compute_relational_losses(
+    def compute_relational_losses_distance_aware(
         self,
-        pred_gho: torch.Tensor,
-        pred_hie: torch.Tensor,
-        pred_dec: torch.Tensor,
-        pred_pid: torch.Tensor,
-        idx_targets: torch.Tensor,
+        pred_gho: torch.Tensor,         # [M, P]
+        pred_hie: torch.Tensor,         # [M, P, num_classes]
+        pred_dec: torch.Tensor,         # [M, P, num_classes]
+        pred_pid: torch.Tensor,         # [M, P, num_classes]
+        idx_targets: torch.Tensor,      # [M, P]
         csr_hie: torch.Tensor,
         csr_dec: torch.Tensor,
         csr_pid: torch.Tensor,
         ghost_mask: torch.Tensor,
     ):
+        """
+        Compute relational losses with optional distance awareness for semantic tasks.
+        
+        Ghost loss (gho) is kept as standard BCE (binary classification).
+        Semantic tasks (hie, dec, pid) can use distance-aware losses.
+        """
         raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(idx_targets)
 
-        # Gather embeddings and labels
-        z_gho = pred_gho[tok_row, sub_idx]                    # [N_valid]
-        z_hie = pred_hie[tok_row, sub_idx, :]                 # [N_valid, D]
-        z_dec = pred_dec[tok_row, sub_idx, :]                 # [N_valid, D]
-        z_pid = pred_pid[tok_row, sub_idx, :]                 # [N_valid, D]
-        csr_hie = csr_keep_rows_torch(*csr_hie, raw_idx)[:3]  # ([N+1], [L], [L])
-        csr_dec = csr_keep_rows_torch(*csr_dec, raw_idx)[:3]  # ([N+1], [L], [L])
-        csr_pid = csr_keep_rows_torch(*csr_pid, raw_idx)[:3]  # ([N+1], [L], [L])
+        # Gather ghost predictions and labels (standard BCE)
+        z_gho = pred_gho[tok_row, sub_idx]  # [N_valid]
         ghost = ghost_mask[raw_idx]
-
-        loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc = self.metric_losses_masked_simple(
-            z_gho, z_hie, z_dec, z_pid, csr_hie, csr_dec, csr_pid, ghost,
+        loss_gho = bce_with_logits_label_smoothing(
+            z_gho, ghost.to(z_gho.dtype), 
+            label_smoothing=self.label_smoothing
         )
         
-        return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
+        part_losses = {
+            "gho/total": loss_gho.detach(),
+        }
+        
+        # Semantic segmentation tasks using unified loss function
+        M, P = idx_targets.shape
+        
+        for name, pred, csr in [
+            ('hie', pred_hie, csr_hie),
+            ('dec', pred_dec, csr_dec),
+            ('pid', pred_pid, csr_pid),
+        ]:
+            # Determine exclude class for hie/dec (not for pid)
+            exclude_class = 0 if name != 'pid' else None
+
+            loss_semantic, metrics_semantic = unified_semantic_segmentation_loss(
+                pred_logits=pred, 
+                idx_targets=idx_targets,
+                csr_labels=csr,
+                ghost_mask=ghost_mask,
+                patch_shape=tuple(self.model.fcal_patch_size.tolist()),
+                loss_mode=self.semantic_loss_mode,  # "standard" | "hybrid" | "distance"
+                distance_weight=self.semantic_distance_weight,
+                max_distance=self.semantic_max_distance,
+                gamma_distance=self.semantic_gamma_distance,
+                exclude_classes_from_dt=exclude_class,
+                label_smoothing=self.label_smoothing,
+            )
+            
+            # Store loss
+            if name == 'hie':
+                loss_hie = loss_semantic
+            elif name == 'dec':
+                loss_dec = loss_semantic
+            else:  # pid
+                loss_pid = loss_semantic
+            
+            # Store metrics with prefixes
+            for k, v in metrics_semantic.items():
+                part_losses[f"{name}/{k.split('/')[-1]}"] = v
+        
+        return loss_gho, loss_hie, loss_dec, loss_pid, part_losses
         
 
-    def compute_reconstruction_losses(
+    def compute_reconstruction_losses_distance_aware(
         self,
         targ_reg: torch.Tensor,         # [N_hits, C_in]
         pred_occ: torch.Tensor,         # [M, P]
@@ -189,8 +266,12 @@ class MAEPreTrainer(pl.LightningModule):
         name_prefix: str = "",          # optional prefix for metrics
         per_event_mean: bool = False,
     ):
+        """
+        Compute reconstruction losses with distance awareness using unified interface.
+        """
         p_h, p_w, p_d = patch_shape
-        loss_occ, loss_reg, part_losses_dec = reconstruction_losses_masked_simple(
+        
+        loss_occ, loss_reg, part_losses_dec = unified_reconstruction_loss(
             targ_reg=targ_reg,
             pred_occ=pred_occ,
             pred_reg=pred_reg,
@@ -200,11 +281,17 @@ class MAEPreTrainer(pl.LightningModule):
             patch_shape=(p_h, p_w, p_d),
             dataset=self.dataset,
             preprocessing_input=self.preprocessing_input,
-            label_smoothing=self.label_smoothing,
-            per_event_mean=per_event_mean,
+            loss_mode=self.reconstruction_loss_mode,
+            chamfer_weight=self.reconstruction_chamfer_weight,
+            distance_reg_weight=self.reconstruction_distance_reg_weight,
+            max_distance=self.reconstruction_max_distance,
+            gamma_distance=self.reconstruction_gamma_distance,
+            occ_label_smoothing=self.label_smoothing,
         )
+        
         if name_prefix:
             part_losses_dec = {f"{name_prefix}{k}": v for k, v in part_losses_dec.items()}
+        
         return loss_occ, loss_reg, part_losses_dec
 
 
@@ -213,9 +300,8 @@ class MAEPreTrainer(pl.LightningModule):
         preds: dict,
         targ_reg: torch.Tensor,
         targ_reg_ahcal: torch.Tensor,
-        rel_idx_targets: torch.Tensor,
-        rec_idx_targets: torch.Tensor,
-        rec_idx_targets_ahcal: torch.Tensor,
+        idx_targets_fas: torch.Tensor,
+        idx_targets_ahcal: torch.Tensor,
         labels: dict,
     ):
         # FASERCal predictions
@@ -238,16 +324,22 @@ class MAEPreTrainer(pl.LightningModule):
         hit_event_id_ah=labels['hit_event_id_ahcal']
         ghost_mask_ah = torch.zeros_like(hit_event_id_ah, dtype=torch.bool)
 
-        loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses(
-            pred_gho, pred_hie, pred_dec, pred_pid, rel_idx_targets, csr_hie, csr_dec, csr_pid, ghost_mask,
+        # Both relational and reconstruction tasks now operate on the same masked patches
+        # Relational losses (with optional distance awareness for semantic tasks)
+        loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses_distance_aware(
+            pred_gho, pred_hie, pred_dec, pred_pid, idx_targets_fas, csr_hie, csr_dec, csr_pid, ghost_mask,
         )
-        loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses(
-            targ_reg, pred_occ, pred_reg, rec_idx_targets, hit_event_id, ghost_mask,
+        
+        # Distance-aware reconstruction losses for FASERCal
+        loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses_distance_aware(
+            targ_reg, pred_occ, pred_reg, idx_targets_fas, hit_event_id, ghost_mask,
             patch_shape=tuple(self.model.fcal_patch_size.tolist()),
             name_prefix="",        # keep original metric names
         )
-        loss_occ_ah, loss_reg_ah, part_dec_ah = self.compute_reconstruction_losses(
-            targ_reg_ahcal, pred_occ_ah, pred_reg_ah, rec_idx_targets_ahcal, hit_event_id_ah, ghost_mask=ghost_mask_ah,
+        
+        # Distance-aware reconstruction losses for AHCAL
+        loss_occ_ah, loss_reg_ah, part_dec_ah = self.compute_reconstruction_losses_distance_aware(
+            targ_reg_ahcal, pred_occ_ah, pred_reg_ah, idx_targets_ahcal, hit_event_id_ah, ghost_mask=ghost_mask_ah,
             patch_shape=tuple(self.model.ahcal_patch_size.tolist()),
             name_prefix="ahcal_",   # metrics logged as ahcal_occ/..., ahcal_reg/...
         )
@@ -259,16 +351,13 @@ class MAEPreTrainer(pl.LightningModule):
             return weighted_loss(loss, ls, kind) if ls is not None else loss
 
         total_loss = (
-            _weight(loss_gho, "log_sigma_gho", kind="ce")       +
-            0.25 * loss_hie +
-            0.25 * loss_dec +
-            0.5  * loss_pid +
-            #_weight(loss_hie, "log_sigma_hie", kind="ce")       +
-            #_weight(loss_dec, "log_sigma_dec", kind="ce")       +
-            #_weight(loss_pid, "log_sigma_pid", kind="ce")       +
-            _weight(loss_occ, "log_sigma_occ", kind="ce")       +
-            _weight(loss_reg, "log_sigma_reg", kind="huber")    +
-            _weight(loss_occ_ah, "log_sigma_occ_ah", kind="ce") +
+            _weight(loss_gho,    "log_sigma_gho",    kind="ce")     +
+            _weight(loss_hie,    "log_sigma_hie",    kind="ce")     +
+            _weight(loss_dec,    "log_sigma_dec",    kind="ce")     +
+            _weight(loss_pid,    "log_sigma_pid",    kind="ce")     +
+            _weight(loss_occ,    "log_sigma_occ",    kind="ce")     +
+            _weight(loss_reg,    "log_sigma_reg",    kind="huber")  +
+            _weight(loss_occ_ah, "log_sigma_occ_ah", kind="ce")     +
             _weight(loss_reg_ah, "log_sigma_reg_ah", kind="huber")
         )
 
@@ -283,11 +372,10 @@ class MAEPreTrainer(pl.LightningModule):
         # Forward pass
         (
             preds,
-            rel_idx_targets,
-            rec_idx_targets_fas,
+            idx_targets_fas,
             _row_evt_fas,
             _row_patch_fas,
-            rec_idx_targets_ah,
+            idx_targets_ah,
             _row_evt_ah,
             _row_patch_ah,
         ) = self.forward(
@@ -297,9 +385,8 @@ class MAEPreTrainer(pl.LightningModule):
             preds=preds,
             targ_reg=batch_input.features,
             targ_reg_ahcal=ahcal_sparse.features,
-            rel_idx_targets=rel_idx_targets,
-            rec_idx_targets=rec_idx_targets_fas,
-            rec_idx_targets_ahcal=rec_idx_targets_ah,
+            idx_targets_fas=idx_targets_fas,
+            idx_targets_ahcal=idx_targets_ah,
             labels=labels,
         )
 

@@ -1,7 +1,7 @@
 """
 Author: Dr. Saul Alonso-Monsalve
 Email: salonso(at)ethz.ch, saul.alonso.monsalve(at)cern.ch
-Date: 09.25
+Date: 01.26
 
 Description: PyTorch MAE-ViT model with spconv patching.
 """
@@ -17,7 +17,7 @@ from .utils import (
 )
 
 
-class MinkMAEViT(nn.Module):
+class SparseMAEViT(nn.Module):
     def __init__(
         self,
         in_chans=1,
@@ -690,7 +690,6 @@ class MinkMAEViT(nn.Module):
             global_enriched,       # [B, 1, C]
             global_rand_mask,      # [B]          True if global token was masked
         )
-        
 
     def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
         # b_ids must be nondecreasing (true for torch.nonzero over [B, ...]).
@@ -701,41 +700,14 @@ class MinkMAEViT(nn.Module):
         return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
 
 
-    def forward_relational(self, tok_keep_enriched, attn_mask_keep, ids_keep, idx_map):
-        """
-        tok_keep_enriched: [B, M, Lk, Cenc]  (enriched token embeddings)
-        attn_mask_keep:    [B, M, Lk]        (bool)
-        ids_keep:          [B, M, Lk]        (intra indices of gathered slots)
-        idx_map:           LazyIdxMap
-        """
-        # real kept positions
-        b_ids, m_ids, lk_ids = torch.nonzero(attn_mask_keep, as_tuple=True)  # [Nk]
-
-        # gather enriched features
-        out_flat = tok_keep_enriched[b_ids, m_ids, lk_ids, :]                # [Nk, Cenc]
-        out_flat_dec = self.enc_to_dec(out_flat)
-
-        # voxel head (+ heads)
-        shared       = self.fasercal_shared_voxel_head["rel"](out_flat_dec)           # [Nk, P, H]
-        preds        = {}
-        preds["gho"] = self.heads["gho"](shared).squeeze(-1)                 # [Nk, P]
-        preds["hie"] = self.heads["hie"](shared)                             # [Nk, P, 3]
-        preds["dec"] = self.heads["dec"](shared)                             # [Nk, P, 3]
-        preds["pid"] = self.heads["pid"](shared)                             # [Nk, P, num_pid]
-
-        l_intra   = ids_keep[b_ids, m_ids, lk_ids]                           # [Nk]
-        patch_ids = self.module_token_indices[m_ids, l_intra]                # [Nk]
-        idx_targets_kept = idx_map[b_ids, patch_ids]                         # [Nk, P]
-
-        return preds, idx_targets_kept
-
-
     def forward_reconstruction(self, tok_enriched, attn_mask_mod, attn_mask_keep, rand_mask, idx_map):
         """
+        Apply both reconstruction and semantic segmentation to masked patches.
+        
         tok_enriched:   [B, M, Lk, Cenc]  enriched kept tokens
         rand_mask:      [B, M, Lm]        True = masked real position (over full intra space)
         attn_mask_mod:  [B, M, Lm]        True = real
-        attn_mask_keep: [B, M, Lm]        True = kept
+        attn_mask_keep: [B, M, Lk]        True = kept
         idx_map:        LazyIdxMap
         """
         B, M, Lk, Cenc = tok_enriched.shape
@@ -771,13 +743,22 @@ class MinkMAEViT(nn.Module):
 
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
-        # heads
-        shared       = self.fasercal_shared_voxel_head["rec"](out_flat)      # [Nm, P, H]
-        preds        = {}
-        preds["occ"] = self.heads["occ"](shared).squeeze(-1)                 # [Nm, P]
-        preds["reg"] = self.heads["reg"](shared)                             # [Nm, P, in_chans]
+        # Apply both voxel heads to masked positions
+        preds = {}
+        
+        # Reconstruction heads (occupancy + charge regression)
+        shared_rec = self.fasercal_shared_voxel_head["rec"](out_flat)        # [Nm, P, H_rec]
+        preds["occ"] = self.heads["occ"](shared_rec).squeeze(-1)             # [Nm, P]
+        preds["reg"] = self.heads["reg"](shared_rec)                         # [Nm, P, in_chans]
+        
+        # Semantic segmentation heads (relational tasks)
+        shared_rel = self.fasercal_shared_voxel_head["rel"](out_flat)        # [Nm, P, H_rel]
+        preds["gho"] = self.heads["gho"](shared_rel).squeeze(-1)             # [Nm, P]
+        preds["hie"] = self.heads["hie"](shared_rel)                         # [Nm, P, 3]
+        preds["dec"] = self.heads["dec"](shared_rel)                         # [Nm, P, 3]
+        preds["pid"] = self.heads["pid"](shared_rel)                         # [Nm, P, num_pid]
 
-        # targets
+        # targets (same for all predictions on masked patches)
         patch_ids = self.module_token_indices[m_ids, l_ids]                  # [Nm]
         idx_targets = idx_map[b_ids, patch_ids]                              # [Nm, P]
 
@@ -844,9 +825,8 @@ class MinkMAEViT(nn.Module):
     def forward(self, x, x_glob, mask_ratio=0.75):
         """
         Single encoder pass with masking (mask_ratio), then:
-          - relational decoder on kept FASERcal tokens,
-          - FASERcal reconstruction decoder (masked patches),
-          - AHCAL reconstruction decoder (masked patches).
+          - FASERcal reconstruction + semantic segmentation on masked patches,
+          - AHCAL reconstruction on masked patches.
         """
         # occupancy maps
         idx_map = self.build_patch_occupancy_map(x, self.fcal_patch_size, self.grid_size)
@@ -869,16 +849,8 @@ class MinkMAEViT(nn.Module):
          global_enriched,          # [B, 1, C]
          global_rand_mask) = self.forward_encoder(x, x_glob, mask_ratio)
 
-        # relational decoder
-        preds_rel, rel_idx_targets = self.forward_relational(
-            tok_enriched_fas,      # [B, M, Lk_fas, C]
-            attn_mask_keep,        # [B, M, Lk_fas] (kept tokens)
-            ids_keep,              # [B, M, Lk_fas]
-            idx_map,
-        )
-
-        # FASERcal reconstruction (MAE)
-        preds_rec_fas, rec_idx_targets, row_event_ids, row_patch_ids = \
+        # FASERcal: both reconstruction and semantic segmentation on masked patches
+        preds_fas, idx_targets_fas, row_event_ids_fas, row_patch_ids_fas = \
             self.forward_reconstruction(
                 tok_enriched_fas,   # [B, M, Lk_fas, Cenc], enriched kept FASERcal tokens
                 attn_mask_mod,      # [B, M, Lm_fas], real positions (full intra space)
@@ -887,8 +859,8 @@ class MinkMAEViT(nn.Module):
                 idx_map,
             )
 
-        # AHCAL reconstruction
-        preds_rec_ah, rec_idx_targets_ah, row_event_ids_ah, row_patch_ids_ah = \
+        # AHCAL reconstruction on masked patches
+        preds_ah, idx_targets_ah, row_event_ids_ah, row_patch_ids_ah = \
             self.forward_reconstruction_ahcal(
                 tok_enriched_ah,    # [B, Lk_ah, Cenc], enriched kept AHCAL tokens
                 ah_mask,            # [B, Na], real AHCAL positions
@@ -898,15 +870,14 @@ class MinkMAEViT(nn.Module):
             )
 
         # merge all predictions
-        preds = {**preds_rel, **preds_rec_fas, **preds_rec_ah}
+        preds = {**preds_fas, **preds_ah}
 
         return (
             preds,
-            rel_idx_targets,        # relational (FASERcal) idx_targets
-            rec_idx_targets,        # FASERcal reconstruction idx_targets
-            row_event_ids,
-            row_patch_ids,
-            rec_idx_targets_ah,     # AHCAL reconstruction idx_targets
+            idx_targets_fas,        # FASERcal idx_targets (for all tasks: occ, reg, gho, hie, dec, pid)
+            row_event_ids_fas,
+            row_patch_ids_fas,
+            idx_targets_ah,         # AHCAL idx_targets (for occ_ahcal, reg_ahcal)
             row_event_ids_ah,
             row_patch_ids_ah,
         )
@@ -1073,7 +1044,7 @@ class MinkMAEViT(nn.Module):
 
 
 def mae_vit_tiny(**kwargs):
-    model = MinkMAEViT(
+    model = SparseMAEViT(
         in_chans=1, D=3, embed_dim=528, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
@@ -1085,7 +1056,7 @@ def mae_vit_tiny(**kwargs):
 
 
 def mae_vit_base(**kwargs):
-    model = MinkMAEViT(
+    model = SparseMAEViT(
         in_chans=1, D=3, embed_dim=768, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
@@ -1097,7 +1068,7 @@ def mae_vit_base(**kwargs):
     
 
 def mae_vit_large(**kwargs):
-    model = MinkMAEViT(
+    model = SparseMAEViT(
         in_chans=1, D=3, embed_dim=768, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
@@ -1109,7 +1080,7 @@ def mae_vit_large(**kwargs):
 
 
 def mae_vit_huge(**kwargs):
-    model = MinkMAEViT(
+    model = SparseMAEViT(
         in_chans=1, D=3, embed_dim=768, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),

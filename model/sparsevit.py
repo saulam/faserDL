@@ -18,7 +18,7 @@ from .utils import (
 )
 
 
-class MinkViT(vit.VisionTransformer):
+class SparseViT(vit.VisionTransformer):
     """ 
     Vision Transformer with spconv patching
     and support for global average pooling
@@ -38,7 +38,7 @@ class MinkViT(vit.VisionTransformer):
         metadata=None,
         **kwargs
     ):
-        super(MinkViT, self).__init__(**kwargs)
+        super(SparseViT, self).__init__(**kwargs)
         
         self.metadata = metadata
         self.head_init = head_init
@@ -540,7 +540,7 @@ class MinkViT(vit.VisionTransformer):
 
 
 def vit_tiny(**kwargs):
-    model = MinkViT(
+    model = SparseViT(
         in_chans=1, D=3, embed_dim=528,
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
@@ -553,7 +553,7 @@ def vit_tiny(**kwargs):
 
 
 def vit_base(**kwargs):
-    model = MinkViT(
+    model = SparseViT(
         in_chans=1, D=3, embed_dim=768, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
@@ -566,7 +566,7 @@ def vit_base(**kwargs):
     
 
 def vit_large(**kwargs):
-    model = MinkViT(
+    model = SparseViT(
         in_chans=1, D=3, embed_dim=1008, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
@@ -579,7 +579,7 @@ def vit_large(**kwargs):
 
 
 def vit_huge(**kwargs):
-    model = MinkViT(
+    model = SparseViT(
         in_chans=1, D=3, embed_dim=1296, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),

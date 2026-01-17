@@ -7,7 +7,7 @@ shardshuffle=200
 shuffle=4000
 model="tiny"
 eps=1e-8
-batch_size=256
+batch_size=32
 preprocessing_input="log"
 label_smoothing=0.02
 dropout=0.0
@@ -27,14 +27,23 @@ weight_decay=0.05
 beta1=0.9
 beta2=0.95
 save_dir="logs_final"
-name="pretrain_v7.0_v1"
+name="pretrain_v7.0_distance_v1"
 log_every_n_steps=50
 save_top_k=1
 checkpoint_path="checkpoints_final"
-checkpoint_name="pretrain_v7.0_dlnu_v1"
+checkpoint_name="pretrain_v7.0_distance_v1"
 early_stop_patience=200
-load_checkpoint="checkpoints_final/pretrain_v6.0_dlnu_log_v2/loss_total_val/last.ckpt"
-gpus=(0 1)
+load_checkpoint=""
+gpus=(0)
+reconstruction_loss_mode="hybrid"
+reconstruction_chamfer_weight=0.3
+reconstruction_distance_reg_weight=0.3
+reconstruction_max_distance=5.0
+reconstruction_gamma_distance=2.0
+semantic_loss_mode="hybrid"
+semantic_distance_weight=0.3
+semantic_max_distance=5.0
+semantic_gamma_distance=2.0
 
 python -m train.pretrain \
     --train \
@@ -70,5 +79,13 @@ python -m train.pretrain \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
-    --gpus "${gpus[@]}"
-
+    --gpus "${gpus[@]}" \
+    --reconstruction_loss_mode $reconstruction_loss_mode \
+    --reconstruction_chamfer_weight $reconstruction_chamfer_weight \
+    --reconstruction_distance_reg_weight $reconstruction_distance_reg_weight \
+    --reconstruction_max_distance $reconstruction_max_distance \
+    --reconstruction_gamma_distance $reconstruction_gamma_distance \
+    --semantic_loss_mode $semantic_loss_mode \
+    --semantic_distance_weight $semantic_distance_weight \
+    --semantic_max_distance $semantic_max_distance \
+    --semantic_gamma_distance $semantic_gamma_distance
