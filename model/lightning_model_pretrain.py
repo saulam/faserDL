@@ -61,7 +61,8 @@ class MAEPreTrainer(pl.LightningModule):
         self.reconstruction_loss_mode = args.reconstruction_loss_mode
         self.reconstruction_chamfer_weight = args.reconstruction_chamfer_weight
         self.reconstruction_distance_reg_weight = args.reconstruction_distance_reg_weight
-        self.reconstruction_max_distance = args.reconstruction_max_distance
+        self.reconstruction_max_distance_fcal = args.reconstruction_max_distance_fcal
+        self.reconstruction_max_distance_ahcal = args.reconstruction_max_distance_ahcal
         self.reconstruction_gamma_distance = args.reconstruction_gamma_distance
         
         # Semantic segmentation distance-aware parameters
@@ -265,11 +266,16 @@ class MAEPreTrainer(pl.LightningModule):
         patch_shape,                    # (p_h, p_w, p_d)
         name_prefix: str = "",          # optional prefix for metrics
         per_event_mean: bool = False,
+        max_distance: float = None,     # optional override for max_distance
     ):
         """
         Compute reconstruction losses with distance awareness using unified interface.
         """
         p_h, p_w, p_d = patch_shape
+        
+        # Use provided max_distance or fall back to FASERCal default
+        if max_distance is None:
+            max_distance = self.reconstruction_max_distance_fcal
         
         loss_occ, loss_reg, part_losses_dec = unified_reconstruction_loss(
             targ_reg=targ_reg,
@@ -284,7 +290,7 @@ class MAEPreTrainer(pl.LightningModule):
             loss_mode=self.reconstruction_loss_mode,
             chamfer_weight=self.reconstruction_chamfer_weight,
             distance_reg_weight=self.reconstruction_distance_reg_weight,
-            max_distance=self.reconstruction_max_distance,
+            max_distance=max_distance,
             gamma_distance=self.reconstruction_gamma_distance,
             occ_label_smoothing=self.label_smoothing,
         )
@@ -335,6 +341,7 @@ class MAEPreTrainer(pl.LightningModule):
             targ_reg, pred_occ, pred_reg, idx_targets_fas, hit_event_id, ghost_mask,
             patch_shape=tuple(self.model.fcal_patch_size.tolist()),
             name_prefix="",        # keep original metric names
+            max_distance=self.reconstruction_max_distance_fcal,
         )
         
         # Distance-aware reconstruction losses for AHCAL
@@ -342,6 +349,7 @@ class MAEPreTrainer(pl.LightningModule):
             targ_reg_ahcal, pred_occ_ah, pred_reg_ah, idx_targets_ahcal, hit_event_id_ah, ghost_mask=ghost_mask_ah,
             patch_shape=tuple(self.model.ahcal_patch_size.tolist()),
             name_prefix="ahcal_",   # metrics logged as ahcal_occ/..., ahcal_reg/...
+            max_distance=self.reconstruction_max_distance_ahcal,
         )
 
         # Kendall et al. aggregation

@@ -33,7 +33,7 @@ class SparseMAEViT(nn.Module):
         io_depth=4,
         io_decode_depth=4,
         num_heads=16,
-        num_modes=(16, 8),
+        num_modes=(8, 4),
         num_pid_classes=3,
         decoder_embed_dim=192,
         decoder_num_heads=16,
@@ -213,18 +213,15 @@ class SparseMAEViT(nn.Module):
         self.fasercal_sep_basis = SeparableDCT3D(
             self.fcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6)
         )
-        self.fasercal_shared_voxel_head = nn.ModuleDict({
-            name: SharedLatentVoxelHead(
-                decoder_embed_dim, self.fasercal_sep_basis, H=num_modes[i],
-                norm_layer=norm_layer, post_norm=True
-            )
-            for i, name in enumerate(["rel", "rec"])
-        })
+        self.fasercal_shared_voxel_head = SharedLatentVoxelHead(
+            decoder_embed_dim, self.fasercal_sep_basis, H=num_modes[0],
+            norm_layer=norm_layer, post_norm=True
+        )
         self.ahcal_sep_basis = SeparableDCT3D(
             self.ahcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6)
         )
         self.ahcal_voxel_head = SharedLatentVoxelHead(
-            decoder_embed_dim, self.ahcal_sep_basis, H=num_modes[1], # same H as FASERCal reconstruction
+            decoder_embed_dim, self.ahcal_sep_basis, H=num_modes[1],
             norm_layer=norm_layer, post_norm=True,
         )
         self.head_channels = {
@@ -240,7 +237,7 @@ class SparseMAEViT(nn.Module):
         self.heads = nn.ModuleDict({
             name: (
                 nn.Linear(
-                    num_modes[0] if name in ["gho", "hie", "pid", "dec"] else num_modes[1],
+                    num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0],
                     self.head_channels[name]
                 )
             )
@@ -746,17 +743,14 @@ class SparseMAEViT(nn.Module):
         # Apply both voxel heads to masked positions
         preds = {}
         
-        # Reconstruction heads (occupancy + charge regression)
-        shared_rec = self.fasercal_shared_voxel_head["rec"](out_flat)        # [Nm, P, H_rec]
-        preds["occ"] = self.heads["occ"](shared_rec).squeeze(-1)             # [Nm, P]
-        preds["reg"] = self.heads["reg"](shared_rec)                         # [Nm, P, in_chans]
-        
-        # Semantic segmentation heads (relational tasks)
-        shared_rel = self.fasercal_shared_voxel_head["rel"](out_flat)        # [Nm, P, H_rel]
-        preds["gho"] = self.heads["gho"](shared_rel).squeeze(-1)             # [Nm, P]
-        preds["hie"] = self.heads["hie"](shared_rel)                         # [Nm, P, 3]
-        preds["dec"] = self.heads["dec"](shared_rel)                         # [Nm, P, 3]
-        preds["pid"] = self.heads["pid"](shared_rel)                         # [Nm, P, num_pid]
+        # Heads heads (occupancy + charge regression)
+        shared = self.fasercal_shared_voxel_head(out_flat)                   # [Nm, P, H]
+        preds["occ"] = self.heads["occ"](shared).squeeze(-1)                 # [Nm, P]
+        preds["reg"] = self.heads["reg"](shared)                             # [Nm, P, in_chans]
+        preds["gho"] = self.heads["gho"](shared).squeeze(-1)                 # [Nm, P]
+        preds["hie"] = self.heads["hie"](shared)                             # [Nm, P, 3]
+        preds["dec"] = self.heads["dec"](shared)                             # [Nm, P, 3]
+        preds["pid"] = self.heads["pid"](shared)                             # [Nm, P, num_pid]
 
         # targets (same for all predictions on masked patches)
         patch_ids = self.module_token_indices[m_ids, l_ids]                  # [Nm]
@@ -1049,7 +1043,7 @@ def mae_vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=4, num_heads=12, io_depth=3, io_decode_depth=2, num_module_cls=1,
-        num_modes=(32, 8), decoder_embed_dim=384, decoder_num_heads=12,
+        num_modes=(8, 8), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
@@ -1061,7 +1055,7 @@ def mae_vit_base(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=4, num_heads=12, io_depth=8, io_decode_depth=4, num_module_cls=2,
-        num_modes=(48, 8), decoder_embed_dim=528, decoder_num_heads=12,
+        num_modes=(16, 8), decoder_embed_dim=528, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
@@ -1073,7 +1067,7 @@ def mae_vit_large(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=8, num_heads=12, io_depth=16, io_decode_depth=6, num_module_cls=4,
-        num_modes=(64, 12), decoder_embed_dim=528, decoder_num_heads=16,
+        num_modes=(32, 12), decoder_embed_dim=528, decoder_num_heads=16,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model

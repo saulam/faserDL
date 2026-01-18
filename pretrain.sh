@@ -38,7 +38,8 @@ gpus=(0)
 reconstruction_loss_mode="hybrid"
 reconstruction_chamfer_weight=0.3
 reconstruction_distance_reg_weight=0.3
-reconstruction_max_distance=5.0
+reconstruction_max_distance_fcal=5.0
+reconstruction_max_distance_ahcal=3.0
 reconstruction_gamma_distance=2.0
 semantic_loss_mode="hybrid"
 semantic_distance_weight=0.3
@@ -83,7 +84,8 @@ python -m train.pretrain \
     --reconstruction_loss_mode $reconstruction_loss_mode \
     --reconstruction_chamfer_weight $reconstruction_chamfer_weight \
     --reconstruction_distance_reg_weight $reconstruction_distance_reg_weight \
-    --reconstruction_max_distance $reconstruction_max_distance \
+    --reconstruction_max_distance_fcal $reconstruction_max_distance_fcal \
+    --reconstruction_max_distance_ahcal $reconstruction_max_distance_ahcal \
     --reconstruction_gamma_distance $reconstruction_gamma_distance \
     --semantic_loss_mode $semantic_loss_mode \
     --semantic_distance_weight $semantic_distance_weight \

@@ -84,8 +84,10 @@ def ini_argparse(
                         help="Weight for soft chamfer loss component (occupancy reconstruction)")
     parser.add_argument("--reconstruction_distance_reg_weight", type=float, default=0.3, 
                         help="Weight for distance regression loss component (charge reconstruction)")
-    parser.add_argument("--reconstruction_max_distance", type=float, default=5.0, 
-                        help="Maximum distance (in voxels) for spatial forgiveness in reconstruction")
+    parser.add_argument("--reconstruction_max_distance_fcal", type=float, default=5.0, 
+                        help="Maximum distance (in voxels) for spatial forgiveness in FASERCal reconstruction")
+    parser.add_argument("--reconstruction_max_distance_ahcal", type=float, default=3.0, 
+                        help="Maximum distance (in voxels) for spatial forgiveness in AHCAL reconstruction")
     parser.add_argument("--reconstruction_gamma_distance", type=float, default=2.0, 
                         help="Distance decay exponent (controls smoothness) for reconstruction")
     
