@@ -159,7 +159,7 @@ class SparseViT(vit.VisionTransformer):
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per-module
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index
         self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
-        self.kv_src_embed = nn.Embedding(2, embed_dim)                                   # identity embedding for AHCAL / ecal+spec
+        self.kv_src_embed = nn.Embedding(3, embed_dim)                                   # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
 
         # Perceiver-IO bottleneck
         self.ecal_embed = nn.Linear(25, embed_dim)
@@ -469,35 +469,34 @@ class SparseViT(vit.VisionTransformer):
             # ignore AHCAL for events with too few non-empty patches
             ah_mask[degenerate] = False
 
-        # ecal + muon spec as a single token
-        ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
+        # ecal token
+        ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
+        ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                  # tag as ECAL
+
+        # muon spectrometer token
         muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)       # [B, 1, C]
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                # [B, N_muspec, C]
         has_tracks = (muspec_counts > 0)                                                  # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
-        safe_mask[~has_tracks.squeeze(-1), 0] = True  # avoid all-false rows
-        muon_spec_emb = self.muon_spec_xattn(
+        safe_mask[~has_tracks.squeeze(-1), 0] = True
+        muon_tok = self.muon_spec_xattn(
             muspec_count_emb,
             muon_spec_emb,
             attn_mask=safe_mask
-        )                                                                                 # [B, 1, C]
-        muon_spec_emb = muon_spec_emb * has_tracks.view(B, 1, 1).float()                  # [B, 1, C]
-        global_emb = ecal_emb + muon_spec_emb + \
-            self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
+        )
+        muon_tok = muon_tok * has_tracks.view(B, 1, 1).float()                            # [B, 1, C]
+        muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                  # tag as MUON_SPEC
 
         # pack kept tokens for cross-attention
         kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
             self._pack_by_mask(tok_mod, attn_mask_mod)                                    # [B, N_max, C], [B, N_max]
 
-        # append AHCAL tokens as additional real KVs (respect their mask)
-        kv_tokens = torch.cat([kv_tokens, ah_tokens], dim=1)                              # [B, Nmax + Na, C]
-        kv_keep   = torch.cat([kv_keep, ah_mask], dim=1)                                  # [B, Nmax + Na]
+        # append AHCal, ECAL, MUON_SPEC tokens as additional real KVs
+        kv_tokens = torch.cat([kv_tokens, ah_tokens, ecal_tok, muon_tok], dim=1)          # [B, Nmax + Na + 2, C]
+        kv_keep   = torch.cat([
+            kv_keep, ah_mask, torch.ones(B, 2, dtype=torch.bool, device=kv_keep.device)
+        ], dim=1)                                                                         # [B, Nmax + Na + 2]
 
-        # append global tokens as real KV
-        kv_tokens = torch.cat([kv_tokens, global_emb], dim=1)                             # [B, Nmax + Na + 1, C]
-        kv_keep   = torch.cat([kv_keep, torch.ones(
-            B, 1, dtype=torch.bool, device=kv_keep.device)], dim=1)                       # [B, Nmax + Na + 1]
-        
         # prepare queries and masks
         queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]
         lat = queries

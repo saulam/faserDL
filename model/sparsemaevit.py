@@ -148,7 +148,7 @@ class SparseMAEViT(nn.Module):
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per patch
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index for intra-attn
         self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
-        self.kv_src_embed = nn.Embedding(2, embed_dim)                                   # identity embedding for AHCAL / ecal+spec
+        self.kv_src_embed = nn.Embedding(3, embed_dim)                                   # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
 
         # Intra-module transformer blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.intra_depth)]
@@ -234,15 +234,20 @@ class SparseMAEViT(nn.Module):
             "occ_ahcal": 1,
             "reg_ahcal": in_chans,
         }
-        self.heads = nn.ModuleDict({
-            name: (
-                nn.Linear(
-                    num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0],
-                    self.head_channels[name]
+        # Define which heads require dropout (semantic heads tend to overfit)
+        dropout_heads = {"dec", "hie", "pid"}
+        
+        self.heads = nn.ModuleDict()
+        for name, out_channels in self.head_channels.items():
+            in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0]
+            linear_layer = nn.Linear(in_dim, out_channels)
+            if name in dropout_heads:
+                self.heads[name] = nn.Sequential(
+                    nn.Dropout(0.2),
+                    linear_layer
                 )
-            )
-            for name in self.head_channels.keys()
-        })
+            else:
+                self.heads[name] = linear_layer
 
         self.initialize_weights()
 
@@ -611,36 +616,36 @@ class SparseMAEViT(nn.Module):
         ah_rand_mask   = ah_rand_mask_mod.squeeze(1)                                      # [B, Na]     (bool, True = masked real position)
         ah_ids_keep    = ah_ids_keep_mod.squeeze(1)                                       # [B, Lk_ah]  indices in [0..Na-1]
 
-        # ecal + muon spec as a single token
-        ecal_emb = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
+        # ecal token
+        ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
+        ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                  # tag as ECAL
+
+        # muon spectrometer token
         muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)       # [B, 1, C]
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                # [B, N_muspec, C]
         has_tracks = (muspec_counts > 0)                                                  # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
-        safe_mask[~has_tracks.squeeze(-1), 0] = True  # avoid all-false rows
-        muon_spec_emb = self.muon_spec_xattn(
+        safe_mask[~has_tracks.squeeze(-1), 0] = True
+        muon_tok = self.muon_spec_xattn(
             muspec_count_emb,
             muon_spec_emb,
             attn_mask=safe_mask
-        )                                                                                 # [B, 1, C]
-        muon_spec_emb = muon_spec_emb * has_tracks.view(B, 1, 1).float()                  # [B, 1, C]
-        global_emb = ecal_emb + muon_spec_emb + \
-            self.kv_src_embed.weight[1].view(1, 1, -1)                                    # tag as muon ecal+spec
-        keep_global = (torch.rand(B, device=global_emb.device) > mask_ratio)              # [B]
-        global_rand_mask = ~keep_global
-        global_kv_mask = keep_global.view(B, 1)                                           # [B, 1]
+        )
+        muon_tok = muon_tok * has_tracks.view(B, 1, 1).float()                            # [B, 1, C]
+        muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                  # tag as MUON_SPEC
+
+        keep_ecal = (torch.rand(B, device=ecal_tok.device) > mask_ratio/2.0)              # [B]
+        keep_muon = (torch.rand(B, device=muon_tok.device) > mask_ratio/2.0)              # [B]
+        ecal_kv_mask = keep_ecal.view(B, 1)                                               # [B, 1]
+        muon_kv_mask = keep_muon.view(B, 1)                                               # [B, 1]
 
         # pack kept FASERCal tokens for cross-attention
         kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
             self._pack_by_mask(tok_mod, attn_mask_keep)                                   # [B, N_max,C], [B, N_max]
         
-        # append kept AHCal tokens as additional KVs
-        kv_tokens = torch.cat([kv_tokens, ah_tokens_keep], dim=1)                         # [B, Nmax + Na_k, C]
-        kv_keep   = torch.cat([kv_keep, ah_attn_keep], dim=1)                             # [B, Nmax + Na_k]
-
-        # append global token (ECal+spectrometer)
-        kv_tokens = torch.cat([kv_tokens, global_emb], dim=1)                             # [B, Nmax + Na_k + 1, C]
-        kv_keep   = torch.cat([kv_keep, global_kv_mask], dim=1)                           # [B, Nmax + Na_k + 1]
+        # append kept AHCal, ECAL, MUON_SPEC tokens as additional KVs
+        kv_tokens = torch.cat([kv_tokens, ah_tokens_keep, ecal_tok, muon_tok], dim=1)     # [B, Nmax + Na_k + 2, C]
+        kv_keep   = torch.cat([kv_keep, ah_attn_keep, ecal_kv_mask, muon_kv_mask], dim=1) # [B, Nmax + Na_k + 2]
 
         # prepare queries and masks
         queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]
@@ -668,8 +673,9 @@ class SparseMAEViT(nn.Module):
         end_ah   = N_max + ah_tokens_keep.size(1)
         tok_enriched_ahcal = kv_tokens[:, start_ah:end_ah, :]      # [B, Lk_ah, C]
 
-        # Global (ECal + spectrometer): last slot
-        global_enriched = kv_tokens[:, end_ah:, :]              # [B, 1, C]
+        # Last two tokens are [ECAL, MUON] in that order (because we appended in that order)
+        ecal_enriched = kv_tokens[:, end_ah:end_ah + 1, :]                            # [B, 1, C]
+        muon_enriched = kv_tokens[:, end_ah + 1:end_ah + 2, :]                        # [B, 1, C]
 
         return (
             tok_enriched_fasercal, # [B, M, Lk, C]
@@ -684,8 +690,8 @@ class SparseMAEViT(nn.Module):
             ah_rand_mask,          # [B, Na]      AHCAL masked real positions
             ah_ids_keep,           # [B, Lk_ah]   AHCAL kept indices in [0..Na-1]
 
-            global_enriched,       # [B, 1, C]
-            global_rand_mask,      # [B]          True if global token was masked
+            ecal_enriched,         # [B, 1, C]
+            muon_enriched,         # [B, 1, C]
         )
 
     def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
@@ -743,7 +749,7 @@ class SparseMAEViT(nn.Module):
         # Apply both voxel heads to masked positions
         preds = {}
         
-        # Heads heads (occupancy + charge regression)
+        # Heads
         shared = self.fasercal_shared_voxel_head(out_flat)                   # [Nm, P, H]
         preds["occ"] = self.heads["occ"](shared).squeeze(-1)                 # [Nm, P]
         preds["reg"] = self.heads["reg"](shared)                             # [Nm, P, in_chans]
@@ -840,8 +846,9 @@ class SparseMAEViT(nn.Module):
          ah_rand_mask,             # [B, Na]          True = masked real AHCAL patch
          ah_ids_keep,              # [B, Lk_ah]       AHCAL kept indices in [0..Na-1]
 
-         global_enriched,          # [B, 1, C]
-         global_rand_mask) = self.forward_encoder(x, x_glob, mask_ratio)
+         ecal_enriched,
+         muon_enriched,
+        ) = self.forward_encoder(x, x_glob, mask_ratio)
 
         # FASERcal: both reconstruction and semantic segmentation on masked patches
         preds_fas, idx_targets_fas, row_event_ids_fas, row_patch_ids_fas = \
@@ -1043,7 +1050,7 @@ def mae_vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
         depth=4, num_heads=12, io_depth=3, io_decode_depth=2, num_module_cls=1,
-        num_modes=(8, 8), decoder_embed_dim=384, decoder_num_heads=12,
+        num_modes=(8, 4), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model

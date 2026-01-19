@@ -14,23 +14,6 @@ from typing import Dict, Tuple, Optional, Sequence, Union
 
 
 class KinematicsMultiTaskLoss(nn.Module):
-    """
-    Predict (p_vis, p_jet). Derive p_lep = p_vis - p_jet.
-
-    forward() inputs:
-      p_vis_hat:  (B,3) predicted visible momentum
-      p_jet_hat:  (B,3) predicted jet momentum
-      p_vis_true: (B,3) true visible momentum
-      p_jet_true: (B,3) true jet momentum  (provided)
-      is_cc:      (B,)  ground-truth CC mask in {0,1}
-      is_cc_hat:  (B,)  predicted CC prob in [0,1] (already sigmoid’d)
-      vis_latents, jet_latents: optional latents for tiny priors
-
-    Design:
-      - Magnitudes supervised via relative residuals.
-      - XY-direction loss added (plus optional 3D direction).
-      - Lepton vector supervision is CC-only. Optional NC zero-attractor on raw lep.
-    """
 
     def __init__(
         self,
@@ -51,6 +34,7 @@ class KinematicsMultiTaskLoss(nn.Module):
         self.register_buffer("s_vis_xyz", torch.tensor(stats["vis"]["s_xyz"], dtype=torch.float32).view(1,3))
         self.register_buffer("s_jet_xyz", torch.tensor(stats["jet"]["s_xyz"], dtype=torch.float32).view(1,3))
         self.register_buffer("s_lep_xyz", torch.tensor(stats["lep"]["s_xyz"], dtype=torch.float32).view(1,3))
+        
         self.s_vis_pT = float(stats["vis"]["s_pT"])
         self.s_jet_pT = float(stats["jet"]["s_pT"])
         self.s_lep_pT = float(stats["lep"]["s_pT"])
@@ -166,11 +150,8 @@ class KinematicsMultiTaskLoss(nn.Module):
         )
         
         losses = {
-            # vis
             'loss_vis/geom': L_vis_comp,
-            # jet
             'loss_jet/geom': L_jet_comp,
-            # lep (CC-only)
             'loss_lep/geom': L_lep_comp,
         }
 
