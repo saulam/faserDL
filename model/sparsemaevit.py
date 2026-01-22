@@ -29,16 +29,15 @@ class SparseMAEViT(nn.Module):
         ahcal_patch_size=(6, 6, 5),
         num_module_cls=1,
         num_ahcal_cls=2,
-        depth=8,
+        depth=4,
         ahcal_depth=2,
-        io_depth=4,
-        io_decode_depth=4,
-        io_decode_depth_tok=1,
+        io_depth=3,
+        io_decode_depth=2,
         num_heads=12,
         num_modes=(8, 4),
         num_pid_classes=3,
-        decoder_embed_dim=192,
-        decoder_num_heads=12,
+        decoder_embed_dim=256,
+        decoder_num_heads=8,
         mlp_ratio=4.0,
         drop_rate=0.,
         attn_drop_rate=0.,
@@ -222,7 +221,7 @@ class SparseMAEViT(nn.Module):
 
         self.enc_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
         
-        # Stage A: masked queries attend to LATENTS
+        # masked queries attend to LATENTS
         self.decode_lat_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=decoder_embed_dim, num_heads=decoder_num_heads,
@@ -230,16 +229,6 @@ class SparseMAEViT(nn.Module):
                 attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
             )
             for _ in range(io_decode_depth)
-        ])
-
-        # Stage B: masked queries attend to KEPT TOKENS for sharper local details
-        self.decode_tok_xattn_blocks = nn.ModuleList([
-            CrossAttnBlock(
-                dim=decoder_embed_dim, num_heads=decoder_num_heads,
-                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec,
-                attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
-            )
-            for _ in range(int(io_decode_depth_tok))
         ])
 
         self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim)
