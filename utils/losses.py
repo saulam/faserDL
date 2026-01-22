@@ -13,6 +13,187 @@ from torch.nn import functional as F
 from typing import Dict, Tuple, Optional, Sequence, Union
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CylindricalConsistencyLoss(nn.Module):
+    """
+    Drop-in kinematics loss designed for CylindricalHeadNormalized outputs.
+
+    Expects:
+      pred_vis: dict with keys: "p_cart", "cos_phi", "sin_phi", "pz", "pT", optional "latents" (zT, zz)
+      pred_jet: same
+      true_vis: (B,3) tensor
+      true_jet: (B,3) tensor
+
+    Returns dict of per-event losses (B,) just like your current loss.
+    """
+    def __init__(
+        self,
+        *,
+        stats,
+        huber_delta=1.0,
+        # weights
+        lam_latent=1.0,      # zT/zz supervision
+        lam_phi=0.5,         # phi direction supervision
+        lam_cart=0.15,       # small cartesian tie-breaker
+        lam_lep=0.5,         # lepton consistency (auto-gated)
+        lam_lep_zero=0.05,   # zero-attractor when true lepton ~ 0
+        # behavior
+        clamp_truth_pz_to_zero=True,   # recommended if "neg pz is tiny"
+        phi_pt_floor_frac=1.0,         # scale of the pT gating for phi
+        eps=1e-8,
+    ):
+        super().__init__()
+        self.eps = float(eps)
+        self.huber_delta = float(huber_delta)
+
+        self.lam_latent = float(lam_latent)
+        self.lam_phi = float(lam_phi)
+        self.lam_cart = float(lam_cart)
+        self.lam_lep = float(lam_lep)
+        self.lam_lep_zero = float(lam_lep_zero)
+
+        self.clamp_truth_pz_to_zero = bool(clamp_truth_pz_to_zero)
+        self.phi_pt_floor_frac = float(phi_pt_floor_frac)
+
+        # --- loss scales (cartesian) ---
+        self.register_buffer("s_vis_xyz", torch.tensor(stats["vis"]["s_xyz"], dtype=torch.float32).view(1,3))
+        self.register_buffer("s_jet_xyz", torch.tensor(stats["jet"]["s_xyz"], dtype=torch.float32).view(1,3))
+        self.register_buffer("s_lep_xyz", torch.tensor(stats["lep"]["s_xyz"], dtype=torch.float32).view(1,3))
+
+        # --- floors for gating ---
+        self.tau_pt_vis  = float(stats["vis"]["tau_pt"])
+        self.tau_pt_jet  = float(stats["jet"]["tau_pt"])
+        self.tau_mag_lep = float(stats["lep"]["tau_mag"])
+
+        # --- cylindrical standardization params ---
+        # store as plain floats (fast, and your stats are constants)
+        self.vis_k_T   = float(stats["vis"]["k_T"])
+        self.vis_mu_uT = float(stats["vis"]["mu_uT"])
+        self.vis_sig_uT= float(stats["vis"]["sigma_uT"])
+        self.vis_k_Z   = float(stats["vis"]["k_Z"])
+        self.vis_mu_uZ = float(stats["vis"]["mu_uZ"])
+        self.vis_sig_uZ= float(stats["vis"]["sigma_uZ"])
+
+        self.jet_k_T   = float(stats["jet"]["k_T"])
+        self.jet_mu_uT = float(stats["jet"]["mu_uT"])
+        self.jet_sig_uT= float(stats["jet"]["sigma_uT"])
+        self.jet_k_Z   = float(stats["jet"]["k_Z"])
+        self.jet_mu_uZ = float(stats["jet"]["mu_uZ"])
+        self.jet_sig_uZ= float(stats["jet"]["sigma_uZ"])
+
+    @staticmethod
+    def _huber(x, delta):
+        ax = x.abs()
+        quad = torch.clamp(ax, max=delta)
+        lin = ax - quad
+        return 0.5 * quad**2 + delta * lin
+
+    def _cart_component(self, p_hat, p_true, s_xyz):
+        z = (p_hat - p_true) / s_xyz
+        return self._huber(z, self.huber_delta).sum(-1)
+
+    def _truth_phi(self, p_true):
+        # robust unit vector in xy; if pT ~ 0, return (0,0) but we will gate it out
+        px, py = p_true[..., 0], p_true[..., 1]
+        pT = torch.sqrt(px*px + py*py + self.eps)
+        cos_phi = px / pT
+        sin_phi = py / pT
+        return cos_phi, sin_phi, pT
+
+    def _phi_loss(self, cos_hat, sin_hat, p_true, tau_pt):
+        cos_true, sin_true, pT_true = self._truth_phi(p_true)
+        # cosine distance between unit vectors in xy
+        l = 1.0 - (cos_hat * cos_true + sin_hat * sin_true)
+        # gate when pT_true is tiny (phi ill-defined)
+        tau = tau_pt * self.phi_pt_floor_frac
+        w = (pT_true / (pT_true + tau)).clamp(0.0, 1.0)
+        return w * l
+
+    def _truth_latents(self, p_true, k_T, mu_uT, sig_uT, k_Z, mu_uZ, sig_uZ):
+        px, py, pz = p_true[...,0], p_true[...,1], p_true[...,2]
+        if self.clamp_truth_pz_to_zero:
+            pz = pz.clamp_min(0.0)
+
+        pT = torch.sqrt(px*px + py*py + self.eps)
+
+        # u = log1p(x/k), then z = (u-mu)/sigma
+        uT = torch.log1p(pT / k_T)
+        uZ = torch.log1p(torch.clamp(pz / k_Z, min=-0.999999))  # keep domain safe
+        zT = (uT - mu_uT) / sig_uT
+        zZ = (uZ - mu_uZ) / sig_uZ
+        return zT, zZ
+
+    def _latent_loss(self, pred_dict, p_true, *, k_T, mu_uT, sig_uT, k_Z, mu_uZ, sig_uZ):
+        # get predicted latents if available; otherwise derive from predicted pT/pz
+        if "latents" in pred_dict and pred_dict["latents"] is not None:
+            z_hat = pred_dict["latents"]
+            zT_hat, zZ_hat = z_hat[...,0], z_hat[...,1]
+        else:
+            # fallback: infer z from predicted magnitudes
+            pT_hat = pred_dict["pT"]
+            pz_hat = pred_dict["pz"]
+            uT_hat = torch.log1p(pT_hat.clamp_min(0.0) / k_T)
+            uZ_hat = torch.log1p(pz_hat.clamp_min(0.0) / k_Z)
+            zT_hat = (uT_hat - mu_uT) / sig_uT
+            zZ_hat = (uZ_hat - mu_uZ) / sig_uZ
+
+        zT_true, zZ_true = self._truth_latents(p_true, k_T, mu_uT, sig_uT, k_Z, mu_uZ, sig_uZ)
+
+        lT = self._huber(zT_hat - zT_true, self.huber_delta)
+        lZ = self._huber(zZ_hat - zZ_true, self.huber_delta)
+        return lT + lZ
+
+    def forward(self, *, pred_vis, pred_jet, true_vis, true_jet):
+        # --- vis terms ---
+        L_vis_lat = self._latent_loss(
+            pred_vis, true_vis,
+            k_T=self.vis_k_T, mu_uT=self.vis_mu_uT, sig_uT=self.vis_sig_uT,
+            k_Z=self.vis_k_Z, mu_uZ=self.vis_mu_uZ, sig_uZ=self.vis_sig_uZ,
+        )
+        L_vis_phi = self._phi_loss(pred_vis["cos_phi"], pred_vis["sin_phi"], true_vis, self.tau_pt_vis)
+        L_vis_cart= self._cart_component(pred_vis["p_cart"], true_vis, self.s_vis_xyz)
+
+        # --- jet terms ---
+        L_jet_lat = self._latent_loss(
+            pred_jet, true_jet,
+            k_T=self.jet_k_T, mu_uT=self.jet_mu_uT, sig_uT=self.jet_sig_uT,
+            k_Z=self.jet_k_Z, mu_uZ=self.jet_mu_uZ, sig_uZ=self.jet_sig_uZ,
+        )
+        L_jet_phi = self._phi_loss(pred_jet["cos_phi"], pred_jet["sin_phi"], true_jet, self.tau_pt_jet)
+        L_jet_cart= self._cart_component(pred_jet["p_cart"], true_jet, self.s_jet_xyz)
+
+        # --- lepton consistency (auto-gated by ||p_lep_true||) ---
+        p_lep_true = true_vis - true_jet
+        p_lep_hat  = pred_vis["p_cart"] - pred_jet["p_cart"]
+
+        mag_lep_true = p_lep_true.norm(dim=-1)
+        # auto-gate: ~0 for NC-like, ~1 for CC-like
+        w_lep = (mag_lep_true / (mag_lep_true + self.tau_mag_lep)).clamp(0.0, 1.0)
+
+        L_lep_cart = self._cart_component(p_lep_hat, p_lep_true, self.s_lep_xyz)
+        # zero-attractor when true lepton is tiny
+        L_lep_zero = self._cart_component(p_lep_hat, torch.zeros_like(p_lep_hat), self.s_lep_xyz)
+
+        # --- combine ---
+        losses = {
+            "loss_vis/latent": self.lam_latent * L_vis_lat,
+            "loss_vis/phi":    self.lam_phi    * L_vis_phi,
+            "loss_vis/cart":   self.lam_cart   * L_vis_cart,
+
+            "loss_jet/latent": self.lam_latent * L_jet_lat,
+            "loss_jet/phi":    self.lam_phi    * L_jet_phi,
+            "loss_jet/cart":   self.lam_cart   * L_jet_cart,
+
+            "loss_lep/cons":   self.lam_lep      * (w_lep * L_lep_cart),
+            "loss_lep/zero":   self.lam_lep_zero * ((1.0 - w_lep) * L_lep_zero),
+        }
+        return losses
+
+
 class KinematicsMultiTaskLoss(nn.Module):
 
     def __init__(
@@ -156,6 +337,7 @@ class KinematicsMultiTaskLoss(nn.Module):
         }
 
         return losses
+
 '''
 class KinematicsMultiTaskLoss(nn.Module):
     """

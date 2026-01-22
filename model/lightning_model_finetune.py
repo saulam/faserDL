@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 from typing import Any
 from torch_ema import ExponentialMovingAverage
 from utils import (
-    param_groups_lrd, KinematicsMultiTaskLoss,
+    param_groups_lrd, KinematicsMultiTaskLoss, CylindricalConsistencyLoss,
     arrange_input, arrange_truth,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj
 )
@@ -36,6 +36,7 @@ class ViTFineTuner(pl.LightningModule):
             lep_nc_zero_w=0.05, latent_prior_w=0.0,
             enforce_nonneg_truth_pz=True, decouple_radial=False,
         )
+        self.crit = CylindricalConsistencyLoss(stats=stats)
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.log_sigma_flavour   = nn.Parameter(torch.zeros(()))
@@ -160,6 +161,7 @@ class ViTFineTuner(pl.LightningModule):
         targ_jet_momentum    = target['jet_momentum']
         targ_primary_vertex  = target['primary_vertex']
 
+        '''
         outs = self.crit(
             p_vis_hat=out_vis["p_cart"],
             p_jet_hat=out_jet["p_cart"],
@@ -169,11 +171,19 @@ class ViTFineTuner(pl.LightningModule):
             vis_latents=out_vis.get("latents"),
             jet_latents=out_jet.get("latents"),
         )
+        '''
+        outs = self.crit(
+            pred_vis=out_vis,
+            pred_jet=out_jet,
+            true_vis=targ_vis_sp_momentum,
+            true_jet=targ_jet_momentum,
+        )
 
         # classification losses
         loss_flavour = self.loss_flavour(out_flavour, targ_flavour)
         loss_charm   = self.loss_charm(out_charm, targ_charm)
 
+        '''
         # regression per-sample tensors from the criterion
         loss_vis_geom    = outs["loss_vis/geom"]
         #loss_vis_pt      = outs["loss_vis/pt"]
@@ -184,6 +194,19 @@ class ViTFineTuner(pl.LightningModule):
         loss_lep_geom    = outs["loss_lep/geom"]
         #loss_lep_pt      = outs["loss_lep/pt"]
         #loss_lep_mag     = outs["loss_lep/mag"]
+        '''
+        loss_vis_latent = outs["loss_vis/latent"]
+        loss_vis_phi = outs["loss_vis/phi"]
+        loss_vis_cart = outs["loss_vis/cart"]
+        loss_jet_latent = outs["loss_jet/latent"]
+        loss_jet_phi = outs["loss_jet/phi"]
+        loss_jet_cart = outs["loss_jet/cart"]
+        loss_lep_cons = outs["loss_lep/cons"]
+        loss_lep_zero = outs["loss_lep/zero"]
+
+        loss_vis_geom = loss_vis_latent + loss_vis_phi + loss_vis_cart
+        loss_jet_geom = loss_jet_latent + loss_jet_phi + loss_jet_cart
+        loss_lep_geom = loss_lep_cons + loss_lep_zero
         
         # vertex reconstruction loss (MSE)
         loss_vertex = torch.nn.functional.mse_loss(out_vertex, targ_primary_vertex, reduction='none').mean(dim=1)
@@ -245,15 +268,27 @@ class ViTFineTuner(pl.LightningModule):
             'loss_cls/charm':   loss_charm.mean().detach().item(),
 
             # regression (unmasked/batch means)
-            'loss_vis/geom': loss_vis_geom.mean().detach().item(),
+            #'loss_vis/geom': loss_vis_geom.mean().detach().item(),
             #'loss_vis/pt':   loss_vis_pt.mean().detach().item(),
             #'loss_vis/mag':  loss_vis_mag.mean().detach().item(),
-            'loss_jet/geom': loss_jet_geom.mean().detach().item(),
+            #'loss_jet/geom': loss_jet_geom.mean().detach().item(),
             #'loss_jet/pt':   loss_jet_pt.mean().detach().item(),
             #'loss_jet/mag':  loss_jet_mag.mean().detach().item(),
-            'loss_lep/geom': loss_lep_geom.mean().detach().item(),
+            #'loss_lep/geom': loss_lep_geom.mean().detach().item(),
             #'loss_lep/pt':   loss_lep_pt.mean().detach().item(),
             #'loss_lep/mag':  loss_lep_mag.mean().detach().item(),
+            'loss_vis/geom': loss_vis_geom.mean().detach().item(),
+            'loss_jet/geom': loss_jet_geom.mean().detach().item(),
+            'loss_lep/geom': loss_lep_geom.mean().detach().item(),
+            'loss_vis/latent': loss_vis_latent.mean().detach().item(),
+            'loss_vis/phi': loss_vis_phi.mean().detach().item(),
+            'loss_vis/cart': loss_vis_cart.mean().detach().item(),
+            'loss_jet/latent': loss_jet_latent.mean().detach().item(),
+            'loss_jet/phi': loss_jet_phi.mean().detach().item(),
+            'loss_jet/cart': loss_jet_cart.mean().detach().item(),
+            'loss_lep/cons': loss_lep_cons.mean().detach().item(),
+            'loss_lep/zero': loss_lep_zero.mean().detach().item(),
+
             'loss_vertex':   loss_vertex.mean().detach().item(),
         }
         

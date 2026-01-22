@@ -29,16 +29,6 @@ from utils.distance_losses import (
 class MAEPreTrainer(pl.LightningModule):
     """
     MAE PreTrainer with distance-aware reconstruction losses.
-    
-    Key differences from standard MAEPreTrainer:
-    1. Uses soft chamfer loss for occupancy (considers spatial proximity)
-    2. Uses distance-weighted regression loss (nearby mispredictions penalized less)
-    3. Optional focal distance transform loss for smoother gradients
-    
-    Loss modes:
-    - 'hybrid': Combines standard voxel-level + distance-aware losses (recommended for transition)
-    - 'distance_only': Uses only distance-aware losses
-    - 'focal_dt': Uses focal distance transform for occupancy
     """
     
     def __init__(self, model, dataset, args):

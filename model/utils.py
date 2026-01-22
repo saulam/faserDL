@@ -257,6 +257,30 @@ class CrossAttnBlock(nn.Module):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm_q(q), self.norm_kv(kv), attn_mask=attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
+    
+
+def _split_even_3(embed_dim):
+    """
+    Split embed_dim into 3 even integers that sum to embed_dim.
+    If embed_dim is odd, we'll use embed_dim-1 and pad 1 dim later.
+    """
+    pad = embed_dim % 2
+    E = embed_dim - pad  # make even
+
+    base = (E // 3)
+    base -= base % 2     # make base even
+
+    dims = [base, base, base]
+    remaining = E - sum(dims)  # remaining is even
+
+    # distribute remaining in steps of 2, round-robin
+    i = 0
+    while remaining > 0:
+        dims[i] += 2
+        remaining -= 2
+        i = (i + 1) % 3
+
+    return dims, pad  # pad is 0 or 1
 
 
 def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
@@ -275,8 +299,8 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     d = np.arange(D, dtype=np.float32)
     grid_h, grid_w, grid_d = np.meshgrid(h, w, d, indexing='ij')
     grid = np.stack([grid_h, grid_w, grid_d], axis=0)
-    grid = grid.reshape(3, 1, H, W, D).reshape(3, -1)
-
+    grid = grid.reshape(3, -1)
+    
     pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token:
         # prepend a zero-vector for class tokens
@@ -290,16 +314,19 @@ def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
     grid: np.ndarray of shape (3, N)
     returns: (N, embed_dim)
     """
-    assert embed_dim % 3 == 0, "embed_dim must be divisible by 3"
-    dim_each = embed_dim // 3
-    # each dim_each must be even so that it can be split sin/cos
-    assert dim_each % 2 == 0, "embed_dim/3 must be even"
+    dims, pad = _split_even_3(embed_dim)
+    dh, dw, dd = dims
 
-    emb_h = get_1d_sincos_pos_embed_from_grid(dim_each, grid[0])  # (N, dim_each)
-    emb_w = get_1d_sincos_pos_embed_from_grid(dim_each, grid[1])  # (N, dim_each)
-    emb_d = get_1d_sincos_pos_embed_from_grid(dim_each, grid[2])  # (N, dim_each)
-    
-    return np.concatenate([emb_h, emb_w, emb_d], axis=1)  # (N, 3*dim_each = embed_dim)
+    emb_h = get_1d_sincos_pos_embed_from_grid(dh, grid[0])  # (N, dh)
+    emb_w = get_1d_sincos_pos_embed_from_grid(dw, grid[1])  # (N, dw)
+    emb_d = get_1d_sincos_pos_embed_from_grid(dd, grid[2])  # (N, dd)
+
+    out = np.concatenate([emb_h, emb_w, emb_d], axis=1)     # (N, dh+dw+dd)
+
+    if pad:  # embed_dim was odd; add a zero channel
+        out = np.concatenate([out, np.zeros((out.shape[0], 1), dtype=out.dtype)], axis=1)
+
+    return out  # (N, embed_dim)
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -541,8 +568,8 @@ class SharedLatentVoxelHead(nn.Module):
 
 class CylindricalHeadNormalized(nn.Module):
     """
-    pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)   (>=0)
-    pz:  uZ = mu_uZ + sigma_uZ*zz,  pz = k_Z * expm1(uZ)   (>=0)
+    pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)
+    pz:  uZ = mu_uZ + sigma_uZ*zz,  pz = k_Z * expm1(uZ)
     phi: via normalised (cos_phi, sin_phi)
     """
     def __init__(self, k_T, mu_uT, sigma_uT, k_Z, mu_uZ, sigma_uZ, hidden=128):
@@ -562,12 +589,10 @@ class CylindricalHeadNormalized(nn.Module):
         # pT via log1p/expm1
         uT = self.mu_uT + self.sigma_uT * zT
         pT = self.k_T * torch.expm1(uT)
-        #pT = torch.clamp(pT, min=0.0)
 
         # pz via log1p/expm1
         uZ = self.mu_uZ + self.sigma_uZ * zz
         pz = self.k_Z * torch.expm1(uZ)
-        #pz = torch.clamp(pz, min=0.0)
 
         px, py = pT * cos_phi, pT * sin_phi
         p_cart = torch.stack([px, py, pz], dim=-1)

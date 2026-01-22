@@ -53,6 +53,7 @@ checkpoint*/
 dataset/faser/
 dataset/output*.txt
 *.txt
+*.tex
 
 # VS Code
 .vscode/

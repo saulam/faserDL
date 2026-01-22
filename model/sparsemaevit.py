@@ -21,22 +21,24 @@ class SparseMAEViT(nn.Module):
     def __init__(
         self,
         in_chans=1,
-        D=3,
         fcal_size=(48, 48, 200),
         module_depth_voxels=20,
         embed_dim=384,
-        fcal_patch_size=(16, 16, 4),
+        fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40),
-        ahcal_patch_size=(9, 9, 10),
+        ahcal_patch_size=(6, 6, 5),
         num_module_cls=1,
+        num_ahcal_cls=2,
         depth=8,
+        ahcal_depth=2,
         io_depth=4,
         io_decode_depth=4,
-        num_heads=16,
+        io_decode_depth_tok=1,
+        num_heads=12,
         num_modes=(8, 4),
         num_pid_classes=3,
         decoder_embed_dim=192,
-        decoder_num_heads=16,
+        decoder_num_heads=12,
         mlp_ratio=4.0,
         drop_rate=0.,
         attn_drop_rate=0.,
@@ -62,7 +64,7 @@ class SparseMAEViT(nn.Module):
         self.register_buffer('fcal_patch_size', torch.tensor(fcal_patch_size, dtype=torch.long))
         self.register_buffer('ahcal_patch_size', torch.tensor(ahcal_patch_size, dtype=torch.long))
 
-        # module slicing along Z
+        # FASERCAL module slicing along Z
         assert module_depth_voxels % p_d == 0, "module_depth_voxels must be divisible by patch depth"
         self.module_depth_voxels = module_depth_voxels
         self.module_depth_patches = module_depth_voxels // p_d
@@ -141,16 +143,20 @@ class SparseMAEViT(nn.Module):
             module_indices.append(flat_m[order])
         self.register_buffer('module_token_indices', torch.stack(module_indices, 0))  # [M, Lm]
 
+        # =========================
         # Encoder: hierarchical ViT
+        # =========================
         self.intra_depth = depth
         self.num_module_cls = num_module_cls
+
         self.module_cls_token = nn.Parameter(torch.zeros(1, num_module_cls, embed_dim))  # per-module CLS (shared weights)
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per patch
         self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index for intra-attn
+
         self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
         self.kv_src_embed = nn.Embedding(3, embed_dim)                                   # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
 
-        # Intra-module transformer blocks
+        # FASERCAL intra-module transformer blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.intra_depth)]
         self.blocks = nn.ModuleList([
             BlockWithMask(
@@ -162,7 +168,24 @@ class SparseMAEViT(nn.Module):
         ])
         self.norm = norm_layer(embed_dim)
 
-        # Perceiver-IO bottleneck (encoder side)
+        # AHCAL short self-attention + K CLS
+        self.num_ahcal_cls = int(num_ahcal_cls)
+        self.ahcal_depth = int(ahcal_depth)
+        self.ahcal_cls_token = nn.Parameter(torch.zeros(1, self.num_ahcal_cls, embed_dim))
+        dpr_ahcal = [x.item() for x in torch.linspace(0, drop_path_rate, self.ahcal_depth)]
+        self.ahcal_blocks = nn.ModuleList([
+            BlockWithMask(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
+                drop_path=dpr_ahcal[i], norm_layer=norm_layer
+            )
+            for i in range(self.ahcal_depth)
+        ])
+        self.ahcal_norm = norm_layer(embed_dim)
+
+        # ==========================
+        # Perceiver-IO bottleneck (encoder side): lat <- tok + latent self
+        # ==========================
         self.ecal_embed = nn.Linear(25, embed_dim)
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
@@ -171,17 +194,14 @@ class SparseMAEViT(nn.Module):
                     qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
                     drop_path=0., norm_layer=norm_layer
                 )
-        self.xattn_blocks = nn.ModuleDict({
-            name: nn.ModuleList([
-                CrossAttnBlock(
-                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                    qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                    drop_path=0., norm_layer=norm_layer
-                )
-                for _ in range(io_depth)
-            ])
-            for name in ["lat<-tok", "tok<-lat"]
-        })
+        self.lat_xattn_blocks = nn.ModuleList([
+            CrossAttnBlock(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+                drop_path=0., norm_layer=norm_layer
+            )
+            for _ in range(io_depth)
+        ])
         self.latent_self_blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -192,21 +212,37 @@ class SparseMAEViT(nn.Module):
         ])
         self.tokens_norm = norm_layer(embed_dim)
 
-        # Perceiver-IO decoder for reconstruction
+        # ==========================
+        # Perceiver-IO decoder (reconstruction)
+        # ==========================
         assert decoder_embed_dim % decoder_num_heads == 0, "decoder_embed_dim must be divisible by decoder_num_heads"
-        self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim) # frozen sin-cos
+        self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim)  # frozen sin-cos
         self.module_embed_dec = nn.Embedding(self.num_modules, decoder_embed_dim)
         self.query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+
         self.enc_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
-        self.decode_xattn_blocks = nn.ModuleList([
+        
+        # Stage A: masked queries attend to LATENTS
+        self.decode_lat_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
-                dim=decoder_embed_dim, num_heads=decoder_num_heads, 
-                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec, 
+                dim=decoder_embed_dim, num_heads=decoder_num_heads,
+                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec,
                 attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
             )
             for _ in range(io_decode_depth)
         ])
-        self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim) # not sure needed
+
+        # Stage B: masked queries attend to KEPT TOKENS for sharper local details
+        self.decode_tok_xattn_blocks = nn.ModuleList([
+            CrossAttnBlock(
+                dim=decoder_embed_dim, num_heads=decoder_num_heads,
+                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec,
+                attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
+            )
+            for _ in range(int(io_decode_depth_tok))
+        ])
+
+        self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim)
         self.ahcal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
 
         # Heads
@@ -234,20 +270,11 @@ class SparseMAEViT(nn.Module):
             "occ_ahcal": 1,
             "reg_ahcal": in_chans,
         }
-        # Define which heads require dropout (semantic heads tend to overfit)
-        dropout_heads = {"dec", "hie", "pid"}
         
         self.heads = nn.ModuleDict()
         for name, out_channels in self.head_channels.items():
             in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0]
-            linear_layer = nn.Linear(in_dim, out_channels)
-            if name in dropout_heads:
-                self.heads[name] = nn.Sequential(
-                    nn.Dropout(0.2),
-                    linear_layer
-                )
-            else:
-                self.heads[name] = linear_layer
+            self.heads[name] = nn.Linear(in_dim, out_channels)
 
         self.initialize_weights()
 
@@ -293,6 +320,7 @@ class SparseMAEViT(nn.Module):
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.module_cls_token, std=.02)
+            nn.init.normal_(self.ahcal_cls_token, std=.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
             nn.init.normal_(self.kv_src_embed.weight, std=0.02)
             nn.init.normal_(self.module_embed_dec.weight, std=0.02)
@@ -321,6 +349,7 @@ class SparseMAEViT(nn.Module):
     def no_weight_decay(self):
         return {
             'module_cls_token',
+            'ahcal_cls_token',
             'module_embed_enc.weight',
             'kv_src_embed.weight',
             'module_embed_dec.weight',
@@ -328,42 +357,48 @@ class SparseMAEViT(nn.Module):
         }
     
 
-    def densify_patches(self, x_sp):
-        # MAIN stream (grid == self.grid_size)
-        B = x_sp.batch_size
-        C = x_sp.features.size(1)
-        X, Y, Z = x_sp.spatial_shape  # == (H, W, D)
-        Np = X * Y * Z
+    def densify_patches(self, x_sp, is_fasercal: bool = True):
+        """
+        Convert a SparseConvTensor to dense tokens + occupancy mask + positional indices.
 
-        # Dense is [B, C, X, Y, Z] → flatten H->W->D by permuting to [B, X, Y, Z, C]
-        x_dense = x_sp.dense()  # [B, C, X, Y, Z]
-        dense_tokens = x_dense.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
+        Args:
+            x_sp: SparseConvTensor after patch embedding.
+            is_fasercal: 
+                True  -> uses self.intra_idx_template (module-aware intra indexing)
+                False -> uses a simple [0..Np-1] indexing (generic/AHCAL-style)
 
-        # Mask from indices
-        idx = x_sp.indices.long()
-        b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
-        occ = torch.zeros((B, X, Y, Z), dtype=torch.bool, device=x_sp.features.device)
-        occ[b, h, w, d] = True
-        attn_mask = occ.view(B, -1)  # H->W->D order matches the permute above
-
-        intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
-        return dense_tokens, attn_mask, intra_idx
-    
-
-    def densify_patches_generic(self, x_sp):
-        # For AHCAL (or any non-main grid)
+        Returns:
+            dense_tokens: [B, Np, C]
+            attn_mask:    [B, Np]    (True where a patch token is real/non-empty)
+            intra_idx:    [B, Np]    indices for positional embedding lookup
+        """
         B = x_sp.batch_size
         C = x_sp.features.size(1)
         X, Y, Z = x_sp.spatial_shape
         Np = X * Y * Z
-        x_dense = x_sp.dense()
+
+        # Dense: [B, C, X, Y, Z] -> tokens [B, Np, C] with flatten order matching occ.view(B, -1)
+        x_dense = x_sp.dense()  # [B, C, X, Y, Z]
         dense_tokens = x_dense.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
-        idx = x_sp.indices.long()
+
+        # Occupancy mask from sparse indices
+        idx = x_sp.indices.long()  # [N, 4] = [b, x, y, z]
         b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
         occ = torch.zeros((B, X, Y, Z), dtype=torch.bool, device=x_sp.features.device)
         occ[b, h, w, d] = True
-        attn_mask = occ.view(B, -1)
-        intra_idx = torch.arange(Np, device=x_sp.features.device).view(1, -1).expand(B, -1)
+        attn_mask = occ.view(B, -1)  # [B, Np]
+
+        # Positional indices
+        if is_fasercal:
+            # Must match the*main grid's intra indexing
+            assert Np == self.intra_idx_template.numel(), (
+                f"FASERCal densify expected Np={self.intra_idx_template.numel()} but got {Np}. "
+                "Call with is_fasercal=False for non-main grids."
+            )
+            intra_idx = self.intra_idx_template.unsqueeze(0).expand(B, -1)
+        else:
+            intra_idx = torch.arange(Np, device=x_sp.features.device, dtype=torch.long).view(1, -1).expand(B, -1)
+
         return dense_tokens, attn_mask, intra_idx
 
 
@@ -537,25 +572,26 @@ class SparseMAEViT(nn.Module):
         out[b_ids, m_ids, l_ids, :] = packed[b_ids, within, :]
         return out    
 
-    
-    def _prepare_queries(
+
+    def _prepare_latent_queries(
         self,
-        cls_mod: torch.Tensor,  # [B, M, CLS, C]  per-module CLS
+        cls_mod: torch.Tensor,   # [B, M, CLS, C]
+        ah_cls: torch.Tensor,    # [B, K, C]
     ):
-        """
-        Returns: queries        [B, M*CLS, C]
-        """
         B, M, CLS, C = cls_mod.shape
-        device  = cls_mod.device
+        device = cls_mod.device
 
-        # Anchored CLS queries
-        mod_ids   = torch.arange(M, device=device)
-        queries  = cls_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)  # [B, M, CLS, C]
-        queries = queries.view(B, M * CLS, C)                                 # [B, M*CLS, C]
+        # FASERCal CLS queries anchored by module id
+        mod_ids = torch.arange(M, device=device)
+        q_fas = cls_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)   # [B, M, CLS,C]
+        q_fas = q_fas.view(B, M * CLS, C)                                   # [B, M*CLS, C]
 
-        return queries
+        # AHCAL CLS queries tagged as AHCAL (type embedding)
+        q_ah = ah_cls + self.kv_src_embed.weight[0].view(1, 1, C)           # [B, K, C]
 
-    
+        return torch.cat([q_fas, q_ah], dim=1)                              # [B, M*CLS+K, C]
+
+
     def forward_encoder(self, x_sparse, x_glob, mask_ratio):
         """
         x_sparse:                   sparse input
@@ -565,21 +601,17 @@ class SparseMAEViT(nn.Module):
         # retrieve global features
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
 
-        # patchify
+        # FASERCAL patchify + mask + intra-attn
         x_sparse = self.fcal_patch_embed(x_sparse)
-        x, attn_mask, intra_idx = self.densify_patches(x_sparse)
-
-        # add positional embeddings
+        x, attn_mask, intra_idx = self.densify_patches(x_sparse, is_fasercal=True)
         x = x + self.intra_pos_embed(intra_idx)
 
-        # group to modules and mask
         x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
         x_keep, attn_mask_keep, rand_mask, ids_keep, _ = self._module_random_masking(
             x_mod, attn_mask_mod, mask_ratio
         )
         B, M, Lk, C = x_keep.shape
 
-        # Intra-module transformer with per-module CLS
         cls = self.module_cls_token.expand(B*M, self.num_module_cls, C)
         x_intra = x_keep.reshape(B*M, Lk, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
@@ -590,109 +622,98 @@ class SparseMAEViT(nn.Module):
             x_intra = blk(x_intra, attn_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
-        # extract intra-module CLS and patch features
-        cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)  # [B, M, CLS, C]
-        tok_mod = x_intra[:, self.num_module_cls:, :].reshape(B, M, Lk, C)                # [B, M, Lk, C]
+        cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)    # [B, M, CLS, C]
+        tok_mod = x_intra[:, self.num_module_cls:, :].reshape(B, M, Lk, C)                  # [B, M, Lk, C]
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
-        tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, -1)
+        tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)
 
-        # ahcal embedding
+        # AHCAL patchify + mask + self-attn
         ahcal_sparse = self.ahcal_patch_embed(ahcal_sparse)
-        ah_tokens, ah_mask, ah_idx = self.densify_patches_generic(ahcal_sparse)           # [B, Na, C], [B, Na], [B, Na]
+        ah_tokens, ah_mask, ah_idx = self.densify_patches(ahcal_sparse, is_fasercal=False)  # [B, Na, C], [B, Na], [B, Na]
         ah_tokens = ah_tokens + self.ahcal_pos_embed(ah_idx) \
-                               + self.kv_src_embed.weight[0].view(1, 1, -1)               # tag as AHCAL
-        ah_counts = ah_mask.sum(dim=1)                                                    # [B]
-        degenerate = ah_counts < 2                                                        # [B]
+            + self.kv_src_embed.weight[0].view(1, 1, -1)                                    # tag as AHCAL
+        ah_counts = ah_mask.sum(dim=1)
+        degenerate = (ah_counts < 2)
         if degenerate.any():
-            # ignore AHCAL for events with too few non-empty patches
+            ah_mask = ah_mask.clone()
             ah_mask[degenerate] = False
-        ah_tokens_mod = ah_tokens.unsqueeze(1)                                            # [B, 1, Na, C]
-        ah_mask_mod   = ah_mask.unsqueeze(1)                                              # [B, 1, Na]
-        ah_keep_mod, ah_attn_keep_mod, ah_rand_mask_mod, ah_ids_keep_mod, _ = \
-            self._module_random_masking(ah_tokens_mod, ah_mask_mod, mask_ratio,
-        )
-        ah_tokens_keep = ah_keep_mod.squeeze(1)                                           # [B, Lk_ah, C]
-        ah_attn_keep   = ah_attn_keep_mod.squeeze(1)                                      # [B, Lk_ah]  (bool)
-        ah_rand_mask   = ah_rand_mask_mod.squeeze(1)                                      # [B, Na]     (bool, True = masked real position)
-        ah_ids_keep    = ah_ids_keep_mod.squeeze(1)                                       # [B, Lk_ah]  indices in [0..Na-1]
 
-        # ecal token
-        ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                    # [B, 1, C]
-        ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                  # tag as ECAL
+        ah_tokens_mod = ah_tokens.unsqueeze(1)                                              # [B, 1, Na, C]
+        ah_mask_mod   = ah_mask.unsqueeze(1)                                                # [B, 1, Na]
+        ah_keep_mod, ah_attn_keep_mod, ah_rand_mask_mod, ah_ids_keep_mod, _ = \
+            self._module_random_masking(ah_tokens_mod, ah_mask_mod, mask_ratio
+        )
+        tok_ah_keep = ah_keep_mod.squeeze(1)                                                # [B, Lk_ah, C]
+        ah_attn_keep = ah_attn_keep_mod.squeeze(1)                                          # [B, Lk_ah]
+        ah_rand_mask = ah_rand_mask_mod.squeeze(1)                                          # [B, Na]
+
+        # self-attn on AHCAL kept tokens with K CLS
+        K = self.num_ahcal_cls
+        cls_ah = self.ahcal_cls_token.expand(B, K, C)                                       # [B, K, C]
+        x_ah = torch.cat([cls_ah, tok_ah_keep], dim=1)                                      # [B, K+Lk_ah, C]
+        ah_attn_intra = torch.cat(
+            [torch.ones(B, K, dtype=torch.bool, device=x_ah.device),
+                ah_attn_keep], dim=1
+        )
+        for blk in self.ahcal_blocks:
+            x_ah = blk(x_ah, attn_mask=ah_attn_intra)
+        x_ah = self.ahcal_norm(x_ah)
+
+        ah_cls = x_ah[:, :K, :]                                                             # [B, K, C]
+        tok_ah_keep = x_ah[:, K:, :]                                                        # [B, Lk_ah, C]
+
+        # if degenerate: zero out AHCAL CLS so it doesn't inject noise into latents
+        if degenerate.any():
+            ah_cls = ah_cls.clone()
+            ah_cls[degenerate] = 0.0
+
+        # ECAL token
+        ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                      # [B, 1, C]
+        ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                    # tag as ECAL
 
         # muon spectrometer token
-        muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)       # [B, 1, C]
-        muon_spec_emb = self.muon_spec_embed(muspec_feats)                                # [B, N_muspec, C]
-        has_tracks = (muspec_counts > 0)                                                  # [B, 1] bool
+        muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)         # [B, 1, C]
+        muon_spec_emb = self.muon_spec_embed(muspec_feats)                                  # [B, N_muspec, C]
+        has_tracks = (muspec_counts > 0)                                                    # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
+        
         muon_tok = self.muon_spec_xattn(
             muspec_count_emb,
             muon_spec_emb,
             attn_mask=safe_mask
         )
-        muon_tok = muon_tok * has_tracks.view(B, 1, 1).float()                            # [B, 1, C]
-        muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                  # tag as MUON_SPEC
+        muon_tok = muon_tok * has_tracks.view(B, 1, 1).float()                              # [B, 1, C]
+        muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                    # tag as MUON_SPEC
 
-        keep_ecal = (torch.rand(B, device=ecal_tok.device) > mask_ratio/2.0)              # [B]
-        keep_muon = (torch.rand(B, device=muon_tok.device) > mask_ratio/2.0)              # [B]
-        ecal_kv_mask = keep_ecal.view(B, 1)                                               # [B, 1]
-        muon_kv_mask = keep_muon.view(B, 1)                                               # [B, 1]
+        # randomly drop global tokens (consistent with masking policy)
+        keep_ecal = (torch.rand(B, device=ecal_tok.device) > mask_ratio)                    # [B]
+        keep_muon = (torch.rand(B, device=muon_tok.device) > mask_ratio)                    # [B]
+        ecal_kv_mask = keep_ecal.view(B, 1)                                                 # [B, 1]
+        muon_kv_mask = keep_muon.view(B, 1)                                                 # [B, 1]
 
-        # pack kept FASERCal tokens for cross-attention
-        kv_tokens, kv_keep, b_ids, m_ids, lk_ids, within, N_max = \
-            self._pack_by_mask(tok_mod, attn_mask_keep)                                   # [B, N_max,C], [B, N_max]
-        
-        # append kept AHCal, ECAL, MUON_SPEC tokens as additional KVs
-        kv_tokens = torch.cat([kv_tokens, ah_tokens_keep, ecal_tok, muon_tok], dim=1)     # [B, Nmax + Na_k + 2, C]
-        kv_keep   = torch.cat([kv_keep, ah_attn_keep, ecal_kv_mask, muon_kv_mask], dim=1) # [B, Nmax + Na_k + 2]
+        # build KV for lat <- tok
+        kv_fas, kv_fas_keep, *_ = self._pack_by_mask(tok_mod, attn_mask_keep)               # [B, Nmax, C], [B, Nmax]
+        kv_tokens = torch.cat([kv_fas, tok_ah_keep, ecal_tok, muon_tok], dim=1)
+        kv_keep   = torch.cat([kv_fas_keep, ah_attn_keep, ecal_kv_mask, muon_kv_mask], dim=1)
+        kv_tokens = self.tokens_norm(kv_tokens)
 
-        # prepare queries and masks
-        queries = self._prepare_queries(cls_mod)                                          # [B, M*CLS, C]
-        lat = queries
-        for xa_lat, sa, xa_tok in zip(
-            self.xattn_blocks["lat<-tok"],
-            self.latent_self_blocks,
-            self.xattn_blocks["tok<-lat"]
-        ):
-            lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep)                               # cross: lat <- tokens
-            lat = sa(lat, attn_mask=None)                                                 # self-attn over latents
-            kv_tokens = xa_tok(kv_tokens, lat, attn_mask=None)                            # cross: tokens <- latents
+        # latents: FASER CLS + AHCAL CLS
+        lat = self._prepare_latent_queries(cls_mod, ah_cls)                                 # [B, N_lat, C]
 
-        kv_tokens = self.tokens_norm(kv_tokens)                                           # [B, N_max + G, C]
-
-        # FASERcal: unpack back into [B, M, Lk, C]
-        tok_enriched_fasercal = self._unpack_to_modules(
-            kv_tokens[:, :N_max, :],  # FASERCal region
-            b_ids, m_ids, lk_ids, within,
-            out_shape=torch.Size([B, M, Lk, C])
-        )
-
-        # AHCAL: the slice after FASERcal, before global
-        start_ah = N_max
-        end_ah   = N_max + ah_tokens_keep.size(1)
-        tok_enriched_ahcal = kv_tokens[:, start_ah:end_ah, :]      # [B, Lk_ah, C]
-
-        # Last two tokens are [ECAL, MUON] in that order (because we appended in that order)
-        ecal_enriched = kv_tokens[:, end_ah:end_ah + 1, :]                            # [B, 1, C]
-        muon_enriched = kv_tokens[:, end_ah + 1:end_ah + 2, :]                        # [B, 1, C]
+        # Perceiver-IO encoder loop
+        for xa_lat, sa in zip(self.lat_xattn_blocks, self.latent_self_blocks):
+            lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep)                                 # lat <- tokens
+            lat = sa(lat, attn_mask=None)                                                   # latent self-attn
 
         return (
-            tok_enriched_fasercal, # [B, M, Lk, C]
-            rand_mask,             # [B, M, Lm]   FASERcal masked real positions
-            attn_mask_mod,         # [B, M, Lm]   FASERcal real positions
-            attn_mask_keep,        # [B, M, Lk]   FASERcal kept positions
-            ids_keep,              # [B, M, Lk]   FASERcal kept intra indices
-
-            tok_enriched_ahcal,    # [B, Lk_ah, C]
-            ah_mask,               # [B, Na]      AHCAL real positions
-            ah_attn_keep,          # [B, Lk_ah]   AHCAL kept positions
-            ah_rand_mask,          # [B, Na]      AHCAL masked real positions
-            ah_ids_keep,           # [B, Lk_ah]   AHCAL kept indices in [0..Na-1]
-
-            ecal_enriched,         # [B, 1, C]
-            muon_enriched,         # [B, 1, C]
+            lat,                   # [B, N_lat, C]
+            rand_mask,             # [B, M, Lm]     FASERcal masked real positions
+            attn_mask_mod,         # [B, M, Lm]     FASERcal real positions
+            ah_mask,               # [B, Na]        AHCAL real positions
+            ah_rand_mask,          # [B, Na]        AHCAL masked real positions
         )
+
 
     def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
         # b_ids must be nondecreasing (true for torch.nonzero over [B, ...]).
@@ -703,83 +724,76 @@ class SparseMAEViT(nn.Module):
         return torch.arange(N, device=b_ids.device) - torch.repeat_interleave(starts, counts)
 
 
-    def forward_reconstruction(self, tok_enriched, attn_mask_mod, attn_mask_keep, rand_mask, idx_map):
+    def forward_reconstruction_fcal(
+        self,
+        lat: torch.Tensor,            # [B, N_lat, Cenc]
+        attn_mask_mod: torch.Tensor,  # [B, M, Lm]
+        rand_mask: torch.Tensor,      # [B, M, Lm]
+        idx_map,
+    ):
         """
-        Apply both reconstruction and semantic segmentation to masked patches.
-        
-        tok_enriched:   [B, M, Lk, Cenc]  enriched kept tokens
-        rand_mask:      [B, M, Lm]        True = masked real position (over full intra space)
-        attn_mask_mod:  [B, M, Lm]        True = real
-        attn_mask_keep: [B, M, Lk]        True = kept
-        idx_map:        LazyIdxMap
+        FASERCal reconstruction from bottleneck latents only.
         """
-        B, M, Lk, Cenc = tok_enriched.shape
+        B = lat.size(0)
         Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
 
-        # which positions to predict: masked real
-        prediction_mask = rand_mask & attn_mask_mod                          # [B, M, Lm]
+        # which FASERCAL patches to predict: masked real
+        prediction_mask = rand_mask & attn_mask_mod                            # [B, M, Lm]
         counts = prediction_mask.view(B, -1).sum(-1)
         max_n  = int(counts.max().item())
 
         # indices for masked positions
-        b_ids, m_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)  # [Nm]
+        b_ids, m_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)    # [Nm]
         Nm = b_ids.numel()
 
         # build queries in decoder dim for these masked positions
         within = self._compute_within_ranks(b_ids, Nm)
-        Q = tok_enriched.new_zeros(B, max_n, Cdec)
-        q = ( self.decoder_intra_pos_embed(l_ids) +
-            self.module_embed_dec(m_ids) +
-            self.query_tokens )                                              # [Nm, Cdec]
+        Q = self.query_tokens.new_zeros(B, max_n, Cdec)
+
+        q = ( self.decoder_intra_pos_embed(l_ids)
+            + self.module_embed_dec(m_ids)
+            + self.query_tokens )                                              # [Nm, Cdec]
         Q[b_ids, within] = q
 
-        # KV: enriched tokens, packed (only real kept)
-        kv_tokens, kv_keep, *_ = self._pack_by_mask(
-            tok_enriched, attn_mask_keep
-        )
-        KV = self.enc_to_dec(kv_tokens)                                      # [B, Nk_max, Cdec]
-
-        # Perceiver-IO decode: queries (masked positions) attend to enriched tokens
+        # query -> latents
+        LAT = self.enc_to_dec(lat)                                             # [B, N_lat, Cdec] (no mask needed)
         X = Q
-        for blk in self.decode_xattn_blocks:
-            X = blk(X, KV, attn_mask=kv_keep)                                # respect KV mask
+        for blk in self.decode_lat_xattn_blocks:
+            X = blk(X, LAT, attn_mask=None)
 
-        out_flat = X[b_ids, within]                                          # [Nm, Cdec]
+        out_flat = X[b_ids, within]                                            # [Nm, Cdec]
 
-        # Apply both voxel heads to masked positions
-        preds = {}
-        
         # Heads
-        shared = self.fasercal_shared_voxel_head(out_flat)                   # [Nm, P, H]
-        preds["occ"] = self.heads["occ"](shared).squeeze(-1)                 # [Nm, P]
-        preds["reg"] = self.heads["reg"](shared)                             # [Nm, P, in_chans]
-        preds["gho"] = self.heads["gho"](shared).squeeze(-1)                 # [Nm, P]
-        preds["hie"] = self.heads["hie"](shared)                             # [Nm, P, 3]
-        preds["dec"] = self.heads["dec"](shared)                             # [Nm, P, 3]
-        preds["pid"] = self.heads["pid"](shared)                             # [Nm, P, num_pid]
+        preds = {}
+        shared = self.fasercal_shared_voxel_head(out_flat)                     # [Nm, P, H]
+        preds["occ"] = self.heads["occ"](shared).squeeze(-1)                   # [Nm, P]
+        preds["reg"] = self.heads["reg"](shared)                               # [Nm, P, in_chans]
+        preds["gho"] = self.heads["gho"](shared).squeeze(-1)                   # [Nm, P]
+        preds["hie"] = self.heads["hie"](shared)                               # [Nm, P, 3]
+        preds["dec"] = self.heads["dec"](shared)                               # [Nm, P, 3]
+        preds["pid"] = self.heads["pid"](shared)                               # [Nm, P, num_pid]
 
         # targets (same for all predictions on masked patches)
-        patch_ids = self.module_token_indices[m_ids, l_ids]                  # [Nm]
-        idx_targets = idx_map[b_ids, patch_ids]                              # [Nm, P]
+        patch_ids = self.module_token_indices[m_ids, l_ids]                    # [Nm]
+        idx_targets = idx_map[b_ids, patch_ids]                                # [Nm, P]
 
         return preds, idx_targets, b_ids, patch_ids
     
 
     def forward_reconstruction_ahcal(
         self,
-        tok_enriched_ah,   # [B, Lk_ah, Cenc]  enriched kept AHCAL tokens
-        ah_mask,           # [B, Na]          True = real AHCAL patch
-        ah_attn_keep,      # [B, Lk_ah]       True = kept AHCAL token
-        ah_rand_mask,      # [B, Na]          True = masked real AHCAL patch
-        ah_idx_map: LazyIdxMap,
+        lat: torch.Tensor,            # [B, N_lat, Cenc]
+        ah_mask: torch.Tensor,        # [B, Na]
+        ah_rand_mask: torch.Tensor,   # [B, Na]
+        ah_idx_map,
     ):
         """
-        AHCAL MAE-style reconstruction (symmetric to FASERcal).
+        AHCAL reconstruction from bottleneck latents only.
         """
-        B, Lk_ah, Cenc = tok_enriched_ah.shape
+        B = lat.size(0)
         Cdec = self.decoder_ahcal_pos_embed.weight.shape[-1]
 
-        # Which AHCAL patches to predict: masked real ones
+        # which AHCAL patches to predict: masked real
         prediction_mask = ah_rand_mask & ah_mask                             # [B, Na]
         counts = prediction_mask.sum(dim=-1)
         max_n = int(counts.max().item()) if B > 0 else 0
@@ -790,26 +804,19 @@ class SparseMAEViT(nn.Module):
 
         # build queries in decoder dim for these masked AHCAL positions
         within = self._compute_within_ranks(b_ids, Nm)                       # [Nm]
-        Q = tok_enriched_ah.new_zeros(B, max_n, Cdec)                        # [B, max_n, Cdec]
+        Q = self.ahcal_query_tokens.new_zeros(B, max_n, Cdec)                # [B, max_n, Cdec]
         q = self.decoder_ahcal_pos_embed(l_ids) + self.ahcal_query_tokens    # [Nm, Cdec]
         Q[b_ids, within] = q
 
-        # KV: enriched kept AHCAL tokens, packed
-        ah_tokens_mod = tok_enriched_ah.unsqueeze(1)                         # [B, 1, Lk_ah, Cenc]
-        ah_keep_mod   = ah_attn_keep.unsqueeze(1)                            # [B, 1, Lk_ah]
-        kv_tokens, kv_keep, *_ = self._pack_by_mask(
-            ah_tokens_mod, ah_keep_mod
-        )                                                                    # [B, Nk_max_ah, Cenc], [B, Nk_max_ah]
-        KV = self.enc_to_dec(kv_tokens)                                      # [B, Nk_max_ah, Cdec]
-
-        # Perceiver-IO decode: masked AHCAL queries attend to kept AHCAL tokens
+        # query -> latents
+        LAT = self.enc_to_dec(lat)  # [B,N_lat,Cdec]
         X = Q
-        for blk in self.decode_xattn_blocks:
-            X = blk(X, KV, attn_mask=kv_keep)
+        for blk in self.decode_lat_xattn_blocks:
+            X = blk(X, LAT, attn_mask=None)
 
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
-        # AHCAL voxel head (+ heads)
+        # Heads
         shared_ah       = self.ahcal_voxel_head(out_flat)                    # [Nm, P_ah, H]
         preds_ah        = {}
         preds_ah["occ_ah"] = self.heads["occ_ahcal"](shared_ah).squeeze(-1)  # [Nm, P_ah]
@@ -825,50 +832,38 @@ class SparseMAEViT(nn.Module):
     def forward(self, x, x_glob, mask_ratio=0.75):
         """
         Single encoder pass with masking (mask_ratio), then:
-          - FASERcal reconstruction + semantic segmentation on masked patches,
+          - FASERCAL reconstruction + semantic segmentation on masked patches,
           - AHCAL reconstruction on masked patches.
         """
         # occupancy maps
         idx_map = self.build_patch_occupancy_map(x, self.fcal_patch_size, self.grid_size)
-        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
+        ahcal_sparse, *_ = x_glob
         ah_idx_map = self.build_patch_occupancy_map(ahcal_sparse, self.ahcal_patch_size, self.ahcal_grid_size)
 
         # single encoder pass
-        (tok_enriched_fas,         # [B, M, Lk_fas, C]
-         rand_mask,                # [B, M, Lm_fas]   True = masked real FASERcal pos
-         attn_mask_mod,            # [B, M, Lm_fas]   True = real FASERcal pos
-         attn_mask_keep,           # [B, M, Lk_fas]   True = kept FASERcal token
-         ids_keep,                 # [B, M, Lk_fas]   FASERcal intra indices of kept slots
-
-         tok_enriched_ah,          # [B, Lk_ah, C]
-         ah_mask,                  # [B, Na]          True = real AHCAL patch
-         ah_attn_keep,             # [B, Lk_ah]       True = kept AHCAL token
-         ah_rand_mask,             # [B, Na]          True = masked real AHCAL patch
-         ah_ids_keep,              # [B, Lk_ah]       AHCAL kept indices in [0..Na-1]
-
-         ecal_enriched,
-         muon_enriched,
+        (
+            lat,
+            rand_mask,
+            attn_mask_mod,
+            ah_mask,
+            ah_rand_mask,
         ) = self.forward_encoder(x, x_glob, mask_ratio)
 
-        # FASERcal: both reconstruction and semantic segmentation on masked patches
-        preds_fas, idx_targets_fas, row_event_ids_fas, row_patch_ids_fas = \
-            self.forward_reconstruction(
-                tok_enriched_fas,   # [B, M, Lk_fas, Cenc], enriched kept FASERcal tokens
-                attn_mask_mod,      # [B, M, Lm_fas], real positions (full intra space)
-                attn_mask_keep,     # [B, M, Lk_fas], kept tokens (for KV)
-                rand_mask,          # [B, M, Lm_fas], masked real positions
-                idx_map,
-            )
+        # FASERCAL: both reconstruction and semantic segmentation on masked patches
+        preds_fas, idx_targets_fas, row_event_ids_fas, row_patch_ids_fas = self.forward_reconstruction_fcal(
+            lat=lat,
+            attn_mask_mod=attn_mask_mod,
+            rand_mask=rand_mask,
+            idx_map=idx_map,
+        )
 
         # AHCAL reconstruction on masked patches
-        preds_ah, idx_targets_ah, row_event_ids_ah, row_patch_ids_ah = \
-            self.forward_reconstruction_ahcal(
-                tok_enriched_ah,    # [B, Lk_ah, Cenc], enriched kept AHCAL tokens
-                ah_mask,            # [B, Na], real AHCAL positions
-                ah_attn_keep,       # [B, Lk_ah], kept AHCAL tokens (for KV)
-                ah_rand_mask,       # [B, Na], masked real AHCAL positions
-                ah_idx_map,
-            )
+        preds_ah, idx_targets_ah, row_event_ids_ah, row_patch_ids_ah = self.forward_reconstruction_ahcal(
+            lat=lat,
+            ah_mask=ah_mask,
+            ah_rand_mask=ah_rand_mask,
+            ah_idx_map=ah_idx_map,
+        )
 
         # merge all predictions
         preds = {**preds_fas, **preds_ah}
@@ -884,209 +879,27 @@ class SparseMAEViT(nn.Module):
         )
 
 
-    def print_param_report(self):
-        """
-        Prints parameter counts grouped by logical component:
-
-        - patch_embed          : FASERCal + AHCAL sparse patch embeddings
-        - intra_vit            : module CLS token/emb, intra-module pos emb, encoder blocks, norm
-        - perceiver_encoder    : AHCAL and global (ECal + spectrometer) streams, cross/self-attn, norm
-        - perceiver_decoder    : decoder pos embeddings, module embeddings, query tokens,
-                                 enc->dec projection, Perceiver-IO cross-attn blocks
-        - heads_relational     : FASERCal relational voxel head + relational heads (gho/hie/dec/pid)
-        - heads_reconstruction : FASERCal and AHCAL MAE-style reconstruction heads
-        - ALL (sanity) / SUM(groups)
-        """
-        from collections import OrderedDict
-
-        def _iter_params(obj):
-            """
-            Yield parameters from nn.Modules, nn.Parameters, and containers
-            (list/tuple/dict/etc.).
-            """
-            if obj is None:
-                return
-            if isinstance(obj, nn.Parameter):
-                yield obj
-                return
-            if isinstance(obj, nn.Module):
-                for p in obj.parameters(recurse=True):
-                    yield p
-                return
-            # Python containers
-            if isinstance(obj, (list, tuple, set)):
-                for o in obj:
-                    yield from _iter_params(o)
-                return
-            if isinstance(obj, dict):
-                for o in obj.values():
-                    yield from _iter_params(o)
-                return
-
-        def _count(objs):
-            # Collect and de-duplicate by id within a group
-            ps = list(_iter_params(objs))
-            seen = set()
-            uniq = []
-            for p in ps:
-                pid = id(p)
-                if pid not in seen:
-                    seen.add(pid)
-                    uniq.append(p)
-            total = sum(p.numel() for p in uniq)
-            train = sum(p.numel() for p in uniq if p.requires_grad)
-            return total, train
-
-        groups = OrderedDict()
-
-        # Patch embeddings
-        patch_list = []
-        if hasattr(self, "fcal_patch_embed"):
-            patch_list.append(self.fcal_patch_embed)
-        if hasattr(self, "ahcal_patch_embed"):
-            patch_list.append(self.ahcal_patch_embed)
-        groups["patch_embed"] = patch_list
-
-        # Intra ViT (per-module transformer)
-        intra_list = []
-        if hasattr(self, "intra_pos_embed"):
-            intra_list.append(self.intra_pos_embed)
-        if hasattr(self, "module_cls_token"):
-            intra_list.append(self.module_cls_token)
-        if hasattr(self, "module_embed_enc"):
-            intra_list.append(self.module_embed_enc)
-        if hasattr(self, "blocks"):
-            intra_list.append(self.blocks)
-        if hasattr(self, "norm"):
-            intra_list.append(self.norm)
-        groups["intra_vit"] = intra_list
-
-        # Perceiver-style encoder (global + AHCAL + latent cross/self)
-        enc_list = []
-        if hasattr(self, "ahcal_pos_embed"):
-            enc_list.append(self.ahcal_pos_embed)
-        if hasattr(self, "kv_src_embed"):
-            enc_list.append(self.kv_src_embed)
-        if hasattr(self, "ecal_embed"):
-            enc_list.append(self.ecal_embed)
-        if hasattr(self, "muon_spec_count_encoder"):
-            enc_list.append(self.muon_spec_count_encoder)
-        if hasattr(self, "muon_spec_embed"):
-            enc_list.append(self.muon_spec_embed)
-        if hasattr(self, "muon_spec_xattn"):
-            enc_list.append(self.muon_spec_xattn)
-        if hasattr(self, "xattn_blocks"):
-            enc_list.append(self.xattn_blocks)
-        if hasattr(self, "latent_self_blocks"):
-            enc_list.append(self.latent_self_blocks)
-        if hasattr(self, "tokens_norm"):
-            enc_list.append(self.tokens_norm)
-        groups["perceiver_encoder"] = enc_list
-
-        # Perceiver-style decoders (FASERCal + AHCAL)
-        dec_list = []
-        if hasattr(self, "decoder_intra_pos_embed"):
-            dec_list.append(self.decoder_intra_pos_embed)
-        if hasattr(self, "decoder_ahcal_pos_embed"):
-            dec_list.append(self.decoder_ahcal_pos_embed)
-        if hasattr(self, "module_embed_dec"):
-            dec_list.append(self.module_embed_dec)
-        if hasattr(self, "query_tokens"):
-            dec_list.append(self.query_tokens)
-        if hasattr(self, "ahcal_query_tokens"):
-            dec_list.append(self.ahcal_query_tokens)
-        if hasattr(self, "enc_to_dec"):
-            dec_list.append(self.enc_to_dec)
-        if hasattr(self, "decode_xattn_blocks"):
-            dec_list.append(self.decode_xattn_blocks)
-        groups["perceiver_decoder"] = dec_list
-
-        # Heads: relational (FASERCal relational voxel + gho/hie/dec/pid)
-        heads_rel = []
-        if hasattr(self, "fasercal_shared_voxel_head"):
-            if isinstance(self.fasercal_shared_voxel_head, nn.ModuleDict):
-                if "rel" in self.fasercal_shared_voxel_head:
-                    heads_rel.append(self.fasercal_shared_voxel_head["rel"])
-        if hasattr(self, "heads"):
-            for key in ["gho", "hie", "dec", "pid"]:
-                if key in self.heads:
-                    heads_rel.append(self.heads[key])
-        groups["heads_relational"] = heads_rel
-
-        # Heads: reconstruction (FASERCal + AHCAL MAE)
-        heads_rec = []
-        if hasattr(self, "fasercal_shared_voxel_head"):
-            if isinstance(self.fasercal_shared_voxel_head, nn.ModuleDict):
-                if "rec" in self.fasercal_shared_voxel_head:
-                    heads_rec.append(self.fasercal_shared_voxel_head["rec"])
-        if hasattr(self, "ahcal_voxel_head"):
-            heads_rec.append(self.ahcal_voxel_head)
-        if hasattr(self, "heads"):
-            for key in ["occ", "reg", "occ_ahcal", "reg_ahcal"]:
-                if key in self.heads:
-                    heads_rec.append(self.heads[key])
-        groups["heads_reconstruction"] = heads_rec
-
-        # Print report
-        grand_total = grand_train = 0
-        print("=== Parameter report ===")
-        for name, objs in groups.items():
-            tot, trn = _count(objs)
-            grand_total += tot
-            grand_train += trn
-            print(f"{name:24s} total={tot/1e6:8.3f}M  trainable={trn/1e6:8.3f}M")
-
-        # Full model sanity check
-        tot_all = sum(p.numel() for p in self.parameters())
-        trn_all = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print("-" * 64)
-        print(f"{'ALL (sanity)':24s} total={tot_all/1e6:8.3f}M  trainable={trn_all/1e6:8.3f}M")
-        print(f"{'SUM(groups)':24s} total={grand_total/1e6:8.3f}M  trainable={grand_train/1e6:8.3f}M")
-
-
 def mae_vit_tiny(**kwargs):
     model = SparseMAEViT(
-        in_chans=1, D=3, embed_dim=528, 
+        in_chans=1, embed_dim=384, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
-        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
-        depth=4, num_heads=12, io_depth=3, io_decode_depth=2, num_module_cls=1,
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
+        depth=4, ahcal_depth=2, num_heads=12, io_depth=3, io_decode_depth=2, 
+        num_module_cls=1, num_ahcal_cls=2,
+        num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
+        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
+    )
+    return model
+
+def mae_vit_base(**kwargs):
+    model = SparseMAEViT(
+        in_chans=1, embed_dim=528, 
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
+        ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
+        depth=4, ahcal_depth=2, num_heads=12, io_depth=3, io_decode_depth=2, 
+        num_module_cls=1, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
 
-
-def mae_vit_base(**kwargs):
-    model = SparseMAEViT(
-        in_chans=1, D=3, embed_dim=768, 
-        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
-        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
-        depth=4, num_heads=12, io_depth=8, io_decode_depth=4, num_module_cls=2,
-        num_modes=(16, 8), decoder_embed_dim=528, decoder_num_heads=12,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
-    )
-    return model
-    
-
-def mae_vit_large(**kwargs):
-    model = SparseMAEViT(
-        in_chans=1, D=3, embed_dim=768, 
-        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
-        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
-        depth=8, num_heads=12, io_depth=16, io_decode_depth=6, num_module_cls=4,
-        num_modes=(32, 12), decoder_embed_dim=528, decoder_num_heads=16,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
-    )
-    return model
-
-
-def mae_vit_huge(**kwargs):
-    model = SparseMAEViT(
-        in_chans=1, D=3, embed_dim=768, 
-        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
-        ahcal_size=(18, 18, 40), ahcal_patch_size=(9, 9, 10),
-        depth=16, num_heads=12, io_depth=32, io_decode_depth=8, num_module_cls=4,
-        num_modes=(64, 16), decoder_embed_dim=528, decoder_num_heads=16,
-        mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
-    )
-    return model
