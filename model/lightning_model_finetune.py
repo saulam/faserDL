@@ -246,20 +246,24 @@ class ViTFineTuner(pl.LightningModule):
         loss_lep_geom = loss_lep_geom * sample_weights
         loss_vertex = loss_vertex * sample_weights
 
+        kendall_w = {}
+        kendall_s = {}
+
+        def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
+            u = self._uncertainty_params[name]
+            loss_w, w, s = weighted_loss(loss, u)
+            kendall_w[name] = w.detach()
+            kendall_s[name] = s.detach()
+            return loss_w
+
         # Kendall-weighted total
         total_loss = (
-            weighted_loss(loss_flavour,  self.log_sigma_flavour,  kind="ce").mean()  +
-            weighted_loss(loss_charm,    self.log_sigma_charm,    kind="ce").mean()  +
-            weighted_loss(loss_vis_geom, self.log_sigma_vis_geom, kind="reg").mean() +
-            #weighted_loss(loss_vis_pt,   self.log_sigma_vis_pt,   kind="reg").mean() +
-            #weighted_loss(loss_vis_mag,  self.log_sigma_vis_mag,  kind="reg").mean() +
-            weighted_loss(loss_jet_geom, self.log_sigma_jet_geom, kind="reg").mean() +
-            #weighted_loss(loss_jet_pt,   self.log_sigma_jet_pt,   kind="reg").mean() +
-            #weighted_loss(loss_jet_mag,  self.log_sigma_jet_mag,  kind="reg").mean() +
-            weighted_loss(loss_lep_geom, self.log_sigma_lep_geom, kind="reg").mean() +
-            #weighted_loss(loss_lep_pt,   self.log_sigma_lep_pt,   kind="reg").mean() +
-            #weighted_loss(loss_lep_mag,  self.log_sigma_lep_mag,  kind="reg").mean() +
-            weighted_loss(loss_vertex,   self.log_sigma_vertex,   kind="reg").mean()
+            _weight("flavour",  loss_flavour).mean()  +
+            _weight("charm",    loss_charm).mean()    +
+            _weight("vis_geom", loss_vis_geom).mean() +
+            _weight("jet_geom", loss_jet_geom).mean() +
+            _weight("lep_geom", loss_lep_geom).mean() +
+            _weight("vertex",   loss_vertex).mean()
         )
 
         part_losses = {
@@ -292,7 +296,7 @@ class ViTFineTuner(pl.LightningModule):
             'loss_vertex':   loss_vertex.mean().detach().item(),
         }
         
-        return total_loss, part_losses
+        return total_loss, part_losses, kendall_w, kendall_s
 
     
     def get_lr_for_module(self, module: torch.nn.Module) -> float:
@@ -314,28 +318,46 @@ class ViTFineTuner(pl.LightningModule):
 
         # Forward pass
         batch_output = self.forward(batch_input, batch_input_global)
-        loss, part_losses = self.compute_losses(batch_output, target)
+        loss, part_losses, kendall_w, kendall_s = self.compute_losses(batch_output, target)
 
-        return loss, part_losses, batch_size
+        return loss, part_losses, kendall_w, kendall_s, batch_size
 
 
     def training_step(self, batch, batch_idx):
-        loss, part_losses, batch_size = self.common_step(batch)
-
+        loss, part_losses, kendall_w, kendall_s, batch_size = self.common_step(batch)
         self.log(f"loss_total/train", loss.item(), batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():
             self.log("{}/train".format(key), value, batch_size=batch_size, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         
-        # log the actual sigmas (exp(-log_sigma))
-        for key, log_sigma in self._uncertainty_params.items():
-            uncertainty = torch.exp(-log_sigma)
-            self.log(f'uncertainty/{key}', uncertainty, batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        # log the effective Kendall weights w
+        for key, w in kendall_w.items():
+            self.log(
+                f"uncertainty/{key}",
+                w,
+                batch_size=batch_size,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True
+            )
+
+            # Optional: sigma = 1/sqrt(w)
+            sigma = (1.0 / torch.sqrt(w.clamp_min(1e-12))).detach()
+            self.log(
+                f"uncertainty_sigma/{key}",
+                sigma,
+                batch_size=batch_size,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True
+            )
 
         return loss
 
 
     def validation_step(self, batch, batch_idx):
-        loss, part_losses, batch_size = self.common_step(batch)
+        loss, part_losses, _, _, batch_size = self.common_step(batch)
 
         self.log(f"loss_total/val", loss.item(), batch_size=batch_size, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         for key, value in part_losses.items():

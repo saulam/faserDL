@@ -420,6 +420,7 @@ def distance_aware_semantic_segmentation_loss(
     class_threshold: float = 0.01,
     min_weight: float = 0.05,
     exclude_classes_from_dt: Optional[Sequence[int]] = None,
+    voxel_keep_prob: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Distance-aware soft CE for semantic segmentation with soft (CSR) labels.
@@ -445,6 +446,20 @@ def distance_aware_semantic_segmentation_loss(
     is_occ = idx_targets >= 0
     is_ghost = _safe_ghost_mask_lookup(idx_targets, ghost_mask)
     valid_mask = is_occ & ~is_ghost
+    if voxel_keep_prob < 1.0:
+        keep = torch.rand(valid_mask.shape, device=device) < float(voxel_keep_prob)
+        valid_mask = valid_mask & keep
+        # Ensure at least 1 supervised voxel per patch row if there was any valid voxel
+        row_has_valid = valid_mask.any(dim=1)  # [M]
+        row_has_any_before = (is_occ & ~is_ghost).any(dim=1)  # [M] original-valid rows
+        need_fix = row_has_any_before & ~row_has_valid  # rows where we dropped all valids
+        if need_fix.any():
+            # pick 1 random valid voxel from the original valid set for those rows
+            noise = torch.rand((M, P), device=device)
+            orig_valid = (is_occ & ~is_ghost)
+            noise = noise.masked_fill(~orig_valid, float('inf'))
+            pick = noise.argmin(dim=1)  # [M]
+            valid_mask[need_fix, pick[need_fix]] = True
     valid_flat = valid_mask.view(-1)
     N_valid = int(valid_flat.sum().item())
 
@@ -829,6 +844,7 @@ def unified_semantic_segmentation_loss(
     standard_class_weights: Optional[torch.Tensor] = None,  # [C] or None
     none_index: Optional[int] = None,
     none_row_weight: float = 1.0,
+    voxel_keep_prob: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Unified semantic segmentation loss.
@@ -852,6 +868,20 @@ def unified_semantic_segmentation_loss(
     is_occ = idx_targets >= 0
     is_ghost = _safe_ghost_mask_lookup(idx_targets, ghost_mask)
     valid_mask = is_occ & ~is_ghost
+    if voxel_keep_prob < 1.0:
+        keep = torch.rand(valid_mask.shape, device=device) < float(voxel_keep_prob)
+        valid_mask = valid_mask & keep
+        # Ensure at least 1 supervised voxel per patch row if there was any valid voxel
+        row_has_valid = valid_mask.any(dim=1)  # [M]
+        row_has_any_before = (is_occ & ~is_ghost).any(dim=1)  # [M] original-valid rows
+        need_fix = row_has_any_before & ~row_has_valid  # rows where we dropped all valids
+        if need_fix.any():
+            # pick 1 random valid voxel from the original valid set for those rows
+            noise = torch.rand((M, P), device=device)
+            orig_valid = (is_occ & ~is_ghost)
+            noise = noise.masked_fill(~orig_valid, float('inf'))
+            pick = noise.argmin(dim=1)  # [M]
+            valid_mask[need_fix, pick[need_fix]] = True
     valid_flat = valid_mask.view(-1)
     N_valid = int(valid_flat.sum().item())
 
@@ -896,6 +926,7 @@ def unified_semantic_segmentation_loss(
         class_threshold=class_threshold,
         min_weight=min_weight,
         exclude_classes_from_dt=([exclude_classes_from_dt] if isinstance(exclude_classes_from_dt, int) else exclude_classes_from_dt),
+        voxel_keep_prob=voxel_keep_prob,
     )
     metrics.update(m_dist)
 

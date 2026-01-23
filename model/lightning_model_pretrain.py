@@ -131,7 +131,7 @@ class MAEPreTrainer(pl.LightningModule):
     def mask_and_align_voxels(self, idx_targets):
         """
         idx_targets: [N_tok, P] with -1 for empty slots.
-        Returns indices to slice your flat hit tensors; no ghost filtering here.
+        Returns indices to slice the flat hit tensors; no ghost filtering here.
         """
         valid = idx_targets >= 0
         tok_row, sub_idx = torch.nonzero(valid, as_tuple=True)   # where a voxel is present
@@ -228,6 +228,7 @@ class MAEPreTrainer(pl.LightningModule):
                 gamma_distance=self.semantic_gamma_distance,
                 exclude_classes_from_dt=exclude_class,
                 label_smoothing=self.label_smoothing,
+                voxel_keep_prob=1-self.mask_ratio,  # key, avoids overfitting on semantic tasks
             )
             
             # Store loss
@@ -344,22 +345,28 @@ class MAEPreTrainer(pl.LightningModule):
 
         # Kendall et al. aggregation
         part_losses = {**part_enc, **part_dec, **part_dec_ah}
-        def _weight(loss, attr, kind):
-            ls = getattr(self, attr, None)
-            return weighted_loss(loss, ls, kind) if ls is not None else loss
+        kendall_w = {}
+        kendall_s = {}
+
+        def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
+            u = self._uncertainty_params[name]
+            loss_w, w, s = weighted_loss(loss, u)
+            kendall_w[name] = w.detach()
+            kendall_s[name] = s.detach()
+            return loss_w
 
         total_loss = (
-            _weight(loss_gho,    "log_sigma_gho",    kind="ce")     +
-            _weight(loss_hie,    "log_sigma_hie",    kind="ce")     +
-            _weight(loss_dec,    "log_sigma_dec",    kind="ce")     +
-            _weight(loss_pid,    "log_sigma_pid",    kind="ce")     +
-            _weight(loss_occ,    "log_sigma_occ",    kind="ce")     +
-            _weight(loss_reg,    "log_sigma_reg",    kind="huber")  +
-            _weight(loss_occ_ah, "log_sigma_occ_ah", kind="ce")     +
-            _weight(loss_reg_ah, "log_sigma_reg_ah", kind="huber")
+            _weight("gho",    loss_gho)    +
+            _weight("hie",    loss_hie)    +
+            _weight("dec",    loss_dec)    +
+            _weight("pid",    loss_pid)    +
+            _weight("occ",    loss_occ)    +
+            _weight("reg",    loss_reg)    +
+            _weight("occ_ah", loss_occ_ah) +
+            _weight("reg_ah", loss_reg_ah)
         )
 
-        return total_loss, part_losses
+        return total_loss, part_losses, kendall_w, kendall_s
 
 
     def common_step(self, batch):
@@ -371,15 +378,11 @@ class MAEPreTrainer(pl.LightningModule):
         (
             preds,
             idx_targets_fas,
-            _row_evt_fas,
-            _row_patch_fas,
             idx_targets_ah,
-            _row_evt_ah,
-            _row_patch_ah,
         ) = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
-        loss, part_losses = self.compute_losses(
+        loss, part_losses, kendall_w, kendall_s = self.compute_losses(
             preds=preds,
             targ_reg=batch_input.features,
             targ_reg_ahcal=ahcal_sparse.features,
@@ -388,12 +391,11 @@ class MAEPreTrainer(pl.LightningModule):
             labels=labels,
         )
 
-        return loss, part_losses, batch_size
+        return loss, part_losses, kendall_w, kendall_s, batch_size
    
 
     def training_step(self, batch, batch_idx):
-        loss, part_losses, batch_size = self.common_step(batch)
-
+        loss, part_losses, kendall_w, kendall_s, batch_size = self.common_step(batch)
         self.log(
             f"loss_total/train",
             loss.detach(), 
@@ -414,12 +416,23 @@ class MAEPreTrainer(pl.LightningModule):
                 sync_dist=True
             )
 
-        # log the actual sigmas (exp(-log_sigma))
-        for key, log_sigma in self._uncertainty_params.items():
-            uncertainty = torch.exp(-log_sigma).detach()
+        # log the effective Kendall weights w
+        for key, w in kendall_w.items():
             self.log(
-                f'uncertainty/{key}',
-                uncertainty,
+                f"uncertainty/{key}",
+                w,
+                batch_size=batch_size,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True
+            )
+
+            # Optional: log sigma = 1/sqrt(w)
+            sigma = (1.0 / torch.sqrt(w.clamp_min(1e-12))).detach()
+            self.log(
+                f"uncertainty_sigma/{key}",
+                sigma,
                 batch_size=batch_size,
                 on_step=True,
                 on_epoch=True,
@@ -431,7 +444,7 @@ class MAEPreTrainer(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        loss, part_losses, batch_size = self.common_step(batch)
+        loss, part_losses, _, _, batch_size = self.common_step(batch)
 
         self.log(
             f"loss_total/val",

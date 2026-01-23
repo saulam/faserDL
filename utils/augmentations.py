@@ -45,11 +45,6 @@ def augment(
     """
     Performs augmentations.
     """
-
-    ecal_hits  = global_feats.get("ecal_hits", None)
-    ahcal_hits = global_feats.get("ahcal_hits", None)
-    muspec_p   = global_feats.get("muspec_p", None)
-
     '''
     # Mirror
     if np.random.random() < aug_prob:
@@ -71,45 +66,69 @@ def augment(
             primary_vertex, metadata, selected_axes=['x', 'y'],
         )
     '''
-    # Re-store possibly modified extras
-    if ecal_hits is not None:
-        global_feats["ecal_hits"] = ecal_hits
-    if ahcal_hits is not None:
-        global_feats["ahcal_hits"] = ahcal_hits
-    if muspec_p is not None:
-        global_feats["muspec_p"] = muspec_p
-
-    # Global features multiplicative jitter
+    # FASERCAL ±1 voxel translation in x/y
     if np.random.random() < aug_prob:
-        global_feats = module_multiplicative_jitter(
-            global_feats, log_sigma=0.1,
+        coords, modules, feats, labels, (dx, dy) = translate_fasercal_xy_pm1(
+            coords, modules, feats, labels, metadata,
+            prob_shift_x=0.5, prob_shift_y=0.5,
+            min_keep=5,
         )
 
-    # Scaling
+    # calo-only gain jitter
+    if np.random.random() < aug_prob:
+        global_feats = module_multiplicative_jitter(global_feats, log_sigma=0.1)
+
+    # calo-only global gain drift
     if np.random.random() < aug_prob:
         feats, global_feats, _, _ = scale_all_by_global_shift_lognormal(
             feats, global_feats, log_sigma=0.1
         )
 
-    # After jitter + scaling, refresh locals from global_feats so we use
-    ahcal_hits = global_feats.get("ahcal_hits", ahcal_hits)
-
-    # Jitter per-hit multiplicative
-    if np.random.random() < aug_prob:
-        feats = jitter_energy_multiplicative(
-            feats, log_sigma=0.12, clamp_min=0.0
+    # ECAL extra noise/dropout
+    if np.random.random() < aug_prob and global_feats.get("ecal_hits", None) is not None:
+        global_feats["ecal_hits"] = ecal_additive_noise_and_dropout(
+            global_feats["ecal_hits"],
+            a=0.02, b=0.10, max_drop=0.10
         )
 
-    # Jitter sqrt-law additive
-    if np.random.random() < aug_prob:
-        feats = jitter_energy_sqrtlaw(
-            feats, a=0.06, b=0.18, clamp_min=0.0
+    # AHCAL extra per-hit smearing
+    if np.random.random() < aug_prob and global_feats.get("ahcal_hits", None) is not None:
+        global_feats["ahcal_hits"] = ahcal_charge_smear(
+            global_feats["ahcal_hits"],
+            log_sigma=0.12, a=0.03, b=0.12
         )
 
-    # Voxel dropping
+    # muon spectrometer augmentation (independent of calo gain)
+    if np.random.random() < aug_prob:
+        n = global_feats.get("nb_muspec_tracks", 0)
+        q = global_feats.get("muspec_q", np.zeros((0,), dtype=np.float32))
+        p = global_feats.get("muspec_p", np.zeros((0, 3), dtype=np.float32))
+        c = global_feats.get("muspec_chi2", np.zeros((0,), dtype=np.float32))
+
+        n2, q2, p2, c2 = augment_muspec(
+            n, q, p, c,
+            permute=True,
+            drop_prob=0.10,
+            rel_p_logsigma=0.02,
+            chi2_logsigma=0.10,
+            flip_q_prob=0.0,   # keep 0 unless you explicitly want charge mis-ID
+        )
+        global_feats["nb_muspec_tracks"] = n2
+        global_feats["muspec_q"] = q2
+        global_feats["muspec_p"] = p2
+        global_feats["muspec_chi2"] = c2
+
+    # FASERCAL hit jitters
+    if np.random.random() < aug_prob:
+        feats = jitter_energy_multiplicative(feats, log_sigma=0.12, clamp_min=0.0)
+    if np.random.random() < aug_prob:
+        feats = jitter_energy_sqrtlaw(feats, a=0.06, b=0.18, clamp_min=0.0)
+
+    # voxel dropping (already drops AHCAL hits too)
     if np.random.random() < aug_prob:
         coords, modules, feats, labels, ahcal_hits = drop_hits(
-            coords, modules, feats, labels, ahcal_hits, max_drop=0.05, min_hits=5,
+            coords, modules, feats, labels, global_feats.get("ahcal_hits", None),
+            max_drop=0.05, min_hits=5,
         )
         global_feats["ahcal_hits"] = ahcal_hits
 
@@ -332,6 +351,74 @@ def translate(
     return coords, modules, rear, ahcal, primary_vertex, shifts
 
 
+def translate_fasercal_xy_pm1(
+    coords,
+    modules,
+    feats,
+    labels,
+    metadata,
+    *,
+    prob_shift_x=0.5,
+    prob_shift_y=0.5,
+    min_keep=5,
+):
+    """
+    Randomly translate FASERCal hits by +/- 1 voxel in x and/or y.
+    - If a hit goes out of bounds, it is removed.
+    - If too few hits remain (min_keep), the augmentation is skipped.
+    - CSR labels are kept consistent by filtering rows with the same mask.
+
+    coords are assumed to be in voxel index space (after voxelise()).
+    """
+    # Decide shift in x and y independently
+    dx = 0
+    dy = 0
+    if np.random.rand() < prob_shift_x:
+        dx = int(np.random.choice([-1, 1]))
+    if np.random.rand() < prob_shift_y:
+        dy = int(np.random.choice([-1, 1]))
+
+    # If neither axis selected, do nothing
+    if dx == 0 and dy == 0:
+        return coords, modules, feats, labels, (0, 0)
+
+    x_max = metadata["x"].shape[0] - 1
+    y_max = metadata["y"].shape[0] - 1
+
+    c2 = coords.copy()
+    c2[:, 0] = c2[:, 0] + dx
+    c2[:, 1] = c2[:, 1] + dy
+
+    # Keep only hits that remain inside the volume
+    keep = (
+        (c2[:, 0] >= 0) & (c2[:, 0] <= x_max) &
+        (c2[:, 1] >= 0) & (c2[:, 1] <= y_max)
+    )
+
+    # Must keep at least some hits; otherwise skip augmentation
+    if int(keep.sum()) < min_keep:
+        return coords, modules, feats, labels, (0, 0)
+
+    # Apply mask to coords/modules/feats
+    c2 = c2[keep]
+    m2 = modules[keep]
+    f2 = feats[keep]
+
+    # Apply mask to labels (CSR + arrays + None)
+    labels_out = []
+    for lab in labels:
+        if lab is None:
+            labels_out.append(None)
+        elif isinstance(lab, np.ndarray):
+            labels_out.append(lab[keep])
+        else:
+            # CSR tuple: (indptr, ids, weights)
+            new_indptr, new_ids, new_w, _ = csr_keep_rows_numpy(*lab, keep)
+            labels_out.append((new_indptr, new_ids, new_w))
+
+    return c2, m2, f2, tuple(labels_out), (dx, dy)
+
+
 def drop_hits(
     coords,
     modules,
@@ -360,8 +447,8 @@ def drop_hits(
         elif isinstance(label, np.ndarray):
             labels_masked.append(label[mask])
         else:
-            csr = csr_keep_rows_numpy(*label, mask)
-            labels_masked.append(csr)
+            new_indptr, new_ids, new_w, _ = csr_keep_rows_numpy(*label, mask)
+            labels_masked.append((new_indptr, new_ids, new_w))
 
     coords = coords[mask]
     modules = modules[mask]
@@ -384,6 +471,115 @@ def _drop_ahcal_hits(ahcal_hits, max_drop, min_hits=2):
     return ahcal_hits[mask_ah]
 
 
+def ecal_additive_noise_and_dropout(ecal_hits, a=0.02, b=0.10, max_drop=0.10, clamp_min=0.0):
+    """
+    sqrt-law additive noise + random dead cells.
+    Works for any dense shape (5x5, 25, etc).
+    """
+    ec = np.asarray(ecal_hits, dtype=np.float32).copy()
+    if ec.size == 0:
+        return ec
+
+    # sqrt-law noise
+    sigma = np.sqrt(a*a + b*b * np.clip(ec, 0, None))
+    ec = ec + np.random.randn(*ec.shape).astype(np.float32) * sigma
+    ec = np.maximum(ec, clamp_min)
+
+    # dead cells
+    p = np.random.rand() * max_drop
+    flat = ec.reshape(-1)
+    mask = (np.random.rand(flat.size) > p)
+    if mask.sum() >= 1:
+        flat[~mask] = 0.0
+    return flat.reshape(ec.shape)
+
+
+def ahcal_charge_smear(ahcal_hits, log_sigma=0.12, a=0.03, b=0.12, clamp_min=0.0):
+    """
+    Per-hit multiplicative + sqrt-law additive smearing on AHCAL charge column.
+    """
+    ah = np.asarray(ahcal_hits, dtype=np.float32).copy()
+    if ah.size == 0:
+        return ah
+
+    q = ah[:, 3]
+
+    # multiplicative (lognormal, mean≈1)
+    mult = np.exp(np.random.randn(*q.shape).astype(np.float32) * log_sigma)
+    mult /= np.exp(0.5 * log_sigma**2)
+    q = q * mult
+
+    # sqrt-law additive
+    sigma = np.sqrt(a*a + b*b * np.clip(q, 0, None))
+    q = q + np.random.randn(*q.shape).astype(np.float32) * sigma
+
+    ah[:, 3] = np.maximum(q, clamp_min)
+    return ah
+
+
+def augment_muspec(
+    nb_tracks,
+    muspec_q,       # shape [T]
+    muspec_p,       # shape [T,3]
+    muspec_chi2,    # shape [T]
+    *,
+    permute=True,
+    drop_prob=0.10,
+    rel_p_logsigma=0.02,     # per-track multiplicative on p-vector (keeps direction)
+    abs_p_sigma=0.0,         # optional additive component noise
+    chi2_logsigma=0.10,      # jitter log(chi2)
+    flip_q_prob=0.0,         # set small (e.g. 1e-3) if want mis-ID simulation
+    min_keep=0,
+):
+    p = np.asarray(muspec_p, dtype=np.float32)
+    q = np.asarray(muspec_q, dtype=np.float32)
+    c = np.asarray(muspec_chi2, dtype=np.float32)
+
+    if p.size == 0:
+        return np.float32(0), q, p, c
+
+    T = p.shape[0]
+    idx = np.arange(T)
+
+    if permute:
+        np.random.shuffle(idx)
+        p = p[idx]
+        if q.size: q = q[idx]
+        if c.size: c = c[idx]
+
+    # drop tracks
+    if drop_prob > 0:
+        keep = (np.random.rand(T) > drop_prob)
+        if min_keep > 0 and keep.sum() < min_keep:
+            keep[np.random.choice(T, size=min_keep, replace=False)] = True
+        p = p[keep]
+        if q.size: q = q[keep]
+        if c.size: c = c[keep]
+
+    # smear momentum (one multiplier per track)
+    if p.size:
+        mult = np.exp(np.random.randn(p.shape[0], 1).astype(np.float32) * rel_p_logsigma)
+        mult /= np.exp(0.5 * rel_p_logsigma**2)
+        p = p * mult
+        if abs_p_sigma > 0:
+            p = p + np.random.randn(*p.shape).astype(np.float32) * abs_p_sigma
+
+    # jitter chi2 in log space (keeps it positive, doesn’t correlate with calo gain)
+    if c.size and chi2_logsigma > 0:
+        l = np.log(c + 1e-3)
+        l = l + np.random.randn(*l.shape).astype(np.float32) * chi2_logsigma
+        c = np.exp(l).astype(np.float32)
+
+    # optional charge flips (rare)
+    if q.size and flip_q_prob > 0:
+        flip = (np.random.rand(q.shape[0]) < flip_q_prob)
+        q = q.copy()
+        q[flip] *= -1.0
+        q = np.sign(q)  # force back to ±1
+
+    return np.float32(p.shape[0]), q, p, c
+
+
 def scale_all_by_global_shift_lognormal(
     feats,
     global_feats,
@@ -391,7 +587,7 @@ def scale_all_by_global_shift_lognormal(
     log_sigma=0.1,
 ):
     """
-    Global multiplicative scale (lognormal, mean≈1).
+    Global gain drift (lognormal, mean≈1) applied to calorimeters.
     """
     # draw shift
     shift = np.exp(np.random.randn() * log_sigma)
@@ -400,48 +596,26 @@ def scale_all_by_global_shift_lognormal(
     # scale hit feats
     feats = feats * shift
 
-    # scale momenta list if provided
-    if momenta is not None:
-        momenta = [p * shift for p in momenta]
+    out = dict(global_feats)
 
-    # scale existing scalar/array globals (simple heuristic: just multiply)
-    scaled_global_feats = {}
-    for k, v in global_feats.items():
-        # we will handle the special ones below
-        if k in ("ahcal_hits", "muspec_p", "muspec_q", "muspec_chi2"):
-            scaled_global_feats[k] = v
-        else:
-            try:
-                scaled_global_feats[k] = v * shift
-            except Exception:
-                # non-numeric, keep as is
-                scaled_global_feats[k] = v
+    # scale ECAL
+    if "ecal_hits" in out and out["ecal_hits"] is not None:
+        ec = np.asarray(out["ecal_hits"], dtype=np.float32).copy()
+        if ec.size > 0:
+            ec *= shift
+            ec = np.maximum(ec, 0.0)
+        out["ecal_hits"] = ec
 
-    # AHCAL charges
-    if "ahcal_hits" in global_feats and global_feats["ahcal_hits"] is not None:
-        ah = np.asarray(global_feats["ahcal_hits"], dtype=float).copy()
+    # scale AHCAL charge column
+    if "ahcal_hits" in out and out["ahcal_hits"] is not None:
+        ah = np.asarray(out["ahcal_hits"], dtype=np.float32).copy()
         if ah.size > 0:
-            ah[:, 3] = ah[:, 3] * shift
-        scaled_global_feats["ahcal_hits"] = ah
+            ah[:, 3] *= shift
+            ah[:, 3] = np.maximum(ah[:, 3], 0.0)
+        out["ahcal_hits"] = ah
 
-    # mu-spec momenta
-    if "muspec_p" in global_feats and global_feats["muspec_p"] is not None:
-        mp = np.asarray(global_feats["muspec_p"], dtype=float).copy()
-        if mp.size > 0:
-            mp = mp * shift
-        scaled_global_feats["muspec_p"] = mp
-
-    # mu-spec q
-    if "muspec_q" in global_feats and global_feats["muspec_q"] is not None:
-        mq = np.asarray(global_feats["muspec_q"], dtype=float).copy()
-        scaled_global_feats["muspec_q"] = mq * shift
-
-    # mu-spec chi2
-    if "muspec_chi2" in global_feats and global_feats["muspec_chi2"] is not None:
-        mc = np.asarray(global_feats["muspec_chi2"], dtype=float).copy()
-        scaled_global_feats["muspec_chi2"] = mc * shift
-
-    return feats, scaled_global_feats, momenta, shift
+    # leave muspec_p, muspec_q, muspec_chi2, nb_muspec_tracks unchanged
+    return feats, out, momenta, shift
 
 
 def jitter_energy_additive(feats, sigma=0.3, clamp_min=0.0):
@@ -526,55 +700,34 @@ def smooth_labels(targets, smoothing: float, num_classes: int = None):
 
 def module_multiplicative_jitter(global_feats, log_sigma=0.1):
     """
-    Apply independent multiplicative lognormal jitter (mean≈1) to the physics-y
-    pieces of global_feats:
+    Per-subdetector gain jitter (mean≈1).
+    muspec_* and nb_muspec_tracks unchanged here
     """
     def _lognormal(shape, s):
         mult = np.exp(np.random.randn(*shape) * s)
         mult /= np.exp(0.5 * s * s)
         return mult
-    
-    # ECAL
-    ec = np.asarray(global_feats["ecal_hits"], dtype=float).copy()
-    if ec.size > 0:
-        mult = _lognormal(ec.shape, log_sigma)
-        ec = np.maximum(ec * mult, 0.0)
-    global_feats["ecal_hits"] = ec
 
-    # AHCAL charges
-    ah = np.asarray(global_feats["ahcal_hits"], dtype=float).copy()
-    if ah.size > 0:
-        # jitter only the charge channel
-        charge = ah[:, 3]
-        mult = _lognormal(charge.shape, log_sigma)
-        ah[:, 3] = np.maximum(charge * mult, 0.0)
-    global_feats["ahcal_hits"] = ah
+    out = dict(global_feats)
 
-    # nb mu-spec tracks
-    nm = np.asarray(global_feats["nb_muspec_tracks"], dtype=float).copy()
-    mult = _lognormal(nm.shape, log_sigma)
-    global_feats["nb_muspec_tracks"] = np.maximum(nm * mult, 0.0)
+    # ECAL (dense 5x5)
+    if "ecal_hits" in out and out["ecal_hits"] is not None:
+        ec = np.asarray(out["ecal_hits"], dtype=np.float32).copy()
+        if ec.size > 0:
+            ec *= _lognormal(ec.shape, log_sigma)
+            ec = np.maximum(ec, 0.0)
+        out["ecal_hits"] = ec
 
-    # mu-spec momenta (vectors)
-    mp = np.asarray(global_feats["muspec_p"], dtype=float).copy()
-    if mp.size > 0:
-        # one multiplier per vector, then broadcast to 3 components
-        nvec = mp.shape[0]
-        mult = _lognormal((nvec, 1), log_sigma)
-        mp = mp * mult
-    global_feats["muspec_p"] = mp
+    # AHCAL (sparse hits: [x,y,z,q])
+    if "ahcal_hits" in out and out["ahcal_hits"] is not None:
+        ah = np.asarray(out["ahcal_hits"], dtype=np.float32).copy()
+        if ah.size > 0:
+            q = ah[:, 3]
+            q *= _lognormal(q.shape, log_sigma)
+            ah[:, 3] = np.maximum(q, 0.0)
+        out["ahcal_hits"] = ah
 
-    # mu-spec charges
-    mq = np.asarray(global_feats["muspec_q"], dtype=float).copy()
-    mult = _lognormal(mq.shape, log_sigma)
-    global_feats["muspec_q"] = np.maximum(mq * mult, 0.0)
-
-    # mu-spec chi2
-    mc = np.asarray(global_feats["muspec_chi2"], dtype=float).copy()
-    mult = _lognormal(mc.shape, log_sigma)
-    global_feats["muspec_chi2"] = np.maximum(mc * mult, 0.0)
-
-    return global_feats
+    return out
 
 
 def csr_keep_rows_numpy(label_indptr, label_ids, label_weight, mask):

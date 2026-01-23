@@ -438,16 +438,6 @@ class SparseFASERCALDataset(Dataset):
             'muspec_p':         muspec_tracks[:, 1:4],
             'muspec_chi2':      muspec_tracks[:, 4],
         }
-        # ensure we have at least 1 AHCAL hit
-        if global_feats["ahcal_hits"].size == 0:
-            # random xyz in the 18x18x40 box, charge = 0
-            xyz = np.array([
-                np.random.randint(0, AHCAL_SHAPE[0]),
-                np.random.randint(0, AHCAL_SHAPE[1]),
-                np.random.randint(0, AHCAL_SHAPE[2]),
-            ], dtype=float)
-            ahcal_hits = np.array([[xyz[0], xyz[1], xyz[2], 0.0]], dtype=float)
-            global_feats["ahcal_hits"] = ahcal_hits
 
         if is_tau:
             assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"

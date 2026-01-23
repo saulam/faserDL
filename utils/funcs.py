@@ -100,10 +100,15 @@ def _make_spconv_tensor(
     bcols, ccols = [], []
     for b, c in enumerate(coords_list):
         n = c.size(0)
-        if n == 0:  # skip empty items (we filtered earlier, but be safe)
-            continue
-        bcols.append(torch.full((n, 1), b, dtype=torch.int32, device=device))
-        ccols.append(c.to(device=device, dtype=torch.int32))
+        if n == 0:
+            # Add a dummy coordinate at origin to maintain batch consistency
+            # The attention mask in the model will ignore this token
+            dummy_coord = torch.zeros((1, D), dtype=torch.int32, device=device)
+            bcols.append(torch.full((1, 1), b, dtype=torch.int32, device=device))
+            ccols.append(dummy_coord)
+        else:
+            bcols.append(torch.full((n, 1), b, dtype=torch.int32, device=device))
+            ccols.append(c.to(device=device, dtype=torch.int32))
     indices_xyz = torch.cat([torch.cat(bcols, 0), torch.cat(ccols, 0)], dim=1)  # [N, 1+D]
     assert indices_xyz.numel() > 0, "No coordinates after batching."
 
@@ -175,6 +180,15 @@ def collate(
     feats_list  = [d["feats"]  for d in batch]
     ahcal_coords_list = [d["ahcal_hits_coords"] for d in batch]
     ahcal_feats_list  = [d["ahcal_hits_feats"]  for d in batch]
+
+    # Ensure empty ahcal events have at least one zero-feature entry
+    # This prevents batch size mismatch when creating sparse tensors
+    for i, (coords, feats) in enumerate(zip(ahcal_coords_list, ahcal_feats_list)):
+        if len(coords) == 0:
+            # Add dummy coordinate at origin with zero feature
+            ahcal_coords_list[i] = torch.zeros((1, 3), dtype=coords.dtype, device=coords.device)
+            ahcal_feats_list[i] = torch.zeros((1, feats.shape[1] if feats.ndim > 1 else 1), 
+                                             dtype=feats.dtype, device=feats.device)
 
     # Build hit_event_id exactly like your current collate
     num_hits = torch.tensor([len(x) for x in feats_list], dtype=torch.long)
@@ -402,18 +416,28 @@ def csr_keep_rows_torch(label_indptr, label_ids, label_weight, raw_idx):
     return new_indptr, new_ids, new_weight, raw_idx
 
 
-def weighted_loss(L, s, kind):
+def weighted_loss(
+    L: torch.Tensor,
+    u: torch.Tensor,
+    w_min: float = 0.3,
+    w_max: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Calculates Kendall et al. uncertainty-weighted loss for any task.
-    L: The raw loss for the task (e.g., MSE, BCE, CrossEntropy).
-    s: The learnable log-variance parameter for the task.
+    Kendall uncertainty weighting with a *bounded* weight:
+      w = w_min + (w_max - w_min) * sigmoid(u)   in (w_min, w_max)
+
+    Uses the usual regularizer term with s = -log(w):
+      loss = w * L + 0.5 * s
+
+    Returns:
+      loss_weighted, w, s
 
     https://arxiv.org/pdf/1705.07115
     """
-    #if kind in ("ce","bce","nce","focal"):    # classification-ish (InfoNCE/focal/BCE/CE)
-    #    return torch.exp(-s) * L + 0.5 * s
-    #return 0.5 * torch.exp(-s) * L + 0.5 * s  # regression-ish
-    return torch.exp(-s) * L + 0.5 * s  # works best for me in practice
+    w = w_min + (w_max - w_min) * torch.sigmoid(u)
+    s = -torch.log(w.clamp_min(1e-12))
+    loss = w * L + 0.5 * s
+    return loss, w, s
 
 
 class CustomLambdaLR(LambdaLR):

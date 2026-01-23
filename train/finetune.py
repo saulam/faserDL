@@ -25,8 +25,6 @@ pl_major = int(pl.__version__.split(".")[0])
 MODEL_FACTORIES = {
     'tiny':  vit_tiny,
     'base':  vit_base,
-    'large': vit_large,
-    'huge':  vit_huge,
 }
 
 

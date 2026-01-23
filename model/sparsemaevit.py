@@ -83,7 +83,7 @@ class SparseMAEViT(nn.Module):
             self.ahcal_grid_size[0] * self.ahcal_grid_size[1] * self.ahcal_grid_size[2]
         )
 
-        # patch embedding
+        # sparse patch embedding
         if self.fcal_patch_size.prod().item() > 512:
             # too large -> use two-step conv
             mid = embed_dim // 4
@@ -189,10 +189,10 @@ class SparseMAEViT(nn.Module):
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
         self.muon_spec_xattn = CrossAttnBlock(
-                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                    qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                    drop_path=0., norm_layer=norm_layer
-                )
+            dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+            qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
+            drop_path=0., norm_layer=norm_layer
+        )
         self.lat_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -343,6 +343,7 @@ class SparseMAEViT(nn.Module):
             'kv_src_embed.weight',
             'module_embed_dec.weight',
             'query_tokens',
+            'ahcal_query_tokens',
         }
     
 
@@ -591,8 +592,8 @@ class SparseMAEViT(nn.Module):
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
 
         # FASERCAL patchify + mask + intra-attn
-        x_sparse = self.fcal_patch_embed(x_sparse)
-        x, attn_mask, intra_idx = self.densify_patches(x_sparse, is_fasercal=True)
+        x_sparse_emb = self.fcal_patch_embed(x_sparse)
+        x, attn_mask, intra_idx = self.densify_patches(x_sparse_emb, is_fasercal=True)
         x = x + self.intra_pos_embed(intra_idx)
 
         x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
@@ -617,12 +618,15 @@ class SparseMAEViT(nn.Module):
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)
 
         # AHCAL patchify + mask + self-attn
+        # Count actual input voxels per batch element (before patch embedding)
+        ahcal_batch_ids = ahcal_sparse.indices[:, 0].long()                                # [N_hits]
+        ahcal_hit_counts = torch.bincount(ahcal_batch_ids, minlength=B)                    # [B]
+        degenerate = (ahcal_hit_counts < 2)                                                # True if 0 or 1 voxel (likely dummy)
+        
         ahcal_sparse = self.ahcal_patch_embed(ahcal_sparse)
         ah_tokens, ah_mask, ah_idx = self.densify_patches(ahcal_sparse, is_fasercal=False)  # [B, Na, C], [B, Na], [B, Na]
         ah_tokens = ah_tokens + self.ahcal_pos_embed(ah_idx) \
             + self.kv_src_embed.weight[0].view(1, 1, -1)                                    # tag as AHCAL
-        ah_counts = ah_mask.sum(dim=1)
-        degenerate = (ah_counts < 2)
         if degenerate.any():
             ah_mask = ah_mask.clone()
             ah_mask[degenerate] = False
@@ -651,11 +655,6 @@ class SparseMAEViT(nn.Module):
         ah_cls = x_ah[:, :K, :]                                                             # [B, K, C]
         tok_ah_keep = x_ah[:, K:, :]                                                        # [B, Lk_ah, C]
 
-        # if degenerate: zero out AHCAL CLS so it doesn't inject noise into latents
-        if degenerate.any():
-            ah_cls = ah_cls.clone()
-            ah_cls[degenerate] = 0.0
-
         # ECAL token
         ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                      # [B, 1, C]
         ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                    # tag as ECAL
@@ -666,7 +665,6 @@ class SparseMAEViT(nn.Module):
         has_tracks = (muspec_counts > 0)                                                    # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
-        
         muon_tok = self.muon_spec_xattn(
             muspec_count_emb,
             muon_spec_emb,
@@ -766,7 +764,7 @@ class SparseMAEViT(nn.Module):
         patch_ids = self.module_token_indices[m_ids, l_ids]                    # [Nm]
         idx_targets = idx_map[b_ids, patch_ids]                                # [Nm, P]
 
-        return preds, idx_targets, b_ids, patch_ids
+        return preds, idx_targets
     
 
     def forward_reconstruction_ahcal(
@@ -815,7 +813,7 @@ class SparseMAEViT(nn.Module):
         patch_ids_ah = l_ids                                                 # [Nm]
         idx_targets_ah = ah_idx_map[b_ids, patch_ids_ah]                     # [Nm, P_ah]
 
-        return preds_ah, idx_targets_ah, b_ids, patch_ids_ah
+        return preds_ah, idx_targets_ah
     
 
     def forward(self, x, x_glob, mask_ratio=0.75):
@@ -839,7 +837,7 @@ class SparseMAEViT(nn.Module):
         ) = self.forward_encoder(x, x_glob, mask_ratio)
 
         # FASERCAL: both reconstruction and semantic segmentation on masked patches
-        preds_fas, idx_targets_fas, row_event_ids_fas, row_patch_ids_fas = self.forward_reconstruction_fcal(
+        preds_fas, idx_targets_fas = self.forward_reconstruction_fcal(
             lat=lat,
             attn_mask_mod=attn_mask_mod,
             rand_mask=rand_mask,
@@ -847,7 +845,7 @@ class SparseMAEViT(nn.Module):
         )
 
         # AHCAL reconstruction on masked patches
-        preds_ah, idx_targets_ah, row_event_ids_ah, row_patch_ids_ah = self.forward_reconstruction_ahcal(
+        preds_ah, idx_targets_ah = self.forward_reconstruction_ahcal(
             lat=lat,
             ah_mask=ah_mask,
             ah_rand_mask=ah_rand_mask,
@@ -860,11 +858,7 @@ class SparseMAEViT(nn.Module):
         return (
             preds,
             idx_targets_fas,        # FASERcal idx_targets (for all tasks: occ, reg, gho, hie, dec, pid)
-            row_event_ids_fas,
-            row_patch_ids_fas,
             idx_targets_ah,         # AHCAL idx_targets (for occ_ahcal, reg_ahcal)
-            row_event_ids_ah,
-            row_patch_ids_ah,
         )
 
 

@@ -28,13 +28,13 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v7.0_clariden_dist_v9_v2"
+name="finetune_v7.0_lat_v1"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v7.0_clariden_dist_v9_v2"
+checkpoint_name="finetune_v7.0_lat_v1"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_dist_v9/loss_total_val/epoch=123-step=62992.ckpt"
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v1/loss_total_val/epoch=138-step=70612.ckpt"
 gpus=(1)
 
 python -m train.finetune \

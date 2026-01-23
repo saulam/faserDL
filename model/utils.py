@@ -283,6 +283,58 @@ def _split_even_3(embed_dim):
     return dims, pad  # pad is 0 or 1
 
 
+def _span_idx(d: int, top: int, device=None):
+    if d <= 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return (torch.arange(d, device=device) * top // d).clamp_max(top - 1)
+
+
+def make_parallel_then_merge_dpr(
+    dp_max: float,
+    d_fas: int,
+    d_ah: int,
+    d_io: int,
+    xattn_scale: float = 0.5,
+    include_muon: bool = True,
+    muon_pos: str = "parallel_mid",  # "parallel_mid", "parallel_end", "merge"
+    first_lat_xattn_zero: bool = False,
+):
+    top = max(d_fas, d_ah)
+
+    muon_in_merge = include_muon and (muon_pos == "merge")
+    merge_len = (1 if muon_in_merge else 0) + 2 * d_io
+
+    stage = torch.linspace(0.0, dp_max, top + merge_len)
+
+    # parallel branches span across [0..top-1]
+    dp_fas = stage[_span_idx(d_fas, top, stage.device)].tolist()
+    dp_ah  = stage[_span_idx(d_ah,  top, stage.device)].tolist()
+
+    # muon placement
+    if include_muon:
+        if muon_pos == "merge":
+            dp_muon = (stage[top].item() * xattn_scale)
+            off = top + 1
+        else:
+            muon_stage = (top // 2) if (muon_pos == "parallel_mid") else (top - 1)
+            dp_muon = (stage[muon_stage].item() * xattn_scale)
+            off = top
+    else:
+        dp_muon = 0.0
+        off = top
+
+    # merge: true execution order [x0, s0, x1, s1, ...]
+    merge = stage[off : off + 2 * d_io]
+    dp_lat_x = (merge[0::2] * xattn_scale).tolist()
+    dp_lat_s = (merge[1::2]).tolist()
+
+    if first_lat_xattn_zero and d_io > 0:
+        dp_lat_x[0] = 0.0
+
+    return dp_fas, dp_ah, dp_muon, dp_lat_x, dp_lat_s
+
+
+
 def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     """
     grid_size: int (for cubic grid) or tuple of ints (H, W, D)
