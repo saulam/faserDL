@@ -62,6 +62,8 @@ class MAEPreTrainer(pl.LightningModule):
         self.semantic_gamma_distance = args.semantic_gamma_distance
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
+        self.kendall_w_min = 0.3
+        self.kendall_w_max = 5.0
         self.log_sigma_gho = nn.Parameter(torch.zeros(()))
         self.log_sigma_hie = nn.Parameter(torch.zeros(()))
         self.log_sigma_dec = nn.Parameter(torch.zeros(()))
@@ -350,7 +352,7 @@ class MAEPreTrainer(pl.LightningModule):
 
         def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
             u = self._uncertainty_params[name]
-            loss_w, w, s = weighted_loss(loss, u)
+            loss_w, w, s = weighted_loss(loss, u, w_min=self.kendall_w_min, w_max=self.kendall_w_max)
             kendall_w[name] = w.detach()
             kendall_s[name] = s.detach()
             return loss_w

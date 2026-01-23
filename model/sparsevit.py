@@ -428,6 +428,36 @@ class SparseViT(vit.VisionTransformer):
         return packed, keep, b_ids, m_ids, l_ids, within, N_max 
     
 
+    def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Build a [B, N_lat] boolean mask for Perceiver latents:
+        - FASER latents valid iff that module has >=1 real patch (attn_mask_mod any True)
+        - AHCAL latents valid iff AHCAL has >=1 real patch (ah_mask any True)
+
+        Also ensures at least one latent is kept per batch element (numerical safety).
+        """
+        # attn_mask_mod: [B, M, Lm]
+        # ah_mask:       [B, Na]
+        B, M, _ = attn_mask_mod.shape
+        device = attn_mask_mod.device
+
+        module_valid = attn_mask_mod.any(dim=-1)  # [B, M]
+        lat_fas_keep = module_valid.repeat_interleave(self.num_module_cls, dim=1)  # [B, M*CLS]
+
+        ah_valid = ah_mask.any(dim=-1)  # [B]
+        lat_ah_keep = ah_valid.view(B, 1).expand(B, self.num_ahcal_cls)  # [B, K]
+
+        lat_keep = torch.cat([lat_fas_keep, lat_ah_keep], dim=1).to(device=device)  # [B, N_lat]
+
+        # If an event is totally empty everywhere, keep one dummy latent to avoid "all keys masked" SDPA edge cases.
+        empty_evt = (lat_keep.sum(dim=1) == 0)
+        if empty_evt.any():
+            lat_keep = lat_keep.clone()
+            lat_keep[empty_evt, 0] = True
+
+        return lat_keep
+    
+
     def _prepare_latent_queries(
         self,
         cls_mod: torch.Tensor,   # [B, M, CLS, C]
@@ -452,8 +482,8 @@ class SparseViT(vit.VisionTransformer):
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
 
         # FASERCAL patchify + intra-attn
-        x_sparse = self.fcal_patch_embed(x_sparse)
-        x, attn_mask, intra_idx = self.densify_patches(x_sparse)
+        x_sparse_emb = self.fcal_patch_embed(x_sparse)
+        x, attn_mask, intra_idx = self.densify_patches(x_sparse_emb)
         x = x + self.intra_pos_embed(intra_idx)
 
         x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
@@ -467,7 +497,7 @@ class SparseViT(vit.VisionTransformer):
             [torch.ones(B*M, self.num_module_cls, dtype=torch.bool, device=x_intra.device),
              attn_mask_mod.reshape(B*M, L)], dim=1)
         for blk in self.blocks:
-            x_intra = blk(x_intra, attn_mask=attn_mask_intra)
+            x_intra = blk(x_intra, attn_mask=attn_mask_intra, q_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
         # extract intra-module CLS and patch features
@@ -499,7 +529,7 @@ class SparseViT(vit.VisionTransformer):
                 ah_mask], dim=1
         )
         for blk in self.ahcal_blocks:
-            x_ah = blk(x_ah, attn_mask=ah_attn_intra)
+            x_ah = blk(x_ah, attn_mask=ah_attn_intra, q_mask=ah_attn_intra)
         x_ah = self.ahcal_norm(x_ah)
 
         ah_cls = x_ah[:, :K, :]                                                             # [B, K, C]
@@ -532,20 +562,22 @@ class SparseViT(vit.VisionTransformer):
         kv_tokens = self.tokens_norm(kv_tokens)
 
         # latents: FASER CLS + AHCAL CLS
-        lat = self._prepare_latent_queries(cls_mod, ah_cls)                                 # [B, M*CLS, C]
+        lat = self._prepare_latent_queries(cls_mod, ah_cls)                                 # [B, N_lat, C]
+        lat_keep = self._build_latent_keep(attn_mask_mod=attn_mask_mod, ah_mask=ah_mask)    # [B, N_lat]
 
         # Perceiver encoder loop (NO tok<-lat)
         for xa_lat, sa in zip(self.lat_xattn_blocks, self.latent_self_blocks):
-            lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep)                                 # lat <- tokens
-            lat = sa(lat, attn_mask=None)                                                   # latent self-attn
+            lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep, q_mask=lat_keep)                # lat <- tokens
+            lat = sa(lat, attn_mask=lat_keep, q_mask=lat_keep)                              # latent self-attn
 
         # Task-specific heads
         if self.global_pool:
-            outcome = lat.mean(dim=1)                                                       # [B, C]
+            den = lat_keep.sum(dim=1, keepdim=True).clamp_min(1).type_as(lat)               # [B, 1]
+            outcome = (lat * lat_keep.unsqueeze(-1).type_as(lat)).sum(dim=1) / den          # [B, C]
         else:
             task_q  = self.task_tokens.expand(B, -1, -1)                                    # [B, T, C]
-            kv_tokens = self.latents_norm(kv_tokens)
-            outcome = task_q + self.task_cross_attn(task_q, kv_tokens, attn_mask=kv_keep) * self.gamma
+            lat_kv = self.latents_norm(lat)                                                 # [B, N_lat, C]
+            outcome = task_q + self.task_cross_attn(task_q, lat_kv, attn_mask=lat_keep) * self.gamma
 
         return outcome
     
@@ -574,7 +606,7 @@ def vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=2, num_heads=12, io_depth=3,
-        num_module_cls=1, num_ahcal_cls=2,
+        num_module_cls=2, num_ahcal_cls=2,
         mlp_ratio=4.0, qkv_bias=True, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)

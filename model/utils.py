@@ -200,9 +200,22 @@ class BlockWithMask(Block):
             proj_drop=proj_drop,
         )
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, q_mask=None):
+        if q_mask is None and attn_mask is not None:
+            q_mask = attn_mask
+
+        if q_mask is not None:
+            qm = q_mask.unsqueeze(-1).to(dtype=x.dtype)
+            # zero masked queries before any compute (stabilizes LN/MLP and avoids carrying junk)
+            x = x * qm
+
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+        if q_mask is not None:
+            # ensure masked queries stay exactly zero after residual + MLP
+            x = x * qm
+
         return x
 
 
@@ -252,10 +265,18 @@ class CrossAttnBlock(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()        
     
-    def forward(self, q, kv, attn_mask=None):
+    def forward(self, q, kv, attn_mask=None, q_mask=None):
         x = q
+        if q_mask is not None:
+            qm = q_mask.unsqueeze(-1).to(dtype=x.dtype)
+            x = x * qm  # zero masked queries before compute
+
         x = x + self.drop_path1(self.ls1(self.attn(self.norm_q(q), self.norm_kv(kv), attn_mask=attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+        if q_mask is not None:
+            x = x * qm  # keep masked queries exactly zero
+
         return x
     
 

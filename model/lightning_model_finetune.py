@@ -6,6 +6,7 @@ Date: 01.25
 Description: PyTorch Lightning model - stage 2 (transfer learning from stage 1): classification and regression tasks.
 """
 
+import math
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -39,6 +40,8 @@ class ViTFineTuner(pl.LightningModule):
         self.crit = CylindricalConsistencyLoss(stats=stats)
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
+        self.kendall_w_min = 0.3
+        self.kendall_w_max = 5.0
         self.log_sigma_flavour   = nn.Parameter(torch.zeros(()))
         self.log_sigma_charm     = nn.Parameter(torch.zeros(()))
         self.log_sigma_vis_geom  = nn.Parameter(torch.zeros(()))
@@ -78,6 +81,17 @@ class ViTFineTuner(pl.LightningModule):
         self.betas = (args.beta1, args.beta2)
         self.weight_decay = args.weight_decay
         self.eps = args.eps
+
+        def _u_for_w(w, w_min, w_max, eps=1e-6):
+            # Map desired initial weight w into u so that:
+            # w = w_min + (w_max - w_min) * sigmoid(u)
+            p = (w - w_min) / (w_max - w_min)
+            p = max(eps, min(1.0 - eps, float(p)))
+            return math.log(p / (1.0 - p))
+        w0 = 1.0  # desired initial Kendall weight
+        u0 = _u_for_w(w0, self.kendall_w_min, self.kendall_w_max)
+        for p in self._uncertainty_params.values():
+            p.data.fill_(u0)
 
     
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
@@ -251,7 +265,7 @@ class ViTFineTuner(pl.LightningModule):
 
         def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
             u = self._uncertainty_params[name]
-            loss_w, w, s = weighted_loss(loss, u)
+            loss_w, w, s = weighted_loss(loss, u, w_min=self.kendall_w_min, w_max=self.kendall_w_max)
             kendall_w[name] = w.detach()
             kendall_s[name] = s.detach()
             return loss_w

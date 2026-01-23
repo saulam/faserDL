@@ -561,6 +561,36 @@ class SparseMAEViT(nn.Module):
         out = packed.new_zeros(B, M, L, C)
         out[b_ids, m_ids, l_ids, :] = packed[b_ids, within, :]
         return out    
+    
+
+    def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Build a [B, N_lat] boolean mask for Perceiver latents:
+        - FASER latents valid iff that module has >=1 real patch (attn_mask_mod any True)
+        - AHCAL latents valid iff AHCAL has >=1 real patch (ah_mask any True)
+
+        Also ensures at least one latent is kept per batch element (numerical safety).
+        """
+        # attn_mask_mod: [B, M, Lm]
+        # ah_mask:       [B, Na]
+        B, M, _ = attn_mask_mod.shape
+        device = attn_mask_mod.device
+
+        module_valid = attn_mask_mod.any(dim=-1)  # [B, M]
+        lat_fas_keep = module_valid.repeat_interleave(self.num_module_cls, dim=1)  # [B, M*CLS]
+
+        ah_valid = ah_mask.any(dim=-1)  # [B]
+        lat_ah_keep = ah_valid.view(B, 1).expand(B, self.num_ahcal_cls)  # [B, K]
+
+        lat_keep = torch.cat([lat_fas_keep, lat_ah_keep], dim=1).to(device=device)  # [B, N_lat]
+
+        # If an event is totally empty everywhere, keep one dummy latent to avoid "all keys masked" SDPA edge cases.
+        empty_evt = (lat_keep.sum(dim=1) == 0)
+        if empty_evt.any():
+            lat_keep = lat_keep.clone()
+            lat_keep[empty_evt, 0] = True
+
+        return lat_keep
 
 
     def _prepare_latent_queries(
@@ -609,7 +639,7 @@ class SparseMAEViT(nn.Module):
             [torch.ones(B*M, self.num_module_cls, dtype=torch.bool, device=x_intra.device),
              attn_mask_keep.reshape(B*M, Lk)], dim=1)
         for blk in self.blocks:
-            x_intra = blk(x_intra, attn_mask=attn_mask_intra)
+            x_intra = blk(x_intra, attn_mask=attn_mask_intra, q_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
         cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)    # [B, M, CLS, C]
@@ -649,7 +679,7 @@ class SparseMAEViT(nn.Module):
                 ah_attn_keep], dim=1
         )
         for blk in self.ahcal_blocks:
-            x_ah = blk(x_ah, attn_mask=ah_attn_intra)
+            x_ah = blk(x_ah, attn_mask=ah_attn_intra, q_mask=ah_attn_intra)
         x_ah = self.ahcal_norm(x_ah)
 
         ah_cls = x_ah[:, :K, :]                                                             # [B, K, C]
@@ -687,14 +717,16 @@ class SparseMAEViT(nn.Module):
 
         # latents: FASER CLS + AHCAL CLS
         lat = self._prepare_latent_queries(cls_mod, ah_cls)                                 # [B, N_lat, C]
+        lat_keep = self._build_latent_keep(attn_mask_mod=attn_mask_mod, ah_mask=ah_mask)    # [B, N_lat]
 
         # Perceiver-IO encoder loop
         for xa_lat, sa in zip(self.lat_xattn_blocks, self.latent_self_blocks):
-            lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep)                                 # lat <- tokens
-            lat = sa(lat, attn_mask=None)                                                   # latent self-attn
+            lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep, q_mask=lat_keep)                # lat <- tokens
+            lat = sa(lat, attn_mask=lat_keep, q_mask=lat_keep)                              # latent self-attn
 
         return (
             lat,                   # [B, N_lat, C]
+            lat_keep,              # [B, N_lat]     which latents are valid
             rand_mask,             # [B, M, Lm]     FASERcal masked real positions
             attn_mask_mod,         # [B, M, Lm]     FASERcal real positions
             ah_mask,               # [B, Na]        AHCAL real positions
@@ -714,6 +746,7 @@ class SparseMAEViT(nn.Module):
     def forward_reconstruction_fcal(
         self,
         lat: torch.Tensor,            # [B, N_lat, Cenc]
+        lat_keep: torch.Tensor,       # [B, N_lat]
         attn_mask_mod: torch.Tensor,  # [B, M, Lm]
         rand_mask: torch.Tensor,      # [B, M, Lm]
         idx_map,
@@ -746,7 +779,7 @@ class SparseMAEViT(nn.Module):
         LAT = self.enc_to_dec(lat)                                             # [B, N_lat, Cdec] (no mask needed)
         X = Q
         for blk in self.decode_lat_xattn_blocks:
-            X = blk(X, LAT, attn_mask=None)
+            X = blk(X, LAT, attn_mask=lat_keep)
 
         out_flat = X[b_ids, within]                                            # [Nm, Cdec]
 
@@ -770,6 +803,7 @@ class SparseMAEViT(nn.Module):
     def forward_reconstruction_ahcal(
         self,
         lat: torch.Tensor,            # [B, N_lat, Cenc]
+        lat_keep: torch.Tensor,       # [B, N_lat]
         ah_mask: torch.Tensor,        # [B, Na]
         ah_rand_mask: torch.Tensor,   # [B, Na]
         ah_idx_map,
@@ -799,7 +833,7 @@ class SparseMAEViT(nn.Module):
         LAT = self.enc_to_dec(lat)  # [B,N_lat,Cdec]
         X = Q
         for blk in self.decode_lat_xattn_blocks:
-            X = blk(X, LAT, attn_mask=None)
+            X = blk(X, LAT, attn_mask=lat_keep)
 
         out_flat = X[b_ids, within]                                          # [Nm, Cdec]
 
@@ -830,6 +864,7 @@ class SparseMAEViT(nn.Module):
         # single encoder pass
         (
             lat,
+            lat_keep,
             rand_mask,
             attn_mask_mod,
             ah_mask,
@@ -839,6 +874,7 @@ class SparseMAEViT(nn.Module):
         # FASERCAL: both reconstruction and semantic segmentation on masked patches
         preds_fas, idx_targets_fas = self.forward_reconstruction_fcal(
             lat=lat,
+            lat_keep=lat_keep,
             attn_mask_mod=attn_mask_mod,
             rand_mask=rand_mask,
             idx_map=idx_map,
@@ -847,6 +883,7 @@ class SparseMAEViT(nn.Module):
         # AHCAL reconstruction on masked patches
         preds_ah, idx_targets_ah = self.forward_reconstruction_ahcal(
             lat=lat,
+            lat_keep=lat_keep,
             ah_mask=ah_mask,
             ah_rand_mask=ah_rand_mask,
             ah_idx_map=ah_idx_map,
