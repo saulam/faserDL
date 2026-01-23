@@ -186,6 +186,7 @@ class SparseMAEViT(nn.Module):
         # Perceiver-IO bottleneck (encoder side): lat <- tok + latent self
         # ==========================
         self.ecal_embed = nn.Linear(25, embed_dim)
+        self.muon_state_embed = nn.Embedding(2, embed_dim)  # 0=abstain (no tracks), 1=present
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
         self.muon_spec_xattn = CrossAttnBlock(
@@ -315,6 +316,7 @@ class SparseMAEViT(nn.Module):
             nn.init.normal_(self.module_embed_dec.weight, std=0.02)
             nn.init.normal_(self.query_tokens, std=0.02)
             nn.init.normal_(self.ahcal_query_tokens, std=0.02)
+            nn.init.normal_(self.muon_state_embed.weight, std=0.02)
 
         self.apply(self._init_weights)
 
@@ -344,6 +346,7 @@ class SparseMAEViT(nn.Module):
             'module_embed_dec.weight',
             'query_tokens',
             'ahcal_query_tokens',
+            'muon_state_embed.weight',
         }
     
 
@@ -695,12 +698,12 @@ class SparseMAEViT(nn.Module):
         has_tracks = (muspec_counts > 0)                                                    # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
-        muon_tok = self.muon_spec_xattn(
-            muspec_count_emb,
-            muon_spec_emb,
-            attn_mask=safe_mask
-        )
-        muon_tok = muon_tok * has_tracks.view(B, 1, 1).float()                              # [B, 1, C]
+        muon_tok_present = self.muon_spec_xattn(
+            muspec_count_emb, muon_spec_emb, attn_mask=safe_mask
+        )                                                                                   # [B,1,C]
+        muon_tok = torch.where(has_tracks.view(B,1,1), muon_tok_present, muspec_count_emb)
+        muon_state = has_tracks.long().squeeze(-1)                                          # [B]
+        muon_tok = muon_tok + self.muon_state_embed(muon_state).unsqueeze(1)                # 0=abstain, 1=present
         muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                    # tag as MUON_SPEC
 
         # randomly drop global tokens (consistent with masking policy)
@@ -905,7 +908,7 @@ def mae_vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=2, num_heads=12, io_depth=3, io_decode_depth=2, 
-        num_module_cls=1, num_ahcal_cls=2,
+        num_module_cls=2, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
@@ -917,7 +920,7 @@ def mae_vit_base(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=2, num_heads=12, io_depth=3, io_decode_depth=2, 
-        num_module_cls=1, num_ahcal_cls=2,
+        num_module_cls=2, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )

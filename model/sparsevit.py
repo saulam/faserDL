@@ -186,6 +186,7 @@ class SparseViT(vit.VisionTransformer):
 
         # Perceiver-IO bottleneck: lat <- tok + latent self
         self.ecal_embed = nn.Linear(25, embed_dim)
+        self.muon_state_embed = nn.Embedding(2, embed_dim)  # 0=abstain (no tracks), 1=present
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
         self.muon_spec_xattn = CrossAttnBlock(
@@ -272,6 +273,7 @@ class SparseViT(vit.VisionTransformer):
             nn.init.normal_(self.ahcal_cls_token, std=0.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
             nn.init.normal_(self.kv_src_embed.weight, std=0.02)
+            nn.init.normal_(self.muon_state_embed.weight, std=0.02)
             if not self.global_pool:
                 nn.init.normal_(self.task_tokens, std=0.02)
 
@@ -310,6 +312,7 @@ class SparseViT(vit.VisionTransformer):
             'module_embed_enc.weight',
             'kv_src_embed.weight',
             'task_tokens',
+            'muon_state_embed.weight',
         }
             
 
@@ -545,12 +548,12 @@ class SparseViT(vit.VisionTransformer):
         has_tracks = (muspec_counts > 0)                                                    # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
-        muon_tok = self.muon_spec_xattn(
-            muspec_count_emb,
-            muon_spec_emb,
-            attn_mask=safe_mask
-        )
-        muon_tok = muon_tok * has_tracks.view(B, 1, 1).float()                              # [B, 1, C]
+        muon_tok_present = self.muon_spec_xattn(
+            muspec_count_emb, muon_spec_emb, attn_mask=safe_mask
+        )                                                                                   # [B,1,C]
+        muon_tok = torch.where(has_tracks.view(B,1,1), muon_tok_present, muspec_count_emb)
+        muon_state = has_tracks.long().squeeze(-1)  # [B]
+        muon_tok = muon_tok + self.muon_state_embed(muon_state).unsqueeze(1)                # 0=abstain, 1=present
         muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                    # tag as MUON_SPEC
 
         # build KV for lat <- tok
