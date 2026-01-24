@@ -13,7 +13,8 @@ from spconv.pytorch import SparseConv3d, SparseSequential
 from functools import partial
 from .utils import (
     get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, 
-    CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead, LazyIdxMap
+    CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead, LazyIdxMap,
+    muon_summary_target
 )
 
 
@@ -235,7 +236,9 @@ class SparseMAEViT(nn.Module):
         self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim)
         self.ahcal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
 
+        # ==========================
         # Heads
+        # ==========================
         self.fasercal_sep_basis = SeparableDCT3D(
             self.fcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6)
         )
@@ -265,6 +268,13 @@ class SparseMAEViT(nn.Module):
         for name, out_channels in self.head_channels.items():
             in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0]
             self.heads[name] = nn.Linear(in_dim, out_channels)
+
+        # ==========================
+        # Global token reconstruction heads
+        # ==========================
+        self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
+        self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
+        self.muon_recon_head = nn.Linear(decoder_embed_dim, 10)
 
         self.initialize_weights()
 
@@ -317,6 +327,7 @@ class SparseMAEViT(nn.Module):
             nn.init.normal_(self.query_tokens, std=0.02)
             nn.init.normal_(self.ahcal_query_tokens, std=0.02)
             nn.init.normal_(self.muon_state_embed.weight, std=0.02)
+            nn.init.normal_(self.global_query, std=0.02)
 
         self.apply(self._init_weights)
 
@@ -347,6 +358,7 @@ class SparseMAEViT(nn.Module):
             'query_tokens',
             'ahcal_query_tokens',
             'muon_state_embed.weight',
+            'global_query',
         }
     
 
@@ -707,8 +719,8 @@ class SparseMAEViT(nn.Module):
         muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                    # tag as MUON_SPEC
 
         # randomly drop global tokens (consistent with masking policy)
-        keep_ecal = (torch.rand(B, device=ecal_tok.device) > mask_ratio)                    # [B]
-        keep_muon = (torch.rand(B, device=muon_tok.device) > mask_ratio)                    # [B]
+        keep_ecal = (torch.rand(B, device=ecal_tok.device) > (mask_ratio * 0.5))              # [B]
+        keep_muon = (torch.rand(B, device=muon_tok.device) > (mask_ratio * 0.5))              # [B]
         ecal_kv_mask = keep_ecal.view(B, 1)                                                 # [B, 1]
         muon_kv_mask = keep_muon.view(B, 1)                                                 # [B, 1]
 
@@ -734,6 +746,8 @@ class SparseMAEViT(nn.Module):
             attn_mask_mod,         # [B, M, Lm]     FASERcal real positions
             ah_mask,               # [B, Na]        AHCAL real positions
             ah_rand_mask,          # [B, Na]        AHCAL masked real positions
+            ~keep_ecal,            # [B]            ECAL dropped events
+            ~keep_muon,            # [B]            MUON dropped events
         )
 
 
@@ -853,6 +867,58 @@ class SparseMAEViT(nn.Module):
         return preds_ah, idx_targets_ah
     
 
+    def forward_reconstruction_global(
+        self,
+        lat: torch.Tensor,              # [B, N_lat, Cenc]
+        lat_keep: torch.Tensor,         # [B, N_lat] bool
+        ecal_hits: torch.Tensor,        # [B, 5, 5] or [B, 25]
+        muspec_feats: torch.Tensor,     # [B, N, 5]
+        muspec_attn_mask: torch.Tensor, # [B, N] bool
+        muspec_counts: torch.Tensor,    # [B, 1]
+        ecal_drop: torch.Tensor,        # [B] bool
+        muon_drop: torch.Tensor,        # [B] bool
+    ):
+        """
+        Predict ECAL and muon-summary only (loss-masked) when the corresponding token was dropped.
+        """
+        B = lat.size(0)
+        Cdec = self.global_query.size(-1)
+
+        LAT = self.enc_to_dec(lat) # [B, N_lat, Cdec]
+
+        # Targets
+        ecal_tgt = ecal_hits.view(B, -1)  # [B, 25]
+        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask, muspec_counts)  # [B, 10]
+
+        preds = {}
+
+        # ECAL query -> latents
+        q_ecal = self.global_query[0].view(1, 1, Cdec).expand(B, 1, Cdec)  # [B,1,Cdec]
+        x = q_ecal
+        for blk in self.decode_lat_xattn_blocks:
+            x = blk(x, LAT, attn_mask=lat_keep)
+        preds["ecal_rec"] = self.ecal_recon_head(x.squeeze(1))  # [B, 25]
+
+        # MUON query -> latents
+        q_muon = self.global_query[1].view(1, 1, Cdec).expand(B, 1, Cdec)
+        x = q_muon
+        for blk in self.decode_lat_xattn_blocks:
+            x = blk(x, LAT, attn_mask=lat_keep)
+        preds["muon_rec"] = self.muon_recon_head(x.squeeze(1))  # [B, 10]
+
+        # Return masks so your training step can apply loss only when dropped
+        masks = {
+            "ecal_drop": ecal_drop,  # [B] bool
+            "muon_drop": muon_drop,  # [B] bool
+        }
+        targets = {
+            "ecal_tgt": ecal_tgt,    # [B, 25]
+            "muon_tgt": muon_tgt,    # [B, 10]
+        }
+        return preds, targets, masks
+
+    
+
     def forward(self, x, x_glob, mask_ratio=0.75):
         """
         Single encoder pass with masking (mask_ratio), then:
@@ -872,6 +938,8 @@ class SparseMAEViT(nn.Module):
             attn_mask_mod,
             ah_mask,
             ah_rand_mask,
+            ecal_drop,
+            muon_drop,
         ) = self.forward_encoder(x, x_glob, mask_ratio)
 
         # FASERCAL: both reconstruction and semantic segmentation on masked patches
@@ -892,13 +960,28 @@ class SparseMAEViT(nn.Module):
             ah_idx_map=ah_idx_map,
         )
 
+        # global reconstructions (ECAL, MUON_SPEC) when dropped
+        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
+        preds_glob, glob_tgts, glob_masks = self.forward_reconstruction_global(
+            lat=lat,
+            lat_keep=lat_keep,
+            ecal_hits=ecal_hits,
+            muspec_feats=muspec_feats,
+            muspec_attn_mask=muspec_attn_mask,
+            muspec_counts=muspec_counts,
+            ecal_drop=ecal_drop,
+            muon_drop=muon_drop,
+        )
+
         # merge all predictions
-        preds = {**preds_fas, **preds_ah}
+        preds = {**preds_fas, **preds_ah, **preds_glob}
 
         return (
             preds,
             idx_targets_fas,        # FASERcal idx_targets (for all tasks: occ, reg, gho, hie, dec, pid)
             idx_targets_ah,         # AHCAL idx_targets (for occ_ahcal, reg_ahcal)
+            glob_tgts,              # global targets (ecal_tgt, muon_tgt)
+            glob_masks,             # global masks (ecal_drop, muon_drop)
         )
 
 

@@ -278,6 +278,72 @@ class CrossAttnBlock(nn.Module):
             x = x * qm  # keep masked queries exactly zero
 
         return x
+
+
+def muon_summary_target(
+    muspec_feats: torch.Tensor,       # [B, N, 5] = (q, px, py, pz, chi2)
+    muspec_attn_mask: torch.Tensor,   # [B, N] bool
+    muspec_counts: torch.Tensor,      # [B, 1] float
+) -> torch.Tensor:
+    """
+    Fixed-size muon target [B, 10]:
+      [count,
+       sum_q,
+       px_lead, py_lead, pz_lead,
+       chi2_lead,
+       sum_px, sum_py, sum_pz,
+       mean_chi2]
+    Lead = max |p| among valid tracks. If count==0 -> zeros except count.
+    """
+    B, N, _ = muspec_feats.shape
+    device = muspec_feats.device
+    mask = muspec_attn_mask  # [B,N] bool
+
+    q    = muspec_feats[..., 0]
+    px   = muspec_feats[..., 1]
+    py   = muspec_feats[..., 2]
+    pz   = muspec_feats[..., 3]
+    chi2 = muspec_feats[..., 4]
+
+    # Sums over valid tracks
+    m = mask.float()
+    sum_q   = (q * m).sum(dim=1, keepdim=True)  # [B,1]
+    sum_px  = (px * m).sum(dim=1, keepdim=True)
+    sum_py  = (py * m).sum(dim=1, keepdim=True)
+    sum_pz  = (pz * m).sum(dim=1, keepdim=True)
+    sum_chi2 = (chi2 * m).sum(dim=1, keepdim=True)
+
+    denom = muspec_counts.clamp_min(1.0)  # [B,1]
+    mean_chi2 = sum_chi2 / denom          # [B,1]
+    mean_chi2 = mean_chi2 * (muspec_counts > 0).float()
+
+    # Leading track by |p|
+    p2 = px*px + py*py + pz*pz  # [B,N]
+    # Mask invalid tracks to -inf so argmax ignores them
+    p2_masked = p2.masked_fill(~mask, float("-inf"))
+    lead_idx = torch.argmax(p2_masked, dim=1)  # [B]
+
+    # Gather lead values (safe even if all invalid; we’ll zero them if count==0)
+    b = torch.arange(B, device=device)
+    px_lead  = px[b, lead_idx].view(B, 1)
+    py_lead  = py[b, lead_idx].view(B, 1)
+    pz_lead  = pz[b, lead_idx].view(B, 1)
+    chi2_lead = chi2[b, lead_idx].view(B, 1)
+
+    has = (muspec_counts > 0).float()  # [B,1]
+    px_lead   = px_lead * has
+    py_lead   = py_lead * has
+    pz_lead   = pz_lead * has
+    chi2_lead = chi2_lead * has
+    sum_q     = sum_q * has
+    sum_px    = sum_px * has
+    sum_py    = sum_py * has
+    sum_pz    = sum_pz * has
+
+    return torch.cat(
+        [muspec_counts, sum_q, px_lead, py_lead, pz_lead, chi2_lead, sum_px, sum_py, sum_pz, mean_chi2],
+        dim=-1
+    )  # [B, 10]
     
 
 def _split_even_3(embed_dim):

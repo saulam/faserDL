@@ -67,7 +67,7 @@ def augment(
         )
     '''
     # FASERCAL ±1 voxel translation in x/y
-    if np.random.random() < aug_prob:
+    if stage1 and np.random.random() < aug_prob:
         coords, modules, feats, labels, (dx, dy) = translate_fasercal_xy_pm1(
             coords, modules, feats, labels, metadata,
             prob_shift_x=0.5, prob_shift_y=0.5,

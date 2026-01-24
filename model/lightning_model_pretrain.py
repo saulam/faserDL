@@ -72,6 +72,8 @@ class MAEPreTrainer(pl.LightningModule):
         self.log_sigma_reg = nn.Parameter(torch.zeros(()))
         self.log_sigma_occ_ah = nn.Parameter(torch.zeros(()))
         self.log_sigma_reg_ah = nn.Parameter(torch.zeros(()))
+        self.log_sigma_ecal = nn.Parameter(torch.zeros(()))
+        self.log_sigma_muon = nn.Parameter(torch.zeros(()))
         
         self._uncertainty_params = {
             "gho": self.log_sigma_gho,
@@ -82,6 +84,8 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": self.log_sigma_reg,
             "occ_ah": self.log_sigma_occ_ah,
             "reg_ah": self.log_sigma_reg_ah,
+            "ecal": self.log_sigma_ecal,
+            "muon": self.log_sigma_muon,
         }
 
 
@@ -294,6 +298,32 @@ class MAEPreTrainer(pl.LightningModule):
         return loss_occ, loss_reg, part_losses_dec
 
 
+    def compute_global_losses(
+        self,
+        preds: dict,
+        glob_targets: dict,
+        glob_masks: dict,
+    ):
+        """
+        Compute global reconstruction losses for ECAL energy and muon momentum.
+        """
+        ecal_drop = glob_masks["ecal_drop"].float().unsqueeze(-1)
+        muon_drop = glob_masks["muon_drop"].float().unsqueeze(-1)
+        
+        loss_ecal = F.smooth_l1_loss(preds["ecal_rec"], glob_targets["ecal_tgt"], reduction="none")
+        loss_ecal = (loss_ecal * ecal_drop).sum() / (ecal_drop.sum().clamp_min(1.0))
+        
+        loss_muon = F.smooth_l1_loss(preds["muon_rec"], glob_targets["muon_tgt"], reduction="none")
+        loss_muon = (loss_muon * muon_drop).sum() / (muon_drop.sum().clamp_min(1.0))
+        
+        part_losses_glob = {
+            "ecal/total": loss_ecal.detach(),
+            "muon/total": loss_muon.detach(),
+        }
+        
+        return loss_ecal, loss_muon, part_losses_glob
+
+
     def compute_losses(
         self,
         preds: dict,
@@ -302,6 +332,8 @@ class MAEPreTrainer(pl.LightningModule):
         idx_targets_fas: torch.Tensor,
         idx_targets_ahcal: torch.Tensor,
         labels: dict,
+        glob_targets: dict,
+        glob_masks: dict,
     ):
         # FASERCal predictions
         pred_gho=preds["gho"]
@@ -344,9 +376,14 @@ class MAEPreTrainer(pl.LightningModule):
             name_prefix="ahcal_",   # metrics logged as ahcal_occ/..., ahcal_reg/...
             max_distance=self.reconstruction_max_distance_ahcal,
         )
+        
+        # Global reconstruction losses
+        loss_ecal, loss_muon, part_glob = self.compute_global_losses(
+            preds, glob_targets, glob_masks
+        )
 
         # Kendall et al. aggregation
-        part_losses = {**part_enc, **part_dec, **part_dec_ah}
+        part_losses = {**part_enc, **part_dec, **part_dec_ah, **part_glob}
         kendall_w = {}
         kendall_s = {}
 
@@ -365,7 +402,9 @@ class MAEPreTrainer(pl.LightningModule):
             _weight("occ",    loss_occ)    +
             _weight("reg",    loss_reg)    +
             _weight("occ_ah", loss_occ_ah) +
-            _weight("reg_ah", loss_reg_ah)
+            _weight("reg_ah", loss_reg_ah) +
+            _weight("ecal",   loss_ecal)   +
+            _weight("muon",   loss_muon)
         )
 
         return total_loss, part_losses, kendall_w, kendall_s
@@ -381,6 +420,8 @@ class MAEPreTrainer(pl.LightningModule):
             preds,
             idx_targets_fas,
             idx_targets_ah,
+            glob_tgts,
+            glob_masks,
         ) = self.forward(
             batch_input, batch_input_global, mask_ratio=self.mask_ratio)
 
@@ -391,6 +432,8 @@ class MAEPreTrainer(pl.LightningModule):
             idx_targets_fas=idx_targets_fas,
             idx_targets_ahcal=idx_targets_ah,
             labels=labels,
+            glob_targets=glob_tgts,
+            glob_masks=glob_masks,
         )
 
         return loss, part_losses, kendall_w, kendall_s, batch_size
