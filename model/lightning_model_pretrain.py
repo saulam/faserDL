@@ -322,15 +322,38 @@ class MAEPreTrainer(pl.LightningModule):
         ecal_drop = glob_masks["ecal_drop"].float().unsqueeze(-1)
         muon_drop = glob_masks["muon_drop"].float().unsqueeze(-1)
         
-        loss_ecal = F.smooth_l1_loss(preds["ecal_rec"], glob_targets["ecal_tgt"], reduction="none")
-        loss_ecal = (loss_ecal * ecal_drop).sum() / (ecal_drop.sum().clamp_min(1.0))
+        # --------------------
+        # ECAL loss (per-dim mean, only when dropped)
+        # --------------------
+        ecal_pred = preds["ecal_rec"]          # [B,25]
+        ecal_tgt  = glob_targets["ecal_tgt"]   # [B,25]
+        loss_ecal_raw = F.smooth_l1_loss(ecal_pred, ecal_tgt, reduction="none")  # [B, 25]
+        loss_ecal_evt = loss_ecal_raw.mean(dim=-1, keepdim=True)                 # [B, 1]
+        loss_ecal = (loss_ecal_evt * ecal_drop).sum() / ecal_drop.sum().clamp_min(1.0)
         
-        loss_muon = F.smooth_l1_loss(preds["muon_rec"], glob_targets["muon_tgt"], reduction="none")
-        loss_muon = (loss_muon * muon_drop).sum() / (muon_drop.sum().clamp_min(1.0))
+        # --------------------
+        # Muon loss (per-dim masked mean, only when dropped)
+        # muon_tgt layout assumed:
+        # [count, sum_q, px_lead, py_lead, pz_lead, chi2_lead, sum_px, sum_py, sum_pz, mean_chi2]
+        # --------------------
+        muon_pred = preds["muon_rec"]          # [B, 10]
+        muon_tgt  = glob_targets["muon_tgt"]   # [B, 10]
+        has = (muon_tgt[:, 0:1] > 0).float()   # [B, 1]
+        # build per-dim mask: always supervise dims [0,1,6,7,8,9]; supervise lead dims [2..5] only if has_tracks
+        dim_mask = muon_pred.new_zeros(muon_pred.shape)  # [B, 10]
+        dim_mask[:, [0, 1, 6, 7, 8, 9]] = 1.0
+        dim_mask[:, 2:6] = has  # broadcast [B, 1] -> [B, 4]
+        # combine with "token was dropped" mask
+        w = dim_mask * muon_drop  # [B, 10]
+        loss_muon_raw = F.smooth_l1_loss(muon_pred, muon_tgt, reduction="none")  # [B, 10]
+        loss_muon = (loss_muon_raw * w).sum() / w.sum().clamp_min(1.0)
         
         part_losses_glob = {
             "ecal/total": loss_ecal.detach(),
             "muon/total": loss_muon.detach(),
+            "ecal/drop_frac": ecal_drop.mean().detach(),
+            "muon/drop_frac": muon_drop.mean().detach(),
+            "muon/has_frac": has.mean().detach(),
         }
         
         return loss_ecal, loss_muon, part_losses_glob
