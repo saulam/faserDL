@@ -483,7 +483,7 @@ class SparseFASERCALDataset(Dataset):
         if self.train and self.augmentations_enabled:
             coords, modules, q, (csr_hie, csr_dec, csr_pid, ghost_mask), \
             (out_lepton_momentum, jet_momentum, vis_sp_momentum), \
-            global_feats, _ = augment(
+            global_feats, primary_vertex = augment(
                 coords, modules, q, (csr_hie, csr_dec, csr_pid, ghost_mask), 
                 (out_lepton_momentum, jet_momentum, vis_sp_momentum),
                 global_feats, primary_vertex, self.metadata, self.stage1

@@ -67,11 +67,10 @@ def augment(
         )
     '''
     # FASERCAL ±1 voxel translation in x/y
-    if stage1 and np.random.random() < aug_prob:
-        coords, modules, feats, labels, (dx, dy) = translate_fasercal_xy_pm1(
-            coords, modules, feats, labels, metadata,
-            prob_shift_x=0.5, prob_shift_y=0.5,
-            min_keep=5,
+    if np.random.random() < aug_prob:
+        coords, modules, feats, labels, primary_vertex, (dx, dy) = translate_fasercal_xy_pm1(
+            coords, modules, feats, labels, primary_vertex, metadata,
+            prob_shift_x=0.5, prob_shift_y=0.5, min_keep=5,
         )
 
     # calo-only gain jitter
@@ -356,6 +355,7 @@ def translate_fasercal_xy_pm1(
     modules,
     feats,
     labels,
+    primary_vertex,
     metadata,
     *,
     prob_shift_x=0.5,
@@ -380,7 +380,7 @@ def translate_fasercal_xy_pm1(
 
     # If neither axis selected, do nothing
     if dx == 0 and dy == 0:
-        return coords, modules, feats, labels, (0, 0)
+        return coords, modules, feats, labels, primary_vertex, (0, 0)
 
     x_max = metadata["x"].shape[0] - 1
     y_max = metadata["y"].shape[0] - 1
@@ -397,7 +397,7 @@ def translate_fasercal_xy_pm1(
 
     # Must keep at least some hits; otherwise skip augmentation
     if int(keep.sum()) < min_keep:
-        return coords, modules, feats, labels, (0, 0)
+        return coords, modules, feats, labels, primary_vertex, (0, 0)
 
     # Apply mask to coords/modules/feats
     c2 = c2[keep]
@@ -416,7 +416,16 @@ def translate_fasercal_xy_pm1(
             new_indptr, new_ids, new_w, _ = csr_keep_rows_numpy(*lab, keep)
             labels_out.append((new_indptr, new_ids, new_w))
 
-    return c2, m2, f2, tuple(labels_out), (dx, dy)
+    # update primary vertex consistently
+    pv2 = primary_vertex
+    if primary_vertex is not None:
+        pv2 = np.array(primary_vertex, copy=True)
+
+        # shift x/y (assumes pv[0]=x, pv[1]=y)
+        pv2[0] = pv2[0] + dx * 10  # 10 = FASERCal voxel size in mm
+        pv2[1] = pv2[1] + dy * 10  # 10 = FASERCal voxel size in mm
+
+    return c2, m2, f2, tuple(labels_out), pv2, (dx, dy)
 
 
 def drop_hits(
