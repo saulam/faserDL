@@ -420,7 +420,7 @@ class ViTFineTuner(pl.LightningModule):
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer=optimizer,
                 T_max=self.cosine_annealing_steps,
-                eta_min=0.
+                eta_min=self.lr * 1e-2,
             )
 
         # Combine both schedulers
