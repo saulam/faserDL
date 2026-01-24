@@ -10,6 +10,7 @@ but misaligned predictions. Uses distance transforms and soft chamfer losses to 
 smoother gradients for near-miss predictions.
 """
 
+import math
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -87,6 +88,17 @@ class MAEPreTrainer(pl.LightningModule):
             "ecal": self.log_sigma_ecal,
             "muon": self.log_sigma_muon,
         }
+
+        def _u_for_w(w, w_min, w_max, eps=1e-6):
+            # Map desired initial weight w into u so that:
+            # w = w_min + (w_max - w_min) * sigmoid(u)
+            p = (w - w_min) / (w_max - w_min)
+            p = max(eps, min(1.0 - eps, float(p)))
+            return math.log(p / (1.0 - p))
+        w0 = 1.0  # desired initial Kendall weight
+        u0 = _u_for_w(w0, self.kendall_w_min, self.kendall_w_max)
+        for p in self._uncertainty_params.values():
+            p.data.fill_(u0)
 
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
