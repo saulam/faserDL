@@ -149,7 +149,7 @@ class SparseViT(vit.VisionTransformer):
             module_indices.append(flat_m[order])
         self.register_buffer('module_token_indices', torch.stack(module_indices, 0))  # [M, Lm]
 
-        # drop path schedule (ViT only)
+        # drop path schedule
         dp_fas, dp_ah, dp_muon, dp_lat_x, dp_lat_s = make_parallel_then_merge_dpr(
             drop_path_rate, depth, ahcal_depth, io_depth,
             xattn_scale=0.5, include_muon=True, first_lat_xattn_zero=True

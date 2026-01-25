@@ -14,7 +14,7 @@ from functools import partial
 from .utils import (
     get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, 
     CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead, LazyIdxMap,
-    muon_summary_target
+    muon_summary_target, make_parallel_then_merge_dpr
 )
 
 
@@ -156,13 +156,18 @@ class SparseMAEViT(nn.Module):
         self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
         self.kv_src_embed = nn.Embedding(3, embed_dim)                                   # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
 
+        # drop path schedule
+        dp_fas, dp_ah, dp_muon, dp_lat_x, dp_lat_s = make_parallel_then_merge_dpr(
+            drop_path_rate, self.intra_depth, self.ahcal_depth, io_depth,
+            xattn_scale=0.5, include_muon=True, first_lat_xattn_zero=True
+        )
+
         # FASERCAL intra-module transformer blocks
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.intra_depth)]
         self.blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=dpr[i], norm_layer=norm_layer
+                drop_path=dp_fas[i], norm_layer=norm_layer
             )
             for i in range(self.intra_depth)
         ])
@@ -172,12 +177,11 @@ class SparseMAEViT(nn.Module):
         self.num_ahcal_cls = int(num_ahcal_cls)
         self.ahcal_depth = int(ahcal_depth)
         self.ahcal_cls_token = nn.Parameter(torch.zeros(1, self.num_ahcal_cls, embed_dim))
-        dpr_ahcal = [x.item() for x in torch.linspace(0, drop_path_rate, self.ahcal_depth)]
         self.ahcal_blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=dpr_ahcal[i], norm_layer=norm_layer
+                drop_path=dp_ah[i], norm_layer=norm_layer
             )
             for i in range(self.ahcal_depth)
         ])
@@ -193,23 +197,23 @@ class SparseMAEViT(nn.Module):
         self.muon_spec_xattn = CrossAttnBlock(
             dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
             qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-            drop_path=0., norm_layer=norm_layer
+            drop_path=dp_muon, norm_layer=norm_layer
         )
         self.lat_xattn_blocks = nn.ModuleList([
             CrossAttnBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=0., norm_layer=norm_layer
+                drop_path=dp_lat_x[i], norm_layer=norm_layer
             )
-            for _ in range(io_depth)
+            for i in range(io_depth)
         ])
         self.latent_self_blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
-                drop_path=0., norm_layer=norm_layer
+                drop_path=dp_lat_s[i], norm_layer=norm_layer
             )
-            for _ in range(io_depth)
+            for i in range(io_depth)
         ])
         self.tokens_norm = norm_layer(embed_dim)
 
@@ -990,8 +994,8 @@ def mae_vit_tiny(**kwargs):
         in_chans=1, embed_dim=384, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
-        depth=4, ahcal_depth=2, num_heads=12, io_depth=3, io_decode_depth=2, 
-        num_module_cls=2, num_ahcal_cls=2,
+        depth=4, ahcal_depth=2, num_heads=12, io_depth=4, io_decode_depth=3, 
+        num_module_cls=1, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
@@ -1002,7 +1006,7 @@ def mae_vit_base(**kwargs):
         in_chans=1, embed_dim=528, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
-        depth=4, ahcal_depth=2, num_heads=12, io_depth=3, io_decode_depth=2, 
+        depth=4, ahcal_depth=2, num_heads=12, io_depth=4, io_decode_depth=3, 
         num_module_cls=2, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=384, decoder_num_heads=12,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
