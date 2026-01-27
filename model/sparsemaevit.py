@@ -278,7 +278,7 @@ class SparseMAEViT(nn.Module):
         # ==========================
         self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
         self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
-        self.muon_recon_head = nn.Linear(decoder_embed_dim, 10)
+        self.muon_recon_head = nn.Linear(decoder_embed_dim, 6)
 
         self.initialize_weights()
 
@@ -711,7 +711,7 @@ class SparseMAEViT(nn.Module):
         # muon spectrometer token
         muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)         # [B, 1, C]
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                  # [B, N_muspec, C]
-        has_tracks = (muspec_counts > 0)                                                    # [B, 1] bool
+        has_tracks = muspec_attn_mask.any(dim=1, keepdim=True)                              # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
         muon_tok_present = self.muon_spec_xattn(
@@ -878,7 +878,6 @@ class SparseMAEViT(nn.Module):
         ecal_hits: torch.Tensor,        # [B, 5, 5] or [B, 25]
         muspec_feats: torch.Tensor,     # [B, N, 5]
         muspec_attn_mask: torch.Tensor, # [B, N] bool
-        muspec_counts: torch.Tensor,    # [B, 1]
         ecal_drop: torch.Tensor,        # [B] bool
         muon_drop: torch.Tensor,        # [B] bool
     ):
@@ -892,7 +891,7 @@ class SparseMAEViT(nn.Module):
 
         # Targets
         ecal_tgt = ecal_hits.view(B, -1)  # [B, 25]
-        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask, muspec_counts)  # [B, 10]
+        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 10]
 
         preds = {}
 
@@ -965,14 +964,13 @@ class SparseMAEViT(nn.Module):
         )
 
         # global reconstructions (ECAL, MUON_SPEC) when dropped
-        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
+        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, _ = x_glob
         preds_glob, glob_tgts, glob_masks = self.forward_reconstruction_global(
             lat=lat,
             lat_keep=lat_keep,
             ecal_hits=ecal_hits,
             muspec_feats=muspec_feats,
             muspec_attn_mask=muspec_attn_mask,
-            muspec_counts=muspec_counts,
             ecal_drop=ecal_drop,
             muon_drop=muon_drop,
         )
@@ -994,8 +992,8 @@ def mae_vit_tiny(**kwargs):
         in_chans=1, embed_dim=384, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
-        depth=4, ahcal_depth=2, num_heads=12, io_depth=4, io_decode_depth=3, 
-        num_module_cls=1, num_ahcal_cls=2,
+        depth=2, ahcal_depth=2, num_heads=12, io_depth=4, io_decode_depth=2, 
+        num_module_cls=2, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )

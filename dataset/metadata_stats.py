@@ -38,6 +38,10 @@ def _transform_lookup(name: str):
         return np.log1p
     if name == "sqrt":
         return np.sqrt
+    if name == "asinh":
+        return np.arcsinh
+    if name == "slog1p":  # signed log1p
+        return lambda x: np.sign(x) * np.log1p(np.abs(x))
     raise ValueError(f"Unknown transform: {name}")
 
 def _process_muspec(muspec):
@@ -222,15 +226,18 @@ def compute_robust_params_for_array(arr: np.ndarray, transform: str, eps: float 
 
 def add_robust_standardization_metadata_array(arr: np.ndarray, metadata: dict, key_prefix: str):
     """
-    Mirrors add_robust_standardization_metadata but for arrays.
     Produces:
       - f"{key_prefix}"
       - f"{key_prefix}_log1p"
       - f"{key_prefix}_sqrt"
+      - f"{key_prefix}_asinh"
+      - f"{key_prefix}_slog1p"
     """
-    metadata[f"{key_prefix}"]       = compute_robust_params_for_array(arr, "identity")
-    metadata[f"{key_prefix}_log1p"] = compute_robust_params_for_array(arr, "log1p")
-    metadata[f"{key_prefix}_sqrt"]  = compute_robust_params_for_array(arr, "sqrt")
+    metadata[f"{key_prefix}"]         = compute_robust_params_for_array(arr, "identity")
+    metadata[f"{key_prefix}_log1p"]   = compute_robust_params_for_array(arr, "log1p")
+    metadata[f"{key_prefix}_sqrt"]    = compute_robust_params_for_array(arr, "sqrt")
+    metadata[f"{key_prefix}_asinh"]   = compute_robust_params_for_array(arr, "asinh")
+    metadata[f"{key_prefix}_slog1p"]  = compute_robust_params_for_array(arr, "slog1p")
     return metadata
 
 # -------------------------

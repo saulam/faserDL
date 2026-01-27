@@ -15,9 +15,10 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import timm.optim as optim_factory
+from contextlib import contextmanager
 from torch.nn import functional as F
 from utils import (
-    arrange_input, arrange_truth, csr_keep_rows_torch, bce_with_logits_label_smoothing,
+    arrange_input, arrange_truth, bce_with_logits_label_smoothing,
     soft_ce_with_logits_csr,
     CustomLambdaLR, CombinedScheduler, weighted_loss, move_obj,
 )
@@ -125,6 +126,26 @@ class MAEPreTrainer(pl.LightningModule):
 
         lr = self.optimizers().param_groups[0]['lr']
         self.log(f"lr", lr, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+
+    @contextmanager
+    def _fixed_val_rng(self, batch_idx: int, val_mask_seed: int = 42):
+        rank = int(getattr(self, "global_rank", 0) or 0)
+        seed = int(val_mask_seed + batch_idx + 1_000_000 * rank)
+
+        if self.device.type == "cuda":
+            dev = self.device.index
+            if dev is None:
+                dev = torch.cuda.current_device()
+
+            with torch.random.fork_rng(devices=[dev], enabled=True):
+                torch.random.default_generator.manual_seed(seed)
+                torch.cuda.default_generators[dev].manual_seed(seed)
+                yield
+        else:
+            with torch.random.fork_rng(devices=[], enabled=True):
+                torch.random.default_generator.manual_seed(seed)
+                yield
         
 
     def forward(self, x, x_glob, mask_ratio):
@@ -322,30 +343,23 @@ class MAEPreTrainer(pl.LightningModule):
         ecal_drop = glob_masks["ecal_drop"].float().unsqueeze(-1)
         muon_drop = glob_masks["muon_drop"].float().unsqueeze(-1)
         
-        # --------------------
         # ECAL loss (per-dim mean, only when dropped)
-        # --------------------
-        ecal_pred = preds["ecal_rec"]          # [B,25]
-        ecal_tgt  = glob_targets["ecal_tgt"]   # [B,25]
+        ecal_pred = preds["ecal_rec"]                                            # [B, 25]
+        ecal_tgt  = glob_targets["ecal_tgt"]                                     # [B, 25]
         loss_ecal_raw = F.smooth_l1_loss(ecal_pred, ecal_tgt, reduction="none")  # [B, 25]
         loss_ecal_evt = loss_ecal_raw.mean(dim=-1, keepdim=True)                 # [B, 1]
         loss_ecal = (loss_ecal_evt * ecal_drop).sum() / ecal_drop.sum().clamp_min(1.0)
         
-        # --------------------
         # Muon loss (per-dim masked mean, only when dropped)
-        # muon_tgt layout assumed:
-        # [count, sum_q, px_lead, py_lead, pz_lead, chi2_lead, sum_px, sum_py, sum_pz, mean_chi2]
-        # --------------------
-        muon_pred = preds["muon_rec"]          # [B, 10]
-        muon_tgt  = glob_targets["muon_tgt"]   # [B, 10]
-        has = (muon_tgt[:, 0:1] > 0).float()   # [B, 1]
-        # build per-dim mask: always supervise dims [0,1,6,7,8,9]; supervise lead dims [2..5] only if has_tracks
-        dim_mask = muon_pred.new_zeros(muon_pred.shape)  # [B, 10]
-        dim_mask[:, [0, 1, 6, 7, 8, 9]] = 1.0
-        dim_mask[:, 2:6] = has  # broadcast [B, 1] -> [B, 4]
-        # combine with "token was dropped" mask
-        w = dim_mask * muon_drop  # [B, 10]
-        loss_muon_raw = F.smooth_l1_loss(muon_pred, muon_tgt, reduction="none")  # [B, 10]
+        muon_pred = preds["muon_rec"]                                            # [B, 6]
+        muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 6]
+        has = (muon_tgt[:, 0:1] > 0).float()                                     # [B, 1]  bool: has tracks if count > 0
+        dim_mask = muon_pred.new_zeros(muon_pred.shape)                          # [B, 6]
+        dim_mask[:, 0] = 1.0                                                     # always supervise "has"
+        dim_mask[:, 1:] = has                                                    # supervise means only if has==1
+        drop = muon_drop.float().view(-1, 1)                                     # [B, 1]
+        w = dim_mask * drop                                                      # [B, 6]
+        loss_muon_raw = F.smooth_l1_loss(muon_pred, muon_tgt, reduction="none")  # [B, 6]
         loss_muon = (loss_muon_raw * w).sum() / w.sum().clamp_min(1.0)
         
         part_losses_glob = {
@@ -524,7 +538,9 @@ class MAEPreTrainer(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        loss, part_losses, _, _, batch_size = self.common_step(batch)
+        with self._fixed_val_rng(batch_idx):
+            # Ensure that the masking is the same across epochs and resumes
+            loss, part_losses, _, _, batch_size = self.common_step(batch)
 
         self.log(
             f"loss_total/val",

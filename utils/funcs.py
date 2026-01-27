@@ -142,8 +142,8 @@ def pack_muspec(nb_muspec_tracks, muspec_info):
     muspec_info: list of length B
         each element is a tensor of shape (K_i, 5)
     returns:
-        feats: (B, K_max + 1, 5)
-        attn_mask: (B, K_max + 1)  # True = keep, False = pad
+        feats: (B, K_max, 5)
+        attn_mask: (B, K_max)  # True = keep, False = pad
         counts: (B, 1)  # number of tracks per batch element
     """
     # pad_sequence expects (seq_len, *) so we tell it batch_first=True

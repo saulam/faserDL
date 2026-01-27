@@ -19,8 +19,6 @@ from utils.augmentations import augment, smooth_labels
 from utils.pdg import cluster_labels_from_pdgs
 
 
-AHCAL_SHAPE = np.array([18, 18, 40], dtype=np.int32)
-
 class SparseFASERCALDataset(Dataset):
     """
     A PyTorch Dataset for handling sparse FASERCal data.
@@ -193,6 +191,8 @@ class SparseFASERCALDataset(Dataset):
             "identity": lambda u: u,
             "log1p":    lambda u: torch.log1p(u),
             "sqrt":     lambda u: torch.sqrt(u),
+            "asinh":    lambda y: torch.asinh(y),
+            "slog1p":   lambda y: torch.sign(y) * torch.log1p(torch.abs(y)),
         }
         if tname not in lookup:
             raise ValueError(f"Unknown transform: {tname}")
@@ -213,6 +213,8 @@ class SparseFASERCALDataset(Dataset):
             "identity": lambda u: u,
             "log1p":    lambda u: torch.expm1(u),
             "sqrt":     lambda u: torch.square(u),
+            "asinh":    lambda u: torch.sinh(u),
+            "slog1p":   lambda u: torch.sign(u) * torch.expm1(torch.abs(u)),
         }
         if tname not in inv_lookup:
             raise ValueError(f"Unknown transform: {tname}")
@@ -234,6 +236,10 @@ class SparseFASERCALDataset(Dataset):
                 internal_name += "_sqrt"
             elif preprocessing == "log":
                 internal_name += "_log1p"
+            elif preprocessing == "asinh":
+                internal_name += "_asinh"
+            elif preprocessing in ("slog", "slog1p", "signed_log"):
+                internal_name += "_slog1p"
 
             stats = self.metadata[internal_name]
             x = self.robust_standardize(x, params=stats)
@@ -254,6 +260,10 @@ class SparseFASERCALDataset(Dataset):
                 internal_name = param_name + "_sqrt"
             elif preprocessing == "log":
                 internal_name = param_name + "_log1p"
+            elif preprocessing == "asinh":
+                internal_name = param_name + "_asinh"
+            elif preprocessing in ("slog", "slog1p", "signed_log"):
+                internal_name = param_name + "_slog1p"
 
             stats = self.metadata[internal_name]
             x = self.robust_unstandardize(x, params=stats)
@@ -528,19 +538,17 @@ class SparseFASERCALDataset(Dataset):
         """
         # Preprocess features
         feats = self.preprocess(event['q'] * 10, 'q', self.preprocessing_input)
-        event_hits = self.preprocess(len(event['q']), 'event_hits', self.preprocessing_input)
 
         ahcal_hits_coords = event['global_feats']['ahcal_hits'][:, :3]
         ahcal_hits_feats = self.preprocess(event['global_feats']['ahcal_hits'][:, 3] * 10, 'ahcal_hits', self.preprocessing_input)
         ecal_hits = self.preprocess(event['global_feats']['ecal_hits'], 'ecal_hits', self.preprocessing_input)
         nb_muspec_tracks = self.preprocess(event['global_feats']['nb_muspec_tracks'], 'nb_muspec_tracks')
         muspec_p = event['global_feats']['muspec_p']
-        muspec_p[:, 0] = self.preprocess(muspec_p[:, 0], 'muspec_px', "identity")
-        muspec_p[:, 1] = self.preprocess(muspec_p[:, 1], 'muspec_py', "identity")
-        muspec_p[:, 2] = self.preprocess(muspec_p[:, 2], 'muspec_pz', "identity")
         muspec_info = torch.cat([
             self.preprocess(event['global_feats']['muspec_q'], 'muspec_q').reshape(-1, 1),
-            torch.from_numpy(muspec_p).reshape(-1, 3),
+            self.preprocess(muspec_p[:, 0], 'muspec_px', "asinh").reshape(-1, 1),
+            self.preprocess(muspec_p[:, 1], 'muspec_py', "asinh").reshape(-1, 1),
+            self.preprocess(muspec_p[:, 2], 'muspec_pz', self.preprocessing_input).reshape(-1, 1),
             self.preprocess(event['global_feats']['muspec_chi2'], 'muspec_chi2', self.preprocessing_input).reshape(-1, 1),
         ], dim=1)
         
