@@ -608,9 +608,9 @@ def vit_tiny(**kwargs):
         in_chans=1, D=3, embed_dim=384,
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
-        depth=4, ahcal_depth=2, num_heads=12, io_depth=3,
-        num_module_cls=2, num_ahcal_cls=2,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
+        depth=2, ahcal_depth=2, num_heads=12, io_depth=6,
+        num_module_cls=2, num_ahcal_cls=4,
+        mlp_ratio=4.0, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
@@ -621,9 +621,9 @@ def vit_base(**kwargs):
         in_chans=1, D=3, embed_dim=384, 
         fcal_size=(48, 48, 200), fcal_patch_size=(8, 8, 5),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
-        depth=4, ahcal_depth=2, num_heads=12, io_depth=4,
-        num_module_cls=1, num_ahcal_cls=1,
-        mlp_ratio=4.0, qkv_bias=True, global_pool=True,
+        depth=4, ahcal_depth=4, num_heads=12, io_depth=4,
+        num_module_cls=2, num_ahcal_cls=4,
+        mlp_ratio=4.0, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model

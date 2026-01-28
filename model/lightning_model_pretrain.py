@@ -357,7 +357,9 @@ class MAEPreTrainer(pl.LightningModule):
         dim_mask = muon_pred.new_zeros(muon_pred.shape)                          # [B, 6]
         dim_mask[:, 0] = 1.0                                                     # always supervise "has"
         dim_mask[:, 1:] = has                                                    # supervise means only if has==1
-        drop = muon_drop.float().view(-1, 1)                                     # [B, 1]
+        p = 0.25                                                                 # supervise muon objective for ~25% of samples
+        gate = (torch.rand_like(muon_drop.float()) < p).float()                  # [B]
+        drop = (muon_drop.float() * gate).unsqueeze(1)                           # [B, 1]
         w = dim_mask * drop                                                      # [B, 6]
         loss_muon_raw = F.smooth_l1_loss(muon_pred, muon_tgt, reduction="none")  # [B, 6]
         loss_muon = (loss_muon_raw * w).sum() / w.sum().clamp_min(1.0)
