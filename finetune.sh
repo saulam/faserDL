@@ -7,7 +7,7 @@ shardshuffle=200
 shuffle=2000
 model="base"
 eps=1e-8
-batch_size=512
+batch_size=1024
 mixup_alpha=0.0
 preprocessing_input="log"
 preprocessing_output="log"
@@ -28,14 +28,14 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v7.0_lat_v8"
+name="finetune_v7.0_lat_v9"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v7.0_lat_v8"
+checkpoint_name="finetune_v7.0_lat_v9"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v5/loss_total_val/epoch=330-step=83052.ckpt"
-gpus=(1)
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v9/loss_total_val/epoch=122-step=30627.ckpt"
+gpus=(0)
 
 python -m train.finetune \
     --train \

@@ -619,7 +619,7 @@ def vit_tiny(**kwargs):
 def vit_base(**kwargs):
     model = SparseViT(
         in_chans=1, D=3, embed_dim=384, 
-        fcal_size=(48, 48, 200), fcal_patch_size=(8, 8, 5),
+        fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=4, num_heads=12, io_depth=4,
         num_module_cls=2, num_ahcal_cls=4,
