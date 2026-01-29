@@ -354,14 +354,11 @@ class MAEPreTrainer(pl.LightningModule):
         muon_pred = preds["muon_rec"]                                            # [B, 6]
         muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 6]
         has = (muon_tgt[:, 0:1] > 0).float()                                     # [B, 1]  bool: has tracks if count > 0
-        dim_mask = muon_pred.new_zeros(muon_pred.shape)                          # [B, 6]
-        dim_mask[:, 0] = 1.0                                                     # always supervise "has"
-        dim_mask[:, 1:] = has                                                    # supervise means only if has==1
         p_sample = 0.25                                                          # supervise muon loss on ~25% of dropped samples
         p_has    = 0.8                                                           # supervise "has" fairly often
         p_means  = 0.2                                                           # supervise each mean dim less often
         # base mask
-        dim_mask = torch.zeros_like(muon_pred)  # [B,6]
+        dim_mask = torch.zeros_like(muon_pred)                                   # [B,6]
         dim_mask[:, 0]  = 1.0
         dim_mask[:, 1:] = has
         # per-dim stochastic gate
@@ -371,7 +368,7 @@ class MAEPreTrainer(pl.LightningModule):
         dim_gate[:, 1:] *= has
         # per-sample stochastic gate (only matters when dropped)
         gate = (torch.rand_like(muon_drop.float()) < p_sample).float()
-        drop = (muon_drop.float() * gate).unsqueeze(1)  # [B,1]
+        drop = (muon_drop.float() * gate)  # [B,1]
         w = dim_mask * dim_gate * drop
         loss_raw = F.smooth_l1_loss(muon_pred, muon_tgt, reduction="none")
         loss_muon = (loss_raw * w).sum() / w.sum().clamp_min(1.0)
