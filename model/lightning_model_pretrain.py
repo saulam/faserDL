@@ -64,30 +64,30 @@ class MAEPreTrainer(pl.LightningModule):
         self.semantic_gamma_distance = args.semantic_gamma_distance
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
-        self.kendall_w_min = 0.3
+        self.kendall_w_min = 1e-2
         self.kendall_w_max = 5.0
-        self.log_sigma_gho = nn.Parameter(torch.zeros(()))
-        self.log_sigma_hie = nn.Parameter(torch.zeros(()))
-        self.log_sigma_dec = nn.Parameter(torch.zeros(()))
-        self.log_sigma_pid = nn.Parameter(torch.zeros(()))
-        self.log_sigma_occ = nn.Parameter(torch.zeros(()))
-        self.log_sigma_reg = nn.Parameter(torch.zeros(()))
-        self.log_sigma_occ_ah = nn.Parameter(torch.zeros(()))
-        self.log_sigma_reg_ah = nn.Parameter(torch.zeros(()))
-        self.log_sigma_ecal = nn.Parameter(torch.zeros(()))
-        self.log_sigma_muon = nn.Parameter(torch.zeros(()))
+        self.u_gho = nn.Parameter(torch.zeros(()))
+        self.u_hie = nn.Parameter(torch.zeros(()))
+        self.u_dec = nn.Parameter(torch.zeros(()))
+        self.u_pid = nn.Parameter(torch.zeros(()))
+        self.u_occ = nn.Parameter(torch.zeros(()))
+        self.u_reg = nn.Parameter(torch.zeros(()))
+        self.u_occ_ah = nn.Parameter(torch.zeros(()))
+        self.u_reg_ah = nn.Parameter(torch.zeros(()))
+        self.u_ecal = nn.Parameter(torch.zeros(()))
+        self.u_muon = nn.Parameter(torch.zeros(()))
         
         self._uncertainty_params = {
-            "gho": self.log_sigma_gho,
-            "hie": self.log_sigma_hie,
-            "dec": self.log_sigma_dec,
-            "pid": self.log_sigma_pid,
-            "occ": self.log_sigma_occ,
-            "reg": self.log_sigma_reg,
-            "occ_ah": self.log_sigma_occ_ah,
-            "reg_ah": self.log_sigma_reg_ah,
-            "ecal": self.log_sigma_ecal,
-            "muon": self.log_sigma_muon,
+            "gho": self.u_gho,
+            "hie": self.u_hie,
+            "dec": self.u_dec,
+            "pid": self.u_pid,
+            "occ": self.u_occ,
+            "reg": self.u_reg,
+            "occ_ah": self.u_occ_ah,
+            "reg_ah": self.u_reg_ah,
+            "ecal": self.u_ecal,
+            "muon": self.u_muon,
         }
 
         def _u_for_w(w, w_min, w_max, eps=1e-6):
@@ -100,6 +100,10 @@ class MAEPreTrainer(pl.LightningModule):
         u0 = _u_for_w(w0, self.kendall_w_min, self.kendall_w_max)
         for p in self._uncertainty_params.values():
             p.data.fill_(u0)
+        # start with small muon and ecal loss
+        u0_min = _u_for_w(self.kendall_w_min, self.kendall_w_min, self.kendall_w_max)
+        self.u_muon.data.fill_(u0_min)
+        self.u_ecal.data.fill_(u0_min)
 
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
@@ -353,32 +357,36 @@ class MAEPreTrainer(pl.LightningModule):
         # Muon loss (per-dim masked mean, only when dropped)
         muon_pred = preds["muon_rec"]                                            # [B, 6]
         muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 6]
-        has = (muon_tgt[:, 0:1] > 0).float()                                     # [B, 1]  bool: has tracks if count > 0
-        p_sample = 0.25                                                          # supervise muon loss on ~25% of dropped samples
-        p_has    = 0.8                                                           # supervise "has" fairly often
-        p_means  = 0.2                                                           # supervise each mean dim less often
-        # base mask
-        dim_mask = torch.zeros_like(muon_pred)                                   # [B,6]
-        dim_mask[:, 0]  = 1.0
-        dim_mask[:, 1:] = has
-        # per-dim stochastic gate
-        dim_gate = torch.zeros_like(muon_pred)
-        dim_gate[:, 0]  = (torch.rand(muon_pred.size(0), device=muon_pred.device) < p_has).float()
-        dim_gate[:, 1:] = (torch.rand_like(muon_pred[:, 1:]) < p_means).float()
-        dim_gate[:, 1:] *= has
-        # per-sample stochastic gate (only matters when dropped)
-        gate = (torch.rand_like(muon_drop.float()) < p_sample).float()
-        drop = (muon_drop.float() * gate)  # [B,1]
-        w = dim_mask * dim_gate * drop
-        loss_raw = F.smooth_l1_loss(muon_pred, muon_tgt, reduction="none")
-        loss_muon = (loss_raw * w).sum() / w.sum().clamp_min(1.0)
+        has_tgt   = muon_tgt[:, 0]                                               # [B] float 0/1
+        has_logit = muon_pred[:, 0]                                              # [B] logits
+        means_pred = muon_pred[:, 1:]                                            # [B, 5]
+        means_tgt  = muon_tgt[:, 1:]                                             # [B, 5]
+        drop_1d = muon_drop.squeeze(1)                                           # [B]
+        eps = self.label_smoothing
+        if eps > 0.0:
+            has_tgt_smooth = has_tgt * (1.0 - eps) + 0.5 * eps
+        else:
+            has_tgt_smooth = has_tgt
+        loss_has_raw = F.binary_cross_entropy_with_logits(
+            has_logit, has_tgt_smooth, reduction="none"
+        )
+        loss_has = (loss_has_raw * drop_1d).sum() / drop_1d.sum().clamp_min(1.0)
+        means_on = (has_tgt > 0.5).float() * drop_1d                             # [B]
+        w_means = means_on.unsqueeze(1).expand_as(means_pred)                    # [B, 5]
+        loss_means_raw = F.smooth_l1_loss(
+            means_pred, means_tgt, reduction="none"
+        )
+        loss_means = (loss_means_raw * w_means).sum() / w_means.sum().clamp_min(1.0)
+        loss_muon = loss_has + loss_means
         
         part_losses_glob = {
             "ecal/total": loss_ecal.detach(),
             "muon/total": loss_muon.detach(),
+            "muon/has_loss": loss_has.detach(),
+            "muon/means_loss": loss_means.detach(),
             "ecal/drop_frac": ecal_drop.mean().detach(),
             "muon/drop_frac": muon_drop.mean().detach(),
-            "muon/has_frac": has.mean().detach(),
+            "muon/has_frac": has_tgt.mean().detach(),
         }
         
         return loss_ecal, loss_muon, part_losses_glob

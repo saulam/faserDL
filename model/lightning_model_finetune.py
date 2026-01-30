@@ -40,33 +40,33 @@ class ViTFineTuner(pl.LightningModule):
         self.crit = CylindricalConsistencyLoss(stats=stats)
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
-        self.kendall_w_min = 0.3
+        self.kendall_w_min = 1e-2
         self.kendall_w_max = 5.0
-        self.log_sigma_flavour   = nn.Parameter(torch.zeros(()))
-        self.log_sigma_charm     = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vis_geom  = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_vis_pt    = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_vis_mag   = nn.Parameter(torch.zeros(()))
-        self.log_sigma_jet_geom  = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_jet_pt    = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_jet_mag   = nn.Parameter(torch.zeros(()))
-        self.log_sigma_lep_geom  = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_lep_pt    = nn.Parameter(torch.zeros(()))
-        #self.log_sigma_lep_mag   = nn.Parameter(torch.zeros(()))
-        self.log_sigma_vertex    = nn.Parameter(torch.zeros(()))
+        self.u_flavour   = nn.Parameter(torch.zeros(()))
+        self.u_charm     = nn.Parameter(torch.zeros(()))
+        self.u_vis_geom  = nn.Parameter(torch.zeros(()))
+        #self.u_vis_pt    = nn.Parameter(torch.zeros(()))
+        #self.u_vis_mag   = nn.Parameter(torch.zeros(()))
+        self.u_jet_geom  = nn.Parameter(torch.zeros(()))
+        #self.u_jet_pt    = nn.Parameter(torch.zeros(()))
+        #self.u_jet_mag   = nn.Parameter(torch.zeros(()))
+        self.u_lep_geom  = nn.Parameter(torch.zeros(()))
+        #self.u_lep_pt    = nn.Parameter(torch.zeros(()))
+        #self.u_lep_mag   = nn.Parameter(torch.zeros(()))
+        self.u_vertex    = nn.Parameter(torch.zeros(()))
         self._uncertainty_params = {
-            "flavour":     self.log_sigma_flavour,
-            "charm":       self.log_sigma_charm,
-            "vis_geom":    self.log_sigma_vis_geom,
-            #"vis_pt":      self.log_sigma_vis_pt,
-            #"vis_mag":     self.log_sigma_vis_mag,
-            "jet_geom":    self.log_sigma_jet_geom,
-            #"jet_pt":      self.log_sigma_jet_pt,
-            #"jet_mag":     self.log_sigma_jet_mag,
-            "lep_geom":    self.log_sigma_lep_geom,
-            #"lep_pt":      self.log_sigma_lep_pt,
-            #"lep_mag":     self.log_sigma_lep_mag,
-            "vertex":      self.log_sigma_vertex,
+            "flavour":     self.u_flavour,
+            "charm":       self.u_charm,
+            "vis_geom":    self.u_vis_geom,
+            #"vis_pt":      self.u_vis_pt,
+            #"vis_mag":     self.u_vis_mag,
+            "jet_geom":    self.u_jet_geom,
+            #"jet_pt":      self.u_jet_pt,
+            #"jet_mag":     self.u_jet_mag,
+            "lep_geom":    self.u_lep_geom,
+            #"lep_pt":      self.u_lep_pt,
+            #"lep_mag":     self.u_lep_mag,
+            "vertex":      self.u_vertex,
         }
         
         self.warmup_steps = args.warmup_steps

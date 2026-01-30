@@ -278,7 +278,10 @@ class SparseMAEViT(nn.Module):
         # ==========================
         self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
         self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
-        self.muon_recon_head = nn.Linear(decoder_embed_dim, 6)
+        self.muon_recon_head = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(decoder_embed_dim, 6)
+        )
 
         self.initialize_weights()
 
@@ -891,7 +894,7 @@ class SparseMAEViT(nn.Module):
 
         # Targets
         ecal_tgt = ecal_hits.view(B, -1)  # [B, 25]
-        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 10]
+        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 6]
 
         preds = {}
 
@@ -907,7 +910,7 @@ class SparseMAEViT(nn.Module):
         x = q_muon
         for blk in self.decode_lat_xattn_blocks:
             x = blk(x, LAT, attn_mask=lat_keep)
-        preds["muon_rec"] = self.muon_recon_head(x.squeeze(1))  # [B, 10]
+        preds["muon_rec"] = self.muon_recon_head(x.squeeze(1))  # [B, 6]
 
         # Return masks so your training step can apply loss only when dropped
         masks = {
@@ -916,7 +919,7 @@ class SparseMAEViT(nn.Module):
         }
         targets = {
             "ecal_tgt": ecal_tgt,    # [B, 25]
-            "muon_tgt": muon_tgt,    # [B, 10]
+            "muon_tgt": muon_tgt,    # [B, 6]
         }
         return preds, targets, masks
 
