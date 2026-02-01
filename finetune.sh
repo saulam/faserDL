@@ -14,7 +14,7 @@ preprocessing_output="log"
 label_smoothing=0.02
 dropout=0.0
 attn_dropout=0.0
-drop_path_rate=0.2
+drop_path_rate=0.3
 epochs=20
 num_workers=16
 blr=5e-4
@@ -28,13 +28,13 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v7.0_lat_v9"
+name="finetune_v7.0_lat_v12"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v7.0_lat_v9"
+checkpoint_name="finetune_v7.0_lat_v12"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v9/loss_total_val/epoch=122-step=30627.ckpt"
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v9_v3/loss_total_val/epoch=185-step=46314.ckpt"
 gpus=(0)
 
 python -m train.finetune \

@@ -76,6 +76,20 @@ class MAEPreTrainer(pl.LightningModule):
         self.u_reg_ah = nn.Parameter(torch.zeros(()))
         self.u_ecal = nn.Parameter(torch.zeros(()))
         self.u_muon = nn.Parameter(torch.zeros(()))
+
+        # define a min_max dict for each uncertainty param
+        self._uncertainty_params_desired_max = {
+            "gho": (self.kendall_w_min, self.kendall_w_max),
+            "hie": (0.05, 1.0),
+            "dec": (0.05, 1.0),
+            "pid": (0.05, 0.8),
+            "occ": (self.kendall_w_min, self.kendall_w_max),
+            "reg": (self.kendall_w_min, self.kendall_w_max),
+            "occ_ah": (self.kendall_w_min, self.kendall_w_max),
+            "reg_ah": (self.kendall_w_min, self.kendall_w_max),
+            "ecal": (0.05, 2.0),
+            "muon": (0.04, 0.5),
+        }
         
         self._uncertainty_params = {
             "gho": self.u_gho,
@@ -96,14 +110,9 @@ class MAEPreTrainer(pl.LightningModule):
             p = (w - w_min) / (w_max - w_min)
             p = max(eps, min(1.0 - eps, float(p)))
             return math.log(p / (1.0 - p))
-        w0 = 1.0  # desired initial Kendall weight
-        u0 = _u_for_w(w0, self.kendall_w_min, self.kendall_w_max)
-        for p in self._uncertainty_params.values():
-            p.data.fill_(u0)
-        # start with small muon and ecal loss
-        u0_min = _u_for_w(self.kendall_w_min, self.kendall_w_min, self.kendall_w_max)
-        self.u_muon.data.fill_(u0_min)
-        self.u_ecal.data.fill_(u0_min)
+        for key, p in self._uncertainty_params.items():
+            w0, w_max = self._uncertainty_params_desired_max[key]
+            p.data.fill_(_u_for_w(w0, self.kendall_w_min, w_max))
 
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
@@ -457,7 +466,11 @@ class MAEPreTrainer(pl.LightningModule):
 
         def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
             u = self._uncertainty_params[name]
-            loss_w, w, s = weighted_loss(loss, u, w_min=self.kendall_w_min, w_max=self.kendall_w_max)
+            loss_w, w, s = weighted_loss(
+                loss, u, 
+                w_min=self.kendall_w_min, 
+                w_max=self._uncertainty_params_desired_max[name][1]
+            )
             kendall_w[name] = w.detach()
             kendall_s[name] = s.detach()
             return loss_w
