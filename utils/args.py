@@ -91,16 +91,26 @@ def ini_argparse(
     parser.add_argument("--reconstruction_gamma_distance", type=float, default=2.0, 
                         help="Distance decay exponent (controls smoothness) for reconstruction")
     
-    # Distance-aware loss arguments (semantic segmentation - kept patches)
-    parser.add_argument("--semantic_loss_mode", type=str, default='standard',
+    # Distance-aware loss arguments (relational tasks - kept patches)
+    parser.add_argument("--relational_loss_mode", type=str, default='standard',
                         choices=['standard', 'hybrid', 'distance'],
-                        help="Semantic segmentation loss mode: standard (no distance), hybrid (standard + distance), distance")
-    parser.add_argument("--semantic_distance_weight", type=float, default=0.3,
-                        help="Weight for semantic distance-aware component")
-    parser.add_argument("--semantic_max_distance", type=float, default=3.0,
-                        help="Maximum distance for semantic segmentation (typically smaller than reconstruction)")
-    parser.add_argument("--semantic_gamma_distance", type=float, default=2.0, 
-                        help="Distance decay exponent (controls smoothness) for semantic segmentation")
+                        help="Relational loss mode: standard (no distance), hybrid (standard + distance), distance")
+    parser.add_argument("--relational_distance_weight", type=float, default=0.3,
+                        help="Weight for relational distance-aware component")
+    parser.add_argument("--relational_max_distance", type=float, default=3.0,
+                        help="Maximum distance for relational tasks (typically smaller than reconstruction)")
+    parser.add_argument("--relational_gamma_distance", type=float, default=2.0, 
+                        help="Distance decay exponent (controls smoothness) for relational tasks")
+    
+    # Relational pass parameters
+    parser.add_argument("--relational_pass_prob", type=float, default=0.5,
+                        help="Probability of running relational pass during training")
+    parser.add_argument("--relational_mask_ratio", type=float, default=0.25,
+                        help="Mask ratio for relational pass")
+    parser.add_argument("--relational_voxel_keep_prob", type=float, default=0.5,
+                        help="Probability of keeping voxels in relational pass (regularization)")
+    parser.add_argument("--relational_pass_seed", type=int, default=42,
+                        help="Random seed for relational pass stochastic gating")
 
     return parser
 

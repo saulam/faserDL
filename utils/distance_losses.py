@@ -913,22 +913,24 @@ def unified_semantic_segmentation_loss(
         metrics["semantic/standard"] = loss_std.detach()
 
     # ---- distance term ----
-    loss_dist, m_dist = distance_aware_semantic_segmentation_loss(
-        pred_logits=pred_logits,
-        idx_targets=idx_targets,
-        csr_labels=csr_labels,
-        ghost_mask=ghost_mask,
-        patch_shape=patch_shape,
-        max_distance=max_distance,
-        gamma_distance=gamma_distance,
-        label_smoothing=label_smoothing,
-        lambda_cp=0.0,  # avoid double-counting CP if hybrid
-        class_threshold=class_threshold,
-        min_weight=min_weight,
-        exclude_classes_from_dt=([exclude_classes_from_dt] if isinstance(exclude_classes_from_dt, int) else exclude_classes_from_dt),
-        voxel_keep_prob=voxel_keep_prob,
-    )
-    metrics.update(m_dist)
+    loss_dist = None
+    if loss_mode in {"hybrid", "distance"}:
+        loss_dist, m_dist = distance_aware_semantic_segmentation_loss(
+            pred_logits=pred_logits,
+            idx_targets=idx_targets,
+            csr_labels=csr_labels,
+            ghost_mask=ghost_mask,
+            patch_shape=patch_shape,
+            max_distance=max_distance,
+            gamma_distance=gamma_distance,
+            label_smoothing=label_smoothing,
+            lambda_cp=0.0,  # avoid double-counting CP if hybrid
+            class_threshold=class_threshold,
+            min_weight=min_weight,
+            exclude_classes_from_dt=([exclude_classes_from_dt] if isinstance(exclude_classes_from_dt, int) else exclude_classes_from_dt),
+            voxel_keep_prob=voxel_keep_prob,
+        )
+        metrics.update(m_dist)
 
     if loss_mode == "distance":
         loss_total = float(distance_weight) * loss_dist

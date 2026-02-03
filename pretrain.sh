@@ -41,10 +41,14 @@ reconstruction_distance_reg_weight=0.3
 reconstruction_max_distance_fcal=5.0
 reconstruction_max_distance_ahcal=3.0
 reconstruction_gamma_distance=2.0
-semantic_loss_mode="hybrid"
-semantic_distance_weight=0.3
-semantic_max_distance=5.0
-semantic_gamma_distance=2.0
+relational_loss_mode="standard"
+relational_distance_weight=0.3
+relational_max_distance=3.0
+relational_gamma_distance=2.0
+relational_pass_prob=0.5
+relational_mask_ratio=0.25
+relational_voxel_keep_prob=0.5
+relational_pass_seed=42
 
 python -m train.pretrain \
     --train \
@@ -87,7 +91,11 @@ python -m train.pretrain \
     --reconstruction_max_distance_fcal $reconstruction_max_distance_fcal \
     --reconstruction_max_distance_ahcal $reconstruction_max_distance_ahcal \
     --reconstruction_gamma_distance $reconstruction_gamma_distance \
-    --semantic_loss_mode $semantic_loss_mode \
-    --semantic_distance_weight $semantic_distance_weight \
-    --semantic_max_distance $semantic_max_distance \
-    --semantic_gamma_distance $semantic_gamma_distance
+    --relational_loss_mode $relational_loss_mode \
+    --relational_distance_weight $relational_distance_weight \
+    --relational_max_distance $relational_max_distance \
+    --relational_gamma_distance $relational_gamma_distance \
+    --relational_pass_prob $relational_pass_prob \
+    --relational_mask_ratio $relational_mask_ratio \
+    --relational_voxel_keep_prob $relational_voxel_keep_prob \
+    --relational_pass_seed $relational_pass_seed

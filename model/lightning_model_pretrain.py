@@ -56,12 +56,16 @@ class MAEPreTrainer(pl.LightningModule):
         self.reconstruction_max_distance_fcal = args.reconstruction_max_distance_fcal
         self.reconstruction_max_distance_ahcal = args.reconstruction_max_distance_ahcal
         self.reconstruction_gamma_distance = args.reconstruction_gamma_distance
-        
-        # Semantic segmentation distance-aware parameters
-        self.semantic_loss_mode = args.semantic_loss_mode
-        self.semantic_distance_weight = args.semantic_distance_weight
-        self.semantic_max_distance = args.semantic_max_distance
-        self.semantic_gamma_distance = args.semantic_gamma_distance
+
+        # Relational pass
+        self.relational_pass_prob = args.relational_pass_prob
+        self.relational_mask_ratio = args.relational_mask_ratio
+        self.relational_voxel_keep_prob = args.relational_voxel_keep_prob
+        self.relational_pass_seed = args.relational_pass_seed
+        self.relational_loss_mode = args.relational_loss_mode
+        self.relational_distance_weight = args.relational_distance_weight
+        self.relational_max_distance = args.relational_max_distance
+        self.relational_gamma_distance = args.relational_gamma_distance
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.kendall_w_min = 1e-2
@@ -88,7 +92,7 @@ class MAEPreTrainer(pl.LightningModule):
             "occ_ah": (1.0, self.kendall_w_max),
             "reg_ah": (1.0, self.kendall_w_max),
             "ecal": (0.05, 1.0),
-            "muon": (0.02, 0.1),
+            "muon": (0.02, 0.05),
         }
         
         self._uncertainty_params = {
@@ -160,9 +164,28 @@ class MAEPreTrainer(pl.LightningModule):
                 torch.random.default_generator.manual_seed(seed)
                 yield
         
+        
+    def _should_run_relational(self) -> bool:
+        """
+        DDP-safe stochastic gating: same decision across ranks, does not perturb global RNG.
+        Uses a local CPU generator seeded by (seed + global_step).
+        """
+        p = float(self.relational_pass_prob)
+        if p >= 1.0: return True
+        if p <= 0.0: return False
+        step = int(getattr(self.trainer, "global_step", 0))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(self.relational_pass_seed + step))
+        return torch.rand((), generator=g).item() < p
+        
 
-    def forward(self, x, x_glob, mask_ratio):
-        return self.model(x, x_glob, mask_ratio)
+    def forward(self, x, x_glob, mask_ratio, do_relational, relational_mask_ratio):
+        return self.model(
+            x, x_glob,
+            mask_ratio=mask_ratio,
+            do_relational=do_relational,
+            relational_mask_ratio=relational_mask_ratio,
+        )
 
 
     def _arrange_batch(self, batch):
@@ -236,6 +259,7 @@ class MAEPreTrainer(pl.LightningModule):
         csr_dec: torch.Tensor,
         csr_pid: torch.Tensor,
         ghost_mask: torch.Tensor,
+        voxel_keep_prob: float,
     ):
         """
         Compute relational losses with optional distance awareness for semantic tasks.
@@ -274,13 +298,13 @@ class MAEPreTrainer(pl.LightningModule):
                 csr_labels=csr,
                 ghost_mask=ghost_mask,
                 patch_shape=tuple(self.model.fcal_patch_size.tolist()),
-                loss_mode=self.semantic_loss_mode,  # "standard" | "hybrid" | "distance"
-                distance_weight=self.semantic_distance_weight,
-                max_distance=self.semantic_max_distance,
-                gamma_distance=self.semantic_gamma_distance,
+                loss_mode=self.relational_loss_mode,  # "standard" | "hybrid" | "distance"
+                distance_weight=self.relational_distance_weight,
+                max_distance=self.relational_max_distance,
+                gamma_distance=self.relational_gamma_distance,
                 exclude_classes_from_dt=exclude_class,
                 label_smoothing=self.label_smoothing,
-                voxel_keep_prob=1-self.mask_ratio,  # key, avoids overfitting on semantic tasks
+                voxel_keep_prob=voxel_keep_prob,  # key, avoids overfitting on semantic tasks
             )
             
             # Store loss
@@ -406,53 +430,63 @@ class MAEPreTrainer(pl.LightningModule):
         preds: dict,
         targ_reg: torch.Tensor,
         targ_reg_ahcal: torch.Tensor,
-        idx_targets_fas: torch.Tensor,
+        idx_targets_fas_masked: torch.Tensor,
+        idx_targets_fas_rel,
         idx_targets_ahcal: torch.Tensor,
         labels: dict,
         glob_targets: dict,
         glob_masks: dict,
+        did_relational: bool,
+        relational_mask_ratio: float,
     ):
-        # FASERCal predictions
-        pred_gho=preds["gho"]
-        pred_hie=preds["hie"]
-        pred_dec=preds["dec"]
-        pred_pid=preds["pid"]
-        pred_occ=preds["occ"]
-        pred_reg=preds["reg"]
-
-        # AHCAL predictions
+        # Reconstruction losses
+        pred_occ = preds["occ"]
+        pred_reg = preds["reg"]
         pred_occ_ah = preds["occ_ah"]
         pred_reg_ah = preds["reg_ah"]
 
-        csr_hie=labels['csr_hie']
-        csr_dec=labels['csr_dec']
-        csr_pid=labels['csr_pid']
-        ghost_mask=labels['ghost_mask']
-        hit_event_id=labels['hit_event_id']
-        hit_event_id_ah=labels['hit_event_id_ahcal']
+        ghost_mask = labels["ghost_mask"]
+        hit_event_id = labels["hit_event_id"]
+        hit_event_id_ah = labels["hit_event_id_ahcal"]
         ghost_mask_ah = torch.zeros_like(hit_event_id_ah, dtype=torch.bool)
 
-        # Both relational and reconstruction tasks now operate on the same masked patches
-        # Relational losses (with optional distance awareness for semantic tasks)
-        loss_gho, loss_hie, loss_dec, loss_pid, part_enc = self.compute_relational_losses_distance_aware(
-            pred_gho, pred_hie, pred_dec, pred_pid, idx_targets_fas, csr_hie, csr_dec, csr_pid, ghost_mask,
-        )
-        
-        # Distance-aware reconstruction losses for FASERCal
         loss_occ, loss_reg, part_dec = self.compute_reconstruction_losses_distance_aware(
-            targ_reg, pred_occ, pred_reg, idx_targets_fas, hit_event_id, ghost_mask,
+            targ_reg, pred_occ, pred_reg, idx_targets_fas_masked, hit_event_id, ghost_mask,
             patch_shape=tuple(self.model.fcal_patch_size.tolist()),
-            name_prefix="",        # keep original metric names
             max_distance=self.reconstruction_max_distance_fcal,
         )
-        
-        # Distance-aware reconstruction losses for AHCAL
+
         loss_occ_ah, loss_reg_ah, part_dec_ah = self.compute_reconstruction_losses_distance_aware(
             targ_reg_ahcal, pred_occ_ah, pred_reg_ah, idx_targets_ahcal, hit_event_id_ah, ghost_mask=ghost_mask_ah,
             patch_shape=tuple(self.model.ahcal_patch_size.tolist()),
-            name_prefix="ahcal_",   # metrics logged as ahcal_occ/..., ahcal_reg/...
+            name_prefix="ahcal_",
             max_distance=self.reconstruction_max_distance_ahcal,
         )
+
+        # Relational losses (optional)
+        part_rel = {}
+        if did_relational and (idx_targets_fas_rel is not None):
+            pred_gho = preds["gho"]
+            pred_hie = preds["hie"]
+            pred_dec_rel = preds["dec"]
+            pred_pid = preds["pid"]
+
+            csr_hie = labels["csr_hie"]
+            csr_dec = labels["csr_dec"]
+            csr_pid = labels["csr_pid"]
+
+            loss_gho, loss_hie, loss_dec, loss_pid, part_rel = self.compute_relational_losses_distance_aware(
+                pred_gho, pred_hie, pred_dec_rel, pred_pid,
+                idx_targets_fas_rel,
+                csr_hie, csr_dec, csr_pid,
+                ghost_mask,
+                self.relational_voxel_keep_prob,  # regularisation knob
+            )
+        else:
+            loss_gho = torch.zeros((), device=self.device)
+            loss_hie = torch.zeros((), device=self.device)
+            loss_dec = torch.zeros((), device=self.device)
+            loss_pid = torch.zeros((), device=self.device)
         
         # Global reconstruction losses
         loss_ecal, loss_muon, part_glob = self.compute_global_losses(
@@ -460,9 +494,8 @@ class MAEPreTrainer(pl.LightningModule):
         )
 
         # Kendall et al. aggregation
-        part_losses = {**part_enc, **part_dec, **part_dec_ah, **part_glob}
-        kendall_w = {}
-        kendall_s = {}
+        part_losses = {**part_dec, **part_dec_ah, **part_glob, **part_rel}
+        kendall_w, kendall_s = {}, {}
 
         def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
             u = self._uncertainty_params[name]
@@ -476,10 +509,6 @@ class MAEPreTrainer(pl.LightningModule):
             return loss_w
 
         total_loss = (
-            _weight("gho",    loss_gho)    +
-            _weight("hie",    loss_hie)    +
-            _weight("dec",    loss_dec)    +
-            _weight("pid",    loss_pid)    +
             _weight("occ",    loss_occ)    +
             _weight("reg",    loss_reg)    +
             _weight("occ_ah", loss_occ_ah) +
@@ -487,41 +516,70 @@ class MAEPreTrainer(pl.LightningModule):
             _weight("ecal",   loss_ecal)   +
             _weight("muon",   loss_muon)
         )
+        if did_relational and (idx_targets_fas_rel is not None):
+            total_loss = total_loss + (
+                _weight("gho", loss_gho) +
+                _weight("hie", loss_hie) +
+                _weight("dec", loss_dec) +
+                _weight("pid", loss_pid)
+            )
 
         return total_loss, part_losses, kendall_w, kendall_s
 
 
-    def common_step(self, batch):
+    def common_step(self, batch, is_train: bool):
         batch_input, *batch_input_global, labels = self._arrange_batch(batch)
         ahcal_sparse = batch_input_global[0]
         batch_size = batch_input.batch_size
 
+        do_relational = self._should_run_relational() if is_train else True
+
         # Forward pass
         (
             preds,
-            idx_targets_fas,
+            idx_targets_fas_masked,
+            idx_targets_fas_rel,
             idx_targets_ah,
             glob_tgts,
             glob_masks,
+            aux,
         ) = self.forward(
-            batch_input, batch_input_global, mask_ratio=self.mask_ratio)
+            batch_input, 
+            batch_input_global, 
+            mask_ratio=self.mask_ratio,
+            do_relational=do_relational,
+            relational_mask_ratio=self.relational_mask_ratio,
+        )
+
+        self.log(
+            "relational/did_run",
+            float(aux["did_relational"]),
+            batch_size=batch_size,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True
+        )
 
         loss, part_losses, kendall_w, kendall_s = self.compute_losses(
             preds=preds,
             targ_reg=batch_input.features,
             targ_reg_ahcal=ahcal_sparse.features,
-            idx_targets_fas=idx_targets_fas,
+            idx_targets_fas_masked=idx_targets_fas_masked,
+            idx_targets_fas_rel=idx_targets_fas_rel,
             idx_targets_ahcal=idx_targets_ah,
             labels=labels,
             glob_targets=glob_tgts,
             glob_masks=glob_masks,
+            did_relational=aux["did_relational"],
+            relational_mask_ratio=aux["relational_mask_ratio"],
         )
 
         return loss, part_losses, kendall_w, kendall_s, batch_size
    
 
     def training_step(self, batch, batch_idx):
-        loss, part_losses, kendall_w, kendall_s, batch_size = self.common_step(batch)
+        loss, part_losses, kendall_w, kendall_s, batch_size = self.common_step(batch, is_train=True)
         self.log(
             f"loss_total/train",
             loss.detach(), 
@@ -572,7 +630,7 @@ class MAEPreTrainer(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         with self._fixed_val_rng(batch_idx):
             # Ensure that the masking is the same across epochs and resumes
-            loss, part_losses, _, _, batch_size = self.common_step(batch)
+            loss, part_losses, _, _, batch_size = self.common_step(batch, is_train=False)
 
         self.log(
             f"loss_total/val",

@@ -781,7 +781,7 @@ class SparseMAEViT(nn.Module):
         B = lat.size(0)
         Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
 
-        # which FASERCAL patches to predict: masked real
+        # masked real positions only
         prediction_mask = rand_mask & attn_mask_mod                            # [B, M, Lm]
         counts = prediction_mask.view(B, -1).sum(-1)
         max_n  = int(counts.max().item())
@@ -812,10 +812,6 @@ class SparseMAEViT(nn.Module):
         shared = self.fasercal_shared_voxel_head(out_flat)                     # [Nm, P, H]
         preds["occ"] = self.heads["occ"](shared).squeeze(-1)                   # [Nm, P]
         preds["reg"] = self.heads["reg"](shared)                               # [Nm, P, in_chans]
-        preds["gho"] = self.heads["gho"](shared).squeeze(-1)                   # [Nm, P]
-        preds["hie"] = self.heads["hie"](shared)                               # [Nm, P, 3]
-        preds["dec"] = self.heads["dec"](shared)                               # [Nm, P, 3]
-        preds["pid"] = self.heads["pid"](shared)                               # [Nm, P, num_pid]
 
         # targets (same for all predictions on masked patches)
         patch_ids = self.module_token_indices[m_ids, l_ids]                    # [Nm]
@@ -838,7 +834,7 @@ class SparseMAEViT(nn.Module):
         B = lat.size(0)
         Cdec = self.decoder_ahcal_pos_embed.weight.shape[-1]
 
-        # which AHCAL patches to predict: masked real
+        # masked real positions only
         prediction_mask = ah_rand_mask & ah_mask                             # [B, Na]
         counts = prediction_mask.sum(dim=-1)
         max_n = int(counts.max().item()) if B > 0 else 0
@@ -922,21 +918,85 @@ class SparseMAEViT(nn.Module):
             "muon_tgt": muon_tgt,    # [B, 6]
         }
         return preds, targets, masks
-
     
 
-    def forward(self, x, x_glob, mask_ratio=0.75):
+    def forward_relational_fcal(
+        self,
+        lat: torch.Tensor,            # [B, N_lat, Cenc]
+        lat_keep: torch.Tensor,       # [B, N_lat]
+        attn_mask_mod: torch.Tensor,  # [B, M, Lm]  True = real patch
+        rand_mask: torch.Tensor,      # [B, M, Lm]  True = masked real patch
+        idx_map,
+    ):
         """
-        Single encoder pass with masking (mask_ratio), then:
-          - FASERCAL reconstruction + semantic segmentation on masked patches,
+        Relational/semantic heads (gho/hie/dec/pid) on KEPT tokens.
+        """
+        B = lat.size(0)
+        Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
+
+        keep_mask = attn_mask_mod & (~rand_mask)                                # [B, M, Lm]
+        counts = keep_mask.view(B, -1).sum(-1)
+        max_n  = int(counts.max().item()) if B > 0 else 0
+
+        b_ids, m_ids, l_ids = torch.nonzero(keep_mask, as_tuple=True)           # [Nr]
+        Nr = b_ids.numel()
+
+        within = self._compute_within_ranks(b_ids, Nr)
+        Q = self.query_tokens.new_zeros(B, max_n, Cdec)
+
+        q = ( self.decoder_intra_pos_embed(l_ids)
+            + self.module_embed_dec(m_ids)
+            + self.query_tokens )                                              # [Nr, Cdec]
+        Q[b_ids, within] = q
+
+        LAT = self.enc_to_dec(lat)                                             # [B, N_lat, Cdec]
+        X = Q
+        for blk in self.decode_lat_xattn_blocks:
+            X = blk(X, LAT, attn_mask=lat_keep)
+
+        out_flat = X[b_ids, within]                                            # [Nr, Cdec]
+        shared = self.fasercal_shared_voxel_head(out_flat)                     # [Nr, P, H]
+
+        preds = {
+            "gho": self.heads["gho"](shared).squeeze(-1),                      # [Nr, P]
+            "hie": self.heads["hie"](shared),                                  # [Nr, P, 3]
+            "dec": self.heads["dec"](shared),                                  # [Nr, P, 3]
+            "pid": self.heads["pid"](shared),                                  # [Nr, P, num_pid]
+        }
+
+        patch_ids = self.module_token_indices[m_ids, l_ids]                    # [Nr]
+        idx_targets = idx_map[b_ids, patch_ids]                                # [Nr, P]
+
+        return preds, idx_targets
+    
+
+    def forward(self, x, x_glob, mask_ratio=0.75, do_relational = True, relational_mask_ratio=0.0):
+        """
+        Two-pass forward:
+
+        Pass A (masked, MAE):
+          - FASERCAL reconstruction + relational tasks on masked patches,
           - AHCAL reconstruction on masked patches.
+
+        Pass B (optional):
+          - FASERCal relational: hie/dec/pid on all real (kept) patches.
+
+        Returns:
+          preds:                  merged dict of predictions
+          idx_targets_fas_masked: for occ/reg/gho losses (masked patches)
+          idx_targets_fas_sem:    for hie/dec/pid losses (real/kept patches from full pass)
+          idx_targets_ah:         for AHCAL losses
+          glob_tgts, glob_masks:  for global losses
+          aux:                    dict with run flags
         """
-        # occupancy maps
+        # occupancy maps (same for both passes)
         idx_map = self.build_patch_occupancy_map(x, self.fcal_patch_size, self.grid_size)
         ahcal_sparse, *_ = x_glob
         ah_idx_map = self.build_patch_occupancy_map(ahcal_sparse, self.ahcal_patch_size, self.ahcal_grid_size)
 
-        # single encoder pass
+        # ==========================
+        # Pass A: masked MAE
+        # ==========================
         (
             lat,
             lat_keep,
@@ -948,8 +1008,8 @@ class SparseMAEViT(nn.Module):
             muon_drop,
         ) = self.forward_encoder(x, x_glob, mask_ratio)
 
-        # FASERCAL: both reconstruction and semantic segmentation on masked patches
-        preds_fas, idx_targets_fas = self.forward_reconstruction_fcal(
+        # FASERCAL: masked recon
+        preds_fas_masked, idx_targets_fas_masked = self.forward_reconstruction_fcal(
             lat=lat,
             lat_keep=lat_keep,
             attn_mask_mod=attn_mask_mod,
@@ -957,7 +1017,7 @@ class SparseMAEViT(nn.Module):
             idx_map=idx_map,
         )
 
-        # AHCAL reconstruction on masked patches
+        # AHCAL masked recon
         preds_ah, idx_targets_ah = self.forward_reconstruction_ahcal(
             lat=lat,
             lat_keep=lat_keep,
@@ -966,7 +1026,7 @@ class SparseMAEViT(nn.Module):
             ah_idx_map=ah_idx_map,
         )
 
-        # global reconstructions (ECAL, MUON_SPEC) when dropped
+        # global recon (ECAL, MUON_SPEC) when dropped
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, _ = x_glob
         preds_glob, glob_tgts, glob_masks = self.forward_reconstruction_global(
             lat=lat,
@@ -978,15 +1038,46 @@ class SparseMAEViT(nn.Module):
             muon_drop=muon_drop,
         )
 
-        # merge all predictions
-        preds = {**preds_fas, **preds_ah, **preds_glob}
+        preds = {**preds_fas_masked, **preds_ah, **preds_glob}
+
+        # ==========================
+        # Pass B: relational (optional)
+        # ==========================
+        idx_targets_fas_rel = None
+        if do_relational:
+            (
+                lat_full,
+                lat_keep_full,
+                rand_mask_full,
+                attn_mask_mod_full,
+                _ah_mask_full,
+                _ah_rand_mask_full,
+                _ecal_drop_full,
+                _muon_drop_full,
+            ) = self.forward_encoder(x, x_glob, mask_ratio=relational_mask_ratio)
+
+            preds_rel, idx_targets_fas_rel = self.forward_relational_fcal(
+                lat=lat_full,
+                lat_keep=lat_keep_full,
+                attn_mask_mod=attn_mask_mod_full,
+                rand_mask=rand_mask_full,
+                idx_map=idx_map,
+            )
+            preds.update(preds_rel)
+
+        aux = {
+            "did_relational": bool(do_relational),
+            "relational_mask_ratio": float(relational_mask_ratio),
+        }
 
         return (
             preds,
-            idx_targets_fas,        # FASERcal idx_targets (for all tasks: occ, reg, gho, hie, dec, pid)
-            idx_targets_ah,         # AHCAL idx_targets (for occ_ahcal, reg_ahcal)
-            glob_tgts,              # global targets (ecal_tgt, muon_tgt)
-            glob_masks,             # global masks (ecal_drop, muon_drop)
+            idx_targets_fas_masked,  # for occ/reg (masked patches)
+            idx_targets_fas_rel,     # for gho/hie/dec/pid (kept patches)
+            idx_targets_ah,          # for AHCAL occ_ah/reg_ah (masked patches)
+            glob_tgts,               # ecal_tgt, muon_tgt
+            glob_masks,              # ecal_drop, muon_drop
+            aux,
         )
 
 
