@@ -1,6 +1,6 @@
 # MAE-ViT for FASERCal Neutrino Data
 
-This repository provides an implementation of a Masked Autoencoder (MAE) Vision Transformer (ViT) integrated with a MinkowskiEngine-based sparse convolutional patcher, tailored for FASERCal neutrino detector data. It supports a two-stage learning pipeline:
+This repository provides an implementation of a Masked Autoencoder (MAE) Vision Transformer (ViT) integrated with a spconv sparse convolutional patcher, tailored for FASERCal neutrino detector data. It supports a two-stage learning pipeline:
 
 * **Stage 1**: Masked pre-training.
 * **Stage 2**: Muti-task fine-tuning.

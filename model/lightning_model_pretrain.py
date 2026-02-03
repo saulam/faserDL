@@ -79,16 +79,16 @@ class MAEPreTrainer(pl.LightningModule):
 
         # define a min_max dict for each uncertainty param
         self._uncertainty_params_desired_max = {
-            "gho": (self.kendall_w_min, self.kendall_w_max),
+            "gho": (1.0, self.kendall_w_max),
             "hie": (0.05, 1.0),
             "dec": (0.05, 1.0),
             "pid": (0.05, 0.8),
-            "occ": (self.kendall_w_min, self.kendall_w_max),
-            "reg": (self.kendall_w_min, self.kendall_w_max),
-            "occ_ah": (self.kendall_w_min, self.kendall_w_max),
-            "reg_ah": (self.kendall_w_min, self.kendall_w_max),
-            "ecal": (0.05, 2.0),
-            "muon": (0.04, 0.5),
+            "occ": (1.0, self.kendall_w_max),
+            "reg": (1.0, self.kendall_w_max),
+            "occ_ah": (1.0, self.kendall_w_max),
+            "reg_ah": (1.0, self.kendall_w_max),
+            "ecal": (0.05, 1.0),
+            "muon": (0.02, 0.1),
         }
         
         self._uncertainty_params = {

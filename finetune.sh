@@ -5,7 +5,7 @@ dataset_path="/scratch/salonso/sparse-nns/faser/events_v7.0*"
 metadata_path="/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl"
 shardshuffle=200
 shuffle=2000
-model="base"
+model="tiny"
 eps=1e-8
 batch_size=1024
 mixup_alpha=0.0
@@ -14,7 +14,7 @@ preprocessing_output="log"
 label_smoothing=0.02
 dropout=0.0
 attn_dropout=0.0
-drop_path_rate=0.3
+drop_path_rate=0.2
 epochs=20
 num_workers=16
 blr=5e-4
@@ -28,13 +28,13 @@ beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v7.0_lat_v12"
+name="finetune_v7.0_lat_v13"
 log_every_n_steps=10
 save_top_k=1
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v7.0_lat_v12"
+checkpoint_name="finetune_v7.0_lat_v13"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v9_v3/loss_total_val/epoch=185-step=46314.ckpt"
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_v8_v7/loss_total_val/epoch=206-step=51543.ckpt"
 gpus=(0)
 
 python -m train.finetune \
