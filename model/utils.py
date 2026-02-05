@@ -291,26 +291,23 @@ def muon_summary_target(
     px   = muspec_feats[..., 1]
     py   = muspec_feats[..., 2]
     pz   = muspec_feats[..., 3]
-    chi2 = muspec_feats[..., 4]
 
-    count = m.sum(dim=1, keepdim=True)             # [B,1]
-    has   = (count > 0).float()                    # [B,1]
+    count = m.sum(dim=1, keepdim=True)             # [B, 1]
+    has   = (count > 0).float()                    # [B, 1]
     inv   = 1.0 / count.clamp_min(1.0)
 
     q_mean    = (q    * m).sum(dim=1, keepdim=True) * inv
     px_mean   = (px   * m).sum(dim=1, keepdim=True) * inv
     py_mean   = (py   * m).sum(dim=1, keepdim=True) * inv
     pz_mean   = (pz   * m).sum(dim=1, keepdim=True) * inv
-    chi2_mean = (chi2 * m).sum(dim=1, keepdim=True) * inv
 
     # zero out means for empty events
     q_mean    *= has
     px_mean   *= has
     py_mean   *= has
     pz_mean   *= has
-    chi2_mean *= has
 
-    return torch.cat([has, q_mean, px_mean, py_mean, pz_mean, chi2_mean], dim=-1)  # [B, 6]
+    return torch.cat([has, q_mean, px_mean, py_mean, pz_mean], dim=-1)  # [B, 5]
     
 
 def _split_even_3(embed_dim):

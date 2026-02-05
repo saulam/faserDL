@@ -174,6 +174,15 @@ class MAEPreTrainer(pl.LightningModule):
         g = torch.Generator(device="cpu")
         g.manual_seed(int(self.relational_pass_seed + step))
         return torch.rand((), generator=g).item() < p
+    
+    
+    def _should_compute_muon(self) -> bool:
+        """
+        Compute muon loss every other iteration.
+        DDP-safe: same decision across ranks based on global_step.
+        """
+        step = int(getattr(self.trainer, "global_step", 0))
+        return (step % 2) == 0
         
 
     def forward(self, x, x_glob, mask_ratio, do_relational, relational_mask_ratio):
@@ -374,12 +383,12 @@ class MAEPreTrainer(pl.LightningModule):
         loss_ecal = (loss_ecal_evt * ecal_drop).sum() / ecal_drop.sum().clamp_min(1.0)
         
         # Muon loss (per-dim masked mean, only when dropped)
-        muon_pred = preds["muon_rec"]                                            # [B, 6]
-        muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 6]
+        muon_pred = preds["muon_rec"]                                            # [B, 5]
+        muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 5]
         has_tgt   = muon_tgt[:, 0]                                               # [B] float 0/1
         has_logit = muon_pred[:, 0]                                              # [B] logits
-        means_pred = muon_pred[:, 1:]                                            # [B, 5]
-        means_tgt  = muon_tgt[:, 1:]                                             # [B, 5]
+        means_pred = muon_pred[:, 1:]                                            # [B, 4]
+        means_tgt  = muon_tgt[:, 1:]                                             # [B, 4]
         drop_1d = muon_drop.squeeze(1)                                           # [B]
         eps = self.label_smoothing
         if eps > 0.0:
@@ -391,7 +400,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         loss_has = (loss_has_raw * drop_1d).sum() / drop_1d.sum().clamp_min(1.0)
         means_on = (has_tgt > 0.5).float() * drop_1d                             # [B]
-        w_means = means_on.unsqueeze(1).expand_as(means_pred)                    # [B, 5]
+        w_means = means_on.unsqueeze(1).expand_as(means_pred)                    # [B, 4]
         loss_means_raw = F.smooth_l1_loss(
             means_pred, means_tgt, reduction="none"
         )
@@ -424,6 +433,7 @@ class MAEPreTrainer(pl.LightningModule):
         glob_masks: dict,
         did_relational: bool,
         relational_mask_ratio: float,
+        do_muon: bool = True,
     ):
         # Reconstruction losses
         pred_occ = preds["occ"]
@@ -473,7 +483,13 @@ class MAEPreTrainer(pl.LightningModule):
         )
 
         # Kendall et al. aggregation
-        part_losses = {**part_dec, **part_dec_ah, **part_glob, **part_rel}
+        # Only include muon losses in part_losses if computed this iteration
+        if do_muon:
+            part_losses = {**part_dec, **part_dec_ah, **part_glob, **part_rel}
+        else:
+            # Exclude muon-related metrics when not computed
+            part_glob_no_muon = {k: v for k, v in part_glob.items() if not k.startswith('muon/')}
+            part_losses = {**part_dec, **part_dec_ah, **part_glob_no_muon, **part_rel}
         kendall_w, kendall_s = {}, {}
 
         def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
@@ -492,9 +508,11 @@ class MAEPreTrainer(pl.LightningModule):
             _weight("reg",    loss_reg)    +
             _weight("occ_ah", loss_occ_ah) +
             _weight("reg_ah", loss_reg_ah) +
-            _weight("ecal",   loss_ecal)   +
-            _weight("muon",   loss_muon)
+            _weight("ecal",   loss_ecal)
         )
+        if do_muon:
+            total_loss = total_loss + _weight("muon", loss_muon)
+        
         if did_relational and (idx_targets_fas_rel is not None):
             total_loss = total_loss + (
                 _weight("gho", loss_gho) +
@@ -511,6 +529,7 @@ class MAEPreTrainer(pl.LightningModule):
         batch_size = batch_input.batch_size
 
         do_relational = self._should_run_relational() if is_train else True
+        do_muon = self._should_compute_muon() if is_train else True
 
         # Forward pass
         (
@@ -551,6 +570,7 @@ class MAEPreTrainer(pl.LightningModule):
             glob_masks=glob_masks,
             did_relational=aux["did_relational"],
             relational_mask_ratio=aux["relational_mask_ratio"],
+            do_muon=do_muon,
         )
 
         return loss, part_losses, kendall_w, kendall_s, batch_size
