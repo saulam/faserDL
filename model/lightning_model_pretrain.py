@@ -72,7 +72,6 @@ class MAEPreTrainer(pl.LightningModule):
         self.kendall_w_max = 5.0
         self.u_gho = nn.Parameter(torch.zeros(()))
         self.u_hie = nn.Parameter(torch.zeros(()))
-        self.u_dec = nn.Parameter(torch.zeros(()))
         self.u_pid = nn.Parameter(torch.zeros(()))
         self.u_occ = nn.Parameter(torch.zeros(()))
         self.u_reg = nn.Parameter(torch.zeros(()))
@@ -85,7 +84,6 @@ class MAEPreTrainer(pl.LightningModule):
         self._uncertainty_params_desired_max = {
             "gho": (1.0, self.kendall_w_max),
             "hie": (0.05, 1.0),
-            "dec": (0.05, 1.0),
             "pid": (0.05, 0.8),
             "occ": (1.0, self.kendall_w_max),
             "reg": (1.0, self.kendall_w_max),
@@ -98,7 +96,6 @@ class MAEPreTrainer(pl.LightningModule):
         self._uncertainty_params = {
             "gho": self.u_gho,
             "hie": self.u_hie,
-            "dec": self.u_dec,
             "pid": self.u_pid,
             "occ": self.u_occ,
             "reg": self.u_reg,
@@ -194,7 +191,6 @@ class MAEPreTrainer(pl.LightningModule):
         targets = {}
         targets['vis_sp_momentum'] = labels['vis_sp_momentum']
         targets['csr_hie'] = labels['csr_hie_indptr'], labels['csr_hie_ids'], labels['csr_hie_weights']
-        targets['csr_dec'] = labels['csr_dec_indptr'], labels['csr_dec_ids'], labels['csr_dec_weights']
         targets['csr_pid'] = labels['csr_pid_indptr'], labels['csr_pid_ids'], labels['csr_pid_weights']
         targets['ghost_mask'] = labels['ghost_mask']
         targets['hit_event_id'] = labels['hit_event_id']
@@ -218,22 +214,18 @@ class MAEPreTrainer(pl.LightningModule):
         self,
         z_gho: torch.Tensor,             # [N]
         z_hie: torch.Tensor,             # [N, Dp]
-        z_dec: torch.Tensor,             # [N, Dp]
         z_pid: torch.Tensor,             # [N, Dp]
         csr_hie: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
-        csr_dec: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         csr_pid: torch.Tensor,           # ([N+1], [L], [L]) int64, float32
         ghost_mask: torch.Tensor,        # [N] bool
     ):
         """
-        Computes losses (same-track, same-primary, same-pid) in one call.
+        Computes losses (same-track, same-pid) in one call.
         Standard voxel-level version (kept for ghost loss).
         """
         loss_gho = bce_with_logits_label_smoothing(z_gho, ghost_mask.to(z_gho.dtype), 
                                                    label_smoothing=self.label_smoothing)
         loss_hie = soft_ce_with_logits_csr(z_hie, csr_hie, ghost_mask=ghost_mask, 
-                                           label_smoothing=self.label_smoothing*2.5, lambda_cp=5e-3)
-        loss_dec = soft_ce_with_logits_csr(z_dec, csr_dec, ghost_mask=ghost_mask, 
                                            label_smoothing=self.label_smoothing*2.5, lambda_cp=5e-3)
         loss_pid = soft_ce_with_logits_csr(z_pid, csr_pid, ghost_mask=ghost_mask, 
                                            label_smoothing=self.label_smoothing, lambda_cp=1e-3)
@@ -241,22 +233,19 @@ class MAEPreTrainer(pl.LightningModule):
         part_losses_enc = {
             "gho/total": loss_gho.detach(),
             "hie/total": loss_hie.detach(),
-            "dec/total": loss_dec.detach(),
             "pid/total": loss_pid.detach(),
         }
 
-        return loss_gho, loss_hie, loss_dec, loss_pid, part_losses_enc
+        return loss_gho, loss_hie, loss_pid, part_losses_enc
 
 
     def compute_relational_losses_distance_aware(
         self,
         pred_gho: torch.Tensor,         # [M, P]
         pred_hie: torch.Tensor,         # [M, P, num_classes]
-        pred_dec: torch.Tensor,         # [M, P, num_classes]
         pred_pid: torch.Tensor,         # [M, P, num_classes]
         idx_targets: torch.Tensor,      # [M, P]
         csr_hie: torch.Tensor,
-        csr_dec: torch.Tensor,
         csr_pid: torch.Tensor,
         ghost_mask: torch.Tensor,
         voxel_keep_prob: float,
@@ -265,7 +254,7 @@ class MAEPreTrainer(pl.LightningModule):
         Compute relational losses with optional distance awareness for semantic tasks.
         
         Ghost loss (gho) is kept as standard BCE (binary classification).
-        Semantic tasks (hie, dec, pid) can use distance-aware losses.
+        Semantic tasks (hie, pid) can use distance-aware losses.
         """
         raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(idx_targets)
 
@@ -286,10 +275,9 @@ class MAEPreTrainer(pl.LightningModule):
         
         for name, pred, csr in [
             ('hie', pred_hie, csr_hie),
-            ('dec', pred_dec, csr_dec),
             ('pid', pred_pid, csr_pid),
         ]:
-            # Determine exclude class for hie/dec (not for pid)
+            # Determine exclude class for hie (not for pid)
             exclude_class = 0 if name != 'pid' else None
 
             loss_semantic, metrics_semantic = unified_semantic_segmentation_loss(
@@ -310,8 +298,6 @@ class MAEPreTrainer(pl.LightningModule):
             # Store loss
             if name == 'hie':
                 loss_hie = loss_semantic
-            elif name == 'dec':
-                loss_dec = loss_semantic
             else:  # pid
                 loss_pid = loss_semantic
             
@@ -319,7 +305,7 @@ class MAEPreTrainer(pl.LightningModule):
             for k, v in metrics_semantic.items():
                 part_losses[f"{name}/{k.split('/')[-1]}"] = v
         
-        return loss_gho, loss_hie, loss_dec, loss_pid, part_losses
+        return loss_gho, loss_hie, loss_pid, part_losses
         
 
     def compute_reconstruction_losses_distance_aware(
@@ -468,25 +454,18 @@ class MAEPreTrainer(pl.LightningModule):
         if did_relational and (idx_targets_fas_rel is not None):
             pred_gho = preds["gho"]
             pred_hie = preds["hie"]
-            pred_dec_rel = preds["dec"]
             pred_pid = preds["pid"]
 
             csr_hie = labels["csr_hie"]
-            csr_dec = labels["csr_dec"]
             csr_pid = labels["csr_pid"]
 
-            loss_gho, loss_hie, loss_dec, loss_pid, part_rel = self.compute_relational_losses_distance_aware(
-                pred_gho, pred_hie, pred_dec_rel, pred_pid,
+            loss_gho, loss_hie, loss_pid, part_rel = self.compute_relational_losses_distance_aware(
+                pred_gho, pred_hie, pred_pid,
                 idx_targets_fas_rel,
-                csr_hie, csr_dec, csr_pid,
+                csr_hie, csr_pid,
                 ghost_mask,
                 self.relational_voxel_keep_prob,  # regularisation knob
             )
-        else:
-            loss_gho = torch.zeros((), device=self.device)
-            loss_hie = torch.zeros((), device=self.device)
-            loss_dec = torch.zeros((), device=self.device)
-            loss_pid = torch.zeros((), device=self.device)
         
         # Global reconstruction losses
         loss_ecal, loss_muon, part_glob = self.compute_global_losses(
@@ -520,7 +499,6 @@ class MAEPreTrainer(pl.LightningModule):
             total_loss = total_loss + (
                 _weight("gho", loss_gho) +
                 _weight("hie", loss_hie) +
-                _weight("dec", loss_dec) +
                 _weight("pid", loss_pid)
             )
 

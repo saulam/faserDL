@@ -183,7 +183,7 @@ def main():
         devices=nb_gpus,
         precision="bf16-mixed" if pl_major >= 2 else 32,
         strategy=DDPStrategy(
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             gradient_as_bucket_view=True,
             static_graph=False
         ) if nb_gpus > 1 else "auto",

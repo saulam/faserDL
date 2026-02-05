@@ -1868,7 +1868,7 @@ def soft_ce_with_logits_csr(
             w_used = row_w.clamp_min(1e-12)
             base_loss = per_row_loss.sum() / w_used.sum()
 
-    # Confidence penalty (unchanged)
+    # Confidence penalty
     if lambda_cp > 0.0:
         if ghost_mask is not None:
             mask = ~ghost_mask.to(dtype=torch.bool, device=logits.device)

@@ -147,14 +147,15 @@ class SparseMAEViT(nn.Module):
         # Encoder: hierarchical ViT
         # =========================
         self.intra_depth = depth
-        self.num_module_cls = num_module_cls
+        self.num_module_cls = int(num_module_cls)
+        self.t_patches_per_module_cls = max(1, self.num_intra_positions // max(1, self.num_module_cls))
 
-        self.module_cls_token = nn.Parameter(torch.zeros(1, num_module_cls, embed_dim))  # per-module CLS (shared weights)
-        self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per patch
-        self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                # learned module index for intra-attn
+        self.module_cls_token = nn.Parameter(torch.zeros(1, self.num_module_cls, embed_dim))  # per-module CLS (shared weights)
+        self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)              # fixed sin-cos per patch
+        self.module_embed_enc = nn.Embedding(self.num_modules, embed_dim)                     # learned module index for intra-attn
 
-        self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)         # fixed sin-cos per patch
-        self.kv_src_embed = nn.Embedding(3, embed_dim)                                   # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
+        self.ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, embed_dim)              # fixed sin-cos per patch
+        self.kv_src_embed = nn.Embedding(3, embed_dim)                                        # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
 
         # drop path schedule
         dp_fas, dp_ah, dp_muon, dp_lat_x, dp_lat_s = make_parallel_then_merge_dpr(
@@ -174,8 +175,10 @@ class SparseMAEViT(nn.Module):
         self.norm = norm_layer(embed_dim)
 
         # AHCAL short self-attention + K CLS
-        self.num_ahcal_cls = int(num_ahcal_cls)
         self.ahcal_depth = int(ahcal_depth)
+        self.num_ahcal_cls = int(num_ahcal_cls)
+        self.t_patches_per_ahcal_cls = max(1, self.num_ahcal_positions // max(1, self.num_ahcal_cls))
+
         self.ahcal_cls_token = nn.Parameter(torch.zeros(1, self.num_ahcal_cls, embed_dim))
         self.ahcal_blocks = nn.ModuleList([
             BlockWithMask(
@@ -260,7 +263,6 @@ class SparseMAEViT(nn.Module):
         self.head_channels = {
             "gho": 1,
             "hie": 3,
-            "dec": 3,
             "pid": num_pid_classes,
             "occ": 1,
             "reg": in_chans,
@@ -583,30 +585,85 @@ class SparseMAEViT(nn.Module):
         out = packed.new_zeros(B, M, L, C)
         out[b_ids, m_ids, l_ids, :] = packed[b_ids, within, :]
         return out    
+
     
+    def _cls_keep_from_patchmask(
+        self,
+        patch_mask: torch.Tensor,   # [B,M,L] or [B,L]
+        num_cls: int,
+        t: int,
+        ensure_one_if_nonempty: bool = True,
+        dummy_one_if_empty: bool = False,
+    ) -> torch.Tensor:
+        """
+        Returns boolean CLS keep mask:
+        - if patch_mask is [B, M, L] -> returns [B, M, CLS]
+        - if patch_mask is [B, L]   -> returns [B, CLS]
+        """
+        num_cls = int(num_cls)
+        if num_cls <= 0:
+            # preserve rank: [B,0] or [B,M,0]
+            if patch_mask.dim() == 2:
+                return patch_mask.new_zeros(patch_mask.size(0), 0)
+            elif patch_mask.dim() == 3:
+                return patch_mask.new_zeros(patch_mask.size(0), patch_mask.size(1), 0)
+            else:
+                raise ValueError(f"patch_mask must be rank-2 or rank-3, got {patch_mask.shape}")
+
+        t = max(1, int(t))
+        v = patch_mask.sum(dim=-1).to(torch.long)  # [B,M] or [B]
+
+        k = (v + (t - 1)) // t                     # ceil(v/t)
+        k = torch.minimum(k, v)                    # never more CLS than patches
+        k = k.clamp(min=0, max=num_cls)
+
+        if ensure_one_if_nonempty:
+            k = torch.where(v > 0, k.clamp_min(1), k)
+
+        if dummy_one_if_empty:
+            k = torch.where(v == 0, torch.ones_like(k), k)
+
+        device = patch_mask.device
+        if patch_mask.dim() == 3:
+            # [B, M, CLS]
+            slot = torch.arange(num_cls, device=device).view(1, 1, num_cls)
+            return slot < k.unsqueeze(-1)
+        else:
+            # [B, CLS]
+            slot = torch.arange(num_cls, device=device).view(1, num_cls)
+            return slot < k.view(-1, 1)
+
 
     def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor) -> torch.Tensor:
         """
-        Build a [B, N_lat] boolean mask for Perceiver latents:
-        - FASER latents valid iff that module has >=1 real patch (attn_mask_mod any True)
-        - AHCAL latents valid iff AHCAL has >=1 real patch (ah_mask any True)
+        Build a [B, N_lat] boolean mask for Perceiver latents with occupancy-based CLS gating.
 
-        Also ensures at least one latent is kept per batch element (numerical safety).
+        - For each module: activate k = ceil(v / t_mod) CLS slots, where v=#real patches in that module.
+        - For AHCAL:       activate k = ceil(v / t_ah) CLS slots, where v=#real patches in AHCAL.
         """
-        # attn_mask_mod: [B, M, Lm]
-        # ah_mask:       [B, Na]
+        # attn_mask_mod: [B, M, Lm] bool
+        # ah_mask:       [B, Na] bool
         B, M, _ = attn_mask_mod.shape
-        device = attn_mask_mod.device
 
-        module_valid = attn_mask_mod.any(dim=-1)  # [B, M]
-        lat_fas_keep = module_valid.repeat_interleave(self.num_module_cls, dim=1)  # [B, M*CLS]
+        fas_cls_keep = self._cls_keep_from_patchmask(
+            attn_mask_mod,
+            num_cls=self.num_module_cls,
+            t=self.t_patches_per_module_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=False,   # IMPORTANT: no dummy latents here
+        )  # [B, M, CLS]
 
-        ah_valid = ah_mask.any(dim=-1)  # [B]
-        lat_ah_keep = ah_valid.view(B, 1).expand(B, self.num_ahcal_cls)  # [B, K]
+        ah_cls_keep = self._cls_keep_from_patchmask(
+            ah_mask,
+            num_cls=self.num_ahcal_cls,
+            t=self.t_patches_per_ahcal_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=False,
+        )  # [B, K]
 
-        lat_keep = torch.cat([lat_fas_keep, lat_ah_keep], dim=1).to(device=device)  # [B, N_lat]
+        lat_keep = torch.cat([fas_cls_keep.reshape(B, M * int(self.num_module_cls)), ah_cls_keep], dim=1)
 
-        # If an event is totally empty everywhere, keep one dummy latent to avoid "all keys masked" SDPA edge cases.
+        # global numerical safety: if totally empty everywhere, keep one dummy latent
         empty_evt = (lat_keep.sum(dim=1) == 0)
         if empty_evt.any():
             lat_keep = lat_keep.clone()
@@ -657,15 +714,25 @@ class SparseMAEViT(nn.Module):
         cls = self.module_cls_token.expand(B*M, self.num_module_cls, C)
         x_intra = x_keep.reshape(B*M, Lk, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
+
+        CLS = int(self.num_module_cls)
+        cls_keep_mask_flat = self._cls_keep_from_patchmask(
+            attn_mask_mod,
+            num_cls=CLS,
+            t=self.t_patches_per_module_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=True,
+        ).reshape(B * M, CLS)                                                              # [B*M, CLS]
+
         attn_mask_intra = torch.cat(
-            [torch.ones(B*M, self.num_module_cls, dtype=torch.bool, device=x_intra.device),
-             attn_mask_keep.reshape(B*M, Lk)], dim=1)
+            [cls_keep_mask_flat, attn_mask_keep.reshape(B * M, Lk)], dim=1
+        )
         for blk in self.blocks:
             x_intra = blk(x_intra, attn_mask=attn_mask_intra, q_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
 
-        cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)    # [B, M, CLS, C]
-        tok_mod = x_intra[:, self.num_module_cls:, :].reshape(B, M, Lk, C)                  # [B, M, Lk, C]
+        cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)   # [B, M, CLS, C]
+        tok_mod = x_intra[:, self.num_module_cls:, :].reshape(B, M, Lk, C)                 # [B, M, Lk, C]
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)
 
@@ -696,10 +763,16 @@ class SparseMAEViT(nn.Module):
         K = self.num_ahcal_cls
         cls_ah = self.ahcal_cls_token.expand(B, K, C)                                       # [B, K, C]
         x_ah = torch.cat([cls_ah, tok_ah_keep], dim=1)                                      # [B, K+Lk_ah, C]
-        ah_attn_intra = torch.cat(
-            [torch.ones(B, K, dtype=torch.bool, device=x_ah.device),
-                ah_attn_keep], dim=1
-        )
+
+        ah_cls_keep = self._cls_keep_from_patchmask(
+            ah_mask,
+            num_cls=K,
+            t=self.t_patches_per_ahcal_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=True,
+        )                                                                                   # [B, K]
+
+        ah_attn_intra = torch.cat([ah_cls_keep, ah_attn_keep], dim=1)
         for blk in self.ahcal_blocks:
             x_ah = blk(x_ah, attn_mask=ah_attn_intra, q_mask=ah_attn_intra)
         x_ah = self.ahcal_norm(x_ah)
@@ -929,7 +1002,7 @@ class SparseMAEViT(nn.Module):
         idx_map,
     ):
         """
-        Relational/semantic heads (gho/hie/dec/pid) on KEPT tokens.
+        Relational/semantic heads (gho/hie/pid) on KEPT tokens.
         """
         B = lat.size(0)
         Cdec = self.decoder_intra_pos_embed.weight.shape[-1]
@@ -960,7 +1033,6 @@ class SparseMAEViT(nn.Module):
         preds = {
             "gho": self.heads["gho"](shared).squeeze(-1),                      # [Nr, P]
             "hie": self.heads["hie"](shared),                                  # [Nr, P, 3]
-            "dec": self.heads["dec"](shared),                                  # [Nr, P, 3]
             "pid": self.heads["pid"](shared),                                  # [Nr, P, num_pid]
         }
 
@@ -979,12 +1051,12 @@ class SparseMAEViT(nn.Module):
           - AHCAL reconstruction on masked patches.
 
         Pass B (optional):
-          - FASERCal relational: hie/dec/pid on all real (kept) patches.
+          - FASERCal relational: hie/pid on all real (kept) patches.
 
         Returns:
           preds:                  merged dict of predictions
           idx_targets_fas_masked: for occ/reg/gho losses (masked patches)
-          idx_targets_fas_sem:    for hie/dec/pid losses (real/kept patches from full pass)
+          idx_targets_fas_sem:    for hie/pid losses (real/kept patches from full pass)
           idx_targets_ah:         for AHCAL losses
           glob_tgts, glob_masks:  for global losses
           aux:                    dict with run flags
@@ -1073,7 +1145,7 @@ class SparseMAEViT(nn.Module):
         return (
             preds,
             idx_targets_fas_masked,  # for occ/reg (masked patches)
-            idx_targets_fas_rel,     # for gho/hie/dec/pid (kept patches)
+            idx_targets_fas_rel,     # for gho/hie/pid (kept patches)
             idx_targets_ah,          # for AHCAL occ_ah/reg_ah (masked patches)
             glob_tgts,               # ecal_tgt, muon_tgt
             glob_masks,              # ecal_drop, muon_drop
@@ -1087,11 +1159,12 @@ def mae_vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=2, ahcal_depth=2, num_heads=12, io_depth=6, io_decode_depth=2, 
-        num_module_cls=2, num_ahcal_cls=4,
+        num_module_cls=4, num_ahcal_cls=4,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
+
 
 def mae_vit_base(**kwargs):
     model = SparseMAEViT(
@@ -1099,7 +1172,7 @@ def mae_vit_base(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=4, num_heads=12, io_depth=4, io_decode_depth=2, 
-        num_module_cls=2, num_ahcal_cls=4,
+        num_module_cls=4, num_ahcal_cls=4,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
