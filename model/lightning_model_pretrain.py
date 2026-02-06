@@ -183,6 +183,18 @@ class MAEPreTrainer(pl.LightningModule):
         """
         step = int(getattr(self.trainer, "global_step", 0))
         return (step % 2) == 0
+    
+    
+    def _get_muon_reg_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Generate regularization mask for muon loss (~50% of rows).
+        DDP-safe: deterministic mask based on global_step.
+        """
+        step = int(getattr(self.trainer, "global_step", 0))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(42000 + step)
+        rand_mask = torch.rand(batch_size, generator=g, device="cpu")
+        return (rand_mask < 0.5).float().to(device)
         
 
     def forward(self, x, x_glob, mask_ratio, do_relational, relational_mask_ratio):
@@ -390,7 +402,11 @@ class MAEPreTrainer(pl.LightningModule):
         means_pred = muon_pred[:, 1:]                                            # [B, 4]
         means_tgt  = muon_tgt[:, 1:]                                             # [B, 4]
         drop_1d = muon_drop.squeeze(1)                                           # [B]
-        eps = self.label_smoothing
+        drop_1d = drop_1d * self._get_muon_reg_mask(
+            drop_1d.shape[0], drop_1d.device
+        )                                                                        # extra regularization: ~50% of rows
+        
+        eps = self.label_smoothing * 2.5
         if eps > 0.0:
             has_tgt_smooth = has_tgt * (1.0 - eps) + 0.5 * eps
         else:
