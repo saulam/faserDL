@@ -13,7 +13,7 @@ from spconv.pytorch import SparseConv3d, SparseSequential
 from functools import partial
 from .utils import (
     get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, 
-    CrossAttnBlock, SeparableDCT3D, SharedLatentVoxelHead, LazyIdxMap,
+    CrossAttnBlock, MultiRankSeparableBasis3D, MultiRankSharedLatentVoxelHead, LazyIdxMap,
     muon_summary_target, make_parallel_then_merge_dpr
 )
 
@@ -246,17 +246,17 @@ class SparseMAEViT(nn.Module):
         # ==========================
         # Heads
         # ==========================
-        self.fasercal_sep_basis = SeparableDCT3D(
-            self.fcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6)
+        self.fasercal_sep_basis = MultiRankSeparableBasis3D(
+            self.fcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
         )
-        self.fasercal_shared_voxel_head = SharedLatentVoxelHead(
+        self.fasercal_shared_voxel_head = MultiRankSharedLatentVoxelHead(
             decoder_embed_dim, self.fasercal_sep_basis, H=num_modes[0],
             norm_layer=norm_layer, post_norm=True
         )
-        self.ahcal_sep_basis = SeparableDCT3D(
-            self.ahcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6)
+        self.ahcal_sep_basis = MultiRankSeparableBasis3D(
+            self.ahcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
         )
-        self.ahcal_voxel_head = SharedLatentVoxelHead(
+        self.ahcal_voxel_head = MultiRankSharedLatentVoxelHead(
             decoder_embed_dim, self.ahcal_sep_basis, H=num_modes[1],
             norm_layer=norm_layer, post_norm=True,
         )
@@ -1156,7 +1156,7 @@ def mae_vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=2, ahcal_depth=2, num_heads=12, io_depth=6, io_decode_depth=2, 
-        num_module_cls=4, num_ahcal_cls=4,
+        num_module_cls=2, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
@@ -1169,7 +1169,7 @@ def mae_vit_base(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=4, num_heads=12, io_depth=4, io_decode_depth=2, 
-        num_module_cls=4, num_ahcal_cls=4,
+        num_module_cls=2, num_ahcal_cls=2,
         num_modes=(8, 4), decoder_embed_dim=256, decoder_num_heads=8,
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )

@@ -175,7 +175,7 @@ class MAEPreTrainer(pl.LightningModule):
         g.manual_seed(int(self.relational_pass_seed + step))
         return torch.rand((), generator=g).item() < p
     
-    
+
     def _should_compute_muon(self) -> bool:
         """
         Compute muon loss every other iteration.
@@ -519,6 +519,15 @@ class MAEPreTrainer(pl.LightningModule):
                 _weight("hie", loss_hie) +
                 _weight("pid", loss_pid)
             )
+
+        # basis regularization
+        lambda_basis_fcal = 1e-4
+        lambda_basis_ah   = 3e-5
+        basis_reg_fcal = self.model.fasercal_sep_basis.orthonorm_reg(w_within=1.0, w_across=0.1)
+        basis_reg_ahcal = self.model.ahcal_sep_basis.orthonorm_reg(w_within=1.0, w_across=0.1)
+        total_loss = total_loss + lambda_basis_fcal * basis_reg_fcal + lambda_basis_ah * basis_reg_ahcal
+        part_losses["basis/reg_fcal"] = (lambda_basis_fcal * basis_reg_fcal).detach()
+        part_losses["basis/reg_ahcal"] = (lambda_basis_ah * basis_reg_ahcal).detach()
 
         return total_loss, part_losses, kendall_w, kendall_s
 

@@ -669,6 +669,155 @@ class SharedLatentVoxelHead(nn.Module):
         return Vt
 
 
+class MultiRankSeparableBasis3D(nn.Module):
+    """
+    Sum of R separable bases:
+      V(x,y,z) = sum_r  sum_{kx,ky,kz} c[r,kx,ky,kz] * Bx[r,x,kx] * By[r,y,ky] * Bz[r,z,kz]
+
+    Bx/By/Bz optionally learnable, DCT-initialized.
+    """
+    def __init__(self, patch_size, alphas=(0.4, 0.4, 0.75), max_per_axis=16, R=4, learnable=True):
+        super().__init__()
+        ph, pw, pd = patch_size
+        self.p_h, self.p_w, self.p_d = int(ph), int(pw), int(pd)
+        self.R = int(R)
+
+        Kx, Ky, Kz = self._choose_Kxyz((ph, pw, pd), alphas, max_per_axis)
+        self.Kx, self.Ky, self.Kz = int(Kx), int(Ky), int(Kz)
+
+        def dct_1d(L, K, device=None, dtype=None):
+            if dtype is None:
+                dtype = torch.get_default_dtype()
+            x = torch.arange(L, dtype=dtype, device=device).unsqueeze(1)  # [L,1]
+            k = torch.arange(K, dtype=dtype, device=device).unsqueeze(0)  # [1,K]
+            M = torch.cos(torch.pi * (x + 0.5) * k / L)                    # [L,K]
+            # Orthonormal DCT-II scaling
+            M[:, 0] /= math.sqrt(L)
+            if K > 1:
+                M[:, 1:] *= math.sqrt(2.0 / L)
+            return M
+
+        def init_basis(L, K):
+            base = dct_1d(L, K)                  # [L,K]
+            base = base.unsqueeze(0).repeat(self.R, 1, 1)  # [R,L,K]
+            return base
+
+        Bx0 = init_basis(self.p_h, self.Kx)
+        By0 = init_basis(self.p_w, self.Ky)
+        Bz0 = init_basis(self.p_d, self.Kz)
+
+        if learnable:
+            self.Bx = nn.Parameter(Bx0)
+            self.By = nn.Parameter(By0)
+            self.Bz = nn.Parameter(Bz0)
+        else:
+            self.register_buffer("Bx", Bx0)
+            self.register_buffer("By", By0)
+            self.register_buffer("Bz", Bz0)
+
+    def _choose_Kxyz(self, patch_size, alphas, max_per_axis):
+        ph, pw, pd = patch_size
+        Ks = []
+        for dim, alpha in zip((ph, pw, pd), alphas):
+            K = min(int(round(alpha * dim)), int(max_per_axis), int(dim))
+            if dim >= 2:
+                K = max(K, 2)
+            Ks.append(K)
+        return tuple(Ks)
+
+    @property
+    def K_total(self):
+        return self.Kx * self.Ky * self.Kz
+
+    @property
+    def P(self):
+        return self.p_h * self.p_w * self.p_d
+
+    def expand(self, coeff):
+        """
+        coeff: [N, H, R, Kx, Ky, Kz]
+        returns: [N, H, P]
+        """
+        # n,h,r,k,y,z  and  r,i,k -> n,h,r,i,y,z
+        t = torch.einsum('nhrkyz,rik->nhriyz', coeff, self.Bx)
+        # n,h,r,i,y,z  and  r,j,y -> n,h,r,i,j,z
+        t = torch.einsum('nhriyz,rjy->nhrijz', t, self.By)
+        # n,h,r,i,j,z  and  r,k,z -> n,h,r,i,j,k
+        t = torch.einsum('nhrijz,rkz->nhrijk', t, self.Bz)
+
+        # sum over rank r -> [N,H,ph,pw,pd]
+        out = t.sum(dim=2)
+        return out.reshape(out.size(0), out.size(1), -1)  # [N,H,P]
+
+    def orthonorm_reg(self, w_within=1.0, w_across=1.0):
+        """
+        Regularizer:
+          - within-rank: columns orthonormal for each rank (Bx[r]^T Bx[r] ~ I)
+          - across-rank: discourage different ranks from being the same (flattened rank vectors orthogonal)
+        """
+        reg = 0.0
+        for B in (self.Bx, self.By, self.Bz):  # [R, L, K]
+            R, L, K = B.shape
+
+            # ---- within-rank orthonorm on columns ----
+            # G[r] = B[r]^T B[r]  -> [R,K,K]
+            G = torch.bmm(B.transpose(1, 2), B)
+            I = torch.eye(K, device=G.device, dtype=G.dtype).unsqueeze(0)
+            reg_within = (G - I).pow(2).mean()
+
+            # ---- across-rank diversity ----
+            # Flatten each rank to a vector, normalize, penalize off-diagonal correlations
+            V = B.reshape(R, -1)
+            V = F.normalize(V, dim=1, eps=1e-8)  # [R, L*K]
+            C = V @ V.t()                        # [R,R]
+            I2 = torch.eye(R, device=C.device, dtype=C.dtype)
+            reg_across = (C - I2).pow(2).mean()
+
+            reg = reg + w_within * reg_within + w_across * reg_across
+        return reg
+
+
+class MultiRankSharedLatentVoxelHead(nn.Module):
+    """
+    token -> coeffs -> expand -> [N, P, H]
+    Matches your current head API (returns [N, P, H]).
+    """
+    def __init__(self, in_dim, basis: MultiRankSeparableBasis3D, H=16, norm_layer=nn.LayerNorm,
+                 post_norm=False, coeff_scale="auto"):
+        super().__init__()
+        self.basis = basis
+        self.H = int(H)
+        self.R = int(basis.R)
+        self.norm = norm_layer(in_dim)
+        self.proj = nn.Linear(in_dim, self.H * self.R * basis.K_total)
+        self.post_norm = norm_layer(self.H) if post_norm else None
+
+        # scaling for coeffs before expansion
+        # "auto": 1/sqrt(R*Ktot) is usually stable when summing over ranks
+        if coeff_scale == "auto":
+            self._coeff_scale = 1.0 / math.sqrt(max(1, self.R * basis.K_total))
+        elif isinstance(coeff_scale, (float, int)):
+            self._coeff_scale = float(coeff_scale)
+        else:
+            self._coeff_scale = 1.0
+
+    def forward(self, token_emb):  # [N, D]
+        x = self.norm(token_emb)
+        coef = self.proj(x)  # [N, H*R*Ktot]
+        N = coef.size(0)
+
+        coef = coef.view(
+            N, self.H, self.R, self.basis.Kx, self.basis.Ky, self.basis.Kz
+        )
+        coef = coef * self._coeff_scale
+
+        V = self.basis.expand(coef)     # [N, H, P]
+        Vt = V.transpose(1, 2)          # [N, P, H]
+        if self.post_norm is not None:
+            Vt = self.post_norm(Vt)
+        return Vt
+
+
 class CylindricalHeadNormalized(nn.Module):
     """
     pT:  uT = mu_uT + sigma_uT*zT,  pT = k_T * expm1(uT)
