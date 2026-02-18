@@ -162,7 +162,8 @@ class SparseViT(vit.VisionTransformer):
         for idx, blk in enumerate(self.blocks):
             _set_dp(blk, dp_fas[idx])
                 
-        self.num_module_cls = num_module_cls
+        self.num_module_cls = int(num_module_cls)
+        self.t_patches_per_module_cls = max(1, self.num_intra_positions // max(1, self.num_module_cls))
         
         self.module_cls_token = nn.Parameter(torch.zeros(1, num_module_cls, embed_dim))  # per-module CLS (shared weights)
         self.intra_pos_embed = nn.Embedding(self.num_intra_positions, embed_dim)         # fixed sin-cos per-module
@@ -172,6 +173,7 @@ class SparseViT(vit.VisionTransformer):
         self.kv_src_embed = nn.Embedding(3, embed_dim)                                   # 0: AHCAL, 1: ECAL, 2: MUON_SPEC
 
         self.num_ahcal_cls = int(num_ahcal_cls)
+        self.t_patches_per_ahcal_cls = max(1, self.num_ahcal_positions // max(1, self.num_ahcal_cls))
         self.ahcal_depth = int(ahcal_depth)
         self.ahcal_cls_token = nn.Parameter(torch.zeros(1, self.num_ahcal_cls, embed_dim))
         self.ahcal_blocks = nn.ModuleList([
@@ -431,28 +433,83 @@ class SparseViT(vit.VisionTransformer):
         return packed, keep, b_ids, m_ids, l_ids, within, N_max 
     
 
+    def _cls_keep_from_patchmask(
+        self,
+        patch_mask: torch.Tensor,
+        num_cls: int,
+        t: int,
+        ensure_one_if_nonempty: bool = True,
+        dummy_one_if_empty: bool = False,
+    ) -> torch.Tensor:
+        """
+        Returns boolean CLS keep mask:
+        - if patch_mask is [B, M, L] -> returns [B, M, CLS]
+        - if patch_mask is [B, L]   -> returns [B, CLS]
+        """
+        num_cls = int(num_cls)
+        if num_cls <= 0:
+            # preserve rank: [B,0] or [B,M,0]
+            if patch_mask.dim() == 2:
+                return patch_mask.new_zeros(patch_mask.size(0), 0)
+            elif patch_mask.dim() == 3:
+                return patch_mask.new_zeros(patch_mask.size(0), patch_mask.size(1), 0)
+            else:
+                raise ValueError(f"patch_mask must be rank-2 or rank-3, got {patch_mask.shape}")
+
+        t = max(1, int(t))
+        v = patch_mask.sum(dim=-1).to(torch.long)  # [B,M] or [B]
+
+        k = (v + (t - 1)) // t                     # ceil(v/t)
+        k = torch.minimum(k, v)                    # never more CLS than patches
+        k = k.clamp(min=0, max=num_cls)
+
+        if ensure_one_if_nonempty:
+            k = torch.where(v > 0, k.clamp_min(1), k)
+
+        if dummy_one_if_empty:
+            k = torch.where(v == 0, torch.ones_like(k), k)
+
+        device = patch_mask.device
+        if patch_mask.dim() == 3:
+            # [B, M, CLS]
+            slot = torch.arange(num_cls, device=device).view(1, 1, num_cls)
+            return slot < k.unsqueeze(-1)
+        else:
+            # [B, CLS]
+            slot = torch.arange(num_cls, device=device).view(1, num_cls)
+            return slot < k.view(-1, 1)
+
+
     def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor) -> torch.Tensor:
         """
-        Build a [B, N_lat] boolean mask for Perceiver latents:
-        - FASER latents valid iff that module has >=1 real patch (attn_mask_mod any True)
-        - AHCAL latents valid iff AHCAL has >=1 real patch (ah_mask any True)
+        Build a [B, N_lat] boolean mask for Perceiver latents with occupancy-based CLS gating.
 
-        Also ensures at least one latent is kept per batch element (numerical safety).
+        - For each module: activate k = ceil(v / t_mod) CLS slots, where v=#real patches in that module.
+        - For AHCAL:       activate k = ceil(v / t_ah) CLS slots, where v=#real patches in AHCAL.
         """
-        # attn_mask_mod: [B, M, Lm]
-        # ah_mask:       [B, Na]
+        # attn_mask_mod: [B, M, Lm] bool
+        # ah_mask:       [B, Na] bool
         B, M, _ = attn_mask_mod.shape
-        device = attn_mask_mod.device
 
-        module_valid = attn_mask_mod.any(dim=-1)  # [B, M]
-        lat_fas_keep = module_valid.repeat_interleave(self.num_module_cls, dim=1)  # [B, M*CLS]
+        fas_cls_keep = self._cls_keep_from_patchmask(
+            attn_mask_mod,
+            num_cls=self.num_module_cls,
+            t=self.t_patches_per_module_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=False,   # IMPORTANT: no dummy latents here
+        )  # [B, M, CLS]
 
-        ah_valid = ah_mask.any(dim=-1)  # [B]
-        lat_ah_keep = ah_valid.view(B, 1).expand(B, self.num_ahcal_cls)  # [B, K]
+        ah_cls_keep = self._cls_keep_from_patchmask(
+            ah_mask,
+            num_cls=self.num_ahcal_cls,
+            t=self.t_patches_per_ahcal_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=False,
+        )  # [B, K]
 
-        lat_keep = torch.cat([lat_fas_keep, lat_ah_keep], dim=1).to(device=device)  # [B, N_lat]
+        lat_keep = torch.cat([fas_cls_keep.reshape(B, M * int(self.num_module_cls)), ah_cls_keep], dim=1)
 
-        # If an event is totally empty everywhere, keep one dummy latent to avoid "all keys masked" SDPA edge cases.
+        # global numerical safety: if totally empty everywhere, keep one dummy latent
         empty_evt = (lat_keep.sum(dim=1) == 0)
         if empty_evt.any():
             lat_keep = lat_keep.clone()
@@ -496,9 +553,18 @@ class SparseViT(vit.VisionTransformer):
         x_intra = x_mod.reshape(B*M, L, C)
         x_intra = torch.cat([cls, x_intra], dim=1)
         x_intra = self.pos_drop(x_intra)
+        
+        CLS = int(self.num_module_cls)
+        cls_keep_mask_flat = self._cls_keep_from_patchmask(
+            attn_mask_mod,
+            num_cls=CLS,
+            t=self.t_patches_per_module_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=True,
+        ).reshape(B * M, CLS)                                                              # [B*M, CLS]
+        
         attn_mask_intra = torch.cat(
-            [torch.ones(B*M, self.num_module_cls, dtype=torch.bool, device=x_intra.device),
-             attn_mask_mod.reshape(B*M, L)], dim=1)
+            [cls_keep_mask_flat, attn_mask_mod.reshape(B*M, L)], dim=1)
         for blk in self.blocks:
             x_intra = blk(x_intra, attn_mask=attn_mask_intra, q_mask=attn_mask_intra)
         x_intra = self.norm(x_intra)
@@ -527,10 +593,16 @@ class SparseViT(vit.VisionTransformer):
         K = self.num_ahcal_cls
         cls_ah = self.ahcal_cls_token.expand(B, K, C)                                       # [B, K, C]
         x_ah = torch.cat([cls_ah, ah_tokens], dim=1)                                        # [B, K+Na, C]
-        ah_attn_intra = torch.cat(
-            [torch.ones(B, K, dtype=torch.bool, device=x_ah.device),
-                ah_mask], dim=1
-        )
+        
+        ah_cls_keep = self._cls_keep_from_patchmask(
+            ah_mask,
+            num_cls=K,
+            t=self.t_patches_per_ahcal_cls,
+            ensure_one_if_nonempty=True,
+            dummy_one_if_empty=True,
+        )                                                                                   # [B, K]
+        
+        ah_attn_intra = torch.cat([ah_cls_keep, ah_mask], dim=1)
         for blk in self.ahcal_blocks:
             x_ah = blk(x_ah, attn_mask=ah_attn_intra, q_mask=ah_attn_intra)
         x_ah = self.ahcal_norm(x_ah)
@@ -545,7 +617,7 @@ class SparseViT(vit.VisionTransformer):
         # muon spectrometer token
         muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)         # [B, 1, C]
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                  # [B, N_muspec, C]
-        has_tracks = (muspec_counts > 0)                                                    # [B, 1] bool
+        has_tracks = muspec_attn_mask.any(dim=1, keepdim=True)                              # [B, 1] bool                                                    # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
         muon_tok_present = self.muon_spec_xattn(
@@ -609,7 +681,7 @@ def vit_tiny(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=2, ahcal_depth=2, num_heads=12, io_depth=6,
-        num_module_cls=2, num_ahcal_cls=4,
+        num_module_cls=2, num_ahcal_cls=2,
         mlp_ratio=4.0, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -622,7 +694,7 @@ def vit_base(**kwargs):
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40), ahcal_patch_size=(6, 6, 5),
         depth=4, ahcal_depth=4, num_heads=12, io_depth=4,
-        num_module_cls=2, num_ahcal_cls=4,
+        num_module_cls=2, num_ahcal_cls=2,
         mlp_ratio=4.0, global_pool=True,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
