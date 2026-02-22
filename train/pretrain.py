@@ -193,13 +193,22 @@ def main():
         accumulate_grad_batches=args.accum_grad_batches,
     )
 
+    # Load pre-trained weights (start fresh training)
+    if args.load_checkpoint is not None and os.path.exists(args.load_checkpoint):
+        checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
+        msg = lightning_model.load_state_dict(checkpoint['state_dict'], strict=True)
+        print(f"Loaded pre-trained weights from: {args.load_checkpoint}")
+        print(f"Load msg: {msg}")
+
+    # Resume training from checkpoint (restores optimiser, epoch, etc.)
+    resume_path = args.resume_checkpoint if args.resume_checkpoint and os.path.exists(args.resume_checkpoint) else None
+
     # Train and validate the model
-    ckpt_path = args.load_checkpoint if args.load_checkpoint and os.path.exists(args.load_checkpoint) else None
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=valid_loader,
-        ckpt_path=ckpt_path,
+        ckpt_path=resume_path,
     )
 
 

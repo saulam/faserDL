@@ -109,7 +109,7 @@ def main():
     print(f"start_cosine_step = {args.start_cosine_step}")
     print(f"eff. batch size   = {args.batch_size * denom}")
 
-    # Transfer weights from pre-trained model
+    # Initialise the model
     model = args.model(
         drop_rate = args.dropout,
         attn_drop_rate = args.attn_dropout,
@@ -117,6 +117,8 @@ def main():
         head_init = args.head_init,
         metadata = metadata,
     )
+
+    # Load pre-trained encoder weights (start fresh training)
     if args.load_checkpoint is not None and os.path.exists(args.load_checkpoint):
         checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
         load_mae_encoder(model, checkpoint)
@@ -195,11 +197,15 @@ def main():
         accumulate_grad_batches=args.accum_grad_batches,
     )
 
+    # Resume training from checkpoint (restores optimiser, epoch, etc.)
+    resume_path = args.resume_checkpoint if args.resume_checkpoint and os.path.exists(args.resume_checkpoint) else None
+
     # Train and validate the model
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=valid_loader,
+        ckpt_path=resume_path,
     )
         
 

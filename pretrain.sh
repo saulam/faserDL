@@ -34,6 +34,7 @@ checkpoint_path="checkpoints_final"
 checkpoint_name="pretrain_v7.0_distance_v1"
 early_stop_patience=200
 load_checkpoint=""
+resume_checkpoint=""
 gpus=(0 1)
 reconstruction_loss_mode="hybrid"
 reconstruction_chamfer_weight=0.3
@@ -98,4 +99,6 @@ python -m train.pretrain \
     --relational_pass_prob $relational_pass_prob \
     --relational_mask_ratio $relational_mask_ratio \
     --relational_voxel_keep_prob $relational_voxel_keep_prob \
-    --relational_pass_seed $relational_pass_seed
+    --relational_pass_seed $relational_pass_seed \
+    ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
+    ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"}

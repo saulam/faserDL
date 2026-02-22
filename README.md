@@ -164,6 +164,27 @@ This runs supervised fine-tuning (Stage 2) starting from a pre-trained checkpoin
 python -m train.finetune --train --stage2 [options]
 ```
 
+### Resuming training
+
+Both pre-training and fine-tuning support resuming from a checkpoint via `--resume_checkpoint`. This restores the full training state (model weights, optimiser, learning rate scheduler, epoch counter, etc.):
+
+```bash
+python -m train.pretrain --train --stage1 --resume_checkpoint path/to/checkpoint.ckpt [options]
+python -m train.finetune --train --stage2 --resume_checkpoint path/to/checkpoint.ckpt [options]
+```
+
+### Loading pre-trained weights
+
+Use `--load_checkpoint` to load model weights from a checkpoint and start a fresh training run (no optimiser state or epoch restoration):
+
+- **Pre-training**: all checkpoint keys must match the model exactly (strict loading).
+- **Fine-tuning**: only encoder weights are transferred; task-specific heads are randomly initialised (flexible matching).
+
+```bash
+python -m train.pretrain --train --stage1 --load_checkpoint path/to/pretrain_checkpoint.ckpt [options]
+python -m train.finetune --train --stage2 --load_checkpoint path/to/pretrain_checkpoint.ckpt [options]
+```
+
 ### Training from scratch
 
 ```bash
@@ -244,6 +265,13 @@ Both training scripts share a common argument parser. The main options are liste
 | `--accum_grad_batches` | 1 | Gradient accumulation steps |
 | `--gpus` | `0` | GPU device IDs (space-separated for multi-GPU) |
 
+### Checkpoints
+
+| Argument | Default | Description |
+|---|---|---|
+| `--load_checkpoint` | — | Path to a checkpoint to load weights from (starts fresh training). For pre-training: strict key matching (all keys must match). For fine-tuning: loads encoder weights only with flexible matching |
+| `--resume_checkpoint` | — | Path to a checkpoint to resume training from (restores optimiser state, epoch counter, etc.) |
+
 ### Pre-training specific
 
 | Argument | Default | Description |
@@ -257,7 +285,6 @@ Both training scripts share a common argument parser. The main options are liste
 
 | Argument | Default | Description |
 |---|---|---|
-| `--load_checkpoint` | — | Path to a pre-trained checkpoint to initialise the encoder |
 | `--layer_decay` | 0.9 | Layer-wise learning rate decay factor |
 | `--ema_decay` | 0.9999 | Exponential moving average decay |
 | `--head_init` | 0.001 | Task head weight initialisation scale |

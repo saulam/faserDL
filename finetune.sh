@@ -35,6 +35,7 @@ checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
 checkpoint_name="finetune_v7.0_lat_rel_v9"
 early_stop_patience=10
 load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_rel_v3/loss_total_val/epoch=398-step=101346.ckpt"
+resume_checkpoint=""
 gpus=(0)
 
 python -m train.finetune \
@@ -71,6 +72,7 @@ python -m train.finetune \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
-    --load_checkpoint $load_checkpoint \
+    ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
+    ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
     --gpus "${gpus[@]}"
 

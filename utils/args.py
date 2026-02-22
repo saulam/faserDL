@@ -69,7 +69,8 @@ def ini_argparse(
     parser.add_argument("--save_top_k", type=int, default=1, help="save top k checkpoints")
     parser.add_argument("--checkpoint_path", type=str, default="/scratch/salonso/sparse-nns/faser/deep_learning/faserDL/checkpoints", help="Checkpoint path")
     parser.add_argument("--checkpoint_name", type=str, default="v1", help="checkpoint name")
-    parser.add_argument("--load_checkpoint", type=str, default=None, help="name of the checkpoint to load")
+    parser.add_argument("--load_checkpoint", type=str, default=None, help="path to a checkpoint to load weights from (starts fresh training; for pretraining: strict key matching; for finetuning: encoder-only with flexible matching)")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="path to a checkpoint to resume training from (restores optimiser state, epoch, etc.)")
     parser.add_argument("--nb_nodes", type=int, default=1, help="number of nodes")
     parser.add_argument('--gpus', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
                         default=[0],  # Default list
