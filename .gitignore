@@ -82,6 +82,7 @@ core
 # Documentation (except README.md)
 *.md
 !README.md
+paper*
 
 # Shell scripts (testing/backup scripts)
 pretrainbak.sh
