@@ -95,3 +95,6 @@ Thumbs.db
 # IDE
 .idea/
 *.iml
+
+# VSCode
+.vscode/

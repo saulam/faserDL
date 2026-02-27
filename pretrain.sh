@@ -23,6 +23,7 @@ blr=1.5e-4
 accum_grad_batches=2
 warmup_epochs=40
 cosine_annealing_epochs=360
+# warmup/scheduler steps and linear LR scaling (blr) are computed in the Lightning model
 weight_decay=0.05
 beta1=0.9
 beta2=0.95

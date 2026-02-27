@@ -5,7 +5,7 @@ dataset_path="/scratch/salonso/sparse-nns/faser/events_v7.0*"
 metadata_path="/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl"
 shardshuffle=200
 shuffle=2000
-model="tiny"
+model="base"
 eps=1e-8
 batch_size=1024
 mixup_alpha=0.0
@@ -22,21 +22,22 @@ layer_decay=0.75
 accum_grad_batches=1
 warmup_epochs=5
 cosine_annealing_epochs=15
+# warmup/scheduler steps and linear LR scaling (blr) are computed in the Lightning model
 weight_decay=0.05
 beta1=0.9
 beta2=0.999
 ema_decay=0.9999
 head_init=2e-5
 save_dir="logs_final"
-name="finetune_v7.0_lat_rel_v9"
+name="finetune_v7.0_finerel_v2"
 log_every_n_steps=10
-save_top_k=5
+save_top_k=10
 checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v7.0_lat_rel_v9"
+checkpoint_name="finetune_v7.0_finerel_v2"
 early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_rel_v3/loss_total_val/epoch=398-step=101346.ckpt"
+load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_finerel_v2/loss_total_val/last.ckpt"
 resume_checkpoint=""
-gpus=(0)
+gpus=(1)
 
 python -m train.finetune \
     --train \

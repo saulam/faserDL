@@ -265,6 +265,8 @@ Both training scripts share a common argument parser. The main options are liste
 | `--accum_grad_batches` | 1 | Gradient accumulation steps |
 | `--gpus` | `0` | GPU device IDs (space-separated for multi-GPU) |
 
+Warmup/scheduler step counts and linear LR scaling are computed inside the Lightning modules from trainer state (including devices, nodes, and accumulation).
+
 ### Checkpoints
 
 | Argument | Default | Description |

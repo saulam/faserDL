@@ -69,10 +69,11 @@ class ViTFineTuner(pl.LightningModule):
             "vertex":      self.u_vertex,
         }
         
-        self.warmup_steps = args.warmup_steps
-        self.start_cosine_step = args.start_cosine_step
-        self.cosine_annealing_steps = args.scheduler_steps
+        self.warmup_epochs = args.warmup_epochs
+        self.cosine_annealing_epochs = args.cosine_annealing_epochs
         self.lr = args.lr
+        self.blr = args.blr
+        self._batch_size = args.batch_size
         self.layer_decay = args.layer_decay
         self.ema_decay = args.ema_decay
         self.ema = None
@@ -381,7 +382,44 @@ class ViTFineTuner(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        """Configure optimiser with LR groups, plus warmup & cosine schedulers."""
+        """Configure optimiser with LR groups, plus warmup & cosine schedulers.
+
+        Step counts are derived from self.trainer.estimated_stepping_batches,
+        which accounts for accumulation, DDP world size, and epoch count exactly.
+        LR is linearly scaled from blr if provided.
+        """
+        # Total optimiser steps over the full training run
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        steps_per_epoch = total_steps // self.trainer.max_epochs
+
+        # Linear LR scaling: lr = blr * effective_batch_size / 256
+        if self.blr is not None:
+            eff_bs = (
+                self._batch_size
+                * self.trainer.world_size
+                * self.trainer.accumulate_grad_batches
+            )
+            self.lr = self.blr * eff_bs / 256.0
+
+        warmup_steps = steps_per_epoch * self.warmup_epochs
+        cosine_annealing_steps = steps_per_epoch * self.cosine_annealing_epochs
+        start_cosine_step = total_steps - cosine_annealing_steps
+
+        if self.trainer.is_global_zero:
+            eff_bs = (
+                self._batch_size
+                * self.trainer.world_size
+                * self.trainer.accumulate_grad_batches
+            )
+            print(f"lr                = {self.lr}")
+            print(f"eff. batch size   = {eff_bs}")
+            print(f"total_steps       = {total_steps}")
+            print(f"steps_per_epoch   = {steps_per_epoch}")
+            print(f"warmup_steps      = {warmup_steps}")
+            print(f"scheduler_steps   = {cosine_annealing_steps}")
+            print(f"start_cosine_step = {start_cosine_step}")
+
+        # --- Build param groups with layer-wise LR decay ---
         param_groups = param_groups_lrd(
             self.model, 
             weight_decay=self.weight_decay,
@@ -404,22 +442,22 @@ class ViTFineTuner(pl.LightningModule):
             param_groups, betas=self.betas, eps=self.eps
         )
 
-        if self.warmup_steps==0 and self.cosine_annealing_steps==0:
+        if warmup_steps == 0 and cosine_annealing_steps == 0:
             return optimizer
 
-        if self.warmup_steps == 0:
+        if warmup_steps == 0:
             warmup_scheduler = None
         else:
             # Warm-up scheduler
-            warmup_scheduler = CustomLambdaLR(optimizer, self.warmup_steps)
+            warmup_scheduler = CustomLambdaLR(optimizer, warmup_steps)
  
-        if self.cosine_annealing_steps == 0:
+        if cosine_annealing_steps == 0:
             cosine_scheduler = None
         else:
             # Cosine annealing scheduler
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer=optimizer,
-                T_max=self.cosine_annealing_steps,
+                T_max=cosine_annealing_steps,
                 eta_min=self.lr * 1e-2,
             )
 
@@ -428,8 +466,8 @@ class ViTFineTuner(pl.LightningModule):
             optimizer=optimizer,
             scheduler1=warmup_scheduler,
             scheduler2=cosine_scheduler,
-            warmup_steps=self.warmup_steps,
-            start_cosine_step=self.start_cosine_step,
+            warmup_steps=warmup_steps,
+            start_cosine_step=start_cosine_step,
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': combined_scheduler, 'interval': 'step'}}
