@@ -30,6 +30,7 @@ This code was used in the following publication:
 - [Data preparation](#data-preparation)
 - [Usage](#usage)
 - [Project structure](#project-structure)
+- [Extensions](#extensions)
 - [Command-line arguments](#command-line-arguments)
 - [Licence](#licence)
 
@@ -206,6 +207,11 @@ For large-scale training, the pipeline supports [webdataset](https://github.com/
 ├── finetune.sh                  # Fine-tuning launch script
 ├── scratch.sh                   # Training from scratch launch script
 ├── requirements.txt
+├── data_efficiency_study/
+│   ├── subsample_dataset.py     # Manifest generation for data-budget sweeps
+│   ├── train_with_manifest.py   # Fine-tuning entry point using fixed manifests
+│   ├── run_all.sh               # Sweep launcher for pre-trained vs scratch runs
+│   └── README.md                # Study-specific notes
 ├── dataset/
 │   ├── dataset.py               # Map-style and iterable dataset classes
 │   ├── metadata_stats.py        # Robust standardisation metadata computation
@@ -303,7 +309,10 @@ Warmup/scheduler step counts and linear LR scaling are computed inside the Light
 | `--preprocessing_input` | — | Input transform (`log` or `sqrt`) |
 | `--preprocessing_output` | — | Output transform (`log` or `sqrt`) |
 
+## Extensions
+
+The repository also includes a [data-efficiency fine-tuning study](data_efficiency_study/README.md), which reuses the main stage-2 pipeline with fixed manifests to compare pre-trained and scratch models across several training-set budgets.
+
 ## Licence
 
 This project is released under the [MIT Licence](LICENSE).
-
