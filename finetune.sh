@@ -1,50 +1,55 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Default arguments
-dataset_path="/scratch/salonso/sparse-nns/faser/events_v7.0*"
-metadata_path="/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl"
-shardshuffle=200
-shuffle=2000
-model="base"
-eps=1e-8
-batch_size=1024
-mixup_alpha=0.0
-preprocessing_input="log"
-preprocessing_output="log"
-label_smoothing=0.02
-dropout=0.0
-attn_dropout=0.0
-drop_path_rate=0.2
-epochs=20
-num_workers=16
-blr=5e-4
-layer_decay=0.75
-accum_grad_batches=1
-warmup_epochs=5
-cosine_annealing_epochs=15
-# warmup/scheduler steps and linear LR scaling (blr) are computed in the Lightning model
-weight_decay=0.05
-beta1=0.9
-beta2=0.999
-ema_decay=0.9999
-head_init=2e-5
-save_dir="logs_final"
-name="finetune_v7.0_finerel_v2"
-log_every_n_steps=10
-save_top_k=10
-checkpoint_path="/scratch2/salonso/faser/checkpoints_final"
-checkpoint_name="finetune_v7.0_finerel_v2"
-early_stop_patience=10
-load_checkpoint="/scratch2/salonso/faser/checkpoints_final/pretrain_v7.0_lat_finerel_v2/loss_total_val/last.ckpt"
-resume_checkpoint=""
-gpus=(1)
+set -euo pipefail
+
+: "${DATASET_PATH:?Set DATASET_PATH to the training dataset path or glob.}"
+: "${METADATA_PATH:?Set METADATA_PATH to the metadata statistics pickle.}"
+
+shardshuffle="${SHARDSHUFFLE:-200}"
+shuffle="${SHUFFLE:-2000}"
+model="${MODEL:-base}"
+eps="${EPS:-1e-8}"
+batch_size="${BATCH_SIZE:-1024}"
+mixup_alpha="${MIXUP_ALPHA:-0.0}"
+preprocessing_input="${PREPROCESSING_INPUT:-log}"
+preprocessing_output="${PREPROCESSING_OUTPUT:-log}"
+label_smoothing="${LABEL_SMOOTHING:-0.02}"
+dropout="${DROPOUT:-0.0}"
+attn_dropout="${ATTN_DROPOUT:-0.0}"
+drop_path_rate="${DROP_PATH_RATE:-0.2}"
+kendall_w_max="${KENDALL_W_MAX:-5.0}"
+cls_lr_scale="${CLS_LR_SCALE:-1.0}"
+head_dropout_cls="${HEAD_DROPOUT_CLS:-0.0}"
+head_dropout_reg="${HEAD_DROPOUT_REG:-0.0}"
+epochs="${EPOCHS:-20}"
+num_workers="${NUM_WORKERS:-16}"
+blr="${BLR:-5e-4}"
+layer_decay="${LAYER_DECAY:-0.75}"
+accum_grad_batches="${ACCUM_GRAD_BATCHES:-1}"
+warmup_epochs="${WARMUP_EPOCHS:-5}"
+cosine_annealing_epochs="${COSINE_ANNEALING_EPOCHS:-15}"
+weight_decay="${WEIGHT_DECAY:-0.05}"
+beta1="${BETA1:-0.9}"
+beta2="${BETA2:-0.999}"
+ema_decay="${EMA_DECAY:-0.9999}"
+head_init="${HEAD_INIT:-2e-5}"
+save_dir="${SAVE_DIR:-logs_final}"
+name="${NAME:-finetune_v7.0_finerel_paper}"
+log_every_n_steps="${LOG_EVERY_N_STEPS:-10}"
+save_top_k="${SAVE_TOP_K:-10}"
+checkpoint_path="${CHECKPOINT_PATH:-checkpoints}"
+checkpoint_name="${CHECKPOINT_NAME:-$name}"
+early_stop_patience="${EARLY_STOP_PATIENCE:-10}"
+load_checkpoint="${LOAD_CHECKPOINT:-}"
+resume_checkpoint="${RESUME_CHECKPOINT:-}"
+read -r -a gpus <<< "${GPUS:-0}"
 
 python -m train.finetune \
     --train \
     --stage2 \
     --augmentations_enabled \
-    --dataset_path "$dataset_path" \
-    --metadata_path $metadata_path \
+    --dataset_path "$DATASET_PATH" \
+    --metadata_path "$METADATA_PATH" \
     --model $model \
     --eps $eps \
     --mixup_alpha $mixup_alpha \
@@ -54,6 +59,10 @@ python -m train.finetune \
     --label_smoothing $label_smoothing \
     --dropout $dropout \
     --drop_path_rate $drop_path_rate \
+    --kendall_w_max $kendall_w_max \
+    --cls_lr_scale $cls_lr_scale \
+    --head_dropout_cls $head_dropout_cls \
+    --head_dropout_reg $head_dropout_reg \
     --epochs $epochs \
     --num_workers $num_workers \
     --blr $blr \
@@ -76,4 +85,3 @@ python -m train.finetune \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
     --gpus "${gpus[@]}"
-

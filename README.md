@@ -120,7 +120,7 @@ The main dependencies are:
 - [webdataset](https://github.com/webdataset/webdataset) (≥ 1.0) — sharded data loading
 - [torch-ema](https://github.com/fadel/pytorch_ema) — exponential moving average
 
-> **Note:** [ROOT](https://root.cern/) (PyROOT) is additionally required only for the data preparation scripts (`dataset/read_root*.py`) that convert raw simulation ROOT files to NumPy format. It is not needed for training or inference and should be installed separately (e.g., via conda: `conda install -c conda-forge root`).
+> **Note:** [ROOT](https://root.cern/) (PyROOT) is additionally required only for the data preparation scripts (`dataset/read_root*.py`) that convert raw simulation ROOT files to NumPy format. It is not needed for training or inference and should be installed separately.
 
 ## Data preparation
 
@@ -156,10 +156,14 @@ python -m train.pretrain --train --stage1 [options]
 ### Fine-tuning
 
 ```bash
-./finetune.sh
+export DATASET_PATH='path/to/events_v7.0*'
+export METADATA_PATH='path/to/metadata_stats.pkl'
+export LOAD_CHECKPOINT='path/to/pretrain_checkpoint.ckpt'
+
+bash finetune.sh
 ```
 
-This runs supervised fine-tuning (Stage 2) starting from a pre-trained checkpoint. Edit `finetune.sh` to point `load_checkpoint` to your pre-trained model. The script calls:
+This runs supervised fine-tuning (Stage 2) starting from a pre-trained checkpoint. The script calls:
 
 ```bash
 python -m train.finetune --train --stage2 [options]
@@ -189,12 +193,15 @@ python -m train.finetune --train --stage2 --load_checkpoint path/to/pretrain_che
 ### Training from scratch
 
 ```bash
-./scratch.sh
+export DATASET_PATH='path/to/events_v7.0*'
+export METADATA_PATH='path/to/metadata_stats.pkl'
+
+bash scratch.sh
 ```
 
 This runs the fine-tuning tasks without loading any pre-trained weights, i.e. training the model end-to-end from a random initialisation. It is useful as a baseline to quantify the benefit of pre-training.
 
-Both scripts support multi-GPU training via DDP. Set the `gpus` variable to a list of GPU IDs (e.g., `gpus=(0 1)`).
+Both scripts support multi-GPU training via DDP. Set `GPUS='0 1'` to use multiple GPUs.
 
 ### Sharded datasets
 
@@ -212,6 +219,14 @@ For large-scale training, the pipeline supports [webdataset](https://github.com/
 │   ├── train_with_manifest.py   # Fine-tuning entry point using fixed manifests
 │   ├── run_all.sh               # Sweep launcher for pre-trained vs scratch runs
 │   └── README.md                # Study-specific notes
+├── transfer_learning/
+│   ├── build_transfer_charge_metadata.py      # Charge metadata builder for transfer datasets
+│   ├── transfer_charge_preprocessing.py       # Shared charge preprocessing utilities
+│   └── transfer_pilarnet/
+│       ├── train.py               # PILArNet training entry point
+│       ├── evaluate.py            # PILArNet evaluation entry point
+│       ├── preprocess.py          # PILArNet manifest builder
+│       └── README.md              # PILArNet study notes
 ├── dataset/
 │   ├── dataset.py               # Map-style and iterable dataset classes
 │   ├── metadata_stats.py        # Robust standardisation metadata computation
@@ -311,7 +326,10 @@ Warmup/scheduler step counts and linear LR scaling are computed inside the Light
 
 ## Extensions
 
-The repository also includes a [data-efficiency fine-tuning study](data_efficiency_study/README.md), which reuses the main stage-2 pipeline with fixed manifests to compare pre-trained and scratch models across several training-set budgets.
+The repository also includes:
+
+- a [data-efficiency fine-tuning study](data_efficiency_study/README.md), which reuses the main stage-2 pipeline to compare pre-trained and scratch models across several training-set budgets;
+- a [PILArNet transfer-learning study](transfer_learning/transfer_pilarnet/README.md), which adapts the stage-2 encoder for particle-level PID transfer.
 
 ## Licence
 

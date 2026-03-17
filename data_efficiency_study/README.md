@@ -54,4 +54,3 @@ bash data_efficiency_study/run_all.sh
 - `data_efficiency_study/manifests/` contains the generated manifests.
 - `logs_data_efficiency/` contains CSV logs and TensorBoard logs by default.
 - `checkpoints_data_efficiency/` is the default checkpoint directory unless `CHECKPOINT_BASE` is set.
-- These generated artefacts are ignored by Git.

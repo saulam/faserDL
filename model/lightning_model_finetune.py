@@ -41,7 +41,7 @@ class ViTFineTuner(pl.LightningModule):
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.kendall_w_min = 1e-2
-        self.kendall_w_max = 5.0
+        self.kendall_w_max = getattr(args, 'kendall_w_max', 5.0)
         self.u_flavour   = nn.Parameter(torch.zeros(()))
         self.u_charm     = nn.Parameter(torch.zeros(()))
         self.u_vis_geom  = nn.Parameter(torch.zeros(()))
@@ -73,6 +73,7 @@ class ViTFineTuner(pl.LightningModule):
         self.cosine_annealing_epochs = args.cosine_annealing_epochs
         self.lr = args.lr
         self.blr = args.blr
+        self.cls_lr_scale = getattr(args, 'cls_lr_scale', 1.0)
         self._batch_size = args.batch_size
         self.layer_decay = args.layer_decay
         self.ema_decay = args.ema_decay
@@ -114,7 +115,7 @@ class ViTFineTuner(pl.LightningModule):
         
 
     def on_train_start(self):
-        "Fixing bug: https://github.com/Lightning-AI/pytorch-lightning/issues/17296#issuecomment-1726715614"
+        """Keep the wrapped optimiser param groups accessible to Lightning."""
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
         if not self.trainer.is_global_zero:
             # only keep EMA on rank 0 (for DDP)
@@ -144,8 +145,7 @@ class ViTFineTuner(pl.LightningModule):
             
     
     def on_before_zero_grad(self, optimizer):
-        # called after optimizer.step() but before optimizer.zero_grad()
-        # so this is the perfect spot to capture the freshly updated weights
+        # Update EMA after the optimiser step and before gradients are cleared.
         if self.ema is not None:
             self.ema.update()
         
@@ -271,7 +271,7 @@ class ViTFineTuner(pl.LightningModule):
             kendall_s[name] = s.detach()
             return loss_w
 
-        # Kendall-weighted total
+        # Kendall-weighted total loss
         total_loss = (
             _weight("flavour",  loss_flavour).mean()  +
             _weight("charm",    loss_charm).mean()    +
@@ -388,11 +388,9 @@ class ViTFineTuner(pl.LightningModule):
         which accounts for accumulation, DDP world size, and epoch count exactly.
         LR is linearly scaled from blr if provided.
         """
-        # Total optimiser steps over the full training run
         total_steps = int(self.trainer.estimated_stepping_batches)
         steps_per_epoch = total_steps // self.trainer.max_epochs
 
-        # Linear LR scaling: lr = blr * effective_batch_size / 256
         if self.blr is not None:
             eff_bs = (
                 self._batch_size
@@ -419,7 +417,6 @@ class ViTFineTuner(pl.LightningModule):
             print(f"scheduler_steps   = {cosine_annealing_steps}")
             print(f"start_cosine_step = {start_cosine_step}")
 
-        # --- Build param groups with layer-wise LR decay ---
         param_groups = param_groups_lrd(
             self.model, 
             weight_decay=self.weight_decay,
@@ -431,7 +428,35 @@ class ViTFineTuner(pl.LightningModule):
             lr_scale = param_group.pop("lr_scale", 1.0)
             param_group["lr"] = self.lr * lr_scale
 
-        # group uncertainty params
+        # Optionally slow the classification and vertex heads relative to the
+        # regression heads.
+        if self.cls_lr_scale != 1.0:
+            cls_head_names = {'flavour', 'charm', 'vertex'}
+            cls_param_ids = set()
+            for name in cls_head_names:
+                if name in self.model.heads:
+                    for p in self.model.heads[name].parameters():
+                        cls_param_ids.add(id(p))
+
+            new_groups = []
+            for pg in param_groups:
+                cls_params = [p for p in pg['params'] if id(p) in cls_param_ids]
+                other_params = [p for p in pg['params'] if id(p) not in cls_param_ids]
+                if other_params:
+                    pg['params'] = other_params
+                    new_groups.append(pg)
+                if cls_params:
+                    new_groups.append({
+                        'params': cls_params,
+                        'lr': pg['lr'] * self.cls_lr_scale,
+                        'weight_decay': pg.get('weight_decay', 0.0),
+                    })
+            param_groups = new_groups
+
+            if self.trainer.is_global_zero:
+                print(f"cls_lr_scale      = {self.cls_lr_scale}")
+
+        # Uncertainty parameters use a smaller LR and no weight decay.
         param_groups.append({
             'params': list(self._uncertainty_params.values()),
             'lr': self.lr * 0.1,
@@ -448,20 +473,17 @@ class ViTFineTuner(pl.LightningModule):
         if warmup_steps == 0:
             warmup_scheduler = None
         else:
-            # Warm-up scheduler
             warmup_scheduler = CustomLambdaLR(optimizer, warmup_steps)
  
         if cosine_annealing_steps == 0:
             cosine_scheduler = None
         else:
-            # Cosine annealing scheduler
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer=optimizer,
                 T_max=cosine_annealing_steps,
                 eta_min=self.lr * 1e-2,
             )
 
-        # Combine both schedulers
         combined_scheduler = CombinedScheduler(
             optimizer=optimizer,
             scheduler1=warmup_scheduler,

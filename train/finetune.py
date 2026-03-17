@@ -95,9 +95,7 @@ def main():
         nb_batches_train = len(train_loader)
         nb_batches_val = len(valid_loader)
 
-    # NOTE: LR scaling (blr), warmup steps, and scheduler steps are now computed
-    # inside the Lightning model's configure_optimizers() using
-    # self.trainer.estimated_stepping_batches.
+    # LR scaling and scheduler step counts are derived in the Lightning module.
 
     # Initialise the model
     model = args.model(
@@ -105,6 +103,8 @@ def main():
         attn_drop_rate = args.attn_dropout,
         drop_path_rate = args.drop_path_rate,
         head_init = args.head_init,
+        head_dropout_cls = args.head_dropout_cls,
+        head_dropout_reg = args.head_dropout_reg,
         metadata = metadata,
     )
 
@@ -115,30 +115,27 @@ def main():
     else:
         print("Training from scratch!")
 
-    # define the list of losses to monitor
+    # Validation losses used for checkpoint selection.
     monitor_losses = [
         "loss_total/val",
-        #"loss/val_flavour",
-        #"loss/val_charm",
-        #"loss/val_vis_sp_momentum_mag",
-        #"loss/val_vis_sp_momentum_dir",
-        #"loss/val_lepton_momentum_mag",
-        #"loss/val_lepton_momentum_dir",
-        #"loss/val_e_vis",
-        #"loss/val_pt_miss",
-        #"loss/val_jet_momentum_dir",
-        #"loss/val_jet_momentum_mag",
-        #"loss/val_lepton_momentum_dir",
-        #"loss/val_lepton_momentum_mag",
+        "loss_cls/flavour/val",
+        "loss_cls/charm/val",
+        "loss_vis/geom/val",
+        "loss_jet/geom/val",
+        "loss_lep/geom/val",
+        "loss_vertex/val",
     ]
     
-    # helper to build a fresh checkpoint callback list
+    # Checkpoint callbacks.
     def make_callbacks():
         cbs = []
         for loss in monitor_losses:
+            safe_name = loss.replace('/', '_')
             cbs.append(
                 ModelCheckpoint(
-                    dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{loss.replace('/', '_')}",
+                    dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/{safe_name}",
+                    filename=f"epoch={{epoch}}-{safe_name}={{{loss}:.6f}}",
+                    auto_insert_metric_name=False,
                     save_top_k=args.save_top_k,
                     monitor=loss,
                     mode="min",
@@ -149,7 +146,7 @@ def main():
         cbs.append(progress_bar)
         return cbs
 
-    # Rest of callbacks
+    # Logging
     logger    = CSVLogger(save_dir=f"{args.save_dir}/logs", name=f"{args.name}")
     tb_logger = SplitTensorBoardLogger(   
         save_dir=f"{args.save_dir}/tb_logs",
@@ -159,6 +156,7 @@ def main():
         val_suffix = "_epoch",
     )
     callbacks = make_callbacks()
+
     logger.log_hyperparams(vars(args))
     tb_logger.log_hyperparams(vars(args))
 

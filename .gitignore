@@ -87,6 +87,8 @@ paper*
 # Shell scripts (testing/backup scripts)
 pretrainbak.sh
 train_scratch.sh
+*.local.sh
+finetune2.sh
 
 # OS files
 .DS_Store
@@ -95,3 +97,31 @@ Thumbs.db
 # IDE
 .idea/
 *.iml
+
+# Results
+ML_FASERCal_Results
+ML_FASERCal_Results/*
+
+# Data-efficiency study artefacts
+data_efficiency_study/manifests/
+data_efficiency_study/Plots/
+data_efficiency_study/csv_results/
+data_efficiency_study/results/
+data_efficiency_study/create_csv.py
+data_efficiency_study/**/__pycache__/
+data_efficiency_study/**/*.ipynb
+logs_data_efficiency/
+checkpoints_data_efficiency/
+
+# Transfer-learning artefacts
+transfer_learning/__pycache__/
+transfer_learning/**/__pycache__/
+transfer_learning/transfer_zenodo_pid/
+transfer_learning/transfer_pilarnet/*.npz
+transfer_learning/transfer_pilarnet/*.pkl
+transfer_learning/transfer_pilarnet/*.csv
+transfer_learning/transfer_pilarnet/cache/
+transfer_learning/transfer_pilarnet/logs_pilarnet/
+transfer_learning/transfer_pilarnet/checkpoints_pilarnet/
+transfer_learning/transfer_pilarnet/results/
+transfer_learning/transfer_pilarnet/plots/

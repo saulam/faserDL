@@ -39,6 +39,8 @@ class SparseViT(vit.VisionTransformer):
         head_init=2e-5,
         global_pool=False,
         metadata=None,
+        head_dropout_cls=0.0,
+        head_dropout_reg=0.0,
         **kwargs
     ):
         super(SparseViT, self).__init__(**kwargs)
@@ -236,11 +238,14 @@ class SparseViT(vit.VisionTransformer):
             )
             self.gamma = nn.Parameter(torch.ones(1) * 1e-4) # scaling after cross-attention
 
+        # Allow separate dropout rates for classification/vertex and regression heads.
+        cls_tasks = {"flavour", "charm", "vertex"}
         self.heads = nn.ModuleDict()
         for name in self.head_channels.keys():
+            hd = head_dropout_cls if name in cls_tasks else head_dropout_reg
             self.heads[name] = nn.Sequential(
                 norm_layer(embed_dim),
-                nn.Dropout(drop_rate),
+                nn.Dropout(hd),
                 nn.Linear(embed_dim, self.head_channels[name]) 
                 if name not in metadata 
                 else self.make_head_from_stats(metadata[name], hidden=embed_dim)
@@ -676,6 +681,8 @@ class SparseViT(vit.VisionTransformer):
 
 
 def vit_tiny(**kwargs):
+    head_dropout_cls = kwargs.pop('head_dropout_cls', 0.0)
+    head_dropout_reg = kwargs.pop('head_dropout_reg', 0.0)
     model = SparseViT(
         in_chans=1, D=3, embed_dim=384,
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
@@ -683,12 +690,16 @@ def vit_tiny(**kwargs):
         depth=2, ahcal_depth=2, num_heads=12, io_depth=6,
         num_module_cls=2, num_ahcal_cls=2,
         mlp_ratio=4.0, global_pool=True,
+        head_dropout_cls=head_dropout_cls,
+        head_dropout_reg=head_dropout_reg,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
 
 def vit_base(**kwargs):
+    head_dropout_cls = kwargs.pop('head_dropout_cls', 0.0)
+    head_dropout_reg = kwargs.pop('head_dropout_reg', 0.0)
     model = SparseViT(
         in_chans=1, D=3, embed_dim=384, 
         fcal_size=(48, 48, 200), fcal_patch_size=(12, 12, 10),
@@ -696,6 +707,8 @@ def vit_base(**kwargs):
         depth=4, ahcal_depth=4, num_heads=12, io_depth=4,
         num_module_cls=2, num_ahcal_cls=2,
         mlp_ratio=4.0, global_pool=True,
+        head_dropout_cls=head_dropout_cls,
+        head_dropout_reg=head_dropout_reg,
         block_fn=BlockWithMask,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
