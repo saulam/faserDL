@@ -18,7 +18,7 @@ blr="${BLR:-1e-3}"
 warmup_epochs="${WARMUP_EPOCHS:-10}"
 cosine_annealing_epochs="${COSINE_ANNEALING_EPOCHS:-20}"
 weight_decay="${WEIGHT_DECAY:-0.05}"
-layer_decay="${LAYER_DECAY:-0.95}"
+layer_decay="${LAYER_DECAY:-0.75}"
 drop_path_rate="${DROP_PATH_RATE:-0.2}"
 ema_decay="${EMA_DECAY:-0.9999}"
 label_smoothing="${LABEL_SMOOTHING:-0.02}"
@@ -28,6 +28,7 @@ name="${NAME:-pilarnet_pid_single_base}"
 checkpoint_path="${CHECKPOINT_PATH:-transfer_learning/transfer_pilarnet/checkpoints_pilarnet}"
 checkpoint_name="${CHECKPOINT_NAME:-$name}"
 num_workers="${NUM_WORKERS:-8}"
+nb_nodes="${NB_NODES:-1}"
 gpus="${GPUS:-0}"
 
 python -m transfer_learning.transfer_pilarnet.train \
@@ -57,6 +58,7 @@ python -m transfer_learning.transfer_pilarnet.train \
     --checkpoint_path "$checkpoint_path" \
     --checkpoint_name "$checkpoint_name" \
     --num_workers $num_workers \
+    --nb_nodes $nb_nodes \
     --gpus $gpus \
     --augment \
     --global_pool

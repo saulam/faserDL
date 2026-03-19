@@ -13,7 +13,7 @@ the number of voxels.
 Dataset-specific convention:
   - PILArNet: pre-crop raw charges from manifest-selected particles, scanned
     event-by-event
-  - Zenodo: processed transfer inputs after the dataset crop/dedup logic, but
+  - scintillator: processed transfer inputs after the dataset crop/dedup logic, but
     before charge standardisation
 """
 
@@ -38,7 +38,7 @@ from .transfer_charge_preprocessing import PRETRAIN_CHARGE_SCALE
 MADN_CONST = 1.482602218505602
 DEFAULT_CHARGE_BIN_WIDTH = {
     "pilarnet": 0.1,
-    "zenodo": 1.0,
+    "scintillator": 1.0,
 }
 DEGENERATE_STATS_THRESHOLD = 1e-7
 
@@ -268,26 +268,26 @@ def build_dataset(args: argparse.Namespace):
             raise ValueError("--manifest is required for dataset=pilarnet")
         dataset = PILArNetEventChargeDataset(args.manifest)
         return dataset, concat_charge_collate
-    if args.dataset == "zenodo":
+    if args.dataset == "scintillator":
         if args.data_dir is None:
-            raise ValueError("--data_dir is required for dataset=zenodo")
+            raise ValueError("--data_dir is required for dataset=scintillator")
         try:
-            from .transfer_zenodo_pid.zenodo_dataset import (
-                ZenodoPIDDataset,
-                zenodo_collate_fn,
+            from .transfer_scintillator.scintillator_dataset import (
+                ScintillatorPIDDataset,
+                scintillator_collate_fn,
             )
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
-                "Zenodo support requires transfer_learning/transfer_zenodo_pid."
+                "Scintillator support requires transfer_learning/transfer_scintillator."
             ) from exc
-        dataset = ZenodoPIDDataset(
+        dataset = ScintillatorPIDDataset(
             data_dir=args.data_dir,
             split=args.split,
-            spatial_shape=tuple(args.zenodo_spatial_shape),
+            spatial_shape=tuple(args.scintillator_spatial_shape),
             augment=False,
             charge_metadata_path=None,
         )
-        return dataset, zenodo_collate_fn
+        return dataset, scintillator_collate_fn
     raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 
@@ -324,7 +324,7 @@ def resolve_charge_bin_width(args: argparse.Namespace) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build transfer charge metadata")
-    parser.add_argument("--dataset", choices=["pilarnet", "zenodo"], required=True)
+    parser.add_argument("--dataset", choices=["pilarnet", "scintillator"], required=True)
     parser.add_argument(
         "--manifest",
         "--manifest_path",
@@ -337,14 +337,14 @@ def parse_args() -> argparse.Namespace:
         "--data_dir",
         type=str,
         default=None,
-        help="Zenodo root containing training/ and testing/. Required for --dataset zenodo.",
+        help="Scintillator root containing training/ and testing/. Required for --dataset scintillator.",
     )
     parser.add_argument(
         "--split",
         type=str,
         default="training",
         choices=["training", "testing"],
-        help="Zenodo split to scan (default: training). Ignored for PILArNet.",
+        help="Scintillator split to scan (default: training). Ignored for PILArNet.",
     )
     parser.add_argument("--out", type=str, required=True, help="Output metadata pickle path.")
     parser.add_argument(
@@ -383,15 +383,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Charge-bin width in the scaled-charge space used for Counter accumulation. "
-            "Defaults: 0.1 for PILArNet, 1.0 for Zenodo."
+            "Defaults: 0.1 for PILArNet, 1.0 for scintillator."
         ),
     )
     parser.add_argument(
-        "--zenodo_spatial_shape",
+        "--scintillator_spatial_shape",
         type=int,
         nargs=3,
-        default=[80, 80, 80],
-        help="Zenodo crop shape used before stat collection.",
+        default=[120, 120, 120],
+        help="Scintillator crop shape used before stat collection.",
     )
     return parser.parse_args()
 
@@ -416,9 +416,10 @@ def main() -> None:
     samples_seen = 0
     voxels_seen = 0
 
-    progress = tqdm(loader, total=len(loader), desc=f"Scanning {args.dataset}", ascii=True)
+    dataset_name = args.dataset
+    progress = tqdm(loader, total=len(loader), desc=f"Scanning {dataset_name}", ascii=True)
     for batch in progress:
-        if args.dataset == "zenodo":
+        if args.dataset == "scintillator":
             feats = batch["feats"]
             if isinstance(feats, torch.Tensor):
                 charges = feats.detach().cpu().numpy().reshape(-1)
@@ -453,16 +454,16 @@ def main() -> None:
         "q_log1p": stats,
         "_transfer_charge_metadata": asdict(
             MetadataSummary(
-                dataset=args.dataset,
+                dataset=dataset_name,
                 samples_seen=samples_seen,
                 voxels_seen=voxels_seen,
                 unique_charge_values=len(q_counter),
                 charge_scale=float(args.charge_scale),
                 charge_bin_width=float(charge_bin_width),
                 estimator="exact_counter_quantized_scaled_charges",
-                split=args.split if args.dataset == "zenodo" else None,
+                split=args.split if args.dataset == "scintillator" else None,
                 manifest_path=args.manifest if args.dataset == "pilarnet" else None,
-                data_dir=args.data_dir if args.dataset == "zenodo" else None,
+                data_dir=args.data_dir if args.dataset == "scintillator" else None,
             )
         ),
     }

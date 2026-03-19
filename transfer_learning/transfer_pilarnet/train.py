@@ -97,7 +97,7 @@ def parse_args():
     p.add_argument("--warmup_epochs", type=int, default=10)
     p.add_argument("--cosine_annealing_epochs", type=int, default=70)
     p.add_argument("--weight_decay", type=float, default=0.05)
-    p.add_argument("--layer_decay", type=float, default=0.95)
+    p.add_argument("--layer_decay", type=float, default=0.75)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--eps", type=float, default=1e-8)

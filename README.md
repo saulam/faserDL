@@ -144,10 +144,13 @@ This produces a pickle file containing robust standardisation parameters (median
 ### Pre-training
 
 ```bash
-./pretrain.sh
+export DATASET_PATH='path/to/events_v7.0*'
+export METADATA_PATH='path/to/metadata_stats.pkl'
+
+bash pretrain.sh
 ```
 
-This runs masked autoencoder pre-training (Stage 1). Edit `pretrain.sh` to adjust hyperparameters such as mask ratio, learning rate, batch size, or loss mode. The script calls:
+This runs masked autoencoder pre-training (Stage 1). The script calls:
 
 ```bash
 python -m train.pretrain --train --stage1 [options]

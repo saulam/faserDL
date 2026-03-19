@@ -42,6 +42,7 @@ checkpoint_name="${CHECKPOINT_NAME:-$name}"
 early_stop_patience="${EARLY_STOP_PATIENCE:-10}"
 load_checkpoint="${LOAD_CHECKPOINT:-}"
 resume_checkpoint="${RESUME_CHECKPOINT:-}"
+nb_nodes="${NB_NODES:-1}"
 read -r -a gpus <<< "${GPUS:-0}"
 
 python -m train.finetune \
@@ -82,6 +83,7 @@ python -m train.finetune \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
+    --nb_nodes $nb_nodes \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
     --gpus "${gpus[@]}"

@@ -86,7 +86,6 @@ paper*
 
 # Shell scripts (testing/backup scripts)
 pretrainbak.sh
-train_scratch.sh
 *.local.sh
 finetune2.sh
 
@@ -125,3 +124,8 @@ transfer_learning/transfer_pilarnet/logs_pilarnet/
 transfer_learning/transfer_pilarnet/checkpoints_pilarnet/
 transfer_learning/transfer_pilarnet/results/
 transfer_learning/transfer_pilarnet/plots/
+transfer_learning/transfer_scintillator/*.local.sh
+transfer_learning/transfer_scintillator/logs_scintillator/
+transfer_learning/transfer_scintillator/checkpoints_scintillator/
+transfer_learning/transfer_scintillator/results/
+transfer_learning/transfer_scintillator/plots/

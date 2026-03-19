@@ -11,6 +11,7 @@ DATASET_PATH="${DATASET_PATH:-}"
 METADATA_PATH="${METADATA_PATH:-}"
 VAL_MANIFEST="${MANIFEST_DIR}/val.txt"
 GPUS=(${GPUS_OVERRIDE:-0})
+NB_NODES="${NB_NODES_OVERRIDE:-1}"
 BUDGETS=(${BUDGETS_OVERRIDE:-100 300 1000 3000 10000 30000 100000})
 SEEDS=(${SEEDS_OVERRIDE:-1 2 3})
 CONDITIONS=(${CONDITIONS_OVERRIDE:-pretrained scratch})
@@ -125,6 +126,7 @@ RUN_IDX=0
 echo "Data-efficiency study"
 echo "  runs: ${TOTAL_RUNS} (${#BUDGETS[@]} budgets x ${#CONDITIONS[@]} conditions x ${#SEEDS[@]} seeds)"
 echo "  gpus: ${GPUS[*]}"
+echo "  nb_nodes: ${NB_NODES}"
 echo "  manifests: ${MANIFEST_DIR}"
 echo "  checkpoints: ${CHECKPOINT_BASE}"
 echo
@@ -202,6 +204,7 @@ for BUDGET in "${BUDGETS[@]}"; do
                 --checkpoint_path "$CKPT_DIR" \
                 --checkpoint_name "$EXP_NAME" \
                 --early_stop_patience "$EARLY_STOP" \
+                --nb_nodes "$NB_NODES" \
                 --pl_seed "$SEED" \
                 "${LOAD_CKPT_ARGS[@]}" \
                 "${RESUME_ARGS[@]}" \
