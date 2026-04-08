@@ -1,6 +1,4 @@
-"""
-PyTorch Lightning module for particle-level PILArNet PID fine-tuning.
-"""
+"""Lightning module for PILArNet PID fine-tuning."""
 
 import torch
 import torch.nn as nn
@@ -25,13 +23,11 @@ class PILArNetFineTuner(pl.LightningModule):
             label_smoothing=getattr(args, "label_smoothing", 0.0),
         )
 
-        # Metrics
         self.train_acc = MulticlassAccuracy(num_classes=5, average="micro")
         self.val_acc = MulticlassAccuracy(num_classes=5, average="micro")
         self.val_acc_per_class = MulticlassAccuracy(num_classes=5, average="none")
         self.val_confusion = MulticlassConfusionMatrix(num_classes=5)
 
-        # Optimiser settings from args
         self.lr = getattr(args, "lr", 1e-4)
         self.blr = getattr(args, "blr", 5e-4)
         self.warmup_epochs = getattr(args, "warmup_epochs", 5)
@@ -46,14 +42,10 @@ class PILArNetFineTuner(pl.LightningModule):
         self.ema = None
         self._ema_applied_for_val = False
 
-    # ------------------------------------------------------------------
-    # Batch handling
-    # ------------------------------------------------------------------
-
     def _build_sparse(self, batch):
         """Construct a SparseConvTensor from the collated batch dict."""
-        coords = batch["coords"]  # [N, 4] int32 (batch, x, y, z)
-        feats = batch["feats"]    # [N, 1] float32
+        coords = batch["coords"]
+        feats = batch["feats"]
         B = batch["batch_size"]
 
         if coords.dtype != torch.int32:
@@ -68,10 +60,6 @@ class PILArNetFineTuner(pl.LightningModule):
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         return _move(batch, device)
-
-    # ------------------------------------------------------------------
-    # EMA callbacks
-    # ------------------------------------------------------------------
 
     def on_save_checkpoint(self, checkpoint):
         if self.ema is not None:
@@ -114,16 +102,8 @@ class PILArNetFineTuner(pl.LightningModule):
         self.ema.copy_to(self.model.parameters())
         self._ema_applied_for_val = True
 
-    # ------------------------------------------------------------------
-    # Forward / loss
-    # ------------------------------------------------------------------
-
     def forward(self, x_sp, particle_meta=None):
         return self.model(x_sp, particle_meta)
-
-    # ------------------------------------------------------------------
-    # Training / validation steps
-    # ------------------------------------------------------------------
 
     def training_step(self, batch, batch_idx):
         x_sp = self._build_sparse(batch)
@@ -168,15 +148,10 @@ class PILArNetFineTuner(pl.LightningModule):
             self.ema.restore(self.model.parameters())
             self._ema_applied_for_val = False
 
-    # ------------------------------------------------------------------
-    # Optimiser
-    # ------------------------------------------------------------------
-
     def configure_optimizers(self):
         total_steps = int(self.trainer.estimated_stepping_batches)
         steps_per_epoch = max(1, total_steps // self.trainer.max_epochs)
 
-        # LR scaling
         if self.blr is not None:
             eff_bs = (
                 self._batch_size
@@ -191,7 +166,6 @@ class PILArNetFineTuner(pl.LightningModule):
         if self.trainer.is_global_zero:
             print(f"lr={self.lr:.6f}  total_steps={total_steps}  warmup={warmup_steps}  cosine={cosine_steps}")
 
-        # Layer-wise LR decay
         param_groups = self._build_param_groups()
         for pg in param_groups:
             scale = pg.pop("lr_scale", 1.0)
@@ -242,11 +216,7 @@ class PILArNetFineTuner(pl.LightningModule):
         }
 
     def _build_param_groups(self):
-        """Layer-wise LR decay: pretrained embeddings < blocks < io < heads.
-
-        Any parameter that was not restored from the pretrained checkpoint is
-        treated as freshly initialised and receives the full learning rate.
-        """
+        """Build parameter groups for layer-wise learning-rate decay."""
         loaded_keys = getattr(self.model, "_pretrained_loaded_keys", set())
         reinit_params, pretrained_embed_params = [], []
         block_params, io_params, head_params, other_params = [], [], [], []
@@ -297,9 +267,7 @@ class PILArNetFineTuner(pl.LightningModule):
             return groups
 
         groups = []
-        # Pretrained embeddings (pos_embed, cls_token) — lowest LR
         groups.extend(_make_group(pretrained_embed_params, 0, "encoder_pretrained_embed"))
-        # Each block gets a layer id
         block_by_layer = {}
         for name, p in block_params:
             if name.startswith("blocks."):
@@ -328,11 +296,6 @@ class PILArNetFineTuner(pl.LightningModule):
         groups.extend(_make_group(reinit_params, depth, "encoder_reinit"))
         groups.extend(_make_group(other_params, depth, "encoder_other"))
         return groups
-
-
-# -----------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------
 
 def _move(o, device):
     if isinstance(o, SparseConvTensor):

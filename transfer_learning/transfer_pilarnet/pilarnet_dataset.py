@@ -1,10 +1,4 @@
-"""
-PyTorch Dataset for particle-level PILArNet PID classification.
-
-Each sample is a single particle's sparse voxel cluster extracted from the
-PILArNet larcv3 HDF5 files, centred and placed in a fixed-size spatial grid
-suitable for the sparse patch encoder.
-"""
+"""Dataset utilities for PILArNet PID transfer."""
 
 import hashlib
 import json
@@ -295,15 +289,11 @@ class PILArNetParticleDataset(Dataset):
         self.charge_preprocessor = LogChargePreprocessor(charge_metadata_path)
         self.include_particle_meta = include_particle_meta
 
-        # Thread-local storage for HDF5 file handles (one per worker)
+        # Keep one HDF5 handle per worker thread.
         self._local = threading.local()
 
     def __len__(self):
         return len(self.manifest)
-
-    # ------------------------------------------------------------------
-    # HDF5 access helpers (thread-safe via per-worker handles)
-    # ------------------------------------------------------------------
 
     def _get_h5(self, h5_idx: int) -> h5py.File:
         """Return an open HDF5 file handle, cached per worker thread."""
@@ -315,20 +305,14 @@ class PILArNetParticleDataset(Dataset):
             cache[h5_idx] = h5py.File(self.h5_paths[h5_idx], "r")
         return cache[h5_idx]
 
-    # ------------------------------------------------------------------
-    # Voxel extraction
-    # ------------------------------------------------------------------
-
     def _extract_particle_voxels(self, h5_idx, event_idx, particle_idx):
         """Load a single particle's voxels and energy values from HDF5."""
         f = self._get_h5(h5_idx)
 
-        # Voxel data
         v_ext = f["Data/sparse3d_data_group/voxel_extents"][event_idx]
         vf, vn = int(v_ext["first"]), int(v_ext["N"])
         voxels = f["Data/sparse3d_data_group/voxels"][vf : vf + vn]
 
-        # Group labels (particle index per voxel)
         g_ext = f["Data/sparse3d_group_group/voxel_extents"][event_idx]
         gf, gn = int(g_ext["first"]), int(g_ext["N"])
         groups = f["Data/sparse3d_group_group/voxels"][gf : gf + gn]["value"].astype(
@@ -338,10 +322,6 @@ class PILArNetParticleDataset(Dataset):
         mask = groups == particle_idx
         part_vox = voxels[mask]
         return part_vox
-
-    # ------------------------------------------------------------------
-    # Coordinate processing
-    # ------------------------------------------------------------------
 
     def _decode_voxel_ids(self, voxel_ids):
         """Decode flat voxel IDs to (x, y, z) integer coordinates."""
@@ -355,10 +335,6 @@ class PILArNetParticleDataset(Dataset):
         """Center a particle cluster on its bounding-box midpoint."""
         centered, _ = _center_and_fit_with_scale(coords, self.spatial_shape)
         return centered
-
-    # ------------------------------------------------------------------
-    # Augmentations
-    # ------------------------------------------------------------------
 
     def _sample_xy_orientation_augmentation(self):
         rotate_k = 0 if self.spatial_shape[0] != self.spatial_shape[1] else int(np.random.randint(0, 4))
@@ -440,10 +416,6 @@ class PILArNetParticleDataset(Dataset):
         coords = self._random_translate(coords, self.spatial_shape)
         return coords
 
-    # ------------------------------------------------------------------
-    # Caching (optional)
-    # ------------------------------------------------------------------
-
     def _cache_path(self, idx):
         if self.cache_dir is None:
             return None
@@ -474,10 +446,6 @@ class PILArNetParticleDataset(Dataset):
         ).hexdigest()[:16]
         return f"{self.cache_version}_{digest}"
 
-    # ------------------------------------------------------------------
-    # __getitem__
-    # ------------------------------------------------------------------
-
     def __getitem__(self, idx):
         entry = self.manifest[idx]
         h5_idx = int(entry["h5_idx"])
@@ -485,7 +453,6 @@ class PILArNetParticleDataset(Dataset):
         particle_idx = int(entry["particle_idx"])
         orientation_aug = self._sample_xy_orientation_augmentation() if self.augment else None
 
-        # Try cache first
         cp = self._cache_path(idx)
         raw_coords = energy = None
         particle_meta = None
@@ -503,7 +470,6 @@ class PILArNetParticleDataset(Dataset):
             coords, fit_scale = _center_and_fit_with_scale(raw_coords, self.spatial_shape)
             feats = energy.reshape(-1, 1)
 
-            # Deduplicate voxels that collide after centering / optional rescaling.
             coords, feats = self._deduplicate(coords, feats)
             if self.include_particle_meta:
                 particle_meta = _compute_cluster_features(raw_coords, energy, self.grid_n, fit_scale)
@@ -527,11 +493,9 @@ class PILArNetParticleDataset(Dataset):
 
         feats = self.charge_preprocessor.transform(feats)
 
-        # Augmentations (applied on-the-fly, after cache load)
         if self.augment:
             coords = self._augment_coords(coords, orientation_aug=orientation_aug)
 
-        # Labels
         type_label = int(entry["type_label"])
         output = {
             "coords": torch.from_numpy(coords).int(),
@@ -546,8 +510,6 @@ class PILArNetParticleDataset(Dataset):
                 _select_single_particle_meta(particle_meta)
             )
         return output
-
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _deduplicate(coords, feats):
@@ -736,11 +698,6 @@ class PILArNetMultiParticleDataset(PILArNetParticleDataset):
             "particle_idx": torch.tensor(particle_ids, dtype=torch.int32),
         }
 
-
-# -----------------------------------------------------------------------
-# Collate function — builds a SparseTensor-compatible batch
-# -----------------------------------------------------------------------
-
 def pilarnet_collate_fn(batch):
     """Custom collate that stacks sparse coordinates with a batch index."""
     coords_list, feats_list = [], []
@@ -752,7 +709,7 @@ def pilarnet_collate_fn(batch):
     for i, sample in enumerate(batch):
         c = sample["coords"]
         b_idx = torch.full((c.shape[0], 1), i, dtype=torch.int32)
-        coords_list.append(torch.cat([b_idx, c], dim=1))  # [N_i, 4]
+        coords_list.append(torch.cat([b_idx, c], dim=1))
         feats_list.append(sample["feats"])
         type_labels.append(sample["type_label"])
         n_vox.append(sample["num_voxels"])
@@ -760,9 +717,9 @@ def pilarnet_collate_fn(batch):
             metas.append(sample["particle_meta"])
 
     collated = {
-        "coords": torch.cat(coords_list, dim=0),  # [N_total, 4] = (batch, x, y, z)
-        "feats": torch.cat(feats_list, dim=0),  # [N_total, 1]
-        "type_label": torch.stack(type_labels),  # [B]
+        "coords": torch.cat(coords_list, dim=0),
+        "feats": torch.cat(feats_list, dim=0),
+        "type_label": torch.stack(type_labels),
         "num_voxels": n_vox,
         "batch_size": len(batch),
     }

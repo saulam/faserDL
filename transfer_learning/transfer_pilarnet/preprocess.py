@@ -10,11 +10,10 @@ import numpy as np
 from glob import glob
 
 
-# PILArNet 5-type shape labels (semantic — kept for reference)
+# Shape labels kept for reference.
 SHAPE_NAMES = {0: "shower", 1: "track", 2: "michel", 3: "delta", 4: "low_energy"}
 
-# Particle-type classification: PDG code → 5-class label
-# Matches the label space of Koh et al., JINST 18 (2023) P12013
+# PDG code to the 5-class PID label used by PILArNet.
 PDG_TO_TYPE = {
     22: 0,    # photon
     11: 1,    # electron
@@ -43,7 +42,6 @@ def build_manifest_for_file(h5_path, min_voxels=5):
             gf_raw = group_vext[ev]
             gf, _, gn = int(gf_raw["first"]), int(gf_raw["ID"]), int(gf_raw["N"])
 
-            # Load group ids for this event (particle index per voxel)
             grp_vals = group_voxels[gf : gf + gn]["value"].astype(np.int32)
 
             parts = particles_ds[pf : pf + pn]

@@ -1,4 +1,4 @@
-"""Dataset utilities for the scintillator PID transfer study."""
+"""Dataset helpers for scintillator PID transfer."""
 
 import os
 import glob
@@ -15,18 +15,13 @@ CLASS_TO_IDX = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 NUM_CLASSES = len(CLASS_NAMES)
 SCINTILLATOR_CONTEXT_FEATURE_DIM = 31
 
-# Scintillator voxel size in mm.
 VOXEL_SIZE_MM = 10.0
-
-# Detector coordinates run from -995 mm to 995 mm.
 COORD_OFFSET_MM = 995.0
-
-# Native detector grid in voxels.
 DETECTOR_SHAPE = (200, 200, 200)
 
 
 def _compute_cluster_features(coords, energy, spatial_shape):
-    """Observable local-crop geometry features for the context token."""
+    """Cluster features for the context token."""
     coords = np.asarray(coords, dtype=np.float32)
     energy = np.asarray(energy, dtype=np.float32).reshape(-1)
     spatial_shape = np.asarray(spatial_shape, dtype=np.float32)
@@ -74,7 +69,7 @@ def _compute_cluster_features(coords, energy, spatial_shape):
         low_energy = float(energy[low_mask].sum())
         high_energy = float(energy[~low_mask].sum())
 
-        # Orient the leading PCA axis using the event charge profile.
+        # Fix the PCA sign with the charge profile.
         if (high_energy < (low_energy - 1e-6)) or (
             abs(high_energy - low_energy) <= 1e-6
             and float(energy[hi_idx]) < float(energy[lo_idx])
@@ -148,7 +143,6 @@ class ScintillatorPIDDataset(Dataset):
         if not os.path.isdir(split_dir):
             raise FileNotFoundError(f"Split directory not found: {split_dir}")
 
-        # Build the sample index.
         self.samples = []
         for class_name in CLASS_NAMES:
             class_dir = os.path.join(split_dir, class_name)
@@ -163,10 +157,6 @@ class ScintillatorPIDDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
-
-    # ------------------------------------------------------------------
-    # Coordinate processing
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _deduplicate(coords, feats):
@@ -335,16 +325,12 @@ class ScintillatorPIDDataset(Dataset):
         boundary_features = self._boundary_features_from_origin(origin, self.spatial_shape)
         return local_coords.astype(np.int32), local_feats, origin, boundary_features
 
-    # ------------------------------------------------------------------
-    # __getitem__
-    # ------------------------------------------------------------------
-
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         data = torch.load(path, weights_only=False)
 
         reco = data["reco_hits"]
-        # Convert millimetres to detector voxel indices.
+        # Convert mm coordinates to detector voxels.
         coords = np.rint((reco[:, :3] + COORD_OFFSET_MM) / VOXEL_SIZE_MM).astype(np.int32)
         coords = np.clip(coords, 0, np.asarray(DETECTOR_SHAPE, dtype=np.int32) - 1)
         energy = reco[:, 3:4].astype(np.float32)
@@ -389,9 +375,6 @@ class ScintillatorPIDDataset(Dataset):
             "num_voxels": coords.shape[0],
         }
 
-
-# Collate function for SparseConvTensor batches.
-
 def scintillator_collate_fn(batch):
     """Custom collate that stacks sparse coordinates with a batch index."""
     coords_list, feats_list = [], []
@@ -408,10 +391,10 @@ def scintillator_collate_fn(batch):
         n_vox.append(sample["num_voxels"])
 
     return {
-        "coords": torch.cat(coords_list, dim=0),   # [N_total, 4]
-        "feats": torch.cat(feats_list, dim=0),      # [N_total, 1]
-        "label": torch.stack(labels),                # [B]
-        "global_features": torch.stack(global_features),  # [B, C_ctx]
+        "coords": torch.cat(coords_list, dim=0),
+        "feats": torch.cat(feats_list, dim=0),
+        "label": torch.stack(labels),
+        "global_features": torch.stack(global_features),
         "num_voxels": n_vox,
         "batch_size": len(batch),
     }

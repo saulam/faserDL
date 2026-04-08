@@ -1,9 +1,21 @@
-# Sparse MAE-ViT for FASER neutrino events
+# Sparse MAE-ViT for FASERCal
 
-A two-stage deep learning pipeline for neutrino interaction analysis in the FASERCal detector at CERN. The model is a Masked Autoencoder (MAE) Vision Transformer (ViT) with sparse 3D convolutional patch embedding, designed to process sparse detector hits from a multi-component detector system comprising 3DCal, ECAL, AHCAL, and a muon spectrometer.
+This repository contains the sparse masked autoencoder / Vision Transformer
+pipeline used for FASERCal neutrino-event studies, together with downstream
+fine-tuning and transfer-learning studies.
 
-**Stage 1 — Self-supervised pre-training** on multi-task hit-level objectives to learn rich representations of neutrino interactions.
-**Stage 2 — Supervised fine-tuning** for event-level classification and kinematic regression.
+The main workflow has two stages:
+
+- Stage 1: self-supervised pretraining on FASERCal events
+- Stage 2: supervised fine-tuning for event classification and kinematic
+  regression
+
+The repository also includes:
+
+- transfer learning from a pretrained FASERCal encoder to a public
+  scintillator PID dataset
+- transfer learning to PILArNet
+- a data-efficiency study for stage-2 fine-tuning
 
 This code was used in the following publication:
 
@@ -20,90 +32,71 @@ This code was used in the following publication:
 }
 ```
 
-## Table of contents
+## Detector Inputs
 
-- [Detector geometry](#detector-geometry)
-- [Architecture](#architecture)
-- [Pre-training tasks](#pre-training-tasks)
-- [Fine-tuning tasks](#fine-tuning-tasks)
-- [Installation](#installation)
-- [Data preparation](#data-preparation)
-- [Usage](#usage)
-- [Project structure](#project-structure)
-- [Extensions](#extensions)
-- [Command-line arguments](#command-line-arguments)
-- [Licence](#licence)
+The main FASERCal model consumes four detector branches along the beam
+direction:
 
-## Detector geometry
+| Sub-detector | Technology | Grid | Information used |
+|---|---|---|---|
+| `FASERCal` | SuperFGD-like scintillator | `48 x 48 x 200` voxels (`1 x 1 x 1 cm^3`) | Sparse 3D hits with charge and particle-level truth |
+| `ECAL` | Electromagnetic calorimeter | `5 x 5` image | Energy-deposit matrix |
+| `AHCAL` | Hadronic calorimeter | `18 x 18 x 40` voxels (`4 x 4 x 4 cm^3`) | Sparse 3D hits with charge |
+| `Muon spectrometer` | Tracking + magnet | Per-track tuples | Charge and fitted momentum |
 
-The model processes data from four sequential sub-detectors placed along the neutrino beam direction (+Z):
+The neutrino interaction vertex is always inside FASERCal. The detector
+branches are sequential but not aligned to one shared voxel frame, so geometry
+augmentations are applied within each branch rather than across the full
+detector chain.
 
-| Sub-detector | Technology | Voxel size | Grid dimensions | Information |
-|---|---|---|---|---|
-| **FASERCal** | SuperFGD-like scintillator | 1×1×1 cm³ | 48×48×200 (10 modules of 48×48×20) | Sparse 3D hits with charge, particle-level truth |
-| **ECAL** | Electromagnetic calorimeter | — | 5×5 energy matrix (48×48 cm² face) | Energy deposit matrix capturing EM shower profiles |
-| **AHCAL** | Hadronic calorimeter | 4×4×4 cm³ | 18×18×40 | Sparse 3D hits with charge only |
-| **Muon spectrometer** | Tracking + magnet | — | Per-muon tuples (charge, px, py, pz) | Fitted muon tracks |
+## Model Summary
 
-The neutrino interaction vertex is always within FASERCal. The sub-detectors are sequentially placed but not aligned, so geometric augmentations are not applied across detector boundaries.
-
-## Architecture
-
-The model uses a dual-branch hierarchical encoder with a Perceiver-IO bottleneck:
-
-1. **Sparse patch embedding** — 3D sparse convolutions (`spconv`) convert raw voxel hits into patch-level tokens: FASERCal patches of 12×12×10 voxels (yielding a 4×4×20 patch grid) and AHCAL patches of 6×6×5 voxels (yielding a 3×3×8 patch grid).
-2. **Intra-module self-attention** — FASERCal tokens are grouped by module (each module spans 2 patches in depth) and self-attended independently, with module-level and AHCAL-level learned embeddings contributing positional context. AHCAL tokens are processed through a separate self-attention branch.
-3. **Perceiver-IO cross-attention bottleneck** — A set of learned latent tokens cross-attends to the combined FASERCal and AHCAL tokens, followed by self-attention blocks, producing a compact representation that merges both calorimeter branches alongside global features (ECAL and muon spectrometer) injected via a dedicated encoder.
-4. **Decoder (pre-training only)** — Cross-attention from mask tokens to latent tokens, with multi-rank separable DCT basis heads for voxel-level occupancy and charge reconstruction.
+- Sparse 3D convolutions (`spconv`) convert FASERCal and AHCAL hits into patch
+  tokens.
+- Local self-attention runs over FASERCal modules and AHCAL windows.
+- A Perceiver-IO bottleneck merges calorimeter tokens together with ECAL and
+  muon features.
+- During pretraining, a decoder reconstructs masked detector content.
 
 Two model sizes are provided:
 
-| Variant | Embedding dim | Encoder depth (FASERCal / AHCAL) | Perceiver-IO depth | Decoder dim | Decoder heads |
-|---|---|---|---|---|---|
-| `tiny` | 384 | 2 / 2 | 6 | 256 | 8 |
-| `base` | 384 | 4 / 4 | 4 | 256 | 8 |
+| Variant | Encoder depth (FASERCal / AHCAL) | Perceiver depth | Decoder dim |
+|---|---|---|---|
+| `tiny` | `2 / 2` | `6` | `256` |
+| `base` | `4 / 4` | `4` | `256` |
 
-All variants use 12 attention heads with an MLP ratio of 4.
+Both variants use embedding dimension `384`, `12` attention heads, and an MLP
+ratio of `4`.
 
-## Pre-training tasks
+## Training Targets
 
-Pre-training combines masked reconstruction and relational (hit-level) objectives, optimised jointly with Kendall uncertainty weighting:
+### Pretraining
 
-**Reconstruction tasks (Pass A — on masked patches):**
-- Occupancy and charge prediction for masked FASERCal patches
-- Occupancy and charge prediction for masked AHCAL patches
-- ECAL energy matrix prediction (when masked)
-- Muon spectrometer summary prediction (when masked)
+- masked occupancy and charge prediction for FASERCal patches
+- masked occupancy and charge prediction for AHCAL patches
+- masked ECAL energy-matrix prediction
+- masked muon-summary prediction
+- hit-level relational targets on unmasked patches
 
-**Relational tasks (Pass B — on kept patches):**
-- Ghost/primary/secondary/tertiary hit classification (hierarchy labels)
-- EM shower / muon-MIP / hadronic particle type classification (PID labels)
-- Ghost hit identification
+### Fine-Tuning
 
-Reconstruction losses support multiple modes (standard, hybrid, distance-aware, focal distance transform), with optional soft chamfer and distance-weighted regression components for spatial forgiveness near shower boundaries.
+- flavour identification: `CC nue`, `CC numu`, `CC nutau` and the
+  corresponding NC classes
+- charm identification: 4 classes
+- visible momentum regression
+- jet momentum regression
+- primary lepton momentum regression
+- 3D vertex regression
 
-## Fine-tuning tasks
+## Setup
 
-Fine-tuning uses the frozen or unfrozen pre-trained encoder (without the decoder) and adds task-specific heads with Kendall uncertainty weighting:
+Requirements:
 
-- **Flavour identification** — 6-class classification: CC νe, CC νμ, CC ντ (+ their NC counterparts)
-- **Charm identification** — 4-class classification of charm production modes
-- **Visible momentum** — Regression of (pT, φ, pz) in cylindrical coordinates
-- **Jet momentum** — Regression of (pT, φ, pz) in cylindrical coordinates
-- **Primary lepton momentum** — Derived from visible and jet momentum consistency
-- **Vertex position** — 3D vertex regression
+- Python `>= 3.11`
+- CUDA `>= 12.1`
+- a CUDA-capable GPU
 
-Fine-tuning employs layer-wise learning rate decay, exponential moving average (EMA), and label smoothing.
-
-## Installation
-
-### Requirements
-
-- Python ≥ 3.11
-- CUDA ≥ 12.1
-- A CUDA-capable GPU
-
-### Setup
+Install from the repository root:
 
 ```bash
 git clone https://github.com/saulam/faserDLTrans.git
@@ -111,37 +104,34 @@ cd faserDLTrans
 pip install -r requirements.txt
 ```
 
-The main dependencies are:
+`ROOT` / `PyROOT` is only needed for the raw ROOT-to-NumPy conversion scripts
+in [`dataset/`](dataset). It is not required for training or evaluation once
+the `.npz` files have been produced.
 
-- [PyTorch](https://pytorch.org/) (≥ 2.5)
-- [spconv-cu121](https://github.com/traveller59/spconv) (≥ 2.3) — sparse 3D convolutions
-- [PyTorch Lightning](https://lightning.ai/) (≥ 2.5) — training framework
-- [timm](https://github.com/huggingface/pytorch-image-models) (≥ 1.0) — Vision Transformer building blocks
-- [webdataset](https://github.com/webdataset/webdataset) (≥ 1.0) — sharded data loading
-- [torch-ema](https://github.com/fadel/pytorch_ema) — exponential moving average
+## Data Preparation
 
-> **Note:** [ROOT](https://root.cern/) (PyROOT) is additionally required only for the data preparation scripts (`dataset/read_root*.py`) that convert raw simulation ROOT files to NumPy format. It is not needed for training or inference and should be installed separately.
+The main FASERCal pipeline expects compressed NumPy event files.
 
-## Data preparation
-
-The training pipeline expects pre-processed events stored as compressed NumPy files (`.npz`). To convert raw FASER simulation ROOT files:
+To convert raw FASERCal simulation ROOT files:
 
 ```bash
 cd dataset
 python read_root_v7.py --number <events_per_file>
+cd ..
 ```
 
-A metadata statistics file is also required and can be generated with:
+To build the metadata file used by training:
 
 ```bash
 python -m dataset.metadata_stats
 ```
 
-This produces a pickle file containing robust standardisation parameters (median, MAD) computed over the full dataset, which is passed to both training scripts via `--metadata_path`.
+The resulting pickle file is passed to training with `METADATA_PATH` or
+`--metadata_path`.
 
-## Usage
+## Main FASERCal Pipeline
 
-### Pre-training
+### Pretraining
 
 ```bash
 export DATASET_PATH='path/to/events_v7.0*'
@@ -150,13 +140,7 @@ export METADATA_PATH='path/to/metadata_stats.pkl'
 bash pretrain.sh
 ```
 
-This runs masked autoencoder pre-training (Stage 1). The script calls:
-
-```bash
-python -m train.pretrain --train --stage1 [options]
-```
-
-### Fine-tuning
+### Fine-tuning from a pretrained checkpoint
 
 ```bash
 export DATASET_PATH='path/to/events_v7.0*'
@@ -166,34 +150,7 @@ export LOAD_CHECKPOINT='path/to/pretrain_checkpoint.ckpt'
 bash finetune.sh
 ```
 
-This runs supervised fine-tuning (Stage 2) starting from a pre-trained checkpoint. The script calls:
-
-```bash
-python -m train.finetune --train --stage2 [options]
-```
-
-### Resuming training
-
-Both pre-training and fine-tuning support resuming from a checkpoint via `--resume_checkpoint`. This restores the full training state (model weights, optimiser, learning rate scheduler, epoch counter, etc.):
-
-```bash
-python -m train.pretrain --train --stage1 --resume_checkpoint path/to/checkpoint.ckpt [options]
-python -m train.finetune --train --stage2 --resume_checkpoint path/to/checkpoint.ckpt [options]
-```
-
-### Loading pre-trained weights
-
-Use `--load_checkpoint` to load model weights from a checkpoint and start a fresh training run (no optimiser state or epoch restoration):
-
-- **Pre-training**: all checkpoint keys must match the model exactly (strict loading).
-- **Fine-tuning**: only encoder weights are transferred; task-specific heads are randomly initialised (flexible matching).
-
-```bash
-python -m train.pretrain --train --stage1 --load_checkpoint path/to/pretrain_checkpoint.ckpt [options]
-python -m train.finetune --train --stage2 --load_checkpoint path/to/pretrain_checkpoint.ckpt [options]
-```
-
-### Training from scratch
+### Fine-tuning from scratch
 
 ```bash
 export DATASET_PATH='path/to/events_v7.0*'
@@ -202,138 +159,98 @@ export METADATA_PATH='path/to/metadata_stats.pkl'
 bash scratch.sh
 ```
 
-This runs the fine-tuning tasks without loading any pre-trained weights, i.e. training the model end-to-end from a random initialisation. It is useful as a baseline to quantify the benefit of pre-training.
+`LOAD_CHECKPOINT` starts a fresh run with loaded weights. `RESUME_CHECKPOINT`
+restores the full training state. Multi-GPU runs are supported by setting
+`GPUS='0 1'` or similar.
 
-Both scripts support multi-GPU training via DDP. Set `GPUS='0 1'` to use multiple GPUs.
+## Transfer Learning
 
-### Sharded datasets
+### Public Scintillator Dataset
 
-For large-scale training, the pipeline supports [webdataset](https://github.com/webdataset/webdataset) shards. Use `--web_dataset_path` instead of `--dataset_path` and provide a directory containing `.tar` shards and a `metadata.json` file.
+The scintillator study adapts the pretrained FASERCal encoder to a 4-class
+particle-ID task on a public scintillator dataset.
 
-## Project structure
+Build charge metadata:
 
-```
-├── pretrain.sh                  # Pre-training launch script
-├── finetune.sh                  # Fine-tuning launch script
-├── scratch.sh                   # Training from scratch launch script
-├── requirements.txt
-├── data_efficiency_study/
-│   ├── subsample_dataset.py     # Manifest generation for data-budget sweeps
-│   ├── train_with_manifest.py   # Fine-tuning entry point using fixed manifests
-│   ├── run_all.sh               # Sweep launcher for pre-trained vs scratch runs
-│   └── README.md                # Study-specific notes
-├── transfer_learning/
-│   ├── build_transfer_charge_metadata.py      # Charge metadata builder for transfer datasets
-│   ├── transfer_charge_preprocessing.py       # Shared charge preprocessing utilities
-│   └── transfer_pilarnet/
-│       ├── train.py               # PILArNet training entry point
-│       ├── evaluate.py            # PILArNet evaluation entry point
-│       ├── preprocess.py          # PILArNet manifest builder
-│       └── README.md              # PILArNet study notes
-├── dataset/
-│   ├── dataset.py               # Map-style and iterable dataset classes
-│   ├── metadata_stats.py        # Robust standardisation metadata computation
-│   ├── metadata.py              # Legacy metadata script
-│   ├── read_root.py             # ROOT-to-NumPy converter (v5.1)
-│   ├── read_root_v6.py          # ROOT-to-NumPy converter (v6.0)
-│   └── read_root_v7.py          # ROOT-to-NumPy converter (v7.0)
-├── model/
-│   ├── sparsemaevit.py          # Sparse MAE-ViT (pre-training architecture)
-│   ├── sparsevit.py             # Sparse ViT (fine-tuning architecture)
-│   ├── lightning_model_pretrain.py  # Lightning module for pre-training
-│   ├── lightning_model_finetune.py  # Lightning module for fine-tuning
-│   └── utils.py                 # Attention blocks, positional embeddings, heads
-├── train/
-│   ├── pretrain.py              # Pre-training entry point
-│   └── finetune.py              # Fine-tuning entry point
-└── utils/
-    ├── args.py                  # CLI argument parser
-    ├── augmentations.py         # Data augmentation pipeline
-    ├── distance_losses.py       # Distance-aware reconstruction losses
-    ├── funcs.py                 # Data loading, collation, scheduling utilities
-    ├── logger.py                # Split TensorBoard logger (train/val)
-    ├── losses.py                # Classification, regression, and focal losses
-    ├── lr_decay.py              # Layer-wise learning rate decay
-    ├── pdg.py                   # PDG code to particle cluster mapping
-    ├── plot.py                  # Visualisation utilities
-    └── rotation_conversions.py  # Rotation representation conversions
+```bash
+export DATA_DIR='path/to/scintillator_dataset'
+
+bash transfer_learning/transfer_scintillator/build_charge_metadata.sh
 ```
 
-## Command-line arguments
+Train with transferred weights:
 
-Both training scripts share a common argument parser. The main options are listed below; see `utils/args.py` for the full set.
+```bash
+export DATA_DIR='path/to/scintillator_dataset'
+export LOAD_CHECKPOINT='path/to/pretrain_checkpoint.ckpt'
 
-### General
+bash transfer_learning/transfer_scintillator/train.sh
+```
 
-| Argument | Default | Description |
-|---|---|---|
-| `--train` / `--test` | `--train` | Training or testing mode |
-| `--stage1` / `--stage2` | `--stage1` | Pre-training (stage 1) or fine-tuning (stage 2) |
-| `--model` | `base` | Model variant (`tiny` or `base`) |
-| `--dataset_path` | — | Path to the dataset directory (supports glob patterns) |
-| `--web_dataset_path` | — | Path to webdataset shards (alternative to `--dataset_path`) |
-| `--metadata_path` | — | Path to the metadata statistics pickle file (required) |
+Evaluate a checkpoint:
 
-### Training
+```bash
+export DATA_DIR='path/to/scintillator_dataset'
+export CHECKPOINT='path/to/checkpoint_or_directory'
 
-| Argument | Default | Description |
-|---|---|---|
-| `--batch_size` | 2 | Batch size per GPU |
-| `--epochs` | 50 | Number of training epochs |
-| `--lr` | — | Learning rate (overrides `--blr` if set) |
-| `--blr` | — | Base learning rate (linearly scaled by effective batch size / 256) |
-| `--weight_decay` | 0.05 | AdamW weight decay |
-| `--beta1` / `--beta2` | 0.9 / 0.999 | AdamW beta parameters |
-| `--warmup_epochs` | 0 | Linear warmup epochs |
-| `--cosine_annealing_epochs` | 0 | Cosine annealing epochs |
-| `--accum_grad_batches` | 1 | Gradient accumulation steps |
-| `--gpus` | `0` | GPU device IDs (space-separated for multi-GPU) |
+bash transfer_learning/transfer_scintillator/evaluate.sh
+```
 
-Warmup/scheduler step counts and linear LR scaling are computed inside the Lightning modules from trainer state (including devices, nodes, and accumulation).
+Scratch baselines are available through
+`train_scratch.sh` and `evaluate_scratch.sh`.
+See [transfer_learning/transfer_scintillator/README.md](transfer_learning/transfer_scintillator/README.md)
+for dataset layout and extra options.
 
-### Checkpoints
+### PILArNet
 
-| Argument | Default | Description |
-|---|---|---|
-| `--load_checkpoint` | — | Path to a checkpoint to load weights from (starts fresh training). For pre-training: strict key matching (all keys must match). For fine-tuning: loads encoder weights only with flexible matching |
-| `--resume_checkpoint` | — | Path to a checkpoint to resume training from (restores optimiser state, epoch counter, etc.) |
+The PILArNet study transfers the encoder to particle-level PID on the PILArNet
+dataset, with both single-particle and multi-particle variants.
 
-### Pre-training specific
+Build the manifest and charge metadata:
 
-| Argument | Default | Description |
-|---|---|---|
-| `--mask_ratio` | 0.75 | Fraction of patches masked during pre-training |
-| `--reconstruction_loss_mode` | `standard` | Reconstruction loss mode (`standard`, `hybrid`, `distance`, `focal_dt`) |
-| `--relational_pass_prob` | 0.5 | Probability of running the relational pass |
-| `--relational_mask_ratio` | 0.25 | Mask ratio for the relational pass |
+```bash
+python -m transfer_learning.transfer_pilarnet.preprocess \
+    --data_dir path/to/pilarnet/larcv3 \
+    --out transfer_learning/transfer_pilarnet/manifest_768px.npz \
+    --min_voxels 5
 
-### Fine-tuning specific
+bash transfer_learning/transfer_pilarnet/build_charge_metadata.sh
+```
 
-| Argument | Default | Description |
-|---|---|---|
-| `--layer_decay` | 0.9 | Layer-wise learning rate decay factor |
-| `--ema_decay` | 0.9999 | Exponential moving average decay |
-| `--head_init` | 0.001 | Task head weight initialisation scale |
-| `--drop_path_rate` | 0.0 | Stochastic depth rate |
-| `--mixup_alpha` | 0.0 | Mixup interpolation alpha |
+Run training:
 
-### Regularisation
+```bash
+export LOAD_CHECKPOINT='path/to/pretrain_checkpoint.ckpt'
 
-| Argument | Default | Description |
-|---|---|---|
-| `--dropout` | 0.0 | Dropout rate (encoder) |
-| `--attn_dropout` | 0.0 | Attention dropout rate (encoder) |
-| `--label_smoothing` | 0.0 | Label smoothing factor |
-| `--preprocessing_input` | — | Input transform (`log` or `sqrt`) |
-| `--preprocessing_output` | — | Output transform (`log` or `sqrt`) |
+bash transfer_learning/transfer_pilarnet/train_single.sh
+bash transfer_learning/transfer_pilarnet/train_multi.sh
+```
 
-## Extensions
+See [transfer_learning/transfer_pilarnet/README.md](transfer_learning/transfer_pilarnet/README.md)
+for the full workflow, including scratch baselines and evaluation commands.
 
-The repository also includes:
+### Data-Efficiency Sweep
 
-- a [data-efficiency fine-tuning study](data_efficiency_study/README.md), which reuses the main stage-2 pipeline to compare pre-trained and scratch models across several training-set budgets;
-- a [PILArNet transfer-learning study](transfer_learning/transfer_pilarnet/README.md), which adapts the stage-2 encoder for particle-level PID transfer.
+The repository also includes a stage-2 data-efficiency study that compares
+pretrained and scratch fine-tuning across fixed training budgets. See
+[data_efficiency_study/README.md](data_efficiency_study/README.md).
 
-## Licence
+## Repository Layout
 
-This project is released under the [MIT Licence](LICENSE).
+- `dataset/`: ROOT conversion, metadata building, and dataset loaders for the
+  main FASERCal pipeline
+- `model/`: core FASERCal model definitions and Lightning modules
+- `train/`: pretraining and fine-tuning entry points
+- `transfer_learning/transfer_scintillator/`: public scintillator transfer
+  study
+- `transfer_learning/transfer_pilarnet/`: PILArNet transfer study
+- `data_efficiency_study/`: fixed-budget fine-tuning study
+- `utils/`: losses, augmentations, schedulers, logging, and shared helpers
+
+For the full set of arguments, see [`utils/args.py`](utils/args.py) for the
+main FASERCal pipeline and the corresponding `train.py` / `evaluate.py` files
+inside each transfer-learning directory.
+
+## License
+
+This project is released under the [MIT License](LICENSE).

@@ -1,4 +1,4 @@
-"""PILArNet sparse encoder adapted from the FASERCal fine-tuning model."""
+"""PILArNet encoder for particle-level PID transfer."""
 
 from functools import partial
 
@@ -71,7 +71,6 @@ class PILArNetEncoder(nn.Module):
         self._pretrained_loaded_keys = set()
         self._patch_embed_loaded = False
 
-        # Patch grid dimensions
         S = spatial_shape
         P = patch_size
         assert all(s % p == 0 for s, p in zip(S, P)), \
@@ -90,7 +89,6 @@ class PILArNetEncoder(nn.Module):
         )
         self.num_window_positions = W[0] * W[1] * W[2]
 
-        # Sparse patch embedding
         vol = P[0] * P[1] * P[2]
         if vol > 512:
             mid = embed_dim // 4
@@ -106,7 +104,6 @@ class PILArNetEncoder(nn.Module):
                 in_chans, embed_dim, kernel_size=P, stride=P, padding=0, bias=True
             )
 
-        # Frozen local/window positional embeddings mirror the pretraining layout.
         self.local_pos_embed = nn.Embedding(self.num_window_positions, embed_dim)
         local_pos = get_3d_sincos_pos_embed(embed_dim, self.window_size, cls_token=False)
         with torch.no_grad():
@@ -123,7 +120,6 @@ class PILArNetEncoder(nn.Module):
             self.window_pos_embed.weight.copy_(torch.from_numpy(window_pos).float())
             self.window_pos_embed.weight.requires_grad_(False)
 
-        # Precompute the local-window token order once so the runtime path only gathers.
         Gx, Gy, Gz = self.grid_size
         Wx, Wy, Wz = self.window_size
         Wgx, Wgy, Wgz = self.window_grid_size
@@ -157,17 +153,14 @@ class PILArNetEncoder(nn.Module):
             self.num_window_positions // max(1, int(num_cls)),
         )
 
-        # CLS token(s)
         self.num_cls = num_cls
         self.cls_token = nn.Parameter(torch.zeros(1, num_cls, embed_dim))
         nn.init.normal_(self.cls_token, std=0.02)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        # Drop-path schedule for the self-attention blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
-        # Self-attention blocks (same architecture/role as FASERCal local blocks)
         self.blocks = nn.ModuleList([
             BlockWithMask(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -179,7 +172,6 @@ class PILArNetEncoder(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.tokens_norm = norm_layer(embed_dim)
 
-        # Perceiver-IO bottleneck
         dp_lat_x = [0.0] * io_depth
         dp_lat_s = [0.0] * io_depth
         if drop_path_rate > 0:
@@ -208,7 +200,6 @@ class PILArNetEncoder(nn.Module):
             for i in range(io_depth)
         ])
 
-        # Task head
         num_tasks = 1
         if not global_pool:
             self.latents_norm = norm_layer(embed_dim)
@@ -238,11 +229,8 @@ class PILArNetEncoder(nn.Module):
 
         self._init_weights()
 
-    # ------------------------------------------------------------------
-
     def _init_weights(self):
         self.apply(self.__init_module)
-        # Small head init
         lin = self.head_pid[-1]
         nn.init.trunc_normal_(lin.weight, std=self.head_init)
         if lin.bias is not None:
@@ -266,10 +254,6 @@ class PILArNetEncoder(nn.Module):
     def no_weight_decay(self):
         return {"cls_token", "task_tokens"}
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
     def densify_patches(self, x_sp):
         """Convert SparseConvTensor to dense tokens + occupancy mask."""
         B = x_sp.batch_size
@@ -279,7 +263,6 @@ class PILArNetEncoder(nn.Module):
         x_dense = x_sp.dense()  # [B, C, Gx, Gy, Gz]
         tokens = x_dense.permute(0, 2, 3, 4, 1).contiguous().view(B, -1, C)
 
-        # Occupancy mask from sparse indices
         idx = x_sp.indices.long()
         b, h, w, d = idx[:, 0], idx[:, 1], idx[:, 2], idx[:, 3]
         occ = torch.zeros((B, Gx, Gy, Gz), dtype=torch.bool, device=x_sp.features.device)
@@ -564,11 +547,6 @@ class PILArNetEncoder(nn.Module):
             out_pid = self.head_pid(outcome)
 
         return {"out_pid": out_pid}
-
-
-# -----------------------------------------------------------------------
-# Model factory functions
-# -----------------------------------------------------------------------
 
 def pilarnet_encoder_tiny(**kwargs):
     defaults = dict(
