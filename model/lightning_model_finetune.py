@@ -41,7 +41,7 @@ class ViTFineTuner(pl.LightningModule):
 
         # One learnable log-sigma per head (https://arxiv.org/pdf/1705.07115)
         self.kendall_w_min = 1e-2
-        self.kendall_w_max = getattr(args, 'kendall_w_max', 5.0)
+        self.kendall_w_max = args.kendall_w_max
         self.u_flavour   = nn.Parameter(torch.zeros(()))
         self.u_charm     = nn.Parameter(torch.zeros(()))
         self.u_vis_geom  = nn.Parameter(torch.zeros(()))
@@ -73,7 +73,7 @@ class ViTFineTuner(pl.LightningModule):
         self.cosine_annealing_epochs = args.cosine_annealing_epochs
         self.lr = args.lr
         self.blr = args.blr
-        self.cls_lr_scale = getattr(args, 'cls_lr_scale', 1.0)
+        self.cls_lr_scale = args.cls_lr_scale
         self._batch_size = args.batch_size
         self.layer_decay = args.layer_decay
         self.ema_decay = args.ema_decay

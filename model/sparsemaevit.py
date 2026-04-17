@@ -28,6 +28,9 @@ class SparseMAEViT(nn.Module):
         fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40),
         ahcal_patch_size=(6, 6, 5),
+        ecal_size=(18, 18, 40),
+        ecal_patch_size=(6, 6, 5),
+        sparse_ecal=False,
         num_module_cls=1,
         num_ahcal_cls=2,
         depth=4,
@@ -51,6 +54,7 @@ class SparseMAEViT(nn.Module):
         super().__init__()
 
         self.metadata = metadata
+        self.sparse_ecal = sparse_ecal
     
         # patch and grid setup
         H, W, D_img = fcal_size
@@ -84,6 +88,18 @@ class SparseMAEViT(nn.Module):
             self.ahcal_grid_size[0] * self.ahcal_grid_size[1] * self.ahcal_grid_size[2]
         )
 
+        # ECAL grid bookkeeping (sparse mode only)
+        if self.sparse_ecal:
+            self.register_buffer('ecal_patch_size', torch.tensor(ecal_patch_size, dtype=torch.long))
+            Eh, Ew, Ed = ecal_size
+            ep_h, ep_w, ep_d = ecal_patch_size
+            assert Eh % ep_h == 0 and Ew % ep_w == 0 and Ed % ep_d == 0, \
+                "ECAL grid must be divisible by ecal_patch_size"
+            self.ecal_grid_size = (Eh // ep_h, Ew // ep_w, Ed // ep_d)
+            self.num_ecal_positions = (
+                self.ecal_grid_size[0] * self.ecal_grid_size[1] * self.ecal_grid_size[2]
+            )
+
         # sparse patch embedding
         if self.fcal_patch_size.prod().item() > 512:
             # too large -> use two-step conv
@@ -116,6 +132,23 @@ class SparseMAEViT(nn.Module):
                 in_chans, embed_dim, kernel_size=ahcal_patch_size, stride=ahcal_patch_size, 
                 padding=0, bias=True,
             )
+
+        # ECAL sparse patch embedding (mirrors AHCAL)
+        if self.sparse_ecal:
+            if self.ecal_patch_size.prod().item() > 512:
+                mid = embed_dim // 4
+                k1, k2 = choose_k1_k2(ecal_patch_size)
+                self.ecal_patch_embed = SparseSequential(
+                    SparseConv3d(in_chans, mid, kernel_size=k1, stride=k1, padding=0, bias=False),
+                    norm_layer(mid),
+                    nn.GELU(),
+                    SparseConv3d(mid, embed_dim, kernel_size=k2, stride=k2, padding=0, bias=True)
+                )
+            else:
+                self.ecal_patch_embed = SparseConv3d(
+                    in_chans, embed_dim, kernel_size=ecal_patch_size, stride=ecal_patch_size,
+                    padding=0, bias=True,
+                )
 
         # Precompute dense patch templates
         mh = torch.arange(G_h)
@@ -190,10 +223,27 @@ class SparseMAEViT(nn.Module):
         ])
         self.ahcal_norm = norm_layer(embed_dim)
 
+        # ECAL sparse self-attention (mirrors AHCAL) or dense embedding
+        if self.sparse_ecal:
+            self.num_ecal_cls = int(num_ahcal_cls)
+            self.t_patches_per_ecal_cls = max(1, self.num_ecal_positions // max(1, self.num_ecal_cls))
+            self.ecal_pos_embed = nn.Embedding(self.num_ecal_positions, embed_dim)
+            self.ecal_cls_token = nn.Parameter(torch.zeros(1, self.num_ecal_cls, embed_dim))
+            self.ecal_blocks = nn.ModuleList([
+                BlockWithMask(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                    qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
+                    drop_path=dp_ah[i], norm_layer=norm_layer
+                )
+                for i in range(self.ahcal_depth)
+            ])
+            self.ecal_norm = norm_layer(embed_dim)
+        else:
+            self.ecal_embed = nn.Linear(25, embed_dim)
+
         # ==========================
         # Perceiver-IO bottleneck (encoder side): lat <- tok + latent self
         # ==========================
-        self.ecal_embed = nn.Linear(25, embed_dim)
         self.muon_state_embed = nn.Embedding(2, embed_dim)  # 0=abstain (no tracks), 1=present
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
@@ -243,6 +293,11 @@ class SparseMAEViT(nn.Module):
         self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim)
         self.ahcal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
 
+        # ECAL sparse decoder components
+        if self.sparse_ecal:
+            self.decoder_ecal_pos_embed = nn.Embedding(self.num_ecal_positions, decoder_embed_dim)
+            self.ecal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+
         # ==========================
         # Heads
         # ==========================
@@ -269,17 +324,30 @@ class SparseMAEViT(nn.Module):
             "occ_ahcal": 1,
             "reg_ahcal": in_chans,
         }
+        if self.sparse_ecal:
+            self.ecal_sep_basis = MultiRankSeparableBasis3D(
+                self.ecal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
+            )
+            self.ecal_voxel_head = MultiRankSharedLatentVoxelHead(
+                decoder_embed_dim, self.ecal_sep_basis, H=num_modes[1],
+                norm_layer=norm_layer, post_norm=True,
+            )
+            self.head_channels["occ_ecal"] = 1
+            self.head_channels["reg_ecal"] = in_chans
         
         self.heads = nn.ModuleDict()
         for name, out_channels in self.head_channels.items():
-            in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0]
+            in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal", "occ_ecal", "reg_ecal"] else num_modes[0]
             self.heads[name] = nn.Linear(in_dim, out_channels)
 
         # ==========================
         # Global token reconstruction heads
         # ==========================
-        self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
-        self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
+        if self.sparse_ecal:
+            self.global_query = nn.Parameter(torch.zeros(1, decoder_embed_dim))  # MUON only
+        else:
+            self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
+            self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
         self.muon_recon_head = nn.Linear(decoder_embed_dim, 5)
 
         self.initialize_weights()
@@ -323,6 +391,26 @@ class SparseMAEViT(nn.Module):
             self.decoder_ahcal_pos_embed.weight.copy_(torch.from_numpy(dec_ahcal_pos).float())
             self.decoder_ahcal_pos_embed.weight.requires_grad_(False)
 
+        # ECAL sparse positional embeddings
+        if self.sparse_ecal:
+            ecal_pos = get_3d_sincos_pos_embed(
+                self.ecal_pos_embed.weight.shape[-1],
+                self.ecal_grid_size,
+                cls_token=False
+            )
+            with torch.no_grad():
+                self.ecal_pos_embed.weight.copy_(torch.from_numpy(ecal_pos).float())
+                self.ecal_pos_embed.weight.requires_grad_(False)
+
+            dec_ecal_pos = get_3d_sincos_pos_embed(
+                self.decoder_ecal_pos_embed.weight.shape[-1],
+                self.ecal_grid_size,
+                cls_token=False
+            )
+            with torch.no_grad():
+                self.decoder_ecal_pos_embed.weight.copy_(torch.from_numpy(dec_ecal_pos).float())
+                self.decoder_ecal_pos_embed.weight.requires_grad_(False)
+
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.module_cls_token, std=.02)
@@ -334,6 +422,9 @@ class SparseMAEViT(nn.Module):
             nn.init.normal_(self.ahcal_query_tokens, std=0.02)
             nn.init.normal_(self.muon_state_embed.weight, std=0.02)
             nn.init.normal_(self.global_query, std=0.02)
+            if self.sparse_ecal:
+                nn.init.normal_(self.ecal_cls_token, std=.02)
+                nn.init.normal_(self.ecal_query_tokens, std=0.02)
 
         self.apply(self._init_weights)
 
@@ -355,7 +446,7 @@ class SparseMAEViT(nn.Module):
 
 
     def no_weight_decay(self):
-        return {
+        nwd = {
             'module_cls_token',
             'ahcal_cls_token',
             'module_embed_enc.weight',
@@ -366,6 +457,9 @@ class SparseMAEViT(nn.Module):
             'muon_state_embed.weight',
             'global_query',
         }
+        if self.sparse_ecal:
+            nwd.update({'ecal_cls_token', 'ecal_query_tokens'})
+        return nwd
     
 
     def densify_patches(self, x_sp, is_fasercal: bool = True):
@@ -631,12 +725,14 @@ class SparseMAEViT(nn.Module):
             return slot < k.view(-1, 1)
 
 
-    def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor) -> torch.Tensor:
+    def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor,
+                           ecal_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Build a [B, N_lat] boolean mask for Perceiver latents with occupancy-based CLS gating.
 
         - For each module: activate k = ceil(v / t_mod) CLS slots, where v=#real patches in that module.
         - For AHCAL:       activate k = ceil(v / t_ah) CLS slots, where v=#real patches in AHCAL.
+        - For ECAL (sparse): activate k = ceil(v / t_ecal) CLS slots.
         """
         # attn_mask_mod: [B, M, Lm] bool
         # ah_mask:       [B, Na] bool
@@ -658,7 +754,19 @@ class SparseMAEViT(nn.Module):
             dummy_one_if_empty=False,
         )  # [B, K]
 
-        lat_keep = torch.cat([fas_cls_keep.reshape(B, M * int(self.num_module_cls)), ah_cls_keep], dim=1)
+        parts = [fas_cls_keep.reshape(B, M * int(self.num_module_cls)), ah_cls_keep]
+
+        if self.sparse_ecal and ecal_mask is not None:
+            ecal_cls_keep = self._cls_keep_from_patchmask(
+                ecal_mask,
+                num_cls=self.num_ecal_cls,
+                t=self.t_patches_per_ecal_cls,
+                ensure_one_if_nonempty=True,
+                dummy_one_if_empty=False,
+            )  # [B, K_ecal]
+            parts.append(ecal_cls_keep)
+
+        lat_keep = torch.cat(parts, dim=1)
 
         # global numerical safety: if totally empty everywhere, keep one dummy latent
         empty_evt = (lat_keep.sum(dim=1) == 0)
@@ -673,6 +781,7 @@ class SparseMAEViT(nn.Module):
         self,
         cls_mod: torch.Tensor,   # [B, M, CLS, C]
         ah_cls: torch.Tensor,    # [B, K, C]
+        ecal_cls: torch.Tensor = None,  # [B, K_ecal, C] (sparse ECAL only)
     ):
         B, M, CLS, C = cls_mod.shape
         device = cls_mod.device
@@ -685,7 +794,12 @@ class SparseMAEViT(nn.Module):
         # AHCAL CLS queries tagged as AHCAL (type embedding)
         q_ah = ah_cls + self.kv_src_embed.weight[0].view(1, 1, C)           # [B, K, C]
 
-        return torch.cat([q_fas, q_ah], dim=1)                              # [B, M*CLS+K, C]
+        parts = [q_fas, q_ah]
+        if self.sparse_ecal and ecal_cls is not None:
+            q_ecal = ecal_cls + self.kv_src_embed.weight[1].view(1, 1, C)   # [B, K_ecal, C]
+            parts.append(q_ecal)
+
+        return torch.cat(parts, dim=1)
 
 
     def forward_encoder(self, x_sparse, x_glob, mask_ratio):
@@ -698,8 +812,14 @@ class SparseMAEViT(nn.Module):
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
 
         # FASERCAL patchify + mask + intra-attn
+        fcal_batch_ids = x_sparse.indices[:, 0].long()
+        fcal_hit_counts = torch.bincount(fcal_batch_ids, minlength=x_sparse.batch_size)
+        fcal_degenerate = (fcal_hit_counts < 2)
         x_sparse_emb = self.fcal_patch_embed(x_sparse)
         x, attn_mask, intra_idx = self.densify_patches(x_sparse_emb, is_fasercal=True)
+        if fcal_degenerate.any():
+            attn_mask = attn_mask.clone()
+            attn_mask[fcal_degenerate] = False
         x = x + self.intra_pos_embed(intra_idx)
 
         x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
@@ -777,9 +897,54 @@ class SparseMAEViT(nn.Module):
         ah_cls = x_ah[:, :K, :]                                                             # [B, K, C]
         tok_ah_keep = x_ah[:, K:, :]                                                        # [B, Lk_ah, C]
 
-        # ECAL token
-        ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                      # [B, 1, C]
-        ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                    # tag as ECAL
+        # ECAL: sparse pipeline (mirrors AHCAL) or dense single-token
+        ecal_cls = None
+        ecal_mask = None
+        ecal_rand_mask = None
+        ecal_tok = None
+        ecal_attn_keep = None
+        tok_ecal_keep = None
+        if self.sparse_ecal:
+            ecal_sparse = ecal_hits  # this is a SparseConvTensor when sparse_ecal=True
+            ecal_batch_ids = ecal_sparse.indices[:, 0].long()
+            ecal_hit_counts = torch.bincount(ecal_batch_ids, minlength=B)
+            ecal_degenerate = (ecal_hit_counts < 2)
+
+            ecal_sparse = self.ecal_patch_embed(ecal_sparse)
+            ec_tokens, ecal_mask, ec_idx = self.densify_patches(ecal_sparse, is_fasercal=False)
+            ec_tokens = ec_tokens + self.ecal_pos_embed(ec_idx) \
+                + self.kv_src_embed.weight[1].view(1, 1, -1)                                # tag as ECAL
+            if ecal_degenerate.any():
+                ecal_mask = ecal_mask.clone()
+                ecal_mask[ecal_degenerate] = False
+
+            ec_tokens_mod = ec_tokens.unsqueeze(1)
+            ec_mask_mod = ecal_mask.unsqueeze(1)
+            ec_keep_mod, ec_attn_keep_mod, ec_rand_mask_mod, _, _ = \
+                self._module_random_masking(ec_tokens_mod, ec_mask_mod, mask_ratio)
+            tok_ecal_keep = ec_keep_mod.squeeze(1)
+            ecal_attn_keep = ec_attn_keep_mod.squeeze(1)
+            ecal_rand_mask = ec_rand_mask_mod.squeeze(1)
+
+            # self-attn on ECAL kept tokens with CLS
+            K_ec = self.num_ecal_cls
+            cls_ec = self.ecal_cls_token.expand(B, K_ec, C)
+            x_ec = torch.cat([cls_ec, tok_ecal_keep], dim=1)
+
+            ec_cls_keep = self._cls_keep_from_patchmask(
+                ecal_mask, num_cls=K_ec, t=self.t_patches_per_ecal_cls,
+                ensure_one_if_nonempty=True, dummy_one_if_empty=True,
+            )
+            ec_attn_intra = torch.cat([ec_cls_keep, ecal_attn_keep], dim=1)
+            for blk in self.ecal_blocks:
+                x_ec = blk(x_ec, attn_mask=ec_attn_intra, q_mask=ec_attn_intra)
+            x_ec = self.ecal_norm(x_ec)
+
+            ecal_cls = x_ec[:, :K_ec, :]
+            tok_ecal_keep = x_ec[:, K_ec:, :]
+        else:
+            ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                  # [B, 1, C]
+            ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                # tag as ECAL
 
         # muon spectrometer token
         muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)         # [B, 1, C]
@@ -796,36 +961,62 @@ class SparseMAEViT(nn.Module):
         muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                    # tag as MUON_SPEC
 
         # randomly drop global tokens (consistent with masking policy)
-        keep_ecal = (torch.rand(B, device=ecal_tok.device) > (mask_ratio * 0.5))              # [B]
-        keep_muon = (torch.rand(B, device=muon_tok.device) > (mask_ratio * 0.5))              # [B]
-        ecal_kv_mask = keep_ecal.view(B, 1)                                                 # [B, 1]
-        muon_kv_mask = keep_muon.view(B, 1)                                                 # [B, 1]
+        keep_muon = (torch.rand(B, device=muon_tok.device) > (mask_ratio * 0.5))
+        muon_kv_mask = keep_muon.view(B, 1)
 
         # build KV for lat <- tok
         kv_fas, kv_fas_keep, *_ = self._pack_by_mask(tok_mod, attn_mask_keep)               # [B, Nmax, C], [B, Nmax]
-        kv_tokens = torch.cat([kv_fas, tok_ah_keep, ecal_tok, muon_tok], dim=1)
-        kv_keep   = torch.cat([kv_fas_keep, ah_attn_keep, ecal_kv_mask, muon_kv_mask], dim=1)
+        kv_parts = [kv_fas, tok_ah_keep]
+        kv_keep_parts = [kv_fas_keep, ah_attn_keep]
+
+        if self.sparse_ecal:
+            kv_parts.append(tok_ecal_keep)
+            kv_keep_parts.append(ecal_attn_keep)
+        else:
+            keep_ecal = (torch.rand(B, device=ecal_tok.device) > (mask_ratio * 0.5))
+            ecal_kv_mask = keep_ecal.view(B, 1)
+            kv_parts.append(ecal_tok)
+            kv_keep_parts.append(ecal_kv_mask)
+
+        kv_parts.append(muon_tok)
+        kv_keep_parts.append(muon_kv_mask)
+
+        kv_tokens = torch.cat(kv_parts, dim=1)
+        kv_keep   = torch.cat(kv_keep_parts, dim=1)
         kv_tokens = self.tokens_norm(kv_tokens)
 
-        # latents: FASER CLS + AHCAL CLS
-        lat = self._prepare_latent_queries(cls_mod, ah_cls)                                 # [B, N_lat, C]
-        lat_keep = self._build_latent_keep(attn_mask_mod=attn_mask_mod, ah_mask=ah_mask)    # [B, N_lat]
+        # latents: FASER CLS + AHCAL CLS + (optionally) ECAL CLS
+        lat = self._prepare_latent_queries(cls_mod, ah_cls, ecal_cls)
+        lat_keep = self._build_latent_keep(
+            attn_mask_mod=attn_mask_mod, ah_mask=ah_mask, ecal_mask=ecal_mask
+        )
 
         # Perceiver-IO encoder loop
         for xa_lat, sa in zip(self.lat_xattn_blocks, self.latent_self_blocks):
             lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep, q_mask=lat_keep)                # lat <- tokens
             lat = sa(lat, attn_mask=lat_keep, q_mask=lat_keep)                              # latent self-attn
 
-        return (
+        result = (
             lat,                   # [B, N_lat, C]
             lat_keep,              # [B, N_lat]     which latents are valid
             rand_mask,             # [B, M, Lm]     FASERcal masked real positions
             attn_mask_mod,         # [B, M, Lm]     FASERcal real positions
             ah_mask,               # [B, Na]        AHCAL real positions
             ah_rand_mask,          # [B, Na]        AHCAL masked real positions
-            ~keep_ecal,            # [B]            ECAL dropped events
-            ~keep_muon,            # [B]            MUON dropped events
         )
+        if self.sparse_ecal:
+            result += (
+                ecal_mask,         # [B, Ne]        ECAL real positions
+                ecal_rand_mask,    # [B, Ne]        ECAL masked real positions
+                ~keep_muon,        # [B]            MUON dropped events
+            )
+        else:
+            keep_ecal_local = keep_ecal  # defined in the else branch above
+            result += (
+                ~keep_ecal_local,  # [B]            ECAL dropped events
+                ~keep_muon,        # [B]            MUON dropped events
+            )
+        return result
 
 
     def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:
@@ -859,6 +1050,14 @@ class SparseMAEViT(nn.Module):
         # indices for masked positions
         b_ids, m_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)    # [Nm]
         Nm = b_ids.numel()
+        if Nm == 0:
+            P = int(self.fcal_patch_size.prod().item())
+            preds = {
+                "occ": lat.new_zeros((0, P)),
+                "reg": lat.new_zeros((0, P, self.heads["reg"].out_features)),
+            }
+            idx_targets = torch.empty((0, P), dtype=torch.long, device=lat.device)
+            return preds, idx_targets
 
         # build queries in decoder dim for these masked positions
         within = self._compute_within_ranks(b_ids, Nm)
@@ -912,6 +1111,14 @@ class SparseMAEViT(nn.Module):
         # indices for masked AHCAL patches
         b_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)         # [Nm]
         Nm = b_ids.numel()
+        if Nm == 0:
+            P_ah = int(self.ahcal_patch_size.prod().item())
+            preds_ah = {
+                "occ_ah": lat.new_zeros((0, P_ah)),
+                "reg_ah": lat.new_zeros((0, P_ah, self.heads["reg_ahcal"].out_features)),
+            }
+            idx_targets_ah = torch.empty((0, P_ah), dtype=torch.long, device=lat.device)
+            return preds_ah, idx_targets_ah
 
         # build queries in decoder dim for these masked AHCAL positions
         within = self._compute_within_ranks(b_ids, Nm)                       # [Nm]
@@ -940,53 +1147,103 @@ class SparseMAEViT(nn.Module):
         return preds_ah, idx_targets_ah
     
 
+    def forward_reconstruction_ecal(
+        self,
+        lat: torch.Tensor,            # [B, N_lat, Cenc]
+        lat_keep: torch.Tensor,       # [B, N_lat]
+        ecal_mask: torch.Tensor,      # [B, Ne]
+        ecal_rand_mask: torch.Tensor, # [B, Ne]
+        ecal_idx_map,
+    ):
+        """
+        Sparse ECAL reconstruction from bottleneck latents (mirrors AHCAL reconstruction).
+        """
+        B = lat.size(0)
+        Cdec = self.decoder_ecal_pos_embed.weight.shape[-1]
+
+        prediction_mask = ecal_rand_mask & ecal_mask                          # [B, Ne]
+        counts = prediction_mask.sum(dim=-1)
+        max_n = int(counts.max().item()) if B > 0 else 0
+
+        b_ids, l_ids = torch.nonzero(prediction_mask, as_tuple=True)
+        Nm = b_ids.numel()
+        if Nm == 0:
+            P_ec = int(self.ecal_patch_size.prod().item())
+            preds_ec = {
+                "occ_ecal": lat.new_zeros((0, P_ec)),
+                "reg_ecal": lat.new_zeros((0, P_ec, self.heads["reg_ecal"].out_features)),
+            }
+            idx_targets_ec = torch.empty((0, P_ec), dtype=torch.long, device=lat.device)
+            return preds_ec, idx_targets_ec
+
+        within = self._compute_within_ranks(b_ids, Nm)
+        Q = self.ecal_query_tokens.new_zeros(B, max_n, Cdec)
+        q = self.decoder_ecal_pos_embed(l_ids) + self.ecal_query_tokens
+        Q[b_ids, within] = q
+
+        LAT = self.enc_to_dec(lat)
+        X = Q
+        for blk in self.decode_lat_xattn_blocks:
+            X = blk(X, LAT, attn_mask=lat_keep)
+
+        out_flat = X[b_ids, within]
+
+        shared_ec = self.ecal_voxel_head(out_flat)
+        preds_ec = {}
+        preds_ec["occ_ecal"] = self.heads["occ_ecal"](shared_ec).squeeze(-1)
+        preds_ec["reg_ecal"] = self.heads["reg_ecal"](shared_ec)
+
+        patch_ids_ec = l_ids
+        idx_targets_ec = ecal_idx_map[b_ids, patch_ids_ec]
+
+        return preds_ec, idx_targets_ec
+
+
     def forward_reconstruction_global(
         self,
         lat: torch.Tensor,              # [B, N_lat, Cenc]
         lat_keep: torch.Tensor,         # [B, N_lat] bool
-        ecal_hits: torch.Tensor,        # [B, 5, 5] or [B, 25]
+        ecal_hits,                       # [B, 5, 5] or None (sparse ECAL uses separate method)
         muspec_feats: torch.Tensor,     # [B, N, 5]
         muspec_attn_mask: torch.Tensor, # [B, N] bool
-        ecal_drop: torch.Tensor,        # [B] bool
-        muon_drop: torch.Tensor,        # [B] bool
+        ecal_drop: torch.Tensor = None, # [B] bool (None when sparse ECAL)
+        muon_drop: torch.Tensor = None, # [B] bool
     ):
         """
         Predict ECAL and muon-summary only (loss-masked) when the corresponding token was dropped.
+        When sparse_ecal, ECAL is handled separately; this only does muon.
         """
         B = lat.size(0)
         Cdec = self.global_query.size(-1)
 
         LAT = self.enc_to_dec(lat) # [B, N_lat, Cdec]
 
-        # Targets
-        ecal_tgt = ecal_hits.view(B, -1)  # [B, 25]
-        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 5]
-
         preds = {}
+        targets = {}
+        masks = {}
 
-        # ECAL query -> latents
-        q_ecal = self.global_query[0].view(1, 1, Cdec).expand(B, 1, Cdec)  # [B,1,Cdec]
-        x = q_ecal
-        for blk in self.decode_lat_xattn_blocks:
-            x = blk(x, LAT, attn_mask=lat_keep)
-        preds["ecal_rec"] = self.ecal_recon_head(x.squeeze(1))  # [B, 25]
+        if not self.sparse_ecal:
+            # ECAL query -> latents
+            ecal_tgt = ecal_hits.view(B, -1)  # [B, 25]
+            q_ecal = self.global_query[0].view(1, 1, Cdec).expand(B, 1, Cdec)
+            x = q_ecal
+            for blk in self.decode_lat_xattn_blocks:
+                x = blk(x, LAT, attn_mask=lat_keep)
+            preds["ecal_rec"] = self.ecal_recon_head(x.squeeze(1))
+            targets["ecal_tgt"] = ecal_tgt
+            masks["ecal_drop"] = ecal_drop
 
         # MUON query -> latents
-        q_muon = self.global_query[1].view(1, 1, Cdec).expand(B, 1, Cdec)
+        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 5]
+        q_idx = 0 if self.sparse_ecal else 1
+        q_muon = self.global_query[q_idx].view(1, 1, Cdec).expand(B, 1, Cdec)
         x = q_muon
         for blk in self.decode_lat_xattn_blocks:
             x = blk(x, LAT, attn_mask=lat_keep)
-        preds["muon_rec"] = self.muon_recon_head(x.squeeze(1))  # [B, 5]
+        preds["muon_rec"] = self.muon_recon_head(x.squeeze(1))
+        targets["muon_tgt"] = muon_tgt
+        masks["muon_drop"] = muon_drop
 
-        # Return masks so your training step can apply loss only when dropped
-        masks = {
-            "ecal_drop": ecal_drop,  # [B] bool
-            "muon_drop": muon_drop,  # [B] bool
-        }
-        targets = {
-            "ecal_tgt": ecal_tgt,    # [B, 25]
-            "muon_tgt": muon_tgt,    # [B, 5]
-        }
         return preds, targets, masks
     
 
@@ -1010,6 +1267,15 @@ class SparseMAEViT(nn.Module):
 
         b_ids, m_ids, l_ids = torch.nonzero(keep_mask, as_tuple=True)           # [Nr]
         Nr = b_ids.numel()
+        if Nr == 0:
+            P = int(self.fcal_patch_size.prod().item())
+            preds = {
+                "gho": lat.new_zeros((0, P)),
+                "hie": lat.new_zeros((0, P, self.heads["hie"].out_features)),
+                "pid": lat.new_zeros((0, P, self.heads["pid"].out_features)),
+            }
+            idx_targets = torch.empty((0, P), dtype=torch.long, device=lat.device)
+            return preds, idx_targets
 
         within = self._compute_within_ranks(b_ids, Nr)
         Q = self.query_tokens.new_zeros(B, max_n, Cdec)
@@ -1046,6 +1312,7 @@ class SparseMAEViT(nn.Module):
         Pass A (masked, MAE):
           - FASERCAL reconstruction + relational tasks on masked patches,
           - AHCAL reconstruction on masked patches.
+          - ECAL reconstruction on masked patches (sparse_ecal only).
 
         Pass B (optional):
           - FASERCal relational: hie/pid on all real (kept) patches.
@@ -1055,27 +1322,34 @@ class SparseMAEViT(nn.Module):
           idx_targets_fas_masked: for occ/reg/gho losses (masked patches)
           idx_targets_fas_sem:    for hie/pid losses (real/kept patches from full pass)
           idx_targets_ah:         for AHCAL losses
+          idx_targets_ecal:       for ECAL losses (sparse_ecal only, else None)
           glob_tgts, glob_masks:  for global losses
           aux:                    dict with run flags
         """
         # occupancy maps (same for both passes)
         idx_map = self.build_patch_occupancy_map(x, self.fcal_patch_size, self.grid_size)
-        ahcal_sparse, *_ = x_glob
+        ahcal_sparse, ecal_hits, *_ = x_glob
         ah_idx_map = self.build_patch_occupancy_map(ahcal_sparse, self.ahcal_patch_size, self.ahcal_grid_size)
+
+        ecal_idx_map = None
+        if self.sparse_ecal:
+            ecal_idx_map = self.build_patch_occupancy_map(ecal_hits, self.ecal_patch_size, self.ecal_grid_size)
 
         # ==========================
         # Pass A: masked MAE
         # ==========================
-        (
-            lat,
-            lat_keep,
-            rand_mask,
-            attn_mask_mod,
-            ah_mask,
-            ah_rand_mask,
-            ecal_drop,
-            muon_drop,
-        ) = self.forward_encoder(x, x_glob, mask_ratio)
+        enc_out = self.forward_encoder(x, x_glob, mask_ratio)
+
+        if self.sparse_ecal:
+            (lat, lat_keep, rand_mask, attn_mask_mod,
+             ah_mask, ah_rand_mask,
+             ecal_mask, ecal_rand_mask, muon_drop) = enc_out
+            ecal_drop = None
+        else:
+            (lat, lat_keep, rand_mask, attn_mask_mod,
+             ah_mask, ah_rand_mask,
+             ecal_drop, muon_drop) = enc_out
+            ecal_mask = ecal_rand_mask = None
 
         # FASERCAL: masked recon
         preds_fas_masked, idx_targets_fas_masked = self.forward_reconstruction_fcal(
@@ -1095,35 +1369,44 @@ class SparseMAEViT(nn.Module):
             ah_idx_map=ah_idx_map,
         )
 
-        # global recon (ECAL, MUON_SPEC) when dropped
-        ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, _ = x_glob
+        # ECAL sparse masked recon
+        idx_targets_ecal = None
+        preds_ecal = {}
+        if self.sparse_ecal:
+            preds_ecal, idx_targets_ecal = self.forward_reconstruction_ecal(
+                lat=lat,
+                lat_keep=lat_keep,
+                ecal_mask=ecal_mask,
+                ecal_rand_mask=ecal_rand_mask,
+                ecal_idx_map=ecal_idx_map,
+            )
+
+        # global recon (ECAL dense + MUON when dropped, or MUON only when sparse_ecal)
+        _, ecal_hits_raw, muspec_feats, muspec_attn_mask, _ = x_glob
         preds_glob, glob_tgts, glob_masks = self.forward_reconstruction_global(
             lat=lat,
             lat_keep=lat_keep,
-            ecal_hits=ecal_hits,
+            ecal_hits=None if self.sparse_ecal else ecal_hits_raw,
             muspec_feats=muspec_feats,
             muspec_attn_mask=muspec_attn_mask,
             ecal_drop=ecal_drop,
             muon_drop=muon_drop,
         )
 
-        preds = {**preds_fas_masked, **preds_ah, **preds_glob}
+        preds = {**preds_fas_masked, **preds_ah, **preds_ecal, **preds_glob}
 
         # ==========================
         # Pass B: relational (optional)
         # ==========================
         idx_targets_fas_rel = None
         if do_relational:
-            (
-                lat_full,
-                lat_keep_full,
-                rand_mask_full,
-                attn_mask_mod_full,
-                _ah_mask_full,
-                _ah_rand_mask_full,
-                _ecal_drop_full,
-                _muon_drop_full,
-            ) = self.forward_encoder(x, x_glob, mask_ratio=relational_mask_ratio)
+            enc_out_full = self.forward_encoder(x, x_glob, mask_ratio=relational_mask_ratio)
+            if self.sparse_ecal:
+                (lat_full, lat_keep_full, rand_mask_full, attn_mask_mod_full,
+                 *_rest) = enc_out_full
+            else:
+                (lat_full, lat_keep_full, rand_mask_full, attn_mask_mod_full,
+                 *_rest) = enc_out_full
 
             preds_rel, idx_targets_fas_rel = self.forward_relational_fcal(
                 lat=lat_full,
@@ -1144,7 +1427,8 @@ class SparseMAEViT(nn.Module):
             idx_targets_fas_masked,  # for occ/reg (masked patches)
             idx_targets_fas_rel,     # for gho/hie/pid (kept patches)
             idx_targets_ah,          # for AHCAL occ_ah/reg_ah (masked patches)
-            glob_tgts,               # ecal_tgt, muon_tgt
+            idx_targets_ecal,        # for ECAL occ_ecal/reg_ecal (masked patches) or None
+            glob_tgts,               # ecal_tgt, muon_tgt (dense ECAL only)
             glob_masks,              # ecal_drop, muon_drop
             aux,
         )
@@ -1174,4 +1458,3 @@ def mae_vit_base(**kwargs):
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
-

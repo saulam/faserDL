@@ -32,6 +32,9 @@ class SparseViT(vit.VisionTransformer):
         fcal_patch_size=(12, 12, 10),
         ahcal_size=(18, 18, 40),
         ahcal_patch_size=(6, 6, 5),
+        ecal_size=(18, 18, 40),
+        ecal_patch_size=(6, 6, 5),
+        sparse_ecal=False,
         num_module_cls=1,
         num_ahcal_cls=2,
         io_depth=4,
@@ -47,6 +50,7 @@ class SparseViT(vit.VisionTransformer):
         
         self.metadata = metadata
         self.head_init = head_init
+        self.sparse_ecal = sparse_ecal
 
         depth = kwargs['depth']
         num_heads = kwargs['num_heads']
@@ -89,6 +93,17 @@ class SparseViT(vit.VisionTransformer):
             self.ahcal_grid_size[0] * self.ahcal_grid_size[1] * self.ahcal_grid_size[2]
         )
 
+        # ECAL grid bookkeeping (sparse ECAL only)
+        if sparse_ecal:
+            Eh, Ew, Ed = ecal_size
+            ep_h, ep_w, ep_d = ecal_patch_size
+            assert Eh % ep_h == 0 and Ew % ep_w == 0 and Ed % ep_d == 0
+            self.ecal_grid_size = (Eh // ep_h, Ew // ep_w, Ed // ep_d)
+            self.num_ecal_positions = (
+                self.ecal_grid_size[0] * self.ecal_grid_size[1] * self.ecal_grid_size[2]
+            )
+            self.register_buffer('ecal_patch_size_buf', torch.tensor(ecal_patch_size, dtype=torch.long))
+
         # remove original ViT patch_embed / cls_token
         del self.cls_token, self.patch_embed, self.pos_embed, self.norm_pre, self.fc_norm, self.head
 
@@ -124,6 +139,23 @@ class SparseViT(vit.VisionTransformer):
                 in_chans, embed_dim, kernel_size=ahcal_patch_size, stride=ahcal_patch_size, 
                 padding=0, bias=True,
             )
+
+        # ECAL sparse patch embedding
+        if sparse_ecal:
+            if torch.tensor(ecal_patch_size).prod().item() > 512:
+                mid = embed_dim // 4
+                k1, k2 = choose_k1_k2(ecal_patch_size)
+                self.ecal_patch_embed = SparseSequential(
+                    SparseConv3d(in_chans, mid, kernel_size=k1, stride=k1, padding=0, bias=False),
+                    norm_layer(mid),
+                    nn.GELU(),
+                    SparseConv3d(mid, embed_dim, kernel_size=k2, stride=k2, padding=0, bias=True)
+                )
+            else:
+                self.ecal_patch_embed = SparseConv3d(
+                    in_chans, embed_dim, kernel_size=ecal_patch_size, stride=ecal_patch_size,
+                    padding=0, bias=True,
+                )
 
         # Precompute dense patch templates
         mh = torch.arange(G_h)
@@ -188,8 +220,25 @@ class SparseViT(vit.VisionTransformer):
         ])
         self.ahcal_norm = norm_layer(embed_dim)
 
+        # ECAL: sparse pipeline or dense single-token
+        if sparse_ecal:
+            self.num_ecal_cls = int(num_ahcal_cls)  # same as AHCAL
+            self.t_patches_per_ecal_cls = max(1, self.num_ecal_positions // max(1, self.num_ecal_cls))
+            self.ecal_cls_token = nn.Parameter(torch.zeros(1, self.num_ecal_cls, embed_dim))
+            self.ecal_pos_embed = nn.Embedding(self.num_ecal_positions, embed_dim)
+            self.ecal_blocks = nn.ModuleList([
+                BlockWithMask(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                    qkv_bias=True, proj_drop=drop_rate, attn_drop=attn_drop_rate,
+                    drop_path=dp_ah[i], norm_layer=norm_layer
+                )
+                for i in range(self.ahcal_depth)
+            ])
+            self.ecal_norm = norm_layer(embed_dim)
+        else:
+            self.ecal_embed = nn.Linear(25, embed_dim)
+
         # Perceiver-IO bottleneck: lat <- tok + latent self
-        self.ecal_embed = nn.Linear(25, embed_dim)
         self.muon_state_embed = nn.Embedding(2, embed_dim)  # 0=abstain (no tracks), 1=present
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
         self.muon_spec_embed = nn.Linear(5, embed_dim)
@@ -274,10 +323,22 @@ class SparseViT(vit.VisionTransformer):
             self.ahcal_pos_embed.weight.copy_(torch.from_numpy(ahcal_pos).float())
             self.ahcal_pos_embed.weight.requires_grad_(False)
 
+        if self.sparse_ecal:
+            ecal_pos = get_3d_sincos_pos_embed(
+                self.ecal_pos_embed.weight.shape[-1],
+                self.ecal_grid_size,
+                cls_token=False
+            )
+            with torch.no_grad():
+                self.ecal_pos_embed.weight.copy_(torch.from_numpy(ecal_pos).float())
+                self.ecal_pos_embed.weight.requires_grad_(False)
+
         # init tokens
         with torch.no_grad():
             nn.init.normal_(self.module_cls_token, std=0.02)
             nn.init.normal_(self.ahcal_cls_token, std=0.02)
+            if self.sparse_ecal:
+                nn.init.normal_(self.ecal_cls_token, std=0.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
             nn.init.normal_(self.kv_src_embed.weight, std=0.02)
             nn.init.normal_(self.muon_state_embed.weight, std=0.02)
@@ -313,7 +374,7 @@ class SparseViT(vit.VisionTransformer):
 
     
     def no_weight_decay(self):
-        return {
+        nwd = {
             'module_cls_token',
             'ahcal_cls_token',
             'module_embed_enc.weight',
@@ -321,6 +382,9 @@ class SparseViT(vit.VisionTransformer):
             'task_tokens',
             'muon_state_embed.weight',
         }
+        if self.sparse_ecal:
+            nwd.add('ecal_cls_token')
+        return nwd
             
 
     def make_head_from_stats(self, stats_entry, hidden=128):
@@ -485,15 +549,8 @@ class SparseViT(vit.VisionTransformer):
             return slot < k.view(-1, 1)
 
 
-    def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Build a [B, N_lat] boolean mask for Perceiver latents with occupancy-based CLS gating.
-
-        - For each module: activate k = ceil(v / t_mod) CLS slots, where v=#real patches in that module.
-        - For AHCAL:       activate k = ceil(v / t_ah) CLS slots, where v=#real patches in AHCAL.
-        """
-        # attn_mask_mod: [B, M, Lm] bool
-        # ah_mask:       [B, Na] bool
+    def _build_latent_keep(self, attn_mask_mod: torch.Tensor, ah_mask: torch.Tensor,
+                           ecal_mask: torch.Tensor = None) -> torch.Tensor:
         B, M, _ = attn_mask_mod.shape
 
         fas_cls_keep = self._cls_keep_from_patchmask(
@@ -501,7 +558,7 @@ class SparseViT(vit.VisionTransformer):
             num_cls=self.num_module_cls,
             t=self.t_patches_per_module_cls,
             ensure_one_if_nonempty=True,
-            dummy_one_if_empty=False,   # IMPORTANT: no dummy latents here
+            dummy_one_if_empty=False,
         )  # [B, M, CLS]
 
         ah_cls_keep = self._cls_keep_from_patchmask(
@@ -512,9 +569,20 @@ class SparseViT(vit.VisionTransformer):
             dummy_one_if_empty=False,
         )  # [B, K]
 
-        lat_keep = torch.cat([fas_cls_keep.reshape(B, M * int(self.num_module_cls)), ah_cls_keep], dim=1)
+        parts = [fas_cls_keep.reshape(B, M * int(self.num_module_cls)), ah_cls_keep]
 
-        # global numerical safety: if totally empty everywhere, keep one dummy latent
+        if self.sparse_ecal and ecal_mask is not None:
+            ecal_cls_keep = self._cls_keep_from_patchmask(
+                ecal_mask,
+                num_cls=self.num_ecal_cls,
+                t=self.t_patches_per_ecal_cls,
+                ensure_one_if_nonempty=True,
+                dummy_one_if_empty=False,
+            )
+            parts.append(ecal_cls_keep)
+
+        lat_keep = torch.cat(parts, dim=1)
+
         empty_evt = (lat_keep.sum(dim=1) == 0)
         if empty_evt.any():
             lat_keep = lat_keep.clone()
@@ -527,19 +595,23 @@ class SparseViT(vit.VisionTransformer):
         self,
         cls_mod: torch.Tensor,   # [B, M, CLS, C]
         ah_cls: torch.Tensor,    # [B, K, C]
+        ecal_cls: torch.Tensor = None,
     ):
         B, M, CLS, C = cls_mod.shape
         device = cls_mod.device
 
-        # FASERCal CLS queries anchored by module id
         mod_ids = torch.arange(M, device=device)
-        q_fas = cls_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)   # [B, M, CLS,C]
-        q_fas = q_fas.view(B, M * CLS, C)                                   # [B, M*CLS, C]
+        q_fas = cls_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)
+        q_fas = q_fas.view(B, M * CLS, C)
 
-        # AHCAL CLS queries tagged as AHCAL (type embedding)
-        q_ah = ah_cls + self.kv_src_embed.weight[0].view(1, 1, C)           # [B, K, C]
+        q_ah = ah_cls + self.kv_src_embed.weight[0].view(1, 1, C)
 
-        return torch.cat([q_fas, q_ah], dim=1)                              # [B, M*CLS+K, C]
+        parts = [q_fas, q_ah]
+        if self.sparse_ecal and ecal_cls is not None:
+            q_ecal = ecal_cls + self.kv_src_embed.weight[1].view(1, 1, C)
+            parts.append(q_ecal)
+
+        return torch.cat(parts, dim=1)
 
     
     def forward_features(self, x_sparse, x_glob):
@@ -547,8 +619,14 @@ class SparseViT(vit.VisionTransformer):
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
 
         # FASERCAL patchify + intra-attn
+        fcal_batch_ids = x_sparse.indices[:, 0].long()
+        fcal_hit_counts = torch.bincount(fcal_batch_ids, minlength=x_sparse.batch_size)
+        fcal_degenerate = (fcal_hit_counts < 2)
         x_sparse_emb = self.fcal_patch_embed(x_sparse)
         x, attn_mask, intra_idx = self.densify_patches(x_sparse_emb)
+        if fcal_degenerate.any():
+            attn_mask = attn_mask.clone()
+            attn_mask[fcal_degenerate] = False
         x = x + self.intra_pos_embed(intra_idx)
 
         x_mod, attn_mask_mod = self._group_tokens_by_module(x, attn_mask)
@@ -615,14 +693,46 @@ class SparseViT(vit.VisionTransformer):
         ah_cls = x_ah[:, :K, :]                                                             # [B, K, C]
         tok_ah = x_ah[:, K:, :]                                                             # [B, Na, C]
 
-        # ecal token
-        ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)                      # [B, 1, C]
-        ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)                    # tag as ECAL
+        # ECAL: sparse pipeline or dense single-token
+        ecal_cls = None
+        ecal_mask = None
+        ecal_tok = None
+        tok_ecal = None
+        if self.sparse_ecal:
+            ecal_sparse = ecal_hits
+            ecal_batch_ids = ecal_sparse.indices[:, 0].long()
+            ecal_hit_counts = torch.bincount(ecal_batch_ids, minlength=B)
+            ecal_degenerate = (ecal_hit_counts < 2)
+
+            ecal_sparse = self.ecal_patch_embed(ecal_sparse)
+            ec_tokens, ecal_mask, ec_idx = self.densify_patches(ecal_sparse, is_fasercal=False)
+            ec_tokens = ec_tokens + self.ecal_pos_embed(ec_idx) \
+                + self.kv_src_embed.weight[1].view(1, 1, -1)
+            if ecal_degenerate.any():
+                ecal_mask = ecal_mask.clone()
+                ecal_mask[ecal_degenerate] = False
+
+            K_ec = self.num_ecal_cls
+            cls_ec = self.ecal_cls_token.expand(B, K_ec, C)
+            x_ec = torch.cat([cls_ec, ec_tokens], dim=1)
+            ec_cls_keep = self._cls_keep_from_patchmask(
+                ecal_mask, num_cls=K_ec, t=self.t_patches_per_ecal_cls,
+                ensure_one_if_nonempty=True, dummy_one_if_empty=True,
+            )
+            ec_attn_intra = torch.cat([ec_cls_keep, ecal_mask], dim=1)
+            for blk in self.ecal_blocks:
+                x_ec = blk(x_ec, attn_mask=ec_attn_intra, q_mask=ec_attn_intra)
+            x_ec = self.ecal_norm(x_ec)
+            ecal_cls = x_ec[:, :K_ec, :]
+            tok_ecal = x_ec[:, K_ec:, :]
+        else:
+            ecal_tok = self.ecal_embed(ecal_hits.view(B, -1)).unsqueeze(1)
+            ecal_tok = ecal_tok + self.kv_src_embed.weight[1].view(1, 1, -1)
 
         # muon spectrometer token
         muspec_count_emb = self.muon_spec_count_encoder(muspec_counts).unsqueeze(1)         # [B, 1, C]
         muon_spec_emb = self.muon_spec_embed(muspec_feats)                                  # [B, N_muspec, C]
-        has_tracks = muspec_attn_mask.any(dim=1, keepdim=True)                              # [B, 1] bool                                                    # [B, 1] bool
+        has_tracks = muspec_attn_mask.any(dim=1, keepdim=True)                              # [B, 1] bool
         safe_mask = muspec_attn_mask.clone()
         safe_mask[~has_tracks.squeeze(-1), 0] = True
         muon_tok_present = self.muon_spec_xattn(
@@ -634,16 +744,27 @@ class SparseViT(vit.VisionTransformer):
         muon_tok = muon_tok + self.kv_src_embed.weight[2].view(1, 1, -1)                    # tag as MUON_SPEC
 
         # build KV for lat <- tok
-        kv_fas, kv_fas_keep, *_ = self._pack_by_mask(tok_mod, attn_mask_mod)                # [B, N_max, C], [B, N_max]
-        kv_tokens = torch.cat([kv_fas, tok_ah, ecal_tok, muon_tok], dim=1)                  # [B, Nmax + Na + 2, C]
-        kv_keep   = torch.cat([
-            kv_fas_keep, ah_mask, torch.ones(B, 2, dtype=torch.bool, device=kv_fas_keep.device)
-        ], dim=1)                                                                           # [B, Nmax + Na + 2]
+        kv_fas, kv_fas_keep, *_ = self._pack_by_mask(tok_mod, attn_mask_mod)
+        kv_parts = [kv_fas, tok_ah]
+        kv_keep_parts = [kv_fas_keep, ah_mask]
+
+        if self.sparse_ecal:
+            kv_parts.append(tok_ecal)
+            kv_keep_parts.append(ecal_mask)
+        else:
+            kv_parts.append(ecal_tok)
+            kv_keep_parts.append(torch.ones(B, 1, dtype=torch.bool, device=kv_fas_keep.device))
+
+        kv_parts.append(muon_tok)
+        kv_keep_parts.append(torch.ones(B, 1, dtype=torch.bool, device=kv_fas_keep.device))
+
+        kv_tokens = torch.cat(kv_parts, dim=1)
+        kv_keep   = torch.cat(kv_keep_parts, dim=1)
         kv_tokens = self.tokens_norm(kv_tokens)
 
-        # latents: FASER CLS + AHCAL CLS
-        lat = self._prepare_latent_queries(cls_mod, ah_cls)                                 # [B, N_lat, C]
-        lat_keep = self._build_latent_keep(attn_mask_mod=attn_mask_mod, ah_mask=ah_mask)    # [B, N_lat]
+        # latents: FASER CLS + AHCAL CLS + (optionally) ECAL CLS
+        lat = self._prepare_latent_queries(cls_mod, ah_cls, ecal_cls)
+        lat_keep = self._build_latent_keep(attn_mask_mod=attn_mask_mod, ah_mask=ah_mask, ecal_mask=ecal_mask)
 
         # Perceiver encoder loop (NO tok<-lat)
         for xa_lat, sa in zip(self.lat_xattn_blocks, self.latent_self_blocks):

@@ -49,6 +49,7 @@ class MAEPreTrainer(pl.LightningModule):
         self.dataset = dataset
         self.preprocessing_input = args.preprocessing_input
         self.label_smoothing = args.label_smoothing
+        self.sparse_ecal = args.sparse_ecal
 
         # Reconstruction distance-aware loss parameters
         self.reconstruction_loss_mode = args.reconstruction_loss_mode
@@ -81,6 +82,10 @@ class MAEPreTrainer(pl.LightningModule):
         self.u_ecal = nn.Parameter(torch.zeros(()))
         self.u_muon = nn.Parameter(torch.zeros(()))
 
+        if self.sparse_ecal:
+            self.u_occ_ec = nn.Parameter(torch.zeros(()))
+            self.u_reg_ec = nn.Parameter(torch.zeros(()))
+
         # define a min_max dict for each uncertainty param
         self._uncertainty_params_desired_max = {
             "gho": (1.0, self.kendall_w_max),
@@ -90,9 +95,13 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": (1.0, self.kendall_w_max),
             "occ_ah": (1.0, self.kendall_w_max),
             "reg_ah": (1.0, self.kendall_w_max),
-            "ecal": (0.05, 1.0),
             "muon": (0.02, 0.05),
         }
+        if self.sparse_ecal:
+            self._uncertainty_params_desired_max["occ_ec"] = (1.0, self.kendall_w_max)
+            self._uncertainty_params_desired_max["reg_ec"] = (1.0, self.kendall_w_max)
+        else:
+            self._uncertainty_params_desired_max["ecal"] = (0.05, 1.0)
         
         self._uncertainty_params = {
             "gho": self.u_gho,
@@ -102,9 +111,13 @@ class MAEPreTrainer(pl.LightningModule):
             "reg": self.u_reg,
             "occ_ah": self.u_occ_ah,
             "reg_ah": self.u_reg_ah,
-            "ecal": self.u_ecal,
             "muon": self.u_muon,
         }
+        if self.sparse_ecal:
+            self._uncertainty_params["occ_ec"] = self.u_occ_ec
+            self._uncertainty_params["reg_ec"] = self.u_reg_ec
+        else:
+            self._uncertainty_params["ecal"] = self.u_ecal
 
         def _u_for_w(w, w_min, w_max, eps=1e-6):
             # Map desired initial weight w into u so that:
@@ -217,6 +230,8 @@ class MAEPreTrainer(pl.LightningModule):
         targets['ghost_mask'] = labels['ghost_mask']
         targets['hit_event_id'] = labels['hit_event_id']
         targets['hit_event_id_ahcal'] = labels['hit_event_id_ahcal']
+        if self.sparse_ecal:
+            targets['hit_event_id_ecal'] = labels['hit_event_id_ecal']
 
         return batch_input, *global_params, targets
 
@@ -278,6 +293,15 @@ class MAEPreTrainer(pl.LightningModule):
         Ghost loss (gho) is kept as standard BCE (binary classification).
         Semantic tasks (hie, pid) can use distance-aware losses.
         """
+        if idx_targets.numel() == 0:
+            zero = torch.tensor(0.0, device=pred_gho.device)
+            part_losses = {
+                "gho/total": zero.detach(),
+                "hie/total": zero.detach(),
+                "pid/total": zero.detach(),
+            }
+            return zero, zero, zero, part_losses
+
         raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(idx_targets)
 
         # Gather ghost predictions and labels (standard BCE)
@@ -346,6 +370,20 @@ class MAEPreTrainer(pl.LightningModule):
         """
         Compute reconstruction losses with distance awareness using unified interface.
         """
+        if idx_targets.numel() == 0:
+            zero = torch.tensor(0.0, device=pred_occ.device)
+            part_losses_dec = {
+                "occ/total": zero.detach(),
+                "occ/pos": zero.detach(),
+                "occ/neg": zero.detach(),
+                "reg/total": zero.detach(),
+                "reg/pos": zero.detach(),
+                "reg/neg": zero.detach(),
+            }
+            if name_prefix:
+                part_losses_dec = {f"{name_prefix}{k}": v for k, v in part_losses_dec.items()}
+            return zero, zero, part_losses_dec
+
         p_h, p_w, p_d = patch_shape
         
         # Use provided max_distance or fall back to FASERCal default
@@ -383,17 +421,22 @@ class MAEPreTrainer(pl.LightningModule):
         glob_masks: dict,
     ):
         """
-        Compute global reconstruction losses for ECAL energy and muon momentum.
+        Compute global reconstruction losses for ECAL energy (dense only) and muon momentum.
         """
-        ecal_drop = glob_masks["ecal_drop"].float().unsqueeze(-1)
+        part_losses_glob = {}
+        loss_ecal = torch.tensor(0.0, device=self.device)
+
+        if not self.sparse_ecal:
+            ecal_drop = glob_masks["ecal_drop"].float().unsqueeze(-1)
+            ecal_pred = preds["ecal_rec"]
+            ecal_tgt  = glob_targets["ecal_tgt"]
+            loss_ecal_raw = F.smooth_l1_loss(ecal_pred, ecal_tgt, reduction="none")
+            loss_ecal_evt = loss_ecal_raw.mean(dim=-1, keepdim=True)
+            loss_ecal = (loss_ecal_evt * ecal_drop).sum() / ecal_drop.sum().clamp_min(1.0)
+            part_losses_glob["ecal/total"] = loss_ecal.detach()
+            part_losses_glob["ecal/drop_frac"] = ecal_drop.mean().detach()
+
         muon_drop = glob_masks["muon_drop"].float().unsqueeze(-1)
-        
-        # ECAL loss (per-dim mean, only when dropped)
-        ecal_pred = preds["ecal_rec"]                                            # [B, 25]
-        ecal_tgt  = glob_targets["ecal_tgt"]                                     # [B, 25]
-        loss_ecal_raw = F.smooth_l1_loss(ecal_pred, ecal_tgt, reduction="none")  # [B, 25]
-        loss_ecal_evt = loss_ecal_raw.mean(dim=-1, keepdim=True)                 # [B, 1]
-        loss_ecal = (loss_ecal_evt * ecal_drop).sum() / ecal_drop.sum().clamp_min(1.0)
         
         # Muon loss (per-dim masked mean, only when dropped)
         muon_pred = preds["muon_rec"]                                            # [B, 5]
@@ -424,15 +467,13 @@ class MAEPreTrainer(pl.LightningModule):
         loss_means = (loss_means_raw * w_means).sum() / w_means.sum().clamp_min(1.0)
         loss_muon = loss_has + loss_means
         
-        part_losses_glob = {
-            "ecal/total": loss_ecal.detach(),
+        part_losses_glob.update({
             "muon/total": loss_muon.detach(),
             "muon/has_loss": loss_has.detach(),
             "muon/means_loss": loss_means.detach(),
-            "ecal/drop_frac": ecal_drop.mean().detach(),
             "muon/drop_frac": muon_drop.mean().detach(),
             "muon/has_frac": has_tgt.mean().detach(),
-        }
+        })
         
         return loss_ecal, loss_muon, part_losses_glob
 
@@ -442,9 +483,11 @@ class MAEPreTrainer(pl.LightningModule):
         preds: dict,
         targ_reg: torch.Tensor,
         targ_reg_ahcal: torch.Tensor,
+        targ_reg_ecal: torch.Tensor,
         idx_targets_fas_masked: torch.Tensor,
         idx_targets_fas_rel,
         idx_targets_ahcal: torch.Tensor,
+        idx_targets_ecal,
         labels: dict,
         glob_targets: dict,
         glob_masks: dict,
@@ -476,6 +519,23 @@ class MAEPreTrainer(pl.LightningModule):
             max_distance=self.reconstruction_max_distance_ahcal,
         )
 
+        # ECAL sparse reconstruction losses
+        part_dec_ec = {}
+        loss_occ_ec = torch.tensor(0.0, device=self.device)
+        loss_reg_ec = torch.tensor(0.0, device=self.device)
+        if self.sparse_ecal and idx_targets_ecal is not None:
+            pred_occ_ec = preds["occ_ecal"]
+            pred_reg_ec = preds["reg_ecal"]
+            hit_event_id_ec = labels["hit_event_id_ecal"]
+            ghost_mask_ec = torch.zeros_like(hit_event_id_ec, dtype=torch.bool)
+
+            loss_occ_ec, loss_reg_ec, part_dec_ec = self.compute_reconstruction_losses_distance_aware(
+                targ_reg_ecal, pred_occ_ec, pred_reg_ec, idx_targets_ecal, hit_event_id_ec, ghost_mask=ghost_mask_ec,
+                patch_shape=tuple(self.model.ecal_patch_size.tolist()),
+                name_prefix="ecal_",
+                max_distance=self.reconstruction_max_distance_ahcal,  # same grid as AHCAL
+            )
+
         # Relational losses (optional)
         part_rel = {}
         if did_relational and (idx_targets_fas_rel is not None):
@@ -502,11 +562,10 @@ class MAEPreTrainer(pl.LightningModule):
         # Kendall et al. aggregation
         # Only include muon losses in part_losses if computed this iteration
         if do_muon:
-            part_losses = {**part_dec, **part_dec_ah, **part_glob, **part_rel}
+            part_losses = {**part_dec, **part_dec_ah, **part_dec_ec, **part_glob, **part_rel}
         else:
-            # Exclude muon-related metrics when not computed
             part_glob_no_muon = {k: v for k, v in part_glob.items() if not k.startswith('muon/')}
-            part_losses = {**part_dec, **part_dec_ah, **part_glob_no_muon, **part_rel}
+            part_losses = {**part_dec, **part_dec_ah, **part_dec_ec, **part_glob_no_muon, **part_rel}
         kendall_w, kendall_s = {}, {}
 
         def _weight(name: str, loss: torch.Tensor) -> torch.Tensor:
@@ -524,9 +583,12 @@ class MAEPreTrainer(pl.LightningModule):
             _weight("occ",    loss_occ)    +
             _weight("reg",    loss_reg)    +
             _weight("occ_ah", loss_occ_ah) +
-            _weight("reg_ah", loss_reg_ah) +
-            _weight("ecal",   loss_ecal)
+            _weight("reg_ah", loss_reg_ah)
         )
+        if self.sparse_ecal:
+            total_loss = total_loss + _weight("occ_ec", loss_occ_ec) + _weight("reg_ec", loss_reg_ec)
+        else:
+            total_loss = total_loss + _weight("ecal", loss_ecal)
         if do_muon:
             total_loss = total_loss + _weight("muon", loss_muon)
         
@@ -545,6 +607,11 @@ class MAEPreTrainer(pl.LightningModule):
         total_loss = total_loss + lambda_basis_fcal * basis_reg_fcal + lambda_basis_ah * basis_reg_ahcal
         part_losses["basis/reg_fcal"] = (lambda_basis_fcal * basis_reg_fcal).detach()
         part_losses["basis/reg_ahcal"] = (lambda_basis_ah * basis_reg_ahcal).detach()
+        if self.sparse_ecal:
+            lambda_basis_ec = 3e-5
+            basis_reg_ecal = self.model.ecal_sep_basis.orthonorm_reg(w_within=1.0, w_across=0.1)
+            total_loss = total_loss + lambda_basis_ec * basis_reg_ecal
+            part_losses["basis/reg_ecal"] = (lambda_basis_ec * basis_reg_ecal).detach()
 
         return total_loss, part_losses, kendall_w, kendall_s
 
@@ -552,6 +619,7 @@ class MAEPreTrainer(pl.LightningModule):
     def common_step(self, batch, is_train: bool):
         batch_input, *batch_input_global, labels = self._arrange_batch(batch)
         ahcal_sparse = batch_input_global[0]
+        ecal_input = batch_input_global[1]
         batch_size = batch_input.batch_size
 
         do_relational = self._should_run_relational() if is_train else True
@@ -563,6 +631,7 @@ class MAEPreTrainer(pl.LightningModule):
             idx_targets_fas_masked,
             idx_targets_fas_rel,
             idx_targets_ah,
+            idx_targets_ecal,
             glob_tgts,
             glob_masks,
             aux,
@@ -584,13 +653,18 @@ class MAEPreTrainer(pl.LightningModule):
             sync_dist=True
         )
 
+        # Get ECAL sparse features for reconstruction target
+        targ_reg_ecal = ecal_input.features if self.sparse_ecal else None
+
         loss, part_losses, kendall_w, kendall_s = self.compute_losses(
             preds=preds,
             targ_reg=batch_input.features,
             targ_reg_ahcal=ahcal_sparse.features,
+            targ_reg_ecal=targ_reg_ecal,
             idx_targets_fas_masked=idx_targets_fas_masked,
             idx_targets_fas_rel=idx_targets_fas_rel,
             idx_targets_ahcal=idx_targets_ah,
+            idx_targets_ecal=idx_targets_ecal,
             labels=labels,
             glob_targets=glob_tgts,
             glob_masks=glob_masks,

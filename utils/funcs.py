@@ -150,6 +150,14 @@ def pack_muspec(nb_muspec_tracks, muspec_info):
     feats = pad_sequence(muspec_info, batch_first=True, padding_value=0.0)  # (B, K_max, 5)
     B, K_max, D = feats.shape
 
+    # Keep one dummy token when the whole batch has zero tracks.
+    # Downstream attention already masks it out, but some model paths expect
+    # at least one sequence position to exist.
+    if K_max == 0:
+        feats = feats.new_zeros(B, 1, D)
+        attn_mask = torch.zeros(B, 1, dtype=torch.bool, device=feats.device)
+        return feats, attn_mask, nb_muspec_tracks
+
     lengths = torch.tensor([t.size(0) for t in muspec_info], device=feats.device)
     idxs = torch.arange(K_max, device=feats.device).unsqueeze(0).expand(B, -1)
     attn_mask = idxs < lengths.unsqueeze(1)
@@ -166,6 +174,7 @@ def collate(
     device = None,
     spatial_shape = (48, 48, 200),  # set (X, Y, Z) if fixed grid
     ahcal_spatial_shape = (18, 18, 40),
+    ecal_spatial_shape = (18, 18, 40),
 ):
     """
     Collate that returns a spconv-ready dict.
@@ -175,11 +184,19 @@ def collate(
       - optional: same fields you already propagate
     """
     mode = 'test' if test else 'train'
-    batch = [d for d in batch if len(d["coords"]) > 0]
+    if len(batch) == 0:
+        raise ValueError("Empty batch passed to collate().")
     coords_list = [d["coords"] for d in batch]
     feats_list  = [d["feats"]  for d in batch]
     ahcal_coords_list = [d["ahcal_hits_coords"] for d in batch]
     ahcal_feats_list  = [d["ahcal_hits_feats"]  for d in batch]
+
+    # Preserve empty events by inserting masked dummy sparse entries.
+    for i, (coords, feats) in enumerate(zip(coords_list, feats_list)):
+        if len(coords) == 0:
+            coords_list[i] = torch.zeros((1, 3), dtype=coords.dtype, device=coords.device)
+            feats_list[i] = torch.zeros((1, feats.shape[1] if feats.ndim > 1 else 1),
+                                        dtype=feats.dtype, device=feats.device)
 
     # Ensure empty ahcal events have at least one zero-feature entry
     # This prevents batch size mismatch when creating sparse tensors
@@ -191,7 +208,7 @@ def collate(
                                              dtype=feats.dtype, device=feats.device)
 
     # Build hit_event_id exactly like your current collate
-    num_hits = torch.tensor([len(x) for x in feats_list], dtype=torch.long)
+    num_hits = torch.tensor([len(d["feats"]) for d in batch], dtype=torch.long)
     hit_event_id = torch.arange(len(feats_list), dtype=torch.long).repeat_interleave(num_hits)
 
     feats_cat = torch.cat(feats_list, dim=0)
@@ -205,7 +222,7 @@ def collate(
     )
 
     # Build hit_event_id_ahcal exactly like your current collate
-    num_ahcal_hits = torch.tensor([len(x) for x in ahcal_feats_list], dtype=torch.long)
+    num_ahcal_hits = torch.tensor([len(d["ahcal_hits_feats"]) for d in batch], dtype=torch.long)
     hit_event_id_ahcal = torch.arange(len(ahcal_feats_list), dtype=torch.long).repeat_interleave(num_ahcal_hits)
 
     ret = {
@@ -218,7 +235,29 @@ def collate(
         "hit_event_id_ahcal": hit_event_id_ahcal,
     }
 
-    ret["ecal_hits"] = torch.stack([d["ecal_hits"] for d in batch])
+    # ECAL: sparse or dense depending on data format
+    sparse_ecal = "ecal_hits_coords" in batch[0]
+    if sparse_ecal:
+        ecal_coords_list = [d["ecal_hits_coords"] for d in batch]
+        ecal_feats_list  = [d["ecal_hits_feats"]  for d in batch]
+        for i, (coords, feats) in enumerate(zip(ecal_coords_list, ecal_feats_list)):
+            if len(coords) == 0:
+                ecal_coords_list[i] = torch.zeros((1, 3), dtype=coords.dtype, device=coords.device)
+                ecal_feats_list[i] = torch.zeros((1, feats.shape[1] if feats.ndim > 1 else 1),
+                                                 dtype=feats.dtype, device=feats.device)
+        ecal_feats_cat = torch.cat(ecal_feats_list, dim=0)
+        ecal_x_sp, ecal_spatial_shape_out = _make_spconv_tensor(
+            ecal_feats_cat, ecal_coords_list, device=device, axis_order=axis_order, spatial_shape=ecal_spatial_shape
+        )
+        num_ecal_hits = torch.tensor([len(d["ecal_hits_feats"]) for d in batch], dtype=torch.long)
+        hit_event_id_ecal = torch.arange(len(ecal_feats_list), dtype=torch.long).repeat_interleave(num_ecal_hits)
+        ret["ecal_x_sp"] = ecal_x_sp
+        ret["ecal_spatial_shape"] = ecal_spatial_shape_out
+        ret["hit_event_id_ecal"] = hit_event_id_ecal
+        ret["sparse_ecal"] = True
+    else:
+        ret["ecal_hits"] = torch.stack([d["ecal_hits"] for d in batch])
+        ret["sparse_ecal"] = False
     nb_muspec_tracks = torch.stack([d["nb_muspec_tracks"] for d in batch])
     muspec_info = [d["muspec_info"] for d in batch]    
 
@@ -332,7 +371,11 @@ def csr_stack_rows_torch(indptr_list, class_list, weight_list):
 def arrange_input(data):
     x_sp = data['x_sp']
     ahcal_x_sp = data['ahcal_x_sp']
-    ecal_hits = data['ecal_hits']
+    sparse_ecal = data.get('sparse_ecal', False)
+    if sparse_ecal:
+        ecal_hits = data['ecal_x_sp']
+    else:
+        ecal_hits = data['ecal_hits']
     muspec_feats = data['muspec_feats']
     muspec_attn_mask = data['muspec_attn_mask']
     muspec_counts = data['muspec_counts']
@@ -347,7 +390,7 @@ def arrange_truth(data):
         'csr_hie_indptr', 'csr_hie_ids', 'csr_hie_weights',
         'csr_dec_indptr', 'csr_dec_ids', 'csr_dec_weights',
         'csr_pid_indptr', 'csr_pid_ids', 'csr_pid_weights',
-        'ghost_mask', 'hit_event_id', 'hit_event_id_ahcal',
+        'ghost_mask', 'hit_event_id', 'hit_event_id_ahcal', 'hit_event_id_ecal',
         'run_number', 'event_id', 'primary_vertex', 'is_cc', 'in_neutrino_pdg',
         'in_neutrino_energy', 'primlepton_labels', 'seg_labels', 'flavour_label',
         'charm_label', 'e_vis', 'pt_miss', 

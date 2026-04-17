@@ -6,6 +6,7 @@ Date: 08.25
 Description: script to generate metadata.
 """
 
+import argparse
 import torch
 import os
 import numpy as np
@@ -448,7 +449,7 @@ def compute_all_stats(
 # -------------------------
 
 class SparseFASERCALDataset(Dataset):
-    def __init__(self, root, shuffle=False, **kwargs):
+    def __init__(self, root, shuffle=False, sample_prob=0.10, **kwargs):
         # Normalize root into a list
         self.root = root
         self.data_files = sorted(
@@ -458,7 +459,7 @@ class SparseFASERCALDataset(Dataset):
             ),
             key=str.lower,
         )
-        self.data_files = [x for x in self.data_files if np.random.rand() < 0.10]
+        self.data_files = [x for x in self.data_files if np.random.rand() < sample_prob]
         self.train = False
         self.total_events = self.__len__
 
@@ -511,7 +512,13 @@ class SparseFASERCALDataset(Dataset):
         y = np.unique(data['reco_hits'][:, 1])
         z = np.unique(np.stack((data['reco_hits'][:, 2], data['reco_hits'][:, 3]), axis=1), axis=0)
         q = (data['reco_hits'][:, 4]*10).round().astype(int)
-        ecal_hits = data['ecal_hits'].reshape(-1)
+        ecal_raw = data['ecal_hits']
+        if ecal_raw.ndim == 2 and ecal_raw.shape[1] == 4:
+            # sparse ECAL: (N, 4) with columns (x, y, z, energy)
+            ecal_hits = (ecal_raw[:, 3] * 10).round().astype(int)
+        else:
+            # dense ECAL: (5, 5)
+            ecal_hits = ecal_raw.reshape(-1)
         ahcal_hits = (data['ahcal_hits'][:, 3]*10).round().astype(int)
         nb_muspec_tracks, muspec_tracks = _process_muspec(muspec_info)
         muspec_q = muspec_tracks[:, 0]
@@ -560,8 +567,6 @@ class SparseFASERCALDataset(Dataset):
                 "event_hits": event_hits,
                }
 
-dataset = SparseFASERCALDataset("/scratch/salonso/sparse-nns/faser/events_v7.0*")
-
 def collate(batch):
     pdg = np.unique(np.concatenate([x['pdg'] for x in batch]))
     x = np.unique(np.concatenate([x['x'] for x in batch]))
@@ -604,129 +609,180 @@ def collate(batch):
             "event_hits": event_hits,
            }
     
-loader = DataLoader(dataset, collate_fn=collate, batch_size=10, num_workers=10, drop_last=False, shuffle=False)
+def main():
+    parser = argparse.ArgumentParser(description="Build metadata statistics for FASER datasets.")
+    parser.add_argument(
+        "--dataset_glob",
+        type=str,
+        default="/scratch/salonso/sparse-nns/faser/events_v7.0*",
+        help="Glob that matches dataset directories containing NPZ event files.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl",
+        help="Output pickle path for the metadata statistics.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=10,
+        help="Batch size for the metadata dataloader.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=10,
+        help="Number of dataloader workers.",
+    )
+    parser.add_argument(
+        "--sample_prob",
+        type=float,
+        default=0.10,
+        help="Fraction of files to sample when estimating metadata.",
+    )
+    args = parser.parse_args()
 
-# -------------------------
-# Aggregate
-# -------------------------
+    dataset = SparseFASERCALDataset(args.dataset_glob, sample_prob=args.sample_prob)
+    if len(dataset) == 0:
+        raise FileNotFoundError(f"No NPZ files matched dataset_glob={args.dataset_glob!r}")
 
-pdg = []
-x = []
-y = []
-z = []
-q_counter = Counter()  # memory-safe counter for q
-vis_sp_momentum = []
-out_lepton_momentum = []
-jet_momentum = []
-ecal_hits = []
-ahcal_hits = []
-nb_muspec_tracks = []
-muspec_q = []
-muspec_px = []
-muspec_py = []
-muspec_pz = []
-muspec_chi2 = []
-in_neutrino_energy = []
-out_lepton_energy = []
-is_cc = []
-module_hits = []
-event_hits = []
+    loader = DataLoader(
+        dataset,
+        collate_fn=collate,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        drop_last=False,
+        shuffle=False,
+    )
 
-t = tqdm(enumerate(loader), total=len(loader), disable=False)
-for i, batch in t:
-    pdg.append(batch["pdg"])
-    x.append(batch["x"])
-    y.append(batch["y"])
-    z.append(batch["z"])
-    q_counter.update(batch["q"])
-    vis_sp_momentum.append(batch["vis_sp_momentum"])
-    out_lepton_momentum.append(batch["out_lepton_momentum"])
-    jet_momentum.append(batch["jet_momentum"])
-    ecal_hits.append(batch["ecal_hits"])
-    ahcal_hits.append(batch["ahcal_hits"])
-    nb_muspec_tracks.append(batch["nb_muspec_tracks"])
-    muspec_q.append(batch["muspec_q"])
-    muspec_px.append(batch["muspec_px"])
-    muspec_py.append(batch["muspec_py"])
-    muspec_pz.append(batch["muspec_pz"])
-    muspec_chi2.append(batch["muspec_chi2"])
-    in_neutrino_energy.append(batch["in_neutrino_energy"])
-    out_lepton_energy.append(batch["out_lepton_energy"])
-    is_cc.append(batch["is_cc"])
-    module_hits.append(batch["module_hits"])
-    event_hits.append(batch["event_hits"])
-    
-print("Done with loader")
+    # -------------------------
+    # Aggregate
+    # -------------------------
+    pdg = []
+    x = []
+    y = []
+    z = []
+    q_counter = Counter()  # memory-safe counter for q
+    vis_sp_momentum = []
+    out_lepton_momentum = []
+    jet_momentum = []
+    ecal_hits = []
+    ahcal_hits = []
+    nb_muspec_tracks = []
+    muspec_q = []
+    muspec_px = []
+    muspec_py = []
+    muspec_pz = []
+    muspec_chi2 = []
+    in_neutrino_energy = []
+    out_lepton_energy = []
+    is_cc = []
+    module_hits = []
+    event_hits = []
 
-pdg = np.unique(np.concatenate(pdg))
-x = np.unique(np.concatenate(x))
-y = np.unique(np.concatenate(y))
-z = np.unique(np.concatenate(z), axis=0)
-vis_sp_momentum = np.concatenate(vis_sp_momentum)
-out_lepton_momentum = np.concatenate(out_lepton_momentum)
-jet_momentum = np.concatenate(jet_momentum)
-ecal_hits = np.concatenate(ecal_hits)
-ahcal_hits = np.concatenate(ahcal_hits)
-nb_muspec_tracks = np.concatenate(nb_muspec_tracks)
-muspec_q = np.concatenate(muspec_q)
-muspec_px = np.concatenate(muspec_px)
-muspec_py = np.concatenate(muspec_py)
-muspec_pz = np.concatenate(muspec_pz)
-muspec_chi2 = np.concatenate(muspec_chi2)
-in_neutrino_energy = np.concatenate(in_neutrino_energy)
-out_lepton_energy = np.concatenate(out_lepton_energy)
-is_cc = np.concatenate(is_cc)
-module_hits = np.concatenate(module_hits)
-event_hits = np.concatenate(event_hits)
+    t = tqdm(enumerate(loader), total=len(loader), disable=False)
+    for _, batch in t:
+        pdg.append(batch["pdg"])
+        x.append(batch["x"])
+        y.append(batch["y"])
+        z.append(batch["z"])
+        q_counter.update(batch["q"])
+        vis_sp_momentum.append(batch["vis_sp_momentum"])
+        out_lepton_momentum.append(batch["out_lepton_momentum"])
+        jet_momentum.append(batch["jet_momentum"])
+        ecal_hits.append(batch["ecal_hits"])
+        ahcal_hits.append(batch["ahcal_hits"])
+        nb_muspec_tracks.append(batch["nb_muspec_tracks"])
+        muspec_q.append(batch["muspec_q"])
+        muspec_px.append(batch["muspec_px"])
+        muspec_py.append(batch["muspec_py"])
+        muspec_pz.append(batch["muspec_pz"])
+        muspec_chi2.append(batch["muspec_chi2"])
+        in_neutrino_energy.append(batch["in_neutrino_energy"])
+        out_lepton_energy.append(batch["out_lepton_energy"])
+        is_cc.append(batch["is_cc"])
+        module_hits.append(batch["module_hits"])
+        event_hits.append(batch["event_hits"])
 
-print("Done with concat")
+    print("Done with loader")
 
-# -------------------------
-# Compute vector/jet stats (UNCHANGED OUTPUT SHAPE/KEYS)
-# -------------------------
-stats = compute_all_stats(
-    p_vis_true=vis_sp_momentum,
-    p_jet_true=jet_momentum,
-    p_lep_true=out_lepton_momentum,
-    is_cc=is_cc,
-    use_robust=True,
-    residual_floor_pct=5.0,
-)
+    pdg = np.unique(np.concatenate(pdg))
+    x = np.unique(np.concatenate(x))
+    y = np.unique(np.concatenate(y))
+    z = np.unique(np.concatenate(z), axis=0)
+    vis_sp_momentum = np.concatenate(vis_sp_momentum)
+    out_lepton_momentum = np.concatenate(out_lepton_momentum)
+    jet_momentum = np.concatenate(jet_momentum)
+    ecal_hits = np.concatenate(ecal_hits)
+    ahcal_hits = np.concatenate(ahcal_hits)
+    nb_muspec_tracks = np.concatenate(nb_muspec_tracks)
+    muspec_q = np.concatenate(muspec_q)
+    muspec_px = np.concatenate(muspec_px)
+    muspec_py = np.concatenate(muspec_py)
+    muspec_pz = np.concatenate(muspec_pz)
+    muspec_chi2 = np.concatenate(muspec_chi2)
+    in_neutrino_energy = np.concatenate(in_neutrino_energy)
+    out_lepton_energy = np.concatenate(out_lepton_energy)
+    is_cc = np.concatenate(is_cc)
+    module_hits = np.concatenate(module_hits)
+    event_hits = np.concatenate(event_hits)
 
-# -------------------------
-# Assemble metadata
-# -------------------------
-metadata = {}
+    print("Done with concat")
 
-# q robust standardization (Counter-based)
-add_robust_standardization_metadata(q_counter, metadata, key_prefix="q")
+    # -------------------------
+    # Compute vector/jet stats (UNCHANGED OUTPUT SHAPE/KEYS)
+    # -------------------------
+    stats = compute_all_stats(
+        p_vis_true=vis_sp_momentum,
+        p_jet_true=jet_momentum,
+        p_lep_true=out_lepton_momentum,
+        is_cc=is_cc,
+        use_robust=True,
+        residual_floor_pct=5.0,
+    )
 
-# Robust metadata for base_keys (array-based)
-base_keys = [
-    'in_neutrino_energy', 'out_lepton_energy',
-    'ecal_hits', 'ahcal_hits',
-    'nb_muspec_tracks', 'muspec_q', 'muspec_px', 'muspec_py', 'muspec_pz', 'muspec_chi2',
-    'module_hits', 'event_hits',
-]
+    # -------------------------
+    # Assemble metadata
+    # -------------------------
+    metadata = {}
 
-for key in base_keys:
-    arr = locals()[key]
-    add_robust_standardization_metadata_array(arr, metadata, key_prefix=key)
+    # q robust standardization (Counter-based)
+    add_robust_standardization_metadata(q_counter, metadata, key_prefix="q")
 
-# include coordinate and pdg info
-metadata.update({
-    'x': x, 'y': y, 'z': z,
-    'ghost_pdg': set([-10000]),
-    'muonic_pdg': set([-13, 13]),
-    'electromagnetic_pdg': set([-11, 11, -15, 15, 22]),
-    'hadronic_pdg': set([p for p in pdg if p not in [-10000, -13, 13, -11, 11, -15, 15, 22]])
-})
+    # Robust metadata for base_keys (array-based)
+    base_keys = [
+        'in_neutrino_energy', 'out_lepton_energy',
+        'ecal_hits', 'ahcal_hits',
+        'nb_muspec_tracks', 'muspec_q', 'muspec_px', 'muspec_py', 'muspec_pz', 'muspec_chi2',
+        'module_hits', 'event_hits',
+    ]
 
-# merge vector/jet stats
-metadata = {**metadata, **stats}  # for Python < 3.9 compatibility
+    for key in base_keys:
+        arr = locals()[key]
+        add_robust_standardization_metadata_array(arr, metadata, key_prefix=key)
 
-# save metadata
-with open("/scratch/salonso/sparse-nns/faser/events_v7.0_500_npz/metadata_stats.pkl", "wb") as fd:
-    pk.dump(metadata, fd)
+    # include coordinate and pdg info
+    metadata.update({
+        'x': x, 'y': y, 'z': z,
+        'ghost_pdg': set([-10000]),
+        'muonic_pdg': set([-13, 13]),
+        'electromagnetic_pdg': set([-11, 11, -15, 15, 22]),
+        'hadronic_pdg': set([p for p in pdg if p not in [-10000, -13, 13, -11, 11, -15, 15, 22]])
+    })
 
-print("Metadata saved.")
+    # merge vector/jet stats
+    metadata = {**metadata, **stats}  # for Python < 3.9 compatibility
+
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(args.out, "wb") as fd:
+        pk.dump(metadata, fd)
+
+    print(f"Metadata saved to {args.out}")
+
+
+if __name__ == "__main__":
+    main()

@@ -483,18 +483,29 @@ def _drop_ahcal_hits(ahcal_hits, max_drop, min_hits=2):
 def ecal_additive_noise_and_dropout(ecal_hits, a=0.02, b=0.10, max_drop=0.10, clamp_min=0.0):
     """
     sqrt-law additive noise + random dead cells.
-    Works for any dense shape (5x5, 25, etc).
+    Works for dense shape (5x5, 25, etc) or sparse shape (N, 4).
     """
     ec = np.asarray(ecal_hits, dtype=np.float32).copy()
     if ec.size == 0:
         return ec
 
-    # sqrt-law noise
+    # Sparse format: (N, 4) where column 3 is energy
+    if ec.ndim == 2 and ec.shape[1] == 4:
+        energy = ec[:, 3]
+        sigma = np.sqrt(a*a + b*b * np.clip(energy, 0, None))
+        energy = energy + np.random.randn(len(energy)).astype(np.float32) * sigma
+        ec[:, 3] = np.maximum(energy, clamp_min)
+        # dead cells (drop rows)
+        p = np.random.rand() * max_drop
+        mask = (np.random.rand(len(ec)) > p)
+        if mask.sum() >= 1:
+            ec = ec[mask]
+        return ec
+
+    # Dense format (5x5, 25, etc)
     sigma = np.sqrt(a*a + b*b * np.clip(ec, 0, None))
     ec = ec + np.random.randn(*ec.shape).astype(np.float32) * sigma
     ec = np.maximum(ec, clamp_min)
-
-    # dead cells
     p = np.random.rand() * max_drop
     flat = ec.reshape(-1)
     mask = (np.random.rand(flat.size) > p)
@@ -611,8 +622,14 @@ def scale_all_by_global_shift_lognormal(
     if "ecal_hits" in out and out["ecal_hits"] is not None:
         ec = np.asarray(out["ecal_hits"], dtype=np.float32).copy()
         if ec.size > 0:
-            ec *= shift
-            ec = np.maximum(ec, 0.0)
+            if ec.ndim == 2 and ec.shape[1] == 4:
+                # sparse format: scale energy column only
+                ec[:, 3] *= shift
+                ec[:, 3] = np.maximum(ec[:, 3], 0.0)
+            else:
+                # dense format
+                ec *= shift
+                ec = np.maximum(ec, 0.0)
         out["ecal_hits"] = ec
 
     # scale AHCAL charge column
@@ -719,12 +736,19 @@ def module_multiplicative_jitter(global_feats, log_sigma=0.1):
 
     out = dict(global_feats)
 
-    # ECAL (dense 5x5)
+    # ECAL (dense 5x5 or sparse [N,4])
     if "ecal_hits" in out and out["ecal_hits"] is not None:
         ec = np.asarray(out["ecal_hits"], dtype=np.float32).copy()
         if ec.size > 0:
-            ec *= _lognormal(ec.shape, log_sigma)
-            ec = np.maximum(ec, 0.0)
+            if ec.ndim == 2 and ec.shape[1] == 4:
+                # sparse format: jitter energy column only
+                q = ec[:, 3]
+                q *= _lognormal(q.shape, log_sigma)
+                ec[:, 3] = np.maximum(q, 0.0)
+            else:
+                # dense format
+                ec *= _lognormal(ec.shape, log_sigma)
+                ec = np.maximum(ec, 0.0)
         out["ecal_hits"] = ec
 
     # AHCAL (sparse hits: [x,y,z,q])

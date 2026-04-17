@@ -106,6 +106,7 @@ def main():
         head_dropout_cls = args.head_dropout_cls,
         head_dropout_reg = args.head_dropout_reg,
         metadata = metadata,
+        sparse_ecal = args.sparse_ecal,
     )
 
     # Load pre-trained encoder weights (start fresh training)

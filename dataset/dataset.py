@@ -30,6 +30,7 @@ class SparseFASERCALDataset(Dataset):
         # Configuration from args
         self.train = args.train
         self.stage1 = args.stage1
+        self.sparse_ecal = args.sparse_ecal
         self.augmentations_enabled = False
         self.preprocessing_input = args.preprocessing_input
         self.preprocessing_output = args.preprocessing_output
@@ -541,7 +542,12 @@ class SparseFASERCALDataset(Dataset):
 
         ahcal_hits_coords = event['global_feats']['ahcal_hits'][:, :3]
         ahcal_hits_feats = self.preprocess(event['global_feats']['ahcal_hits'][:, 3] * 10, 'ahcal_hits', self.preprocessing_input)
-        ecal_hits = self.preprocess(event['global_feats']['ecal_hits'], 'ecal_hits', self.preprocessing_input)
+        if self.sparse_ecal:
+            ecal_hits_raw = event['global_feats']['ecal_hits']
+            ecal_hits_coords = ecal_hits_raw[:, :3]
+            ecal_hits_feats = self.preprocess(ecal_hits_raw[:, 3] * 10, 'ecal_hits', self.preprocessing_input)
+        else:
+            ecal_hits = self.preprocess(event['global_feats']['ecal_hits'], 'ecal_hits', self.preprocessing_input)
         nb_muspec_tracks = self.preprocess(event['global_feats']['nb_muspec_tracks'], 'nb_muspec_tracks')
         muspec_p = event['global_feats']['muspec_p']
         muspec_info = torch.cat([
@@ -571,7 +577,6 @@ class SparseFASERCALDataset(Dataset):
             'feats': feats.float(),
             'ahcal_hits_coords': torch.from_numpy(ahcal_hits_coords).float(),
             'ahcal_hits_feats': ahcal_hits_feats.float().reshape(-1, 1),
-            'ecal_hits': ecal_hits.float(),
             'nb_muspec_tracks': nb_muspec_tracks.float(),
             'muspec_info': muspec_info.float(),
             'flavour_label': torch.from_numpy(event['flavour_label']),
@@ -582,6 +587,11 @@ class SparseFASERCALDataset(Dataset):
             'is_cc': torch.tensor(event['is_cc']).reshape(1,).float(),
             'primary_vertex': torch.from_numpy(primary_vertex_standardised).float(),
         }
+        if self.sparse_ecal:
+            output['ecal_hits_coords'] = torch.from_numpy(ecal_hits_coords).float()
+            output['ecal_hits_feats'] = ecal_hits_feats.float().reshape(-1, 1)
+        else:
+            output['ecal_hits'] = ecal_hits.float()
         if self.stage1:
             output.update({
                 'csr_hie_indptr': torch.from_numpy(event['csr_hie'][0]).long(),

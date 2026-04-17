@@ -32,6 +32,7 @@ def ini_argparse(
     parser.add_argument("--preprocessing_output", type=str, default=None, help="output data preprocessing (log or sqrt)")
     parser.add_argument("--augmentations_enabled", action="store_true", default=True, help="set to allow augmentations")
     parser.add_argument("--augmentations_disabled", action="store_false", dest="augmentations_enabled", help="set to disable augmentations")
+    parser.add_argument("--sparse_ecal", action="store_true", default=False, help="use sparse ECAL format (18x18x40 like AHCAL) instead of dense 5x5")
     parser.add_argument("--label_smoothing", type=float, default=0.0, help="label smoothing factor")
     parser.add_argument("--mixup_alpha", type=float, default=0.0, help="mixup alpha")
     parser.add_argument("-d", "--dataset_path", type=str, default=None, help="Dataset path")

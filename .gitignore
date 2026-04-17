@@ -52,6 +52,9 @@ checkpoint*/
 *.parquet
 dataset/faser/
 dataset/output*.txt
+dataset/setup*
+dataset/read_root_v8.py
+dataset/faser_io.py
 *.txt
 *.tex
 
@@ -129,3 +132,6 @@ transfer_learning/transfer_scintillator/logs_scintillator/
 transfer_learning/transfer_scintillator/checkpoints_scintillator/
 transfer_learning/transfer_scintillator/results/
 transfer_learning/transfer_scintillator/plots/
+
+# Codex
+.codex

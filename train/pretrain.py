@@ -111,6 +111,7 @@ def main():
         drop_rate_dec = args.dropout_dec,
         attn_drop_rate_dec = args.attn_dropout_dec,
         metadata = metadata,
+        sparse_ecal = args.sparse_ecal,
     )
     #print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
