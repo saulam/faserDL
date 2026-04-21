@@ -681,7 +681,7 @@ def main():
     module_hits = []
     event_hits = []
 
-    t = tqdm(enumerate(loader), total=len(loader), disable=False)
+    t = tqdm(enumerate(loader), total=len(loader), disable=False, ascii=True)
     for _, batch in t:
         pdg.append(batch["pdg"])
         x.append(batch["x"])
@@ -779,7 +779,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
 
     with open(args.out, "wb") as fd:
-        pk.dump(metadata, fd)
+        pk.dump(metadata, fd, protocol=4)
 
     print(f"Metadata saved to {args.out}")
 

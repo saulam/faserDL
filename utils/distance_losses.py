@@ -48,6 +48,9 @@ def _safe_ghost_mask_lookup(
     ghost_mask = ghost_mask.to(device=device)
     out = torch.zeros_like(idx_targets, dtype=torch.bool, device=device)
     valid = idx_targets >= 0
+    if ghost_mask.numel() == 0:
+        return out
+    valid = valid & (idx_targets < ghost_mask.numel())
     if valid.any():
         out[valid] = ghost_mask[idx_targets[valid]].to(dtype=torch.bool)
     return out

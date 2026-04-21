@@ -245,6 +245,27 @@ class MAEPreTrainer(pl.LightningModule):
         tok_row, sub_idx = torch.nonzero(valid, as_tuple=True)   # where a voxel is present
         raw_idx = idx_targets[tok_row, sub_idx]                  # [N_valid] indices into hit arrays
         return raw_idx, tok_row, sub_idx
+
+
+    def sanitize_idx_targets(self, idx_targets: torch.Tensor, n_rows: int) -> torch.Tensor:
+        """
+        Convert any out-of-range raw-hit indices into -1 so downstream losses
+        treat them as empty voxels instead of indexing past the available labels.
+        """
+        if idx_targets.numel() == 0:
+            return idx_targets
+
+        n_rows = int(n_rows)
+        if n_rows <= 0:
+            return torch.full_like(idx_targets, -1)
+
+        invalid = idx_targets >= n_rows
+        if not invalid.any():
+            return idx_targets
+
+        idx_targets = idx_targets.clone()
+        idx_targets[invalid] = -1
+        return idx_targets
     
 
     def metric_losses_masked_simple(
@@ -302,6 +323,15 @@ class MAEPreTrainer(pl.LightningModule):
             }
             return zero, zero, zero, part_losses
 
+        idx_targets = self.sanitize_idx_targets(idx_targets, ghost_mask.shape[0])
+        if not (idx_targets >= 0).any():
+            zero = torch.tensor(0.0, device=pred_gho.device)
+            part_losses = {
+                "gho/total": zero.detach(),
+                "hie/total": zero.detach(),
+                "pid/total": zero.detach(),
+            }
+            return zero, zero, zero, part_losses
         raw_idx, tok_row, sub_idx = self.mask_and_align_voxels(idx_targets)
 
         # Gather ghost predictions and labels (standard BCE)
@@ -384,6 +414,21 @@ class MAEPreTrainer(pl.LightningModule):
                 part_losses_dec = {f"{name_prefix}{k}": v for k, v in part_losses_dec.items()}
             return zero, zero, part_losses_dec
 
+        n_rows = min(int(hit_event_id.shape[0]), int(ghost_mask.shape[0]))
+        idx_targets = self.sanitize_idx_targets(idx_targets, n_rows)
+        if not (idx_targets >= 0).any():
+            zero = torch.tensor(0.0, device=pred_occ.device)
+            part_losses_dec = {
+                "occ/total": zero.detach(),
+                "occ/pos": zero.detach(),
+                "occ/neg": zero.detach(),
+                "reg/total": zero.detach(),
+                "reg/pos": zero.detach(),
+                "reg/neg": zero.detach(),
+            }
+            if name_prefix:
+                part_losses_dec = {f"{name_prefix}{k}": v for k, v in part_losses_dec.items()}
+            return zero, zero, part_losses_dec
         p_h, p_w, p_d = patch_shape
         
         # Use provided max_distance or fall back to FASERCal default
