@@ -24,6 +24,7 @@ import pickle as pk
 # -------------------------
 
 MADN_CONST = 1.482602218505602  # normalizing constant so MADN ~= std for Gaussian
+TRUE_HIT_COLUMNS = 13
 
 def _mad(x, axis=None):
     med = np.median(x, axis=axis, keepdims=True)
@@ -201,16 +202,31 @@ def compute_robust_params_for_array(arr: np.ndarray, transform: str, eps: float 
     q_med = float(np.median(arr))
     k = max(float(_madn(arr)), eps)
 
-    # Transformed values
-    u = f(arr / k)
-
-    mu = float(np.median(u))
-    sigma = max(float(_madn(u)), eps)
-
     q_min = float(np.min(arr))
     q_max = float(np.max(arr))
-    u_min = float(f(q_min / k))
-    u_max = float(f(q_max / k))
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        u = f(arr / k)
+
+    finite = np.isfinite(u)
+    if not finite.any():
+        return {
+            "transform": transform,
+            "k": float(k),
+            "mu": 0.0,
+            "sigma": 1.0,
+            "orig_median": float(q_med),
+            "orig_min": float(q_min),
+            "orig_max": float(q_max),
+            "u_median": 0.0,
+            "u_min": 0.0,
+            "u_max": 0.0,
+        }
+
+    u = u[finite]
+    mu = float(np.median(u))
+    sigma = max(float(_madn(u)), eps)
+    u_min = float(np.min(u))
+    u_max = float(np.max(u))
 
     return {
         "transform": transform,
@@ -492,6 +508,10 @@ class SparseFASERCALDataset(Dataset):
 
         is_cc = data['is_cc'].item()
         true_hits = data['true_hits']
+        if np.asarray(true_hits).ndim == 0:
+            true_hits = np.empty((0, TRUE_HIT_COLUMNS), dtype=np.float32)
+        else:
+            true_hits = np.asarray(true_hits, dtype=np.float32)
         reco_hits = data['reco_hits']
         true_index = data['true_index']
         vis_sp_momentum = data['vis_sp_momentum']
@@ -503,10 +523,7 @@ class SparseFASERCALDataset(Dataset):
         tau_vis_momentum = data['tau_vis_momentum']
         muspec_info = data['muspec_info']
 
-        try:
-            pdg = np.unique(true_hits[true_index][:, 3])
-        except:
-            assert False, idx
+        pdg = np.unique(true_hits[true_index][:, 3])
             
         x = np.unique(data['reco_hits'][:, 0])
         y = np.unique(data['reco_hits'][:, 1])
@@ -543,10 +560,6 @@ class SparseFASERCALDataset(Dataset):
         in_neutrino_energy = np.array([in_neutrino_energy])
         out_lepton_energy = np.array([out_lepton_energy])
         is_cc = np.array([is_cc], dtype=np.bool_)
-
-        if x.shape[0] == 0:
-            print(idx)
-            assert False
 
         return {"pdg": pdg, "x": x, "y": y, "z": z, "q": q, 
                 "vis_sp_momentum": vis_sp_momentum,

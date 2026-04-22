@@ -53,10 +53,21 @@ relational_pass_prob="${RELATIONAL_PASS_PROB:-0.5}"
 relational_mask_ratio="${RELATIONAL_MASK_RATIO:-0.25}"
 relational_voxel_keep_prob="${RELATIONAL_VOXEL_KEEP_PROB:-0.5}"
 relational_pass_seed="${RELATIONAL_PASS_SEED:-42}"
+sparse_ecal="${SPARSE_ECAL:-auto}"
+
+sparse_ecal_flag=""
+if [[ "$sparse_ecal" == "1" || "$sparse_ecal" == "true" || "$sparse_ecal" == "TRUE" ]]; then
+    sparse_ecal_flag="--sparse_ecal"
+elif [[ "$sparse_ecal" == "auto" ]]; then
+    case "$DATASET_PATH" in
+        *events_v8.*) sparse_ecal_flag="--sparse_ecal" ;;
+    esac
+fi
 
 python -m train.pretrain \
     --train \
     --stage1 \
+    ${sparse_ecal_flag:+$sparse_ecal_flag} \
     --augmentations_enabled \
     --dataset_path "$DATASET_PATH" \
     --metadata_path "$METADATA_PATH" \

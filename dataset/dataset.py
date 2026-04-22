@@ -18,6 +18,8 @@ from torch.utils.data import Dataset, IterableDataset
 from utils.augmentations import augment, smooth_labels
 from utils.pdg import cluster_labels_from_pdgs
 
+TRUE_HIT_COLUMNS = 13
+
 
 class SparseFASERCALDataset(Dataset):
     """
@@ -416,7 +418,11 @@ class SparseFASERCALDataset(Dataset):
         """
         run_number = data['run_number'].item()
         event_id = data['event_id'].item()
-        true_hits = data['true_hits']                   # [T]
+        true_hits = data['true_hits']
+        if np.asarray(true_hits).ndim == 0:
+            true_hits = np.empty((0, TRUE_HIT_COLUMNS), dtype=np.float32)
+        else:
+            true_hits = np.asarray(true_hits, dtype=np.float32)
         true_pdg = true_hits[:, 3]                      # [T]
         true_primary = true_hits[:, 9]                  # [T]
         true_secondary = true_hits[:, 10]               # [T]
