@@ -507,11 +507,6 @@ class SparseFASERCALDataset(Dataset):
         data = np.load(self.data_files[idx], allow_pickle=True)
 
         is_cc = data['is_cc'].item()
-        true_hits = data['true_hits']
-        if np.asarray(true_hits).ndim == 0:
-            true_hits = np.empty((0, TRUE_HIT_COLUMNS), dtype=np.float32)
-        else:
-            true_hits = np.asarray(true_hits, dtype=np.float32)
         reco_hits = data['reco_hits']
         true_index = data['true_index']
         vis_sp_momentum = data['vis_sp_momentum']
@@ -523,7 +518,15 @@ class SparseFASERCALDataset(Dataset):
         tau_vis_momentum = data['tau_vis_momentum']
         muspec_info = data['muspec_info']
 
-        pdg = np.unique(true_hits[true_index][:, 3])
+        if true_index.size > 0:
+            true_hits = data['true_hits']
+            if np.asarray(true_hits).ndim == 0:
+                true_hits = np.empty((0, TRUE_HIT_COLUMNS), dtype=np.float32)
+            else:
+                true_hits = np.asarray(true_hits, dtype=np.float32)
+            pdg = np.unique(true_hits[true_index][:, 3])
+        else:
+            pdg = np.empty((0,), dtype=np.float32)
             
         x = np.unique(data['reco_hits'][:, 0])
         y = np.unique(data['reco_hits'][:, 1])

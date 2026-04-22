@@ -418,16 +418,6 @@ class SparseFASERCALDataset(Dataset):
         """
         run_number = data['run_number'].item()
         event_id = data['event_id'].item()
-        true_hits = data['true_hits']
-        if np.asarray(true_hits).ndim == 0:
-            true_hits = np.empty((0, TRUE_HIT_COLUMNS), dtype=np.float32)
-        else:
-            true_hits = np.asarray(true_hits, dtype=np.float32)
-        true_pdg = true_hits[:, 3]                      # [T]
-        true_primary = true_hits[:, 9]                  # [T]
-        true_secondary = true_hits[:, 10]               # [T]
-        true_tau_decay = true_hits[:, 11]               # [T]
-        true_charm_decay = true_hits[:, 12]             # [T]
         reco_hits = data['reco_hits']                   # [N]
         indptr = data['indptr']                         # [N+1] CSR row pointers for reco->true contributions
         true_index = data['true_index']                 # [E] concatenated true-hit indices for each reco hit
@@ -455,6 +445,23 @@ class SparseFASERCALDataset(Dataset):
             'muspec_p':         muspec_tracks[:, 1:4],
             'muspec_chi2':      muspec_tracks[:, 4],
         }
+
+        true_pdg = np.empty((0,), dtype=np.float32)
+        true_primary = np.empty((0,), dtype=np.float32)
+        true_secondary = np.empty((0,), dtype=np.float32)
+        true_tau_decay = np.empty((0,), dtype=np.float32)
+        true_charm_decay = np.empty((0,), dtype=np.float32)
+        if self.stage1 and true_index.size > 0:
+            true_hits = data['true_hits']
+            if np.asarray(true_hits).ndim == 0:
+                true_hits = np.empty((0, TRUE_HIT_COLUMNS), dtype=np.float32)
+            else:
+                true_hits = np.asarray(true_hits, dtype=np.float32)
+            true_pdg = true_hits[:, 3]                      # [T]
+            true_primary = true_hits[:, 9]                  # [T]
+            true_secondary = true_hits[:, 10]               # [T]
+            true_tau_decay = true_hits[:, 11]               # [T]
+            true_charm_decay = true_hits[:, 12]             # [T]
 
         if is_tau:
             assert in_neutrino_pdg in [-16, 16], "Tau events must have PDG ID of ±16"
