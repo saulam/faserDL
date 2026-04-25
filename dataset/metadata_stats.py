@@ -257,8 +257,44 @@ def add_robust_standardization_metadata_array(arr: np.ndarray, metadata: dict, k
     metadata[f"{key_prefix}_slog1p"]  = compute_robust_params_for_array(arr, "slog1p")
     return metadata
 
+def compute_zscore_params_for_array(arr: np.ndarray, eps: float = 1e-8):
+    """
+    Per-column z-score parameters for vector-valued quantities such as the
+    primary vertex. Downstream code standardizes with (x - mean) / std and
+    reverses with x * std + mean.
+    """
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a 2D array, got shape {arr.shape}")
+
+    dim = arr.shape[1]
+    finite_rows = np.all(np.isfinite(arr), axis=1)
+    arr = arr[finite_rows]
+    if arr.shape[0] == 0:
+        return {
+            "transform": "zscore",
+            "mean": np.zeros(dim, dtype=np.float32),
+            "std": np.ones(dim, dtype=np.float32),
+            "min": np.zeros(dim, dtype=np.float32),
+            "max": np.zeros(dim, dtype=np.float32),
+            "count": 0,
+        }
+
+    mean = np.mean(arr, axis=0)
+    std = np.maximum(np.std(arr, axis=0), eps)
+    return {
+        "transform": "zscore",
+        "mean": mean.astype(np.float32),
+        "std": std.astype(np.float32),
+        "min": np.min(arr, axis=0).astype(np.float32),
+        "max": np.max(arr, axis=0).astype(np.float32),
+        "count": int(arr.shape[0]),
+    }
+
 # -------------------------
-# Dataset (unchanged behavior)
+# Dataset & Loader
 # -------------------------
 
 def _select_cc_leptons(p_lep_true: np.ndarray, is_cc=None, eps=1e-12):
@@ -517,6 +553,7 @@ class SparseFASERCALDataset(Dataset):
         jet_momentum = data['jet_momentum']
         tau_vis_momentum = data['tau_vis_momentum']
         muspec_info = data['muspec_info']
+        primary_vertex = np.asarray(data['primary_vertex'], dtype=np.float32).reshape(1, 3)
 
         if true_index.size > 0:
             true_hits = data['true_hits']
@@ -578,6 +615,7 @@ class SparseFASERCALDataset(Dataset):
                 "muspec_chi2": muspec_chi2,
                 "in_neutrino_energy": in_neutrino_energy,
                 "out_lepton_energy": out_lepton_energy,
+                "primary_vertex": primary_vertex,
                 "is_cc": is_cc,
                 "module_hits": module_hits,
                 "event_hits": event_hits,
@@ -602,6 +640,7 @@ def collate(batch):
     muspec_chi2 = np.concatenate([x['muspec_chi2'] for x in batch])
     in_neutrino_energy = np.concatenate([x['in_neutrino_energy'] for x in batch])
     out_lepton_energy = np.concatenate([x['out_lepton_energy'] for x in batch])
+    primary_vertex = np.concatenate([x['primary_vertex'] for x in batch])
     is_cc = np.concatenate([x['is_cc'] for x in batch])
     module_hits = np.concatenate([x['module_hits'] for x in batch])
     event_hits = np.concatenate([x['event_hits'] for x in batch])
@@ -620,6 +659,7 @@ def collate(batch):
             "muspec_chi2": muspec_chi2,
             "in_neutrino_energy": in_neutrino_energy,
             "out_lepton_energy": out_lepton_energy,
+            "primary_vertex": primary_vertex,
             "is_cc": is_cc,
             "module_hits": module_hits,
             "event_hits": event_hits,
@@ -693,6 +733,7 @@ def main():
     muspec_chi2 = []
     in_neutrino_energy = []
     out_lepton_energy = []
+    primary_vertex = []
     is_cc = []
     module_hits = []
     event_hits = []
@@ -717,6 +758,7 @@ def main():
         muspec_chi2.append(batch["muspec_chi2"])
         in_neutrino_energy.append(batch["in_neutrino_energy"])
         out_lepton_energy.append(batch["out_lepton_energy"])
+        primary_vertex.append(batch["primary_vertex"])
         is_cc.append(batch["is_cc"])
         module_hits.append(batch["module_hits"])
         event_hits.append(batch["event_hits"])
@@ -740,6 +782,7 @@ def main():
     muspec_chi2 = np.concatenate(muspec_chi2)
     in_neutrino_energy = np.concatenate(in_neutrino_energy)
     out_lepton_energy = np.concatenate(out_lepton_energy)
+    primary_vertex = np.concatenate(primary_vertex)
     is_cc = np.concatenate(is_cc)
     module_hits = np.concatenate(module_hits)
     event_hits = np.concatenate(event_hits)
@@ -777,6 +820,8 @@ def main():
     for key in base_keys:
         arr = locals()[key]
         add_robust_standardization_metadata_array(arr, metadata, key_prefix=key)
+
+    metadata["primary_vertex"] = compute_zscore_params_for_array(primary_vertex)
 
     # include coordinate and pdg info
     metadata.update({

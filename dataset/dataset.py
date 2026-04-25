@@ -85,7 +85,7 @@ class SparseFASERCALDataset(Dataset):
     
     def standardize_vertex(self, vertex, reverse=False):
         """
-        Standardises or unstandardizes primary vertex coordinates using z-score normalization.
+        Standardises or unstandardizes primary vertex coordinates using metadata z-score parameters.
         
         Args:
             vertex: array-like of shape (..., 3) with (x, y, z) coordinates
@@ -94,12 +94,21 @@ class SparseFASERCALDataset(Dataset):
         Returns:
             Standardized/unstandardized vertex coordinates
         """
-        # Statistics from training data
-        mean = np.array([174.26, 109.02, -66.38], dtype=np.float32)
-        std = np.array([135.14, 125.34, 652.16], dtype=np.float32)
+        try:
+            stats = self.metadata["primary_vertex"]
+        except KeyError as exc:
+            raise KeyError(
+                "metadata['primary_vertex'] is missing. Regenerate metadata with "
+                "`python -m dataset.metadata_stats` before training or evaluation."
+            ) from exc
+
+        mean = np.asarray(stats["mean"], dtype=np.float32)
+        std = np.asarray(stats["std"], dtype=np.float32)
         
         if not isinstance(vertex, np.ndarray):
             vertex = np.array(vertex, dtype=np.float32)
+        else:
+            vertex = vertex.astype(np.float32, copy=False)
         
         if reverse:
             return vertex * std + mean
