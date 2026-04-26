@@ -82,6 +82,19 @@ class SparseFASERCALDataset(Dataset):
             
         return mapped
 
+
+    def _as_float32_numpy(self, x):
+        """Convert tensors, object arrays, and nested sequences to a float32 ndarray."""
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy().astype(np.float32, copy=False)
+        if isinstance(x, np.ndarray) and x.dtype != object:
+            return x.astype(np.float32, copy=False)
+        if isinstance(x, np.ndarray):
+            x = x.tolist()
+        if isinstance(x, (list, tuple)):
+            return np.stack([self._as_float32_numpy(v) for v in x]).astype(np.float32, copy=False)
+        return np.asarray(x, dtype=np.float32)
+
     
     def standardize_vertex(self, vertex, reverse=False):
         """
@@ -104,11 +117,7 @@ class SparseFASERCALDataset(Dataset):
 
         mean = np.asarray(stats["mean"], dtype=np.float32)
         std = np.asarray(stats["std"], dtype=np.float32)
-        
-        if not isinstance(vertex, np.ndarray):
-            vertex = np.array(vertex, dtype=np.float32)
-        else:
-            vertex = vertex.astype(np.float32, copy=False)
+        vertex = self._as_float32_numpy(vertex)
         
         if reverse:
             return vertex * std + mean
