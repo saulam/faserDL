@@ -175,7 +175,7 @@ class SparseFASERCALDataset(Dataset):
     def decompose_momentum(self, momentum):
         """Splits 3D momentum vectors into magnitude and direction."""
         if not isinstance(momentum, torch.Tensor):
-            momentum = torch.as_tensor(momentum)
+            momentum = torch.as_tensor(self._as_float32_numpy(momentum))
         momentum = torch.atleast_2d(momentum)
         magnitudes = torch.linalg.norm(momentum, dim=1, keepdim=True)
         directions = torch.where(magnitudes != 0, momentum / magnitudes, torch.zeros_like(momentum))
@@ -188,9 +188,9 @@ class SparseFASERCALDataset(Dataset):
     def reconstruct_momentum(self, magnitude, direction):
         """Given magnitude and direction, reconstruct the original momentum vector."""
         if not isinstance(magnitude, torch.Tensor):
-            magnitude = torch.as_tensor(magnitude)
+            magnitude = torch.as_tensor(self._as_float32_numpy(magnitude))
         if not isinstance(direction, torch.Tensor):
-            direction = torch.as_tensor(direction)
+            direction = torch.as_tensor(self._as_float32_numpy(direction))
         direction = torch.atleast_2d(direction)
         if magnitude.ndim == 0:
             magnitude = torch.atleast_1d(magnitude)

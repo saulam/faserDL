@@ -1,0 +1,60 @@
+data:
+  globs:
+    - /scratch/salonso/sparse-nns/faser/events_v8.0_100*_2d
+  input_mode: xz_yz
+  expected_xy_views: 10
+  require_empty_xy_tail: true
+  remove_primary_origin_pixel: true
+  patch_size: 12
+  split_seed: 7
+  split_fractions: [0.85, 0.05, 0.10]
+  manifests_dir: metadata/v8_2d/manifests
+  metadata_path: metadata/v8_2d/metadata.json
+  normalization_clip: 12.0
+  num_workers: 16
+  pin_memory: true
+  invalid_policy: skip
+  load_retries: 2
+  retry_delay: 0.1
+  augmentation:
+    gain_log_sigma: 0.10
+
+model:
+  embed_dim: 384
+  patch_encoder_channels: 16
+  depth: 20
+  num_heads: 12
+  mlp_ratio: 4.0
+  position_bands: 16
+  dropout: 0.0
+  attention_dropout: 0.0
+  drop_path_rate: 0.20
+  head_dropout_cls: 0.0
+  head_dropout_reg: 0.0
+  head_init: 2.0e-5
+  attention_backend: flash
+
+training:
+  device: cuda
+  precision: bf16
+  batch_size: 64
+  accumulation_steps: 16
+  epochs: 40
+  warmup_epochs: 5
+  base_learning_rate: 1.0e-4
+  min_lr_ratio: 0.01
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
+  label_smoothing: 0.02
+  kendall_weight_min: 0.01
+  kendall_weight_max: 5.0
+  ema_decay: 0.9999
+  gradient_clip: 1.0
+  early_stopping_patience: 10
+  resume: null
+
+experiment:
+  name: override_me
+  seed: 42
+  output_dir: artifacts

@@ -61,6 +61,8 @@ dataset/faser_io.py
 # VS Code
 .vscode/
 .vscode*
+.agents/
+.agents*
 
 # Testing and temporary files
 *test*.py

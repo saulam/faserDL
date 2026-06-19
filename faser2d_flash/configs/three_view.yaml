@@ -1,0 +1,7 @@
+extends: common.yaml
+
+data:
+  input_mode: xz_yz_xy
+
+experiment:
+  name: xz_yz_xy

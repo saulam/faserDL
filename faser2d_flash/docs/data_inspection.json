@@ -1,0 +1,600 @@
+{
+  "source_globs": [
+    "/scratch4/salonso/faser/events_v8.0_100*_2d"
+  ],
+  "available_files": 1330269,
+  "sampled_files": 1500,
+  "valid_files": 1500,
+  "invalid_files": [],
+  "required_keys": [
+    "charm_decay",
+    "event_id",
+    "in_neutrino_pdg",
+    "is_cc",
+    "is_charmed",
+    "is_tau",
+    "jet_momentum",
+    "out_lepton_momentum",
+    "primary_vertex",
+    "run_number",
+    "tau_decay_mode",
+    "tau_vis_momentum",
+    "vis_sp_momentum",
+    "xy_projs",
+    "xz_proj",
+    "yz_proj"
+  ],
+  "observed_key_sets": 1,
+  "example_format": {
+    "run_number": {
+      "shape": [],
+      "dtype": "int64"
+    },
+    "event_id": {
+      "shape": [],
+      "dtype": "int64"
+    },
+    "is_cc": {
+      "shape": [],
+      "dtype": "bool"
+    },
+    "is_es": {
+      "shape": [],
+      "dtype": "bool"
+    },
+    "is_tau": {
+      "shape": [],
+      "dtype": "bool"
+    },
+    "is_charmed": {
+      "shape": [],
+      "dtype": "bool"
+    },
+    "po": {
+      "shape": [
+        18
+      ],
+      "dtype": "[('g4_id', '<i4'), ('track_id', '<i4'), ('parent_id', '<i4'), ('pdg', '<i4')]"
+    },
+    "tau_decay": {
+      "shape": [
+        0
+      ],
+      "dtype": "[('g4_id', '<i4'), ('track_id', '<i4'), ('parent_id', '<i4'), ('pdg', '<i4')]"
+    },
+    "charm_decay": {
+      "shape": [
+        0
+      ],
+      "dtype": "[('g4_id', '<i4'), ('track_id', '<i4'), ('parent_id', '<i4'), ('pdg', '<i4')]"
+    },
+    "e_vis": {
+      "shape": [],
+      "dtype": "float64"
+    },
+    "sp_momentum": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "vis_sp_momentum": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "jet_momentum": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "pt_miss": {
+      "shape": [],
+      "dtype": "float64"
+    },
+    "primary_vertex": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "xz_proj": {
+      "shape": [
+        1287,
+        3
+      ],
+      "dtype": "float64"
+    },
+    "yz_proj": {
+      "shape": [
+        1396,
+        3
+      ],
+      "dtype": "float64"
+    },
+    "xy_projs": {
+      "shape": [
+        50
+      ],
+      "dtype": "object",
+      "layer_shapes": [
+        [
+          71,
+          3
+        ],
+        [
+          285,
+          3
+        ],
+        [
+          296,
+          3
+        ],
+        [
+          253,
+          3
+        ],
+        [
+          167,
+          3
+        ],
+        [
+          82,
+          3
+        ],
+        [
+          12,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          16,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ]
+      ],
+      "layer_dtypes": [
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64",
+        "float64"
+      ]
+    },
+    "in_neutrino_pdg": {
+      "shape": [],
+      "dtype": "int64"
+    },
+    "in_neutrino_momentum": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "in_neutrino_energy": {
+      "shape": [],
+      "dtype": "float64"
+    },
+    "out_lepton_pdg": {
+      "shape": [],
+      "dtype": "int64"
+    },
+    "out_lepton_momentum": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "out_lepton_energy": {
+      "shape": [],
+      "dtype": "float64"
+    },
+    "tau_vis_momentum": {
+      "shape": [
+        3
+      ],
+      "dtype": "float64"
+    },
+    "tau_decay_mode": {
+      "shape": [],
+      "dtype": "int64"
+    },
+    "tau_decay_length": {
+      "shape": [],
+      "dtype": "float64"
+    },
+    "tau_kink_angle": {
+      "shape": [],
+      "dtype": "float64"
+    }
+  },
+  "coordinate_ranges": {
+    "xz": {
+      "min": [
+        0.0,
+        0.0
+      ],
+      "max": [
+        47.0,
+        235.0
+      ]
+    },
+    "yz": {
+      "min": [
+        0.0,
+        0.0
+      ],
+      "max": [
+        47.0,
+        235.0
+      ]
+    },
+    "xy": {
+      "min": [
+        0.0,
+        0.0
+      ],
+      "max": [
+        47.0,
+        47.0
+      ]
+    }
+  },
+  "value_ranges": {
+    "xz": {
+      "min": 2.376054908381775e-11,
+      "max": 3079.27978515625
+    },
+    "yz": {
+      "min": 4.888534022029489e-12,
+      "max": 3167.25146484375
+    },
+    "xy": {
+      "min": 4.888534022029489e-12,
+      "max": 23285.296875
+    }
+  },
+  "xy_array_lengths": {
+    "50": 1500
+  },
+  "xy_nonempty_index_counts": {
+    "0": 401,
+    "1": 556,
+    "2": 708,
+    "3": 855,
+    "4": 1016,
+    "5": 1161,
+    "6": 1313,
+    "7": 1403,
+    "8": 1462,
+    "9": 1464
+  },
+  "statistics": {
+    "pixels_two_view": {
+      "min": 37.0,
+      "p05": 387.85,
+      "median": 3909.0,
+      "mean": 4883.796,
+      "p95": 12655.1,
+      "p99": 14630.72,
+      "max": 16308.0
+    },
+    "pixels_three_view": {
+      "min": 49.0,
+      "p05": 557.65,
+      "median": 5934.5,
+      "mean": 8213.645333333334,
+      "p95": 23141.74999999999,
+      "p99": 28213.08,
+      "max": 32543.0
+    },
+    "patches_two_view": {
+      "min": 6.0,
+      "p05": 46.0,
+      "median": 161.0,
+      "mean": 165.66466666666668,
+      "p95": 296.04999999999995,
+      "p99": 314.0,
+      "max": 320.0
+    },
+    "patches_three_view": {
+      "min": 8.0,
+      "p05": 62.0,
+      "median": 234.0,
+      "mean": 242.34333333333333,
+      "p95": 441.0,
+      "p99": 467.01,
+      "max": 479.0
+    },
+    "xy_nonempty_views": {
+      "min": 1.0,
+      "p05": 3.0,
+      "median": 7.0,
+      "mean": 6.892666666666667,
+      "p95": 10.0,
+      "p99": 10.0,
+      "max": 10.0
+    }
+  },
+  "nonfinite_numeric_fields": {
+    "tau_kink_angle": 1
+  },
+  "temporary_files_found": [],
+  "patch_size": 12,
+  "patch_encoding": {
+    "type": "learned_local_cnn",
+    "channels": [
+      "standardized_log1p_charge",
+      "occupancy"
+    ],
+    "xz_yz_patch_shape": [
+      12,
+      5
+    ],
+    "xy_patch_shape": [
+      12,
+      12
+    ],
+    "max_patch_pixels": 144,
+    "vector_size": 288
+  },
+  "projection_geometry": {
+    "transverse_size": 48,
+    "longitudinal_size": 236,
+    "num_modules": 10,
+    "module_active_depth": 20,
+    "module_gap": 4,
+    "module_pitch": 24
+  },
+  "primary_origin_policy": "removed from XZ, YZ, and XY0",
+  "primary_origin_artifact": {
+    "counts": {
+      "xz_proj": 1458,
+      "yz_proj": 1458,
+      "xy_0": 1458
+    },
+    "identical_in_xz_yz_xy0": 1446,
+    "charge_statistics": {
+      "xz_proj": {
+        "min": 2.21613800022169e-06,
+        "p05": 1.5371835529804232,
+        "median": 70.30889892578125,
+        "mean": 233.45646079785655,
+        "p95": 986.3130340576168,
+        "p99": 2074.470289306647,
+        "max": 4641.08154296875
+      },
+      "yz_proj": {
+        "min": 2.21613800022169e-06,
+        "p05": 1.5371835529804232,
+        "median": 70.30889892578125,
+        "mean": 233.45470245265946,
+        "p95": 986.3130340576168,
+        "p99": 2074.470289306647,
+        "max": 4641.08154296875
+      },
+      "xy_0": {
+        "min": 2.21613800022169e-06,
+        "p05": 1.5371835529804232,
+        "median": 70.30889892578125,
+        "mean": 233.46384750075254,
+        "p95": 986.3130340576168,
+        "p99": 2074.470289306647,
+        "max": 4641.08154296875
+      }
+    }
+  }
+}
