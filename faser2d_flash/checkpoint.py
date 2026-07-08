@@ -30,7 +30,14 @@ class ExponentialMovingAverage:
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self.decay = float(state["decay"])
-        self.shadow = state["shadow"]
+        loaded = state["shadow"]
+        self.shadow = {
+            name: value.to(
+                device=self.shadow[name].device,
+                dtype=self.shadow[name].dtype,
+            )
+            for name, value in loaded.items()
+        }
 
     def copy_to(self, model: nn.Module) -> None:
         state = model.state_dict()

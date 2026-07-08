@@ -13,6 +13,6 @@ fi
 
 cd "${REPO_DIR}"
 "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" \
-    python -m unittest faser2d_flash.tests.test_pipeline -v
+    python -m unittest discover -s faser2d_flash/tests -v
 "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" \
     python -m faser2d_flash.runtime

@@ -16,6 +16,7 @@ data:
   invalid_policy: skip
   load_retries: 2
   retry_delay: 0.1
+  repeat_factor: 1
   augmentation:
     gain_log_sigma: 0.10
 
@@ -37,8 +38,8 @@ model:
 training:
   device: cuda
   precision: bf16
-  batch_size: 64
-  accumulation_steps: 16
+  batch_size: 1024
+  accumulation_steps: 1
   epochs: 40
   warmup_epochs: 5
   base_learning_rate: 1.0e-4
@@ -52,7 +53,14 @@ training:
   ema_decay: 0.9999
   gradient_clip: 1.0
   early_stopping_patience: 10
+  enable_checkpointing: true
   resume: null
+
+distributed:
+  devices: 2
+  num_nodes: 1
+  gradient_as_bucket_view: true
+  static_graph: false
 
 experiment:
   name: override_me

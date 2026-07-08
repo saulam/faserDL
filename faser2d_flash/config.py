@@ -84,5 +84,16 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             f"Geometry-aware tokenization requires data.patch_size={TRANSVERSE_PATCH}"
         )
+    if int(config["data"].get("repeat_factor", 1)) <= 0:
+        raise ValueError("data.repeat_factor must be positive")
     if int(config["model"].get("patch_encoder_channels", 16)) <= 0:
         raise ValueError("model.patch_encoder_channels must be positive")
+    distributed = config.get("distributed", {})
+    devices = distributed.get("devices", 1)
+    if isinstance(devices, list):
+        if not devices:
+            raise ValueError("distributed.devices cannot be empty")
+    elif int(devices) <= 0:
+        raise ValueError("distributed.devices must be positive")
+    if int(distributed.get("num_nodes", 1)) <= 0:
+        raise ValueError("distributed.num_nodes must be positive")

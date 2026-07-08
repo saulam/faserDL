@@ -237,6 +237,14 @@ class ProjectionTransformer(nn.Module):
             + self.view_embedding(batch.view_ids)
             + self.kind_embedding(batch.token_kinds)
         )
+        encoder_dependency = x.new_zeros(())
+        for encoder in (
+            self.longitudinal_patch_embedding,
+            self.xy_patch_embedding,
+        ):
+            for parameter in encoder.parameters():
+                encoder_dependency = encoder_dependency + 0.0 * parameter.reshape(-1)[0]
+        x = x + encoder_dependency
         patch_mask = batch.token_kinds == 0
         longitudinal_indices = torch.nonzero(
             patch_mask & (batch.view_ids < 2), as_tuple=False

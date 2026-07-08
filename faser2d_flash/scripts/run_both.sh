@@ -7,23 +7,25 @@ PIPELINE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd -- "${PIPELINE_DIR}/.." && pwd)"
 ENV_NAME="${CONDA_ENV:-platon-flashattn}"
 CONDA_BIN="${CONDA_EXE:-$(command -v conda || true)}"
+GPU_IDS="${GPU_IDS:-0,1}"
+LIGHTNING_DEVICES="${LIGHTNING_DEVICES:-2}"
 if [[ -z "${CONDA_BIN}" ]]; then
     echo "ERROR: conda was not found. Activate ${ENV_NAME} or set CONDA_EXE." >&2
     exit 2
 fi
 PYTHON=("${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" python)
+export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/faser2d-matplotlib-${USER:-user}}"
+mkdir -p "${MPLCONFIGDIR}"
 
 cd "${REPO_DIR}"
 
-if [[ ! -f "${PIPELINE_DIR}/metadata/v8_2d/metadata.json" ]]; then
-    "${PYTHON[@]}" -m faser2d_flash.build_metadata \
-        --config "${PIPELINE_DIR}/configs/two_view.yaml" \
-        --workers "${METADATA_WORKERS:-16}"
-fi
-
-"${PYTHON[@]}" -m faser2d_flash.runtime --require-flash --precision bf16
-"${PYTHON[@]}" -m faser2d_flash.train --config "${PIPELINE_DIR}/configs/two_view.yaml"
-"${PYTHON[@]}" -m faser2d_flash.train --config "${PIPELINE_DIR}/configs/three_view.yaml"
+CONDA_EXE="${CONDA_BIN}" GPU_IDS="${GPU_IDS}" \
+    LIGHTNING_DEVICES="${LIGHTNING_DEVICES}" \
+    bash "${SCRIPT_DIR}/run_two_view.sh"
+CONDA_EXE="${CONDA_BIN}" GPU_IDS="${GPU_IDS}" \
+    LIGHTNING_DEVICES="${LIGHTNING_DEVICES}" \
+    bash "${SCRIPT_DIR}/run_three_view.sh"
 
 "${PYTHON[@]}" -m faser2d_flash.evaluate \
     --config "${PIPELINE_DIR}/configs/two_view.yaml" \

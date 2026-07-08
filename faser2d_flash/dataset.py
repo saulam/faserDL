@@ -70,9 +70,12 @@ class ProjectionDataset(Dataset):
         self.training = training
         self.seed = int(seed)
         self.epoch = 0
+        self.repeat_factor = int(self.config.get("repeat_factor", 1))
+        if self.repeat_factor <= 0:
+            raise ValueError("data.repeat_factor must be positive")
 
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.files) * self.repeat_factor
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -83,7 +86,7 @@ class ProjectionDataset(Dataset):
         return np.random.default_rng(seed)
 
     def __getitem__(self, index: int) -> dict[str, Any] | None:
-        path = self.files[index]
+        path = self.files[index % len(self.files)]
         try:
             event = load_event(
                 path,
@@ -179,8 +182,17 @@ class ProjectionBatch:
         )
 
 
-def collate_events(samples: list[dict[str, Any] | None]) -> ProjectionBatch:
+def collate_events(
+    samples: list[dict[str, Any] | None],
+    *,
+    require_all_valid: bool = False,
+) -> ProjectionBatch:
     valid = [sample for sample in samples if sample is not None]
+    if require_all_valid and len(valid) != len(samples):
+        raise RuntimeError(
+            "A validated DDP manifest produced an invalid sample. Rebuild metadata "
+            "or set data.invalid_policy=error to expose the source file."
+        )
     if not valid:
         raise RuntimeError("Every sample in this batch was invalid")
 

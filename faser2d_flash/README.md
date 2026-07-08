@@ -10,6 +10,11 @@ FlashAttention 2's variable-length packed kernel. There is no silent attention
 fallback. The explicitly configured `torch_sdpa` backend exists only for CPU
 tests and small diagnostics.
 
+Training uses PyTorch Lightning 2.4. Lightning owns DDP process launch,
+distributed sampling, gradient synchronization and accumulation, validation
+metric reduction, checkpointing, and full-state resume. The production
+configuration uses both visible GPUs.
+
 ## Existing pipeline correspondence
 
 The current fine-tuned model has five direct outputs:
@@ -135,25 +140,60 @@ faser2d_flash/metadata/v8_2d/
 Use `--max-files N` only for diagnostics. Metadata produced with that option
 is marked `diagnostic_subset: true` and must not be used for the final study.
 
-## Train
+The metadata command uses `two_view.yaml` only for the shared paths and data
+settings. It always calculates XZ, YZ, and XY input statistics plus two-view
+and three-view token statistics. Both experiments use this one metadata file
+and the same manifests.
+
+## Train with two GPUs
+
+Both production configs specify:
+
+```yaml
+distributed:
+  devices: 2
+  num_nodes: 1
+```
+
+Lightning launches NCCL DDP internally, so do not wrap these commands in
+`torchrun`. Select the two physical GPUs through `CUDA_VISIBLE_DEVICES`.
+
+Run the two-view experiment:
 
 ```bash
-conda run --no-capture-output -n platon-flashattn \
-  python -m faser2d_flash.train \
-  --config faser2d_flash/configs/two_view.yaml
-
-conda run --no-capture-output -n platon-flashattn \
-  python -m faser2d_flash.train \
-  --config faser2d_flash/configs/three_view.yaml
+CONDA_EXE=/scratch/salonso/anaconda3/bin/conda \
+GPU_IDS=0,1 \
+bash faser2d_flash/scripts/run_two_view.sh
 ```
+
+After it finishes, run the three-view experiment:
+
+```bash
+CONDA_EXE=/scratch/salonso/anaconda3/bin/conda \
+GPU_IDS=0,1 \
+bash faser2d_flash/scripts/run_three_view.sh
+```
+
+`run_two_view.sh` uses the configured per-GPU batch and accumulation settings.
+`run_three_view.sh` halves the configured microbatch and doubles accumulation.
+With the current configuration this means:
+
+| Mode | Per-GPU batch | Accumulation | Global effective batch |
+|---|---:|---:|---:|
+| XZ/YZ | 1024 | 1 | 2048 |
+| XZ/YZ/XY | 512 | 2 | 2048 |
+
+This reduces three-view activation memory while keeping optimizer steps and
+linear learning-rate scaling directly comparable.
 
 Resume full state:
 
 ```bash
+CUDA_VISIBLE_DEVICES=0,1 \
 conda run --no-capture-output -n platon-flashattn \
   python -m faser2d_flash.train \
   --config faser2d_flash/configs/two_view.yaml \
-  --resume faser2d_flash/artifacts/xz_yz/checkpoints/last.pt
+  --resume faser2d_flash/artifacts/xz_yz/checkpoints/last.ckpt
 ```
 
 CLI overrides use dotted YAML keys:
@@ -166,9 +206,58 @@ python -m faser2d_flash.train \
 ```
 
 Each run records the active attention backend, package/runtime report,
-parameter counts, effective batch size, throughput, peak CUDA memory,
-epoch metrics, resumable `last.pt`, and best checkpoints for total, flavour,
+parameter counts, effective batch size, epoch metrics, resumable
+`last.ckpt`, and best checkpoints for total, flavour,
 charm, visible, jet, lepton-consistency, and vertex losses.
+
+### Batch-size guidance
+
+The full three-view model passed BF16 DDP optimizer steps at 1024 and 1152
+events per GPU. At 1024, the limiting A100 used 67.42 GiB allocated and
+68.63 GiB reserved. At 1152 it used 75.67/76.99 GiB, which is too close to
+the 80 GiB limit for a long run. Use 1024 as the upper practical per-GPU
+batch.
+
+Batch size changes the optimisation regime:
+
+```text
+effective batch = per-GPU batch × 2 GPUs × accumulation steps
+```
+
+To retain effective batch 1024, use:
+
+```bash
+--set training.batch_size=512 \
+--set training.accumulation_steps=1
+```
+
+To use the tested maximum-throughput setting with effective batch 2048, use:
+
+```bash
+--set training.batch_size=1024 \
+--set training.accumulation_steps=1
+```
+
+See [docs/BATCH_SIZE_BENCHMARK.md](docs/BATCH_SIZE_BENCHMARK.md) for the
+measurement details and memory values.
+
+### TensorBoard
+
+Training writes both CSV logs and standard TensorBoard event files:
+
+```text
+faser2d_flash/artifacts/<experiment>/tensorboard/version_<n>/
+```
+
+The existing `tensorboardX` package supplies the event writer; no environment
+was modified. From any environment providing the TensorBoard viewer:
+
+```bash
+tensorboard --logdir faser2d_flash/artifacts --port 6006
+```
+
+The dashboard includes step and epoch losses, validation losses for every
+task, Kendall weights, and learning rate.
 
 ## Evaluate
 
@@ -191,11 +280,60 @@ macro precision/recall/F1, per-class scores, component MAE/RMSE, vector and
 magnitude errors, relative errors, angular errors, vertex displacement,
 visible-energy MAE, and missing-transverse-momentum MAE.
 
-## Run and compare both modes
+## Export legacy-compatible CSV files
+
+`create_csv_v8.py` reproduces the column names, ordering, class labels, and
+derived quantities from `notebooks_mae/create_csv_v8.py`. It uses the best
+validation checkpoint independently for flavour, charm, visible momentum,
+jet momentum, and vertex. As in the legacy exporter, reconstructed lepton
+momentum is visible momentum minus jet momentum.
+
+The 2D files do not contain muon-spectrometer information, so
+`nb_muspec_tracks` is the only legacy column intentionally omitted. No fields
+are joined from the 3D dataset. By default, raw checkpoint weights are used,
+matching the legacy exporter; `--use-ema` is available as an explicit
+alternative.
+
+Generate both test-set CSV files sequentially on one GPU:
 
 ```bash
+CUDA_VISIBLE_DEVICES=0 \
+MPLCONFIGDIR=/tmp/faser2d-matplotlib-$USER \
+conda run --no-capture-output -n platon-flashattn \
+  python -m faser2d_flash.create_csv_v8 --mode both
+```
+
+The default outputs are:
+
+```text
+faser2d_flash/results/results_v8.0_xz_yz.csv
+faser2d_flash/results/results_v8.0_xz_yz_xy.csv
+```
+
+The exporter reads each experiment's `run_config.json`, including the actual
+training-time batch settings. Override them when needed with
+`--two-batch-size`, `--three-batch-size`, or `--num-workers`. Use
+`--mode two` or `--mode three` to export only one experiment, and
+`--split val` to export the validation split instead of the default test
+split. Output is written atomically and sorted numerically by run and event.
+
+## Run and compare both modes
+
+The launcher builds metadata if necessary, checks FlashAttention, trains
+two-view on both GPUs, then trains three-view on both GPUs, evaluates both,
+and writes the comparison:
+
+```bash
+CONDA_EXE=/scratch/salonso/anaconda3/bin/conda \
+GPU_IDS=0,1 \
 bash faser2d_flash/scripts/run_both.sh
 ```
+
+The experiments run sequentially; each experiment uses both GPUs
+simultaneously. Override `LIGHTNING_DEVICES=1` only for a single-GPU run.
+The combined launcher delegates training to `run_two_view.sh` and
+`run_three_view.sh`, so it uses the same batch settings as the separate
+launchers.
 
 Or compare completed runs directly:
 
@@ -236,16 +374,23 @@ conda run --no-capture-output -n platon-flashattn \
 ```text
 faser2d_flash/artifacts/<experiment>/
 ├── run_config.json
-├── metrics.csv
+├── logs/
+│   └── version_<n>/
+│       ├── hparams.yaml
+│       └── metrics.csv
+├── tensorboard/
+│   └── version_<n>/
+│       ├── events.out.tfevents.*
+│       └── hparams.yaml
 ├── checkpoints/
-│   ├── last.pt
-│   ├── best_total.pt
-│   ├── best_flavour.pt
-│   ├── best_charm.pt
-│   ├── best_vis.pt
-│   ├── best_jet.pt
-│   ├── best_lepton.pt
-│   └── best_vertex.pt
+│   ├── last.ckpt
+│   ├── best_total.ckpt
+│   ├── best_flavour.ckpt
+│   ├── best_charm.ckpt
+│   ├── best_vis.ckpt
+│   ├── best_jet.ckpt
+│   ├── best_lepton.ckpt
+│   └── best_vertex.ckpt
 └── evaluation/<selection>/
     ├── val_metrics.json
     ├── test_metrics.json
@@ -282,7 +427,8 @@ faser2d_flash/artifacts/<experiment>/
 - `runtime.py`: environment and backend checks.
 - `gpu_smoke.py`: full-model real-data FlashAttention forward/backward check.
 - `checkpoint.py`: atomic checkpoints, RNG state, and EMA.
-- `train.py`: scratch training, validation, logging, and resume.
+- `train.py`: Lightning scratch training, NCCL DDP, validation, logging, EMA,
+  checkpointing, and resume.
 - `metrics.py`: evaluation metrics.
 - `evaluate.py`: validation/test inference and optional prediction CSVs.
 - `compare.py`: two-mode metric comparison.

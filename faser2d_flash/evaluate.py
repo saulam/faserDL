@@ -20,12 +20,39 @@ from .train import autocast_context, make_loader, seed_everything
 
 
 TASK_CHECKPOINTS = {
-    "flavour": "best_flavour.pt",
-    "charm": "best_charm.pt",
-    "vis": "best_vis.pt",
-    "jet": "best_jet.pt",
-    "vertex": "best_vertex.pt",
+    "flavour": "best_flavour",
+    "charm": "best_charm",
+    "vis": "best_vis",
+    "jet": "best_jet",
+    "vertex": "best_vertex",
 }
+
+
+def resolve_checkpoint(checkpoint_dir: Path, stem: str) -> Path:
+    for suffix in (".ckpt", ".pt"):
+        path = checkpoint_dir / f"{stem}{suffix}"
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"No checkpoint found for {stem!r} in {checkpoint_dir}; expected .ckpt or .pt"
+    )
+
+
+def component_state(
+    checkpoint: dict[str, Any],
+    component: str,
+) -> dict[str, torch.Tensor]:
+    if component in checkpoint:
+        return checkpoint[component]
+    prefix = f"{component}."
+    state = {
+        key[len(prefix) :]: value
+        for key, value in checkpoint["state_dict"].items()
+        if key.startswith(prefix)
+    }
+    if not state:
+        raise KeyError(f"Checkpoint contains no {component!r} state")
+    return state
 
 
 def load_model(
@@ -38,7 +65,7 @@ def load_model(
 ) -> tuple[ProjectionTransformer, dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model = ProjectionTransformer(config["model"], metadata).to(device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(component_state(checkpoint, "model"))
     if use_ema:
         ema = ExponentialMovingAverage(model, float(config["training"]["ema_decay"]))
         ema.load_state_dict(checkpoint["ema"])
@@ -145,21 +172,23 @@ def main() -> None:
 
     if args.selection == "taskwise":
         models = {}
-        for task, filename in TASK_CHECKPOINTS.items():
+        for task, stem in TASK_CHECKPOINTS.items():
             models[task], _ = load_model(
-                checkpoint_dir / filename,
+                resolve_checkpoint(checkpoint_dir, stem),
                 config,
                 metadata,
                 device,
                 use_ema=args.use_ema,
             )
         total_checkpoint = torch.load(
-            checkpoint_dir / "best_total.pt", map_location=device, weights_only=False
+            resolve_checkpoint(checkpoint_dir, "best_total"),
+            map_location=device,
+            weights_only=False,
         )
     else:
-        filename = "best_total.pt" if args.selection == "total" else "last.pt"
+        stem = "best_total" if args.selection == "total" else "last"
         model, total_checkpoint = load_model(
-            checkpoint_dir / filename,
+            resolve_checkpoint(checkpoint_dir, stem),
             config,
             metadata,
             device,
@@ -174,7 +203,7 @@ def main() -> None:
         kendall_weight_max=float(config["training"]["kendall_weight_max"]),
     ).to(device)
     if total_checkpoint is not None:
-        objective.load_state_dict(total_checkpoint["objective"])
+        objective.load_state_dict(component_state(total_checkpoint, "objective"))
     objective.eval()
 
     splits = ("val", "test") if args.split == "both" else (args.split,)

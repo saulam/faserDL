@@ -18,14 +18,18 @@ def package_version(name: str) -> str | None:
 
 def runtime_report() -> dict[str, Any]:
     cuda = torch.cuda.is_available()
-    device = torch.cuda.get_device_properties(0) if cuda else None
+    device_index = torch.cuda.current_device() if cuda else None
+    device = torch.cuda.get_device_properties(device_index) if cuda else None
     return {
         "python": platform.python_version(),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "cuda_available": cuda,
         "cuda_device": device.name if device else None,
-        "cuda_capability": list(torch.cuda.get_device_capability(0)) if cuda else None,
+        "cuda_device_index": device_index,
+        "cuda_capability": (
+            list(torch.cuda.get_device_capability(device_index)) if cuda else None
+        ),
         "bf16_supported": bool(torch.cuda.is_bf16_supported()) if cuda else False,
         "flash_attn": package_version("flash-attn"),
         "numpy": package_version("numpy"),
