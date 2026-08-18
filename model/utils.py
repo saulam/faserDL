@@ -169,7 +169,7 @@ class BlockWithMask(Block):
             qk_norm=False,
             scale_attn_norm=False,
             scale_mlp_norm=False,
-            proj_bias=False,
+            proj_bias=True,
             proj_drop=0.,
             attn_drop=0.,
             init_values=None,
@@ -177,12 +177,21 @@ class BlockWithMask(Block):
             act_layer=nn.GELU,
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
+            attn_layer=Attention,
+            depth=0,
+            device=None,
+            dtype=None,
     ):
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             dim,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            scale_attn_norm=scale_attn_norm,
+            scale_mlp_norm=scale_mlp_norm,
+            proj_bias=proj_bias,
             proj_drop=proj_drop,
             attn_drop=attn_drop,
             init_values=init_values,
@@ -190,14 +199,20 @@ class BlockWithMask(Block):
             act_layer=act_layer,
             norm_layer=norm_layer,
             mlp_layer=mlp_layer,
+            attn_layer=attn_layer,
+            depth=depth,
+            **factory_kwargs,
         )
         self.attn = MaskableAttention(
             dim=dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
+            proj_bias=proj_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
+            norm_layer=norm_layer,
+            **factory_kwargs,
         )
 
     def forward(self, x, attn_mask=None, q_mask=None):
@@ -280,34 +295,36 @@ class CrossAttnBlock(nn.Module):
         return x
 
 
+# Per-track muon features from the dataset: q, py, pz, chi2, fpErr, npoints.
+MUSPEC_FEATURE_DIM = 6
+MUON_SUMMARY_DIM = 4
+
+
 def muon_summary_target(
-    muspec_feats: torch.Tensor,       # [B, N, 5] = (q, px, py, pz, chi2)
+    muspec_feats: torch.Tensor,       # [B, N, 6] = (q, py, pz, chi2, fpErr, npoints)
     muspec_attn_mask: torch.Tensor,   # [B, N] bool
 ) -> torch.Tensor:
     mask = muspec_attn_mask
     m = mask.float()
 
     q    = muspec_feats[..., 0]
-    px   = muspec_feats[..., 1]
-    py   = muspec_feats[..., 2]
-    pz   = muspec_feats[..., 3]
+    py   = muspec_feats[..., 1]
+    pz   = muspec_feats[..., 2]
 
     count = m.sum(dim=1, keepdim=True)             # [B, 1]
     has   = (count > 0).float()                    # [B, 1]
     inv   = 1.0 / count.clamp_min(1.0)
 
     q_mean    = (q    * m).sum(dim=1, keepdim=True) * inv
-    px_mean   = (px   * m).sum(dim=1, keepdim=True) * inv
     py_mean   = (py   * m).sum(dim=1, keepdim=True) * inv
     pz_mean   = (pz   * m).sum(dim=1, keepdim=True) * inv
 
     # zero out means for empty events
     q_mean    *= has
-    px_mean   *= has
     py_mean   *= has
     pz_mean   *= has
 
-    return torch.cat([has, q_mean, px_mean, py_mean, pz_mean], dim=-1)  # [B, 5]
+    return torch.cat([has, q_mean, py_mean, pz_mean], dim=-1)  # [B, 4]
     
 
 def _split_even_3(embed_dim):

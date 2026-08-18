@@ -43,10 +43,21 @@ early_stop_patience="${EARLY_STOP_PATIENCE:-15}"
 resume_checkpoint="${RESUME_CHECKPOINT:-}"
 nb_nodes="${NB_NODES:-1}"
 read -r -a gpus <<< "${GPUS:-0}"
+sparse_ecal="${SPARSE_ECAL:-auto}"
+
+sparse_ecal_flag=""
+if [[ "$sparse_ecal" == "1" || "$sparse_ecal" == "true" || "$sparse_ecal" == "TRUE" ]]; then
+    sparse_ecal_flag="--sparse_ecal"
+elif [[ "$sparse_ecal" == "auto" ]]; then
+    case "$DATASET_PATH" in
+        *events_v8.*|*events_v9.*) sparse_ecal_flag="--sparse_ecal" ;;
+    esac
+fi
 
 python -m train.finetune \
     --train \
     --stage2 \
+    ${sparse_ecal_flag:+$sparse_ecal_flag} \
     --augmentations_enabled \
     --dataset_path "$DATASET_PATH" \
     --metadata_path "$METADATA_PATH" \

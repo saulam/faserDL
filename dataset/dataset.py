@@ -19,6 +19,7 @@ from utils.augmentations import augment, smooth_labels
 from utils.pdg import cluster_labels_from_pdgs
 
 TRUE_HIT_COLUMNS = 13
+V9_MUSPEC_MIN_POINTS = 2
 
 
 class SparseFASERCALDataset(Dataset):
@@ -300,11 +301,15 @@ class SparseFASERCALDataset(Dataset):
         for i in range(muspec.shape[1]):
             info = muspec[:, i]
             charge, npoints, px, py, pz, p, chi2, ndof, pval, fperr, fiperr = info
-            if npoints >= 3 and chi2 > 0:
+            # v9 has only four muon spectrometer stations total. Keep the
+            # quality cut v9-aware and accept the two-station/point case.
+            if npoints >= V9_MUSPEC_MIN_POINTS and chi2 > 0:
                 ntracks += 1
-                tracks.append([charge, px, py, pz, chi2])
-                
-        return ntracks, np.array(tracks).reshape(ntracks, 5)
+                # px is the unmeasured wire direction; fperr and npoints let the
+                # network weigh how well the momentum was measured.
+                tracks.append([charge, py, pz, chi2, fperr, npoints])
+
+        return ntracks, np.array(tracks).reshape(ntracks, 6)
     
     
     def build_per_hit_labels_from_csr(
@@ -460,8 +465,10 @@ class SparseFASERCALDataset(Dataset):
             'ahcal_hits':       data['ahcal_hits'],
             'nb_muspec_tracks': nb_muspec_tracks,
             'muspec_q':         muspec_tracks[:, 0],
-            'muspec_p':         muspec_tracks[:, 1:4],
-            'muspec_chi2':      muspec_tracks[:, 4],
+            'muspec_p':         muspec_tracks[:, 1:3],
+            'muspec_chi2':      muspec_tracks[:, 3],
+            'muspec_fperr':     muspec_tracks[:, 4],
+            'muspec_npoints':   muspec_tracks[:, 5],
         }
 
         true_pdg = np.empty((0,), dtype=np.float32)
@@ -583,10 +590,11 @@ class SparseFASERCALDataset(Dataset):
         muspec_p = event['global_feats']['muspec_p']
         muspec_info = torch.cat([
             self.preprocess(event['global_feats']['muspec_q'], 'muspec_q').reshape(-1, 1),
-            self.preprocess(muspec_p[:, 0], 'muspec_px', "asinh").reshape(-1, 1),
-            self.preprocess(muspec_p[:, 1], 'muspec_py', "asinh").reshape(-1, 1),
-            self.preprocess(muspec_p[:, 2], 'muspec_pz', self.preprocessing_input).reshape(-1, 1),
+            self.preprocess(muspec_p[:, 0], 'muspec_py', "asinh").reshape(-1, 1),
+            self.preprocess(muspec_p[:, 1], 'muspec_pz', self.preprocessing_input).reshape(-1, 1),
             self.preprocess(event['global_feats']['muspec_chi2'], 'muspec_chi2', self.preprocessing_input).reshape(-1, 1),
+            self.preprocess(event['global_feats']['muspec_fperr'], 'muspec_fperr', "asinh").reshape(-1, 1),
+            self.preprocess(event['global_feats']['muspec_npoints'], 'muspec_npoints', self.preprocessing_input).reshape(-1, 1),
         ], dim=1)
         
         vis_sp_momentum = event['vis_sp_momentum']

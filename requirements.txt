@@ -7,4 +7,5 @@ timm>=1.0
 torch>=2.5
 torch-ema>=0.3
 tqdm>=4.67
+umap-learn>=0.5
 webdataset>=1.0

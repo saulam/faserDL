@@ -77,6 +77,9 @@ def create_loader(ds, shuffle, drop_last, collate_fn=None, args=None):
         shuffle=shuffle,
         pin_memory=True,
         persistent_workers=persistent,
+        # Buffer more batches per worker so slow /scratch4 reads don't starve a
+        # rank (which, under DDP, can stall a collective past the NCCL timeout).
+        prefetch_factor=4 if args.num_workers > 0 else None,
         collate_fn=collate_fn,
         drop_last=drop_last,
     )
@@ -140,14 +143,14 @@ def pack_muspec(nb_muspec_tracks, muspec_info):
     """
     nb_muspec_tracks: tensor (B, 1)
     muspec_info: list of length B
-        each element is a tensor of shape (K_i, 5)
+        each element is a tensor of shape (K_i, 6)
     returns:
-        feats: (B, K_max, 5)
+        feats: (B, K_max, 6)
         attn_mask: (B, K_max)  # True = keep, False = pad
         counts: (B, 1)  # number of tracks per batch element
     """
     # pad_sequence expects (seq_len, *) so we tell it batch_first=True
-    feats = pad_sequence(muspec_info, batch_first=True, padding_value=0.0)  # (B, K_max, 5)
+    feats = pad_sequence(muspec_info, batch_first=True, padding_value=0.0)  # (B, K_max, 6)
     B, K_max, D = feats.shape
 
     # Keep one dummy token when the whole batch has zero tracks.
@@ -162,7 +165,7 @@ def pack_muspec(nb_muspec_tracks, muspec_info):
     idxs = torch.arange(K_max, device=feats.device).unsqueeze(0).expand(B, -1)
     attn_mask = idxs < lengths.unsqueeze(1)
 
-    # Return feats (B, K_max, 5), mask (B, K_max), and the counts (B, 1)
+    # Return feats (B, K_max, 6), mask (B, K_max), and the counts (B, 1)
     return feats, attn_mask, nb_muspec_tracks
 
 
@@ -563,15 +566,13 @@ class CombinedScheduler(_LRScheduler):
 
 def load_mae_encoder(model_vit, mae_ckpt):
     sd = {key.replace("model.", ""): value for key, value in mae_ckpt['state_dict'].items()}
-    # Keep only encoder keys that exist in the fine-tune model
     vit_sd = model_vit.state_dict()
-    #keep = {k: v for k, v in sd.items() if k in vit_sd and v.shape == vit_sd[k].shape}
-    #missing = [k for k in vit_sd.keys() if k not in keep]
-    #dropped = [k for k in sd.keys() if k not in keep]
-    msg = model_vit.load_state_dict(sd, strict=False)
-    #print("Loaded:", len(keep))
-    #print("Missing in ckpt:", len(missing))
-    #print("Dropped from ckpt:", len(dropped))
+    # strict=False ignores missing and unexpected keys but still raises on a shape
+    # mismatch, so drop those and leave the layer at its init.
+    skipped = [k for k, v in sd.items() if k in vit_sd and v.shape != vit_sd[k].shape]
+    for k in skipped:
+        print(f"Shape mismatch, not loaded: {k} {tuple(sd[k].shape)} -> {tuple(vit_sd[k].shape)}")
+    msg = model_vit.load_state_dict({k: v for k, v in sd.items() if k not in skipped}, strict=False)
     print("Load msg:", msg)
 
 

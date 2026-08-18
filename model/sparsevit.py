@@ -15,7 +15,7 @@ from timm.layers import trunc_normal_
 from .utils import (
     get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, 
     CrossAttnBlock, CrossAttention, CylindricalHeadNormalized,
-    make_parallel_then_merge_dpr,
+    make_parallel_then_merge_dpr, MUSPEC_FEATURE_DIM,
 )
 
 
@@ -241,7 +241,7 @@ class SparseViT(vit.VisionTransformer):
         # Perceiver-IO bottleneck: lat <- tok + latent self
         self.muon_state_embed = nn.Embedding(2, embed_dim)  # 0=abstain (no tracks), 1=present
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
-        self.muon_spec_embed = nn.Linear(5, embed_dim)
+        self.muon_spec_embed = nn.Linear(MUSPEC_FEATURE_DIM, embed_dim)
         self.muon_spec_xattn = CrossAttnBlock(
             dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
             qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,

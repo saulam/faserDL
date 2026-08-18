@@ -60,7 +60,7 @@ if [[ "$sparse_ecal" == "1" || "$sparse_ecal" == "true" || "$sparse_ecal" == "TR
     sparse_ecal_flag="--sparse_ecal"
 elif [[ "$sparse_ecal" == "auto" ]]; then
     case "$DATASET_PATH" in
-        *events_v8.*) sparse_ecal_flag="--sparse_ecal" ;;
+        *events_v8.*|*events_v9.*) sparse_ecal_flag="--sparse_ecal" ;;
     esac
 fi
 

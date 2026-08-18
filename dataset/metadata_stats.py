@@ -25,6 +25,7 @@ import pickle as pk
 
 MADN_CONST = 1.482602218505602  # normalizing constant so MADN ~= std for Gaussian
 TRUE_HIT_COLUMNS = 13
+V9_MUSPEC_MIN_POINTS = 2
 
 def _mad(x, axis=None):
     med = np.median(x, axis=axis, keepdims=True)
@@ -54,11 +55,15 @@ def _process_muspec(muspec):
     for i in range(muspec.shape[1]):
         info = muspec[:, i]
         charge, npoints, px, py, pz, p, chi2, ndof, pval, fperr, fiperr = info
-        if npoints > 10 and chi2 > 0:
+        # v9 has only four muon spectrometer stations total. The old v8-era
+        # high-multiplicity cut rejects valid downstream muons, so metadata
+        # stats must use the same v9-aware threshold as the dataset loader.
+        if npoints >= V9_MUSPEC_MIN_POINTS and chi2 > 0:
             ntracks += 1
-            tracks.append([charge, px, py, pz, chi2])
-            
-    return ntracks, np.array(tracks).reshape(ntracks, 5)
+            # keep in step with dataset.py::process_muspec
+            tracks.append([charge, py, pz, chi2, fperr, npoints])
+
+    return ntracks, np.array(tracks).reshape(ntracks, 6)
 
 # -------------------------
 # Robust params from Counter
@@ -579,10 +584,11 @@ class SparseFASERCALDataset(Dataset):
         ahcal_hits = (data['ahcal_hits'][:, 3]*10).round().astype(int)
         nb_muspec_tracks, muspec_tracks = _process_muspec(muspec_info)
         muspec_q = muspec_tracks[:, 0]
-        muspec_px = muspec_tracks[:, 1]
-        muspec_py = muspec_tracks[:, 2]
-        muspec_pz = muspec_tracks[:, 3]
-        muspec_chi2 = muspec_tracks[:, 4]
+        muspec_py = muspec_tracks[:, 1]
+        muspec_pz = muspec_tracks[:, 2]
+        muspec_chi2 = muspec_tracks[:, 3]
+        muspec_fperr = muspec_tracks[:, 4]
+        muspec_npoints = muspec_tracks[:, 5]
 
         if is_cc:
             out_lepton_momentum = out_lepton_momentum.reshape(1, 3)
@@ -609,10 +615,11 @@ class SparseFASERCALDataset(Dataset):
                 "ahcal_hits": ahcal_hits,
                 "nb_muspec_tracks": nb_muspec_tracks,
                 "muspec_q": muspec_q,
-                "muspec_px": muspec_px,
                 "muspec_py": muspec_py,
                 "muspec_pz": muspec_pz,
                 "muspec_chi2": muspec_chi2,
+                "muspec_fperr": muspec_fperr,
+                "muspec_npoints": muspec_npoints,
                 "in_neutrino_energy": in_neutrino_energy,
                 "out_lepton_energy": out_lepton_energy,
                 "primary_vertex": primary_vertex,
@@ -634,10 +641,11 @@ def collate(batch):
     ahcal_hits = np.concatenate([x['ahcal_hits'] for x in batch])
     nb_muspec_tracks = np.array([x['nb_muspec_tracks'] for x in batch])
     muspec_q = np.concatenate([x['muspec_q'] for x in batch])
-    muspec_px = np.concatenate([x['muspec_px'] for x in batch])
     muspec_py = np.concatenate([x['muspec_py'] for x in batch])
     muspec_pz = np.concatenate([x['muspec_pz'] for x in batch])
     muspec_chi2 = np.concatenate([x['muspec_chi2'] for x in batch])
+    muspec_fperr = np.concatenate([x['muspec_fperr'] for x in batch])
+    muspec_npoints = np.concatenate([x['muspec_npoints'] for x in batch])
     in_neutrino_energy = np.concatenate([x['in_neutrino_energy'] for x in batch])
     out_lepton_energy = np.concatenate([x['out_lepton_energy'] for x in batch])
     primary_vertex = np.concatenate([x['primary_vertex'] for x in batch])
@@ -653,7 +661,8 @@ def collate(batch):
             "ahcal_hits": ahcal_hits,
             "nb_muspec_tracks": nb_muspec_tracks,
             "muspec_q": muspec_q,
-            "muspec_px": muspec_px,
+            "muspec_fperr": muspec_fperr,
+            "muspec_npoints": muspec_npoints,
             "muspec_py": muspec_py,
             "muspec_pz": muspec_pz,
             "muspec_chi2": muspec_chi2,
@@ -727,10 +736,11 @@ def main():
     ahcal_hits = []
     nb_muspec_tracks = []
     muspec_q = []
-    muspec_px = []
     muspec_py = []
     muspec_pz = []
     muspec_chi2 = []
+    muspec_fperr = []
+    muspec_npoints = []
     in_neutrino_energy = []
     out_lepton_energy = []
     primary_vertex = []
@@ -752,7 +762,8 @@ def main():
         ahcal_hits.append(batch["ahcal_hits"])
         nb_muspec_tracks.append(batch["nb_muspec_tracks"])
         muspec_q.append(batch["muspec_q"])
-        muspec_px.append(batch["muspec_px"])
+        muspec_fperr.append(batch["muspec_fperr"])
+        muspec_npoints.append(batch["muspec_npoints"])
         muspec_py.append(batch["muspec_py"])
         muspec_pz.append(batch["muspec_pz"])
         muspec_chi2.append(batch["muspec_chi2"])
@@ -776,7 +787,8 @@ def main():
     ahcal_hits = np.concatenate(ahcal_hits)
     nb_muspec_tracks = np.concatenate(nb_muspec_tracks)
     muspec_q = np.concatenate(muspec_q)
-    muspec_px = np.concatenate(muspec_px)
+    muspec_fperr = np.concatenate(muspec_fperr)
+    muspec_npoints = np.concatenate(muspec_npoints)
     muspec_py = np.concatenate(muspec_py)
     muspec_pz = np.concatenate(muspec_pz)
     muspec_chi2 = np.concatenate(muspec_chi2)
@@ -813,7 +825,8 @@ def main():
     base_keys = [
         'in_neutrino_energy', 'out_lepton_energy',
         'ecal_hits', 'ahcal_hits',
-        'nb_muspec_tracks', 'muspec_q', 'muspec_px', 'muspec_py', 'muspec_pz', 'muspec_chi2',
+        'nb_muspec_tracks', 'muspec_q', 'muspec_py', 'muspec_pz', 'muspec_chi2',
+        'muspec_fperr', 'muspec_npoints',
         'module_hits', 'event_hits',
     ]
 

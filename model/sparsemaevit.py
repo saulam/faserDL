@@ -14,7 +14,7 @@ from functools import partial
 from .utils import (
     get_3d_sincos_pos_embed, choose_k1_k2, BlockWithMask, 
     CrossAttnBlock, MultiRankSeparableBasis3D, MultiRankSharedLatentVoxelHead, LazyIdxMap,
-    muon_summary_target, make_parallel_then_merge_dpr
+    muon_summary_target, make_parallel_then_merge_dpr, MUSPEC_FEATURE_DIM, MUON_SUMMARY_DIM
 )
 
 
@@ -246,7 +246,7 @@ class SparseMAEViT(nn.Module):
         # ==========================
         self.muon_state_embed = nn.Embedding(2, embed_dim)  # 0=abstain (no tracks), 1=present
         self.muon_spec_count_encoder = nn.Linear(1, embed_dim)
-        self.muon_spec_embed = nn.Linear(5, embed_dim)
+        self.muon_spec_embed = nn.Linear(MUSPEC_FEATURE_DIM, embed_dim)
         self.muon_spec_xattn = CrossAttnBlock(
             dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
             qkv_bias=True, drop=drop_rate, attn_drop=attn_drop_rate,
@@ -348,7 +348,7 @@ class SparseMAEViT(nn.Module):
         else:
             self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
             self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
-        self.muon_recon_head = nn.Linear(decoder_embed_dim, 5)
+        self.muon_recon_head = nn.Linear(decoder_embed_dim, MUON_SUMMARY_DIM)
 
         self.initialize_weights()
 
@@ -1234,7 +1234,7 @@ class SparseMAEViT(nn.Module):
             masks["ecal_drop"] = ecal_drop
 
         # MUON query -> latents
-        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 5]
+        muon_tgt = muon_summary_target(muspec_feats, muspec_attn_mask)  # [B, 4]
         q_idx = 0 if self.sparse_ecal else 1
         q_muon = self.global_query[q_idx].view(1, 1, Cdec).expand(B, 1, Cdec)
         x = q_muon

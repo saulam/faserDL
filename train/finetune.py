@@ -8,6 +8,7 @@ Description: fine-tuning script.
 
 import json
 import os
+from datetime import timedelta
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
@@ -181,7 +182,11 @@ def main():
         strategy=DDPStrategy(
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
-            static_graph=False
+            static_graph=False,
+            # Default NCCL watchdog is 30 min; a slow /scratch4 dataloader
+            # straggler at the val/checkpoint boundary can exceed that and kill
+            # the run. Give collectives a generous window to resync instead.
+            timeout=timedelta(hours=2),
         ) if nb_gpus > 1 else "auto",
         logger=[logger, tb_logger],
         log_every_n_steps=args.log_every_n_steps,
