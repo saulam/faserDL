@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,7 +108,8 @@ def _attn_sdpa(q, k, v, mask, drop_p, training, is_causal):
             return _attn_classic(q, k, v, mask, drop_p, training, is_causal)
 
 
-_ATTENTION_IMPL = _attn_classic if (not HAS_SDPA) else _attn_sdpa
+_FORCE_CLASSIC_ATTN = os.getenv("PRETRAIN_FORCE_CLASSIC_ATTN", "0").lower() in {"1", "true", "yes"}
+_ATTENTION_IMPL = _attn_classic if (_FORCE_CLASSIC_ATTN or not HAS_SDPA) else _attn_sdpa
 _warned = False
 
 
@@ -177,12 +179,7 @@ class BlockWithMask(Block):
             act_layer=nn.GELU,
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
-            attn_layer=Attention,
-            depth=0,
-            device=None,
-            dtype=None,
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             dim,
             num_heads=num_heads,
@@ -199,9 +196,6 @@ class BlockWithMask(Block):
             act_layer=act_layer,
             norm_layer=norm_layer,
             mlp_layer=mlp_layer,
-            attn_layer=attn_layer,
-            depth=depth,
-            **factory_kwargs,
         )
         self.attn = MaskableAttention(
             dim=dim,
@@ -212,7 +206,6 @@ class BlockWithMask(Block):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             norm_layer=norm_layer,
-            **factory_kwargs,
         )
 
     def forward(self, x, attn_mask=None, q_mask=None):

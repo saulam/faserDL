@@ -55,11 +55,16 @@ elif [[ "$sparse_ecal" == "auto" ]]; then
     esac
 fi
 
+# Augmentations default to OFF for v9: utils/augmentations.py still assumes
+# the v8 muon layout. augment_muspec() drops tracks without filtering
+# muspec_fperr/muspec_npoints (length desync), and mirror()/rotate_90()
+# index muspec_p as 3 columns when v9 has 2. Set
+# AUGMENTATION_FLAG=--augmentations_enabled once those are fixed.
 python -m train.finetune \
     --train \
     --stage2 \
     ${sparse_ecal_flag:+$sparse_ecal_flag} \
-    --augmentations_enabled \
+    ${AUGMENTATION_FLAG:---augmentations_disabled} \
     --dataset_path "$DATASET_PATH" \
     --metadata_path "$METADATA_PATH" \
     --model $model \

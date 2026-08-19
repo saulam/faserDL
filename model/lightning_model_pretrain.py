@@ -233,7 +233,7 @@ class MAEPreTrainer(pl.LightningModule):
         if self.sparse_ecal:
             targets['hit_event_id_ecal'] = labels['hit_event_id_ecal']
 
-        return batch_input, *global_params, targets
+        return (batch_input, *global_params, targets)
 
 
     def mask_and_align_voxels(self, idx_targets):
@@ -484,12 +484,12 @@ class MAEPreTrainer(pl.LightningModule):
         muon_drop = glob_masks["muon_drop"].float().unsqueeze(-1)
         
         # Muon loss (per-dim masked mean, only when dropped)
-        muon_pred = preds["muon_rec"]                                            # [B, 5]
-        muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 5]
+        muon_pred = preds["muon_rec"]                                            # [B, 4] (v9: has, q, py, pz)
+        muon_tgt  = glob_targets["muon_tgt"]                                     # [B, 4] (v9: has, q, py, pz)
         has_tgt   = muon_tgt[:, 0]                                               # [B] float 0/1
         has_logit = muon_pred[:, 0]                                              # [B] logits
-        means_pred = muon_pred[:, 1:]                                            # [B, 4]
-        means_tgt  = muon_tgt[:, 1:]                                             # [B, 4]
+        means_pred = muon_pred[:, 1:]                                            # [B, 3]
+        means_tgt  = muon_tgt[:, 1:]                                             # [B, 3]
         drop_1d = muon_drop.squeeze(1)                                           # [B]
         drop_1d = drop_1d * self._get_muon_reg_mask(
             drop_1d.shape[0], drop_1d.device
@@ -505,7 +505,7 @@ class MAEPreTrainer(pl.LightningModule):
         )
         loss_has = (loss_has_raw * drop_1d).sum() / drop_1d.sum().clamp_min(1.0)
         means_on = (has_tgt > 0.5).float() * drop_1d                             # [B]
-        w_means = means_on.unsqueeze(1).expand_as(means_pred)                    # [B, 4]
+        w_means = means_on.unsqueeze(1).expand_as(means_pred)                    # [B, 3]
         loss_means_raw = F.smooth_l1_loss(
             means_pred, means_tgt, reduction="none"
         )

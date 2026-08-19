@@ -166,11 +166,23 @@ def main():
     lightning_model = ViTFineTuner(model=model, args=args)
 
     # Initialise PyTorch Lightning trainer
+    limit_train_batches = None
+    if os.getenv("FINETUNE_LIMIT_TRAIN_BATCHES"):
+        limit_train_batches = int(os.environ["FINETUNE_LIMIT_TRAIN_BATCHES"])
+    elif args.web_dataset_path:
+        limit_train_batches = nb_batches_train//(nb_gpus*args.nb_nodes)
+
+    limit_val_batches = None
+    if os.getenv("FINETUNE_LIMIT_VAL_BATCHES"):
+        limit_val_batches = int(os.environ["FINETUNE_LIMIT_VAL_BATCHES"])
+    elif args.web_dataset_path:
+        limit_val_batches = nb_batches_val//(nb_gpus*args.nb_nodes)
+
     trainer = pl.Trainer(
         # For IterableDataset (webdataset), Lightning cannot determine epoch length
         # automatically, so we provide the number of batches per device explicitly.
-        limit_train_batches=nb_batches_train//(nb_gpus*args.nb_nodes) if args.web_dataset_path else None,
-        limit_val_batches=nb_batches_val//(nb_gpus*args.nb_nodes) if args.web_dataset_path else None,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
         max_epochs=args.epochs,
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",

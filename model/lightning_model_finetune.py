@@ -111,7 +111,17 @@ class ViTFineTuner(pl.LightningModule):
                 self.model.parameters(),
                 decay=self.ema_decay,
             )
-        self.ema.load_state_dict(checkpoint["ema_state_dict"])
+        if "ema_state_dict" in checkpoint:
+            self.ema.load_state_dict(checkpoint["ema_state_dict"])
+
+
+    def _move_ema_to_model_device(self):
+        if self.ema is None:
+            return
+        device = next(self.model.parameters()).device
+        self.ema.shadow_params = [
+            p.to(device=device) for p in self.ema.shadow_params
+        ]
         
 
     def on_train_start(self):
@@ -119,12 +129,14 @@ class ViTFineTuner(pl.LightningModule):
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
         if not self.trainer.is_global_zero:
             # only keep EMA on rank 0 (for DDP)
+            self.ema = None
             return
         if self.ema is None:
             self.ema = ExponentialMovingAverage(
                 self.model.parameters(),
                 decay=self.ema_decay,
             )
+        self._move_ema_to_model_device()
 
 
     def on_train_epoch_start(self):
@@ -146,7 +158,8 @@ class ViTFineTuner(pl.LightningModule):
     
     def on_before_zero_grad(self, optimizer):
         # Update EMA after the optimiser step and before gradients are cleared.
-        if self.ema is not None:
+        if self.trainer.is_global_zero and self.ema is not None:
+            self._move_ema_to_model_device()
             self.ema.update()
         
     

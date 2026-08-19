@@ -664,10 +664,13 @@ class SparseFASERCALMapDataset(SparseFASERCALDataset, Dataset):
     def __init__(self, args):
         super().__init__(args)
         self.root = args.dataset_path
+        # dataset_path may be a comma-separated list of roots
+        roots = [r.strip() for r in self.root.split(",") if r.strip()]
         self.data_files = sorted(
-            chain(
-                glob(os.path.join(self.root, "*.npz")),
-                glob(os.path.join(self.root, "*", "*.npz")),
+            chain.from_iterable(
+                glob(os.path.join(r, pattern))
+                for r in roots
+                for pattern in ("*.npz", os.path.join("*", "*.npz"))
             ),
             key=str.lower,
         )

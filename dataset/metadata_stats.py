@@ -509,10 +509,13 @@ class SparseFASERCALDataset(Dataset):
     def __init__(self, root, shuffle=False, sample_prob=0.10, **kwargs):
         # Normalize root into a list
         self.root = root
+        # dataset_path may be a comma-separated list of roots
+        roots = [r.strip() for r in self.root.split(",") if r.strip()]
         self.data_files = sorted(
-            chain(
-                glob(os.path.join(self.root, "*.npz")),
-                glob(os.path.join(self.root, "*", "*.npz")),
+            chain.from_iterable(
+                glob(os.path.join(r, pattern))
+                for r in roots
+                for pattern in ("*.npz", os.path.join("*", "*.npz"))
             ),
             key=str.lower,
         )
