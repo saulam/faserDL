@@ -97,25 +97,30 @@ def augment(
             log_sigma=0.12, a=0.03, b=0.12
         )
 
-    # muon spectrometer augmentation (independent of calo gain)
-    if np.random.random() < aug_prob:
-        n = global_feats.get("nb_muspec_tracks", 0)
-        q = global_feats.get("muspec_q", np.zeros((0,), dtype=np.float32))
-        p = global_feats.get("muspec_p", np.zeros((0, 3), dtype=np.float32))
-        c = global_feats.get("muspec_chi2", np.zeros((0,), dtype=np.float32))
-
-        n2, q2, p2, c2 = augment_muspec(
-            n, q, p, c,
-            permute=True,
-            drop_prob=0.10,
-            rel_p_logsigma=0.02,
-            chi2_logsigma=0.10,
-            flip_q_prob=0.0,   # keep 0 unless you explicitly want charge mis-ID
-        )
-        global_feats["nb_muspec_tracks"] = n2
-        global_feats["muspec_q"] = q2
-        global_feats["muspec_p"] = p2
-        global_feats["muspec_chi2"] = c2
+    # Muon spectrometer augmentation: DISABLED for v9, deliberately.
+    #
+    # Not part of the approved v9 augmentation set (the calorimeter calibration /
+    # electronics / efficiency augs below). It is also incompatible with the v9
+    # muon layout: augment_muspec() permutes and drops rows of (q, p, chi2) but
+    # knows nothing about muspec_fperr / muspec_npoints, so those two would keep
+    # their original length and ordering -- a length desync that crashes
+    # dataset.py::_finalise_event, and a silent per-track misalignment even when
+    # no track is dropped. Leave it off; do not "fix" it without deciding first
+    # whether smearing reconstructed muon tracks is physically wanted at all.
+    #
+    # if np.random.random() < aug_prob:
+    #     n = global_feats.get("nb_muspec_tracks", 0)
+    #     q = global_feats.get("muspec_q", np.zeros((0,), dtype=np.float32))
+    #     p = global_feats.get("muspec_p", np.zeros((0, 2), dtype=np.float32))
+    #     c = global_feats.get("muspec_chi2", np.zeros((0,), dtype=np.float32))
+    #     n2, q2, p2, c2 = augment_muspec(
+    #         n, q, p, c, permute=True, drop_prob=0.10,
+    #         rel_p_logsigma=0.02, chi2_logsigma=0.10, flip_q_prob=0.0,
+    #     )
+    #     global_feats["nb_muspec_tracks"] = n2
+    #     global_feats["muspec_q"] = q2
+    #     global_feats["muspec_p"] = p2
+    #     global_feats["muspec_chi2"] = c2
 
     # FASERCAL hit jitters
     if np.random.random() < aug_prob:

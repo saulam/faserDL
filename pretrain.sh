@@ -64,11 +64,17 @@ elif [[ "$sparse_ecal" == "auto" ]]; then
     esac
 fi
 
-# Augmentations default to OFF for v9: utils/augmentations.py still assumes
-# the v8 muon layout. augment_muspec() drops tracks without filtering
-# muspec_fperr/muspec_npoints (length desync), and mirror()/rotate_90()
-# index muspec_p as 3 columns when v9 has 2. Set
-# AUGMENTATION_FLAG=--augmentations_enabled once those are fixed.
+# Augmentations default to OFF. Enable per run with
+#   export AUGMENTATION_FLAG=--augmentations_enabled
+# The enabled set is calorimeter-only: FASERCal +/-1 voxel x/y shift, per-module
+# and global gain jitter, ECAL noise/dropout, AHCAL charge smear, FASERCal
+# energy jitter (multiplicative + sqrt-law), and <=5% voxel dropout.
+# Everything that touches detector geometry or the muon spectrometer is
+# deliberately disabled in augment(): mirror()/rotate_90()/translate() and
+# augment_muspec(). The MDT measures one coordinate per tube and v9 dropped the
+# unmeasured px, so rotating/mirroring a (py, pz) pair is ill-defined and
+# smearing reconstructed muon tracks is not a calibration effect. Do not
+# re-enable any of them without a physics decision first.
 python -m train.pretrain \
     --train \
     --stage1 \

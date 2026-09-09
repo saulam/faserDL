@@ -54,11 +54,13 @@ elif [[ "$sparse_ecal" == "auto" ]]; then
     esac
 fi
 
+# Augmentations default to OFF for v9: utils/augmentations.py still assumes
+# the v8 muon layout. See pretrain.sh for the details.
 python -m train.finetune \
     --train \
     --stage2 \
     ${sparse_ecal_flag:+$sparse_ecal_flag} \
-    --augmentations_enabled \
+    ${AUGMENTATION_FLAG:---augmentations_disabled} \
     --dataset_path "$DATASET_PATH" \
     --metadata_path "$METADATA_PATH" \
     --model $model \

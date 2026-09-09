@@ -17,7 +17,7 @@ from dataset import *
 from model import *
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import CSVLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping
 
 
 torch.backends.cudnn.allow_tf32=True
@@ -146,6 +146,17 @@ def main():
             )
         progress_bar = CustomProgressBar()
         cbs.append(progress_bar)
+        # --early_stop_patience was previously parsed but never used here, so
+        # finetune/scratch always ran the full --epochs even once val had turned.
+        if args.early_stop_patience > 0:
+            cbs.append(
+                EarlyStopping(
+                    monitor='loss_total/val',
+                    patience=args.early_stop_patience,
+                    verbose=True,
+                    mode='min',
+                )
+            )
         return cbs
 
     # Logging

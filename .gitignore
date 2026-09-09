@@ -134,4 +134,5 @@ transfer_learning/transfer_scintillator/results/
 transfer_learning/transfer_scintillator/plots/
 
 # Codex
-.codex
+.codexcore.*
+core_nid*
