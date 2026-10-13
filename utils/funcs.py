@@ -149,6 +149,12 @@ def pack_muspec(nb_muspec_tracks, muspec_info):
     # pad_sequence expects (seq_len, *) so we tell it batch_first=True
     feats = pad_sequence(muspec_info, batch_first=True, padding_value=0.0)  # (B, K_max, 5)
     B, K_max, D = feats.shape
+    if K_max == 0:
+        # The encoder deliberately creates one safe dummy key for events with
+        # no tracks.  A whole batch (notably a batch-size-one smoke test) can
+        # otherwise have sequence length zero and no index 0 to mark as safe.
+        feats = feats.new_zeros(B, 1, D)
+        K_max = 1
 
     lengths = torch.tensor([t.size(0) for t in muspec_info], device=feats.device)
     idxs = torch.arange(K_max, device=feats.device).unsqueeze(0).expand(B, -1)
@@ -518,18 +524,128 @@ class CombinedScheduler(_LRScheduler):
             self.scheduler2.load_state_dict(state_dict['scheduler2'])
 
 
-def load_mae_encoder(model_vit, mae_ckpt):
-    sd = {key.replace("model.", ""): value for key, value in mae_ckpt['state_dict'].items()}
-    # Keep only encoder keys that exist in the fine-tune model
-    vit_sd = model_vit.state_dict()
-    #keep = {k: v for k, v in sd.items() if k in vit_sd and v.shape == vit_sd[k].shape}
-    #missing = [k for k in vit_sd.keys() if k not in keep]
-    #dropped = [k for k in sd.keys() if k not in keep]
-    msg = model_vit.load_state_dict(sd, strict=False)
-    #print("Loaded:", len(keep))
-    #print("Missing in ckpt:", len(missing))
-    #print("Dropped from ckpt:", len(dropped))
-    print("Load msg:", msg)
+def extract_pretrained_encoder_state(checkpoint, encoder_source="auto"):
+    """Extract a bare encoder state dict from MAE or JEPA checkpoints.
+
+    ``auto`` preserves the historical MAE behaviour and prefers the EMA target
+    encoder when a JEPA checkpoint contains both branches.
+    """
+    if encoder_source not in {"auto", "context", "target"}:
+        raise ValueError(f"Unknown encoder source: {encoder_source}")
+
+    state = checkpoint.get("state_dict", checkpoint)
+    target_prefixes = ("model.target_encoder.", "target_encoder.")
+    context_prefixes = ("model.context_encoder.", "context_encoder.")
+
+    def _has_prefix(prefixes):
+        return any(any(key.startswith(prefix) for prefix in prefixes) for key in state)
+
+    has_target = _has_prefix(target_prefixes)
+    has_context = _has_prefix(context_prefixes)
+    if encoder_source == "auto":
+        selected = "target" if has_target else ("context" if has_context else "mae")
+    else:
+        selected = encoder_source
+
+    if selected == "target":
+        if not has_target:
+            raise ValueError("The checkpoint does not contain a JEPA target encoder.")
+        prefixes = target_prefixes
+    elif selected == "context" and has_context:
+        prefixes = context_prefixes
+    elif selected == "context":
+        # An MAE checkpoint has one encoder, which is equivalent to the context
+        # branch for downstream initialisation.
+        selected = "mae"
+        prefixes = ()
+    else:
+        prefixes = ()
+
+    if prefixes:
+        extracted = {}
+        for key, value in state.items():
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    extracted[key[len(prefix):]] = value
+                    break
+    else:
+        extracted = {
+            (key[len("model."):] if key.startswith("model.") else key): value
+            for key, value in state.items()
+            if not key.startswith(("model.context_encoder.", "model.target_encoder."))
+        }
+
+    return extracted, selected
+
+
+def load_mae_encoder(
+    model_vit,
+    mae_ckpt,
+    encoder_source="auto",
+    require_full_encoder=False,
+):
+    """Load compatible pretrained encoder weights into the fine-tuning model.
+
+    Loading remains shape/key compatible for cross-domain transfer utilities,
+    while the main in-domain fine-tuning entry point sets
+    ``require_full_encoder=True`` to enforce an identical backbone.
+    """
+    state, selected = extract_pretrained_encoder_state(mae_ckpt, encoder_source)
+    target_state = model_vit.state_dict()
+    shape_mismatches = {
+        key: (tuple(value.shape), tuple(target_state[key].shape))
+        for key, value in state.items()
+        if key in target_state and value.shape != target_state[key].shape
+    }
+    compatible = {
+        key: value
+        for key, value in state.items()
+        if key in target_state and value.shape == target_state[key].shape
+    }
+    if not compatible:
+        raise RuntimeError("No compatible encoder weights were found in the checkpoint.")
+
+    # SparseViT's supervised-only parameters are all under heads.* when using
+    # the global-pooling configuration.  Excluding those gives a meaningful
+    # target-side encoder coverage even when tiny is transferred into base.
+    target_encoder_keys = [
+        key for key in target_state if not key.startswith("heads.")
+    ]
+    loaded_encoder_keys = [key for key in compatible if key in target_encoder_keys]
+    target_encoder_numel = sum(target_state[key].numel() for key in target_encoder_keys)
+    loaded_encoder_numel = sum(target_state[key].numel() for key in loaded_encoder_keys)
+    encoder_coverage = loaded_encoder_numel / max(1, target_encoder_numel)
+    missing_encoder = [key for key in target_encoder_keys if key not in compatible]
+    unused_source = [key for key in state if key not in compatible]
+    if require_full_encoder and missing_encoder:
+        preview = ", ".join(missing_encoder[:8])
+        if len(missing_encoder) > 8:
+            preview += ", ..."
+        raise RuntimeError(
+            "The pretraining checkpoint does not fully cover the downstream "
+            f"encoder ({encoder_coverage:.1%} by parameters; missing "
+            f"{len(missing_encoder)} tensors: {preview}). Use the same model "
+            "variant for pretraining and fine-tuning."
+        )
+    msg = model_vit.load_state_dict(compatible, strict=False)
+    print(
+        f"Loaded {len(compatible)} encoder tensors from the {selected} branch; "
+        f"target encoder coverage={encoder_coverage:.1%} by parameters; "
+        f"missing encoder tensors={len(missing_encoder)}, "
+        f"missing total={len(msg.missing_keys)}, unused source={len(unused_source)}"
+    )
+    return {
+        "source": selected,
+        "loaded": sorted(compatible),
+        "missing": list(msg.missing_keys),
+        "unexpected": list(msg.unexpected_keys),
+        "missing_encoder": sorted(missing_encoder),
+        "unused_source": sorted(unused_source),
+        "shape_mismatches": shape_mismatches,
+        "encoder_coverage": encoder_coverage,
+        "loaded_encoder_numel": loaded_encoder_numel,
+        "target_encoder_numel": target_encoder_numel,
+    }
 
 
 def move_obj(o, device):

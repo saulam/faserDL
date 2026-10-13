@@ -143,7 +143,8 @@ def _to_sdpa_mask(mask, B, Q, K, device, dtype):
     return m
 
 
-# NOTE: patch works for timm version 0.6.13
+# The custom block accepts the constructor arguments used by both the older
+# project environment and current timm VisionTransformer implementations.
 class MaskableAttention(Attention):
     def forward(self, x, attn_mask=None):  # x: [B, N, C]
         B, N, C = x.shape
@@ -177,6 +178,11 @@ class BlockWithMask(Block):
             act_layer=nn.GELU,
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
+            attn_layer=None,
+            depth=0,
+            device=None,
+            dtype=None,
+            **kwargs,
     ):
         super().__init__(
             dim,

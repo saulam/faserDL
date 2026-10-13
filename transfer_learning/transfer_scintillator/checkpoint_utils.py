@@ -2,6 +2,8 @@
 
 import torch
 
+from utils.funcs import extract_pretrained_encoder_state
+
 
 _KEY_REMAP = {
     "module_cls_token": "cls_token",
@@ -28,8 +30,7 @@ _SKIP_PREFIXES = (
 def load_pretrained_encoder(model, checkpoint_path, verbose=True):
     """Load compatible FASERCal weights into the adapted model."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    state = ckpt.get("state_dict", ckpt)
-    state = {k.replace("model.", "", 1): v for k, v in state.items()}
+    state, encoder_source = extract_pretrained_encoder_state(ckpt, "auto")
 
     target_sd = model.state_dict()
 
@@ -82,6 +83,7 @@ def load_pretrained_encoder(model, checkpoint_path, verbose=True):
 
     if verbose:
         print("\n=== Checkpoint loading summary ===")
+        print(f"  Encoder source:    {encoder_source}")
         print(f"  Loaded:            {len(loaded)}")
         print(f"  Skipped (shape):   {len(skipped_shape)}")
         print(f"  Skipped (detector):{len(skipped_detector)}")

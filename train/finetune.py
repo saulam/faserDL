@@ -55,6 +55,7 @@ def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
+    pl.seed_everything(args.seed, workers=True)
     print("\n- Arguments:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
@@ -108,10 +109,28 @@ def main():
         metadata = metadata,
     )
 
-    # Load pre-trained encoder weights (start fresh training)
-    if args.load_checkpoint is not None and os.path.exists(args.load_checkpoint):
+    # Load pre-trained encoder weights (start fresh training).  Record transfer
+    # provenance in hparams so MAE/JEPA downstream runs remain auditable.
+    args.pretrained_encoder_resolved_source = None
+    args.pretrained_encoder_coverage = None
+    args.pretrained_checkpoint_epoch = None
+    args.pretrained_checkpoint_global_step = None
+    if args.load_checkpoint is not None:
+        if not os.path.exists(args.load_checkpoint):
+            raise FileNotFoundError(
+                f"Pretraining checkpoint does not exist: {args.load_checkpoint}"
+            )
         checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
-        load_mae_encoder(model, checkpoint)
+        load_report = load_mae_encoder(
+            model,
+            checkpoint,
+            encoder_source=args.pretrained_encoder_source,
+            require_full_encoder=True,
+        )
+        args.pretrained_encoder_resolved_source = load_report["source"]
+        args.pretrained_encoder_coverage = load_report["encoder_coverage"]
+        args.pretrained_checkpoint_epoch = checkpoint.get("epoch")
+        args.pretrained_checkpoint_global_step = checkpoint.get("global_step")
     else:
         print("Training from scratch!")
 
@@ -186,6 +205,7 @@ def main():
         log_every_n_steps=args.log_every_n_steps,
         deterministic=False,
         accumulate_grad_batches=args.accum_grad_batches,
+        fast_dev_run=args.fast_dev_run,
     )
 
     # Resume training from checkpoint (restores optimiser, epoch, etc.)

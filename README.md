@@ -10,6 +10,11 @@ The main workflow has two stages:
 - Stage 2: supervised fine-tuning for event classification and kinematic
   regression
 
+Stage-1 training now supports both the published MAE reconstruction objective
+and a controlled JEPA-style latent-prediction objective.  See
+[`docs/JEPA.md`](docs/JEPA.md) for the design, tensor flow, configuration,
+checkpoint behavior, tests, and exact commands.
+
 The repository also includes:
 
 - transfer learning from a pretrained FASERCal encoder to a public
@@ -140,6 +145,9 @@ export METADATA_PATH='path/to/metadata_stats.pkl'
 bash pretrain.sh
 ```
 
+Set `PRETRAINING_OBJECTIVE=jepa` to use EMA-target latent prediction while
+keeping the existing patching and encoder.  The default remains `mae`.
+
 ### Fine-tuning from a pretrained checkpoint
 
 ```bash
@@ -149,6 +157,11 @@ export LOAD_CHECKPOINT='path/to/pretrain_checkpoint.ckpt'
 
 bash finetune.sh
 ```
+
+Pretraining, fine-tuning, and the scratch control default to the same `tiny`
+backbone.  Set `MODEL=base` consistently across stages to use `base`; in-domain
+fine-tuning rejects partial encoder loads.  For the completed JEPA run, use
+`conda run -n spconv bash finetune_jepa.sh`.
 
 ### Fine-tuning from scratch
 
@@ -162,6 +175,21 @@ bash scratch.sh
 `LOAD_CHECKPOINT` starts a fresh run with loaded weights. `RESUME_CHECKPOINT`
 restores the full training state. Multi-GPU runs are supported by setting
 `GPUS='0 1'` or similar.
+
+### JEPA fine-tuning evaluation
+
+Once `finetune_jepa.sh` has completed, create the deterministic v7 test CSV:
+
+```bash
+conda run --no-capture-output -n spconv \
+  python -m evaluation.create_csv_v7_ft --gpu 0
+```
+
+The command selects the best task-specific checkpoints and writes the CSV,
+test-file manifest, and provenance metadata under `results/`. It refuses
+incomplete runs or checkpoints that were not initialized from the complete
+JEPA EMA target encoder. See [`docs/JEPA.md`](docs/JEPA.md) for details and the
+short smoke command.
 
 ## Transfer Learning
 

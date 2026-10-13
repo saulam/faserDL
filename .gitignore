@@ -82,7 +82,13 @@ core
 # Documentation (except README.md)
 *.md
 !README.md
+!docs/
+!docs/*.md
 paper*
+
+# Repository tests are source files, not temporary test outputs.
+!tests/
+!tests/*.py
 
 # Shell scripts (testing/backup scripts)
 pretrainbak.sh
@@ -100,6 +106,7 @@ Thumbs.db
 # Results
 ML_FASERCal_Results
 ML_FASERCal_Results/*
+results/
 
 # Data-efficiency study artefacts
 data_efficiency_study/manifests/
@@ -129,3 +136,21 @@ transfer_learning/transfer_scintillator/logs_scintillator/
 transfer_learning/transfer_scintillator/checkpoints_scintillator/
 transfer_learning/transfer_scintillator/results/
 transfer_learning/transfer_scintillator/plots/
+
+# Local datasets
+/events_v7.0*
+
+# Tool and test caches
+.cache/
+cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local agent metadata
+/.agents/
+/.codex/

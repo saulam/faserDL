@@ -153,7 +153,11 @@ def main():
         if not os.path.exists(args.load_checkpoint):
             raise FileNotFoundError(f"Checkpoint not found: {args.load_checkpoint}")
         checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
-        load_mae_encoder(model, checkpoint)
+        load_mae_encoder(
+            model,
+            checkpoint,
+            encoder_source=args.pretrained_encoder_source,
+        )
     else:
         print("Initialising fine-tuner from scratch.")
 

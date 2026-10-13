@@ -2,6 +2,8 @@
 
 import torch
 
+from utils.funcs import extract_pretrained_encoder_state
+
 
 # Mapping from FASERCal SparseViT keys to PILArNetEncoder keys.
 # Only includes entries where the name differs; same-name keys are matched
@@ -48,10 +50,7 @@ def load_pretrained_encoder(model, checkpoint_path, verbose=True):
     dict with keys: loaded, skipped_shape, skipped_detector, missing, unexpected
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    state = ckpt.get("state_dict", ckpt)
-
-    # Strip the Lightning ``model.`` prefix if present
-    state = {k.replace("model.", "", 1): v for k, v in state.items()}
+    state, encoder_source = extract_pretrained_encoder_state(ckpt, "auto")
 
     target_sd = model.state_dict()
 
@@ -107,6 +106,7 @@ def load_pretrained_encoder(model, checkpoint_path, verbose=True):
 
     if verbose:
         print(f"\n=== Checkpoint loading summary ===")
+        print(f"  Encoder source:    {encoder_source}")
         print(f"  Loaded:            {len(loaded)}")
         print(f"  Skipped (shape):   {len(skipped_shape)}")
         print(f"  Skipped (detector):{len(skipped_detector)}")

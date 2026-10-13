@@ -16,6 +16,7 @@ from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLo
 from dataset import *
 from model import *
 from model.lightning_model_pretrain import MAEPreTrainer
+from model.lightning_model_jepa import JEPAPreTrainer
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar, EarlyStopping 
@@ -27,6 +28,10 @@ pl_major = int(pl.__version__.split(".")[0])
 MODEL_FACTORIES = {
     'tiny':  mae_vit_tiny,
     'base':  mae_vit_base,
+}
+JEPA_MODEL_FACTORIES = {
+    mae_vit_tiny: jepa_vit_tiny,
+    mae_vit_base: jepa_vit_base,
 }
 
 
@@ -104,17 +109,32 @@ def main():
     # self.trainer.estimated_stepping_batches.
 
     # Initialise the model
-    model = args.model(
-        drop_rate = args.dropout,
-        attn_drop_rate = args.attn_dropout,
-        drop_path_rate = args.drop_path_rate,
-        drop_rate_dec = args.dropout_dec,
-        attn_drop_rate_dec = args.attn_dropout_dec,
-        metadata = metadata,
+    model_kwargs = dict(
+        drop_rate=args.dropout,
+        attn_drop_rate=args.attn_dropout,
+        drop_path_rate=args.drop_path_rate,
+        metadata=metadata,
     )
+    if args.pretraining_objective == "jepa":
+        model = JEPA_MODEL_FACTORIES[args.model](
+            **model_kwargs,
+            predictor_hidden_dim=args.jepa_predictor_hidden_dim,
+            predictor_dropout=args.jepa_predictor_dropout,
+            target_normalization=args.jepa_target_normalization,
+            loss_type=args.jepa_loss_type,
+            target_selection=args.jepa_target_selection,
+        )
+    else:
+        model = args.model(
+            **model_kwargs,
+            drop_rate_dec=args.dropout_dec,
+            attn_drop_rate_dec=args.attn_dropout_dec,
+        )
     #print(model)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Total trainable params model (total): {}".format(total_params))
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print("Total trainable params model: {}".format(trainable_params))
+    print("Total stored params model: {}".format(total_params))
     
     # Checkpoint
     callbacks = []
@@ -155,10 +175,14 @@ def main():
     tb_logger.log_hyperparams(vars(args))
 
     # Lightning model with distance-aware losses
-    lightning_model = MAEPreTrainer(
-        model=model,
-        dataset=dataset,
-        args=args)
+    if args.pretraining_objective == "jepa":
+        lightning_model = JEPAPreTrainer(model=model, args=args)
+    else:
+        lightning_model = MAEPreTrainer(
+            model=model,
+            dataset=dataset,
+            args=args,
+        )
  
     # Initialise PyTorch Lightning trainer
     trainer = pl.Trainer(

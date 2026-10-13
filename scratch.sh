@@ -7,7 +7,7 @@ set -euo pipefail
 
 shardshuffle="${SHARDSHUFFLE:-200}"
 shuffle="${SHUFFLE:-2000}"
-model="${MODEL:-base}"
+model="${MODEL:-tiny}"
 eps="${EPS:-1e-8}"
 batch_size="${BATCH_SIZE:-1024}"
 mixup_alpha="${MIXUP_ALPHA:-0.0}"
@@ -41,6 +41,7 @@ checkpoint_path="${CHECKPOINT_PATH:-checkpoints}"
 checkpoint_name="${CHECKPOINT_NAME:-$name}"
 early_stop_patience="${EARLY_STOP_PATIENCE:-15}"
 resume_checkpoint="${RESUME_CHECKPOINT:-}"
+seed="${SEED:-7}"
 nb_nodes="${NB_NODES:-1}"
 read -r -a gpus <<< "${GPUS:-0}"
 
@@ -82,6 +83,7 @@ python -m train.finetune \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
+    --seed $seed \
     --nb_nodes $nb_nodes \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
     --gpus "${gpus[@]}"

@@ -47,10 +47,12 @@ class SparseMAEViT(nn.Module):
         attn_drop_rate_dec=0.,
         norm_layer=nn.LayerNorm,
         metadata=None,
+        build_decoder=True,
     ):
         super().__init__()
 
         self.metadata = metadata
+        self.build_decoder = bool(build_decoder)
     
         # patch and grid setup
         H, W, D_img = fcal_size
@@ -220,67 +222,68 @@ class SparseMAEViT(nn.Module):
         ])
         self.tokens_norm = norm_layer(embed_dim)
 
-        # ==========================
-        # Perceiver-IO decoder (reconstruction)
-        # ==========================
-        assert decoder_embed_dim % decoder_num_heads == 0, "decoder_embed_dim must be divisible by decoder_num_heads"
-        self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim)  # frozen sin-cos
-        self.module_embed_dec = nn.Embedding(self.num_modules, decoder_embed_dim)
-        self.query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+        if self.build_decoder:
+            # ==========================
+            # Perceiver-IO decoder (reconstruction)
+            # ==========================
+            assert decoder_embed_dim % decoder_num_heads == 0, "decoder_embed_dim must be divisible by decoder_num_heads"
+            self.decoder_intra_pos_embed = nn.Embedding(self.num_intra_positions, decoder_embed_dim)  # frozen sin-cos
+            self.module_embed_dec = nn.Embedding(self.num_modules, decoder_embed_dim)
+            self.query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
 
-        self.enc_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
-        
-        # masked queries attend to LATENTS
-        self.decode_lat_xattn_blocks = nn.ModuleList([
-            CrossAttnBlock(
-                dim=decoder_embed_dim, num_heads=decoder_num_heads,
-                mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec,
-                attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
+            self.enc_to_dec = nn.Linear(embed_dim, decoder_embed_dim)
+
+            # masked queries attend to LATENTS
+            self.decode_lat_xattn_blocks = nn.ModuleList([
+                CrossAttnBlock(
+                    dim=decoder_embed_dim, num_heads=decoder_num_heads,
+                    mlp_ratio=mlp_ratio, qkv_bias=True, drop=drop_rate_dec,
+                    attn_drop=attn_drop_rate_dec, drop_path=0., norm_layer=norm_layer
+                )
+                for _ in range(io_decode_depth)
+            ])
+
+            self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim)
+            self.ahcal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+
+            # ==========================
+            # Heads
+            # ==========================
+            self.fasercal_sep_basis = MultiRankSeparableBasis3D(
+                self.fcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
             )
-            for _ in range(io_decode_depth)
-        ])
+            self.fasercal_shared_voxel_head = MultiRankSharedLatentVoxelHead(
+                decoder_embed_dim, self.fasercal_sep_basis, H=num_modes[0],
+                norm_layer=norm_layer, post_norm=True
+            )
+            self.ahcal_sep_basis = MultiRankSeparableBasis3D(
+                self.ahcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
+            )
+            self.ahcal_voxel_head = MultiRankSharedLatentVoxelHead(
+                decoder_embed_dim, self.ahcal_sep_basis, H=num_modes[1],
+                norm_layer=norm_layer, post_norm=True,
+            )
+            self.head_channels = {
+                "gho": 1,
+                "hie": 3,
+                "pid": num_pid_classes,
+                "occ": 1,
+                "reg": in_chans,
+                "occ_ahcal": 1,
+                "reg_ahcal": in_chans,
+            }
 
-        self.decoder_ahcal_pos_embed = nn.Embedding(self.num_ahcal_positions, decoder_embed_dim)
-        self.ahcal_query_tokens = nn.Parameter(torch.zeros(1, decoder_embed_dim))
+            self.heads = nn.ModuleDict()
+            for name, out_channels in self.head_channels.items():
+                in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0]
+                self.heads[name] = nn.Linear(in_dim, out_channels)
 
-        # ==========================
-        # Heads
-        # ==========================
-        self.fasercal_sep_basis = MultiRankSeparableBasis3D(
-            self.fcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
-        )
-        self.fasercal_shared_voxel_head = MultiRankSharedLatentVoxelHead(
-            decoder_embed_dim, self.fasercal_sep_basis, H=num_modes[0],
-            norm_layer=norm_layer, post_norm=True
-        )
-        self.ahcal_sep_basis = MultiRankSeparableBasis3D(
-            self.ahcal_patch_size.tolist(), alphas=(0.4, 0.4, 0.6), R=2,
-        )
-        self.ahcal_voxel_head = MultiRankSharedLatentVoxelHead(
-            decoder_embed_dim, self.ahcal_sep_basis, H=num_modes[1],
-            norm_layer=norm_layer, post_norm=True,
-        )
-        self.head_channels = {
-            "gho": 1,
-            "hie": 3,
-            "pid": num_pid_classes,
-            "occ": 1,
-            "reg": in_chans,
-            "occ_ahcal": 1,
-            "reg_ahcal": in_chans,
-        }
-        
-        self.heads = nn.ModuleDict()
-        for name, out_channels in self.head_channels.items():
-            in_dim = num_modes[1] if name in ["occ_ahcal", "reg_ahcal"] else num_modes[0]
-            self.heads[name] = nn.Linear(in_dim, out_channels)
-
-        # ==========================
-        # Global token reconstruction heads
-        # ==========================
-        self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
-        self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
-        self.muon_recon_head = nn.Linear(decoder_embed_dim, 5)
+            # ==========================
+            # Global token reconstruction heads
+            # ==========================
+            self.global_query = nn.Parameter(torch.zeros(2, decoder_embed_dim))  # 0=ECAL, 1=MUON
+            self.ecal_recon_head = nn.Linear(decoder_embed_dim, 25)
+            self.muon_recon_head = nn.Linear(decoder_embed_dim, 5)
 
         self.initialize_weights()
 
@@ -305,23 +308,24 @@ class SparseMAEViT(nn.Module):
             self.ahcal_pos_embed.weight.copy_(torch.from_numpy(ahcal_pos).float())
             self.ahcal_pos_embed.weight.requires_grad_(False)
 
-        dec_pos = get_3d_sincos_pos_embed(
-            self.decoder_intra_pos_embed.weight.shape[-1],
-            self.intra_grid_size,
-            cls_token=False
-        )
-        with torch.no_grad():
-            self.decoder_intra_pos_embed.weight.copy_(torch.from_numpy(dec_pos).float())
-            self.decoder_intra_pos_embed.weight.requires_grad_(False)
+        if self.build_decoder:
+            dec_pos = get_3d_sincos_pos_embed(
+                self.decoder_intra_pos_embed.weight.shape[-1],
+                self.intra_grid_size,
+                cls_token=False
+            )
+            with torch.no_grad():
+                self.decoder_intra_pos_embed.weight.copy_(torch.from_numpy(dec_pos).float())
+                self.decoder_intra_pos_embed.weight.requires_grad_(False)
 
-        dec_ahcal_pos = get_3d_sincos_pos_embed(
-            self.decoder_ahcal_pos_embed.weight.shape[-1],
-            self.ahcal_grid_size,
-            cls_token=False
-        )
-        with torch.no_grad():
-            self.decoder_ahcal_pos_embed.weight.copy_(torch.from_numpy(dec_ahcal_pos).float())
-            self.decoder_ahcal_pos_embed.weight.requires_grad_(False)
+            dec_ahcal_pos = get_3d_sincos_pos_embed(
+                self.decoder_ahcal_pos_embed.weight.shape[-1],
+                self.ahcal_grid_size,
+                cls_token=False
+            )
+            with torch.no_grad():
+                self.decoder_ahcal_pos_embed.weight.copy_(torch.from_numpy(dec_ahcal_pos).float())
+                self.decoder_ahcal_pos_embed.weight.requires_grad_(False)
 
         # init tokens
         with torch.no_grad():
@@ -329,11 +333,12 @@ class SparseMAEViT(nn.Module):
             nn.init.normal_(self.ahcal_cls_token, std=.02)
             nn.init.normal_(self.module_embed_enc.weight, std=0.02)
             nn.init.normal_(self.kv_src_embed.weight, std=0.02)
-            nn.init.normal_(self.module_embed_dec.weight, std=0.02)
-            nn.init.normal_(self.query_tokens, std=0.02)
-            nn.init.normal_(self.ahcal_query_tokens, std=0.02)
             nn.init.normal_(self.muon_state_embed.weight, std=0.02)
-            nn.init.normal_(self.global_query, std=0.02)
+            if self.build_decoder:
+                nn.init.normal_(self.module_embed_dec.weight, std=0.02)
+                nn.init.normal_(self.query_tokens, std=0.02)
+                nn.init.normal_(self.ahcal_query_tokens, std=0.02)
+                nn.init.normal_(self.global_query, std=0.02)
 
         self.apply(self._init_weights)
 
@@ -355,17 +360,21 @@ class SparseMAEViT(nn.Module):
 
 
     def no_weight_decay(self):
-        return {
+        names = {
             'module_cls_token',
             'ahcal_cls_token',
             'module_embed_enc.weight',
             'kv_src_embed.weight',
-            'module_embed_dec.weight',
-            'query_tokens',
-            'ahcal_query_tokens',
             'muon_state_embed.weight',
-            'global_query',
         }
+        if self.build_decoder:
+            names.update({
+                'module_embed_dec.weight',
+                'query_tokens',
+                'ahcal_query_tokens',
+                'global_query',
+            })
+        return names
     
 
     def densify_patches(self, x_sp, is_fasercal: bool = True):
@@ -1058,6 +1067,9 @@ class SparseMAEViT(nn.Module):
           glob_tgts, glob_masks:  for global losses
           aux:                    dict with run flags
         """
+        if not self.build_decoder:
+            raise RuntimeError("This encoder-only model does not include the MAE reconstruction decoder.")
+
         # occupancy maps (same for both passes)
         idx_map = self.build_patch_occupancy_map(x, self.fcal_patch_size, self.grid_size)
         ahcal_sparse, *_ = x_glob
@@ -1174,4 +1186,3 @@ def mae_vit_base(**kwargs):
         mlp_ratio=4.0, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs,
     )
     return model
-

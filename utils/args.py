@@ -39,7 +39,9 @@ def ini_argparse(
     parser.add_argument("--shardshuffle", type=int, default=200, help="shard shuffling if iterable dataset")
     parser.add_argument("--shuffle", type=int, default=2000, help="sample shuffling if iterable dataset")
     parser.add_argument("--metadata_path", type=str, default=None, required=True, help="Path for metadata")
-    parser.add_argument('--model', type=model_type, default='base', help='Which model size to use (base / large / huge')
+    parser.add_argument('--model', type=model_type, default='tiny', help='Which model size to use (tiny / base)')
+    parser.add_argument("--pretraining_objective", type=str, default="mae", choices=["mae", "jepa"],
+                        help="Stage-1 objective: existing masked reconstruction (mae) or latent prediction (jepa)")
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Percentage of masked patches during pre-training")
     parser.add_argument("--eps", type=float, default=1e-12, help="value to prevent division by zero")
     parser.add_argument("-b", "--batch_size", type=int, default=2, help="batch size")
@@ -55,6 +57,26 @@ def ini_argparse(
     parser.add_argument("-b1", "--beta1", type=float, default=0.9, help="AdamW first beta value")
     parser.add_argument("-b2", "--beta2", type=float, default=0.999, help="AdamW second beta value")
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay")
+    parser.add_argument("--jepa_ema_decay", type=float, default=0.996,
+                        help="Initial EMA decay for the JEPA target encoder")
+    parser.add_argument("--jepa_ema_end_decay", type=float, default=1.0,
+                        help="Final EMA decay reached with a cosine schedule during JEPA pretraining")
+    parser.add_argument("--jepa_predictor_hidden_dim", type=int, default=384,
+                        help="Hidden dimension of the discardable JEPA latent predictor")
+    parser.add_argument("--jepa_predictor_dropout", type=float, default=0.0,
+                        help="Dropout in the JEPA latent predictor")
+    parser.add_argument("--jepa_target_normalization", type=str, default="layernorm",
+                        choices=["none", "layernorm", "l2"],
+                        help="Normalization applied to predicted and target JEPA latents before the loss")
+    parser.add_argument("--jepa_loss_type", type=str, default="smooth_l1",
+                        choices=["smooth_l1", "mse", "cosine"],
+                        help="Latent-space JEPA prediction loss")
+    parser.add_argument("--jepa_target_selection", type=str, default="masked_modules",
+                        choices=["masked_modules", "all"],
+                        help="Predict latent slots associated with masked modules, or every valid latent slot")
+    parser.add_argument("--pretrained_encoder_source", type=str, default="auto",
+                        choices=["auto", "context", "target"],
+                        help="Encoder branch to load from a JEPA checkpoint; auto prefers the EMA target")
     parser.add_argument("--head_init", type=float, default=0.001, help="Fine-tuning head(s) initialisation value")
     parser.add_argument("--head_dropout_cls", type=float, default=0.0, help="Dropout rate for classification/vertex heads (overfit-prone tasks)")
     parser.add_argument("--head_dropout_reg", type=float, default=0.0, help="Dropout rate for regression heads (momentum tasks)")
@@ -75,6 +97,10 @@ def ini_argparse(
     parser.add_argument("--checkpoint_name", type=str, default="v1", help="checkpoint name")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="path to a checkpoint to load weights from (starts fresh training; for pretraining: strict key matching; for finetuning: encoder-only with flexible matching)")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="path to a checkpoint to resume training from (restores optimiser state, epoch, etc.)")
+    parser.add_argument("--fast_dev_run", action="store_true", default=False,
+                        help="run one train and one validation batch without checkpointing (smoke test)")
+    parser.add_argument("--seed", type=int, default=7,
+                        help="random seed for model/head initialization, data order, and workers")
     parser.add_argument("--nb_nodes", type=int, default=1, help="number of nodes")
     parser.add_argument('--gpus', nargs='*',  # 'nargs' can be '*' or '+' depending on your needs
                         default=[0],  # Default list

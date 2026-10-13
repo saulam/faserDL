@@ -8,6 +8,7 @@ set -euo pipefail
 shardshuffle="${SHARDSHUFFLE:-200}"
 shuffle="${SHUFFLE:-4000}"
 model="${MODEL:-tiny}"
+pretraining_objective="${PRETRAINING_OBJECTIVE:-mae}"
 eps="${EPS:-1e-8}"
 batch_size="${BATCH_SIZE:-512}"
 preprocessing_input="${PREPROCESSING_INPUT:-log}"
@@ -19,12 +20,42 @@ dropout_dec="${DROPOUT_DEC:-0.0}"
 attn_dropout_dec="${ATTN_DROPOUT_DEC:-0.0}"
 drop_path_rate_dec="${DROP_PATH_RATE_DEC:-0.0}"
 mask_ratio="${MASK_RATIO:-0.75}"
-epochs="${EPOCHS:-400}"
 num_workers="${NUM_WORKERS:-16}"
 blr="${BLR:-1.5e-4}"
 accum_grad_batches="${ACCUM_GRAD_BATCHES:-2}"
-warmup_epochs="${WARMUP_EPOCHS:-40}"
-cosine_annealing_epochs="${COSINE_ANNEALING_EPOCHS:-360}"
+
+# I-JEPA reaches its reported ImageNet operating point with substantially fewer
+# epochs than the canonical MAE comparison.  Use a shorter hypothesis-driven
+# JEPA schedule while keeping EPOCHS/WARMUP_EPOCHS/COSINE_ANNEALING_EPOCHS as
+# objective-independent overrides for controlled epoch-matched experiments.
+if [[ -n "${EPOCHS:-}" ]]; then
+    epochs="$EPOCHS"
+elif [[ "$pretraining_objective" == "jepa" ]]; then
+    epochs="${JEPA_EPOCHS:-100}"
+else
+    epochs="${MAE_EPOCHS:-400}"
+fi
+
+if [[ -n "${WARMUP_EPOCHS:-}" ]]; then
+    warmup_epochs="$WARMUP_EPOCHS"
+elif [[ "$pretraining_objective" == "jepa" ]]; then
+    warmup_epochs="${JEPA_WARMUP_EPOCHS:-10}"
+else
+    warmup_epochs="${MAE_WARMUP_EPOCHS:-40}"
+fi
+
+if [[ -n "${COSINE_ANNEALING_EPOCHS:-}" ]]; then
+    cosine_annealing_epochs="$COSINE_ANNEALING_EPOCHS"
+elif [[ "$pretraining_objective" == "jepa" ]]; then
+    cosine_annealing_epochs="${JEPA_COSINE_ANNEALING_EPOCHS:-$((epochs - warmup_epochs))}"
+else
+    cosine_annealing_epochs="${MAE_COSINE_ANNEALING_EPOCHS:-$((epochs - warmup_epochs))}"
+fi
+
+if (( warmup_epochs < 0 || cosine_annealing_epochs < 0 )); then
+    echo "Warm-up and cosine-annealing epochs must be non-negative." >&2
+    exit 2
+fi
 weight_decay="${WEIGHT_DECAY:-0.05}"
 beta1="${BETA1:-0.9}"
 beta2="${BETA2:-0.95}"
@@ -38,7 +69,7 @@ early_stop_patience="${EARLY_STOP_PATIENCE:-200}"
 load_checkpoint="${LOAD_CHECKPOINT:-}"
 resume_checkpoint="${RESUME_CHECKPOINT:-}"
 nb_nodes="${NB_NODES:-1}"
-read -r -a gpus <<< "${GPUS:-0 1 2 3}"
+read -r -a gpus <<< "${GPUS:-0 1}"
 reconstruction_loss_mode="${RECONSTRUCTION_LOSS_MODE:-hybrid}"
 reconstruction_chamfer_weight="${RECONSTRUCTION_CHAMFER_WEIGHT:-0.3}"
 reconstruction_distance_reg_weight="${RECONSTRUCTION_DISTANCE_REG_WEIGHT:-0.3}"
@@ -53,6 +84,13 @@ relational_pass_prob="${RELATIONAL_PASS_PROB:-0.5}"
 relational_mask_ratio="${RELATIONAL_MASK_RATIO:-0.25}"
 relational_voxel_keep_prob="${RELATIONAL_VOXEL_KEEP_PROB:-0.5}"
 relational_pass_seed="${RELATIONAL_PASS_SEED:-42}"
+jepa_ema_decay="${JEPA_EMA_DECAY:-0.996}"
+jepa_ema_end_decay="${JEPA_EMA_END_DECAY:-1.0}"
+jepa_predictor_hidden_dim="${JEPA_PREDICTOR_HIDDEN_DIM:-384}"
+jepa_predictor_dropout="${JEPA_PREDICTOR_DROPOUT:-0.0}"
+jepa_target_normalization="${JEPA_TARGET_NORMALIZATION:-layernorm}"
+jepa_loss_type="${JEPA_LOSS_TYPE:-smooth_l1}"
+jepa_target_selection="${JEPA_TARGET_SELECTION:-masked_modules}"
 
 python -m train.pretrain \
     --train \
@@ -61,6 +99,7 @@ python -m train.pretrain \
     --dataset_path "$DATASET_PATH" \
     --metadata_path "$METADATA_PATH" \
     --model $model \
+    --pretraining_objective $pretraining_objective \
     --eps $eps \
     --batch_size $batch_size \
     --preprocessing_input $preprocessing_input \
@@ -104,5 +143,12 @@ python -m train.pretrain \
     --relational_mask_ratio $relational_mask_ratio \
     --relational_voxel_keep_prob $relational_voxel_keep_prob \
     --relational_pass_seed $relational_pass_seed \
+    --jepa_ema_decay $jepa_ema_decay \
+    --jepa_ema_end_decay $jepa_ema_end_decay \
+    --jepa_predictor_hidden_dim $jepa_predictor_hidden_dim \
+    --jepa_predictor_dropout $jepa_predictor_dropout \
+    --jepa_target_normalization $jepa_target_normalization \
+    --jepa_loss_type $jepa_loss_type \
+    --jepa_target_selection $jepa_target_selection \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"}

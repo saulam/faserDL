@@ -7,7 +7,7 @@ set -euo pipefail
 
 shardshuffle="${SHARDSHUFFLE:-200}"
 shuffle="${SHUFFLE:-2000}"
-model="${MODEL:-base}"
+model="${MODEL:-tiny}"
 eps="${EPS:-1e-8}"
 batch_size="${BATCH_SIZE:-1024}"
 mixup_alpha="${MIXUP_ALPHA:-0.0}"
@@ -32,6 +32,7 @@ weight_decay="${WEIGHT_DECAY:-0.05}"
 beta1="${BETA1:-0.9}"
 beta2="${BETA2:-0.999}"
 ema_decay="${EMA_DECAY:-0.9999}"
+pretrained_encoder_source="${PRETRAINED_ENCODER_SOURCE:-auto}"
 head_init="${HEAD_INIT:-2e-5}"
 save_dir="${SAVE_DIR:-logs_final}"
 name="${NAME:-finetune_v7.0_finerel_paper}"
@@ -42,8 +43,15 @@ checkpoint_name="${CHECKPOINT_NAME:-$name}"
 early_stop_patience="${EARLY_STOP_PATIENCE:-10}"
 load_checkpoint="${LOAD_CHECKPOINT:-}"
 resume_checkpoint="${RESUME_CHECKPOINT:-}"
+fast_dev_run="${FAST_DEV_RUN:-0}"
+seed="${SEED:-7}"
 nb_nodes="${NB_NODES:-1}"
 read -r -a gpus <<< "${GPUS:-0}"
+
+fast_dev_run_args=()
+if [[ "$fast_dev_run" == "1" || "$fast_dev_run" == "true" ]]; then
+    fast_dev_run_args+=(--fast_dev_run)
+fi
 
 python -m train.finetune \
     --train \
@@ -75,6 +83,7 @@ python -m train.finetune \
     --beta1 $beta1 \
     --beta2 $beta2 \
     --ema_decay $ema_decay \
+    --pretrained_encoder_source $pretrained_encoder_source \
     --head_init $head_init \
     --save_dir $save_dir \
     --name $name \
@@ -83,7 +92,9 @@ python -m train.finetune \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
+    --seed $seed \
     --nb_nodes $nb_nodes \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
+    "${fast_dev_run_args[@]}" \
     --gpus "${gpus[@]}"
