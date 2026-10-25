@@ -7,7 +7,7 @@ set -euo pipefail
 
 shardshuffle="${SHARDSHUFFLE:-200}"
 shuffle="${SHUFFLE:-2000}"
-model="${MODEL:-tiny}"
+model="${MODEL:-base}"
 eps="${EPS:-1e-8}"
 batch_size="${BATCH_SIZE:-1024}"
 mixup_alpha="${MIXUP_ALPHA:-0.0}"

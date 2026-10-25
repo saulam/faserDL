@@ -10,11 +10,28 @@ Description:
 import math
 import copy
 import torch
+from pathlib import Path
 from torch.nn.utils.rnn import pad_sequence
 from spconv.pytorch import SparseConvTensor
 from functools import partial
 from torch.utils.data import random_split, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
+
+
+def resolve_checkpoint_path(path, argument_name="checkpoint"):
+    """Resolve an optional checkpoint path and fail if an explicit path is absent.
+
+    Training launchers must not silently turn a requested resume/load operation
+    into a fresh run merely because a path is misspelled or unavailable.
+    """
+    if path is None:
+        return None
+    checkpoint = Path(path).expanduser()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"{argument_name} checkpoint does not exist: {checkpoint}"
+        )
+    return str(checkpoint)
 
 
 def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):

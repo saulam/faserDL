@@ -697,11 +697,12 @@ class SparseMAEViT(nn.Module):
         return torch.cat([q_fas, q_ah], dim=1)                              # [B, M*CLS+K, C]
 
 
-    def forward_encoder(self, x_sparse, x_glob, mask_ratio):
+    def forward_encoder(self, x_sparse, x_glob, mask_ratio, return_tokens=False):
         """
         x_sparse:                   sparse input
         x_glob:                     global context
         mask_ratio:   float         masking ratio
+        return_tokens: bool         also return per-token encoder outputs (JEPA targets)
         """
         # retrieve global features
         ahcal_sparse, ecal_hits, muspec_feats, muspec_attn_mask, muspec_counts = x_glob
@@ -739,6 +740,7 @@ class SparseMAEViT(nn.Module):
 
         cls_mod = x_intra[:, :self.num_module_cls, :].view(B, M, self.num_module_cls, C)   # [B, M, CLS, C]
         tok_mod = x_intra[:, self.num_module_cls:, :].reshape(B, M, Lk, C)                 # [B, M, Lk, C]
+        fcal_tokens = tok_mod                                                              # encoder output per patch
         mod_ids = torch.arange(self.num_modules, device=tok_mod.device)
         tok_mod = tok_mod + self.module_embed_enc(mod_ids).view(1, M, 1, C)
 
@@ -825,7 +827,7 @@ class SparseMAEViT(nn.Module):
             lat = xa_lat(lat, kv_tokens, attn_mask=kv_keep, q_mask=lat_keep)                # lat <- tokens
             lat = sa(lat, attn_mask=lat_keep, q_mask=lat_keep)                              # latent self-attn
 
-        return (
+        outputs = (
             lat,                   # [B, N_lat, C]
             lat_keep,              # [B, N_lat]     which latents are valid
             rand_mask,             # [B, M, Lm]     FASERcal masked real positions
@@ -835,6 +837,17 @@ class SparseMAEViT(nn.Module):
             ~keep_ecal,            # [B]            ECAL dropped events
             ~keep_muon,            # [B]            MUON dropped events
         )
+        if not return_tokens:
+            return outputs
+        tokens = {
+            "fcal": fcal_tokens,                   # [B, M, Lk, C]  after self.norm, before module embedding
+            "fcal_ids": ids_keep,                  # [B, M, Lk]     intra position of each gathered token
+            "ahcal": tok_ah_keep,                  # [B, Lk_ah, C]  after ahcal_norm
+            "ahcal_ids": ah_ids_keep_mod.squeeze(1),  # [B, Lk_ah]  AHCAL position of each gathered token
+            "ecal": ecal_tok.squeeze(1),           # [B, C]
+            "muon": muon_tok.squeeze(1),           # [B, C]
+        }
+        return outputs + (tokens,)
 
 
     def _compute_within_ranks(self, b_ids: torch.Tensor, N: int) -> torch.Tensor:

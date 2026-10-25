@@ -149,13 +149,54 @@ class EvaluationCSVTests(unittest.TestCase):
                 pretrained_encoder_coverage=None,
                 load_checkpoint=None,
             )
-            with self.assertRaisesRegex(RuntimeError, "valid JEPA provenance"):
+            with self.assertRaisesRegex(RuntimeError, "valid pretraining provenance"):
                 validate_jepa_provenance(
                     scratch,
                     root / "hparams.yaml",
                     checkpoint_dir,
                     inspect_pretraining_checkpoint=False,
                 )
+
+    def test_provenance_accepts_mae_and_rejects_source_checkpoint_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint_dir = root / "checkpoints" / "fine"
+            checkpoint_dir.mkdir(parents=True)
+            jepa = root / "jepa.ckpt"
+            torch.save({"state_dict": {
+                "model.context_encoder.module_cls_token": torch.ones(1),
+                "model.target_encoder.module_cls_token": torch.ones(1),
+            }}, jepa)
+            mae = root / "mae.ckpt"
+            torch.save({"state_dict": {
+                "model.module_cls_token": torch.ones(1),
+                "model.query_tokens": torch.ones(1),
+            }}, mae)
+
+            def hparams(source, checkpoint):
+                return {
+                    "model": "base",
+                    "pretrained_encoder_resolved_source": source,
+                    "pretrained_encoder_coverage": 1.0,
+                    "load_checkpoint": str(checkpoint),
+                    "checkpoint_path": str(root / "checkpoints"),
+                    "checkpoint_name": "fine",
+                }
+
+            report = validate_jepa_provenance(hparams("mae", mae), root / "h.yaml", checkpoint_dir)
+            self.assertEqual(
+                (report["pretraining_objective"], report["pretrained_encoder_source"]), ("mae", "mae")
+            )
+            report = validate_jepa_provenance(hparams("context", jepa), root / "h.yaml", checkpoint_dir)
+            self.assertEqual(report["pretraining_objective"], "jepa")
+            with self.assertRaisesRegex(RuntimeError, "not a single-encoder MAE checkpoint"):
+                validate_jepa_provenance(hparams("mae", jepa), root / "h.yaml", checkpoint_dir)
+            with self.assertRaisesRegex(RuntimeError, "not a JEPA checkpoint"):
+                validate_jepa_provenance(hparams("target", mae), root / "h.yaml", checkpoint_dir)
+            partial = hparams("mae", mae)
+            partial["pretrained_encoder_coverage"] = 0.6
+            with self.assertRaisesRegex(RuntimeError, "coverage"):
+                validate_jepa_provenance(partial, root / "h.yaml", checkpoint_dir)
 
     def test_completed_validation_epoch_detection(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,4 +1,4 @@
-"""Create the canonical test CSV for a JEPA-initialized v7 fine-tune.
+"""Create the canonical test CSV for a pretrained (JEPA or MAE) v7 fine-tune.
 
 This is the v7 counterpart of the supplied ``create_csv_v9_ft.py`` driver.
 Unlike the exported v9 run, v7 has no split manifest: training creates its
@@ -6,9 +6,11 @@ Unlike the exported v9 run, v7 has no split manifest: training creates its
 repeats that exact operation over the exact ordered file inventory recorded in
 the fine-tuning hparams, then evaluates only the resulting test files.
 
-The script deliberately refuses incomplete, scratch, MAE-initialized, partial-
-coverage, or wrong-backbone runs.  It also writes a test-file manifest and a
-JSON provenance sidecar next to the CSV.
+The script deliberately refuses incomplete, scratch, partial-coverage, or
+wrong-backbone runs, and runs whose recorded encoder source does not match the
+pretraining checkpoint (JEPA context/target branch versus a single MAE
+encoder).  It also writes a test-file manifest and a JSON provenance sidecar
+next to the CSV.
 """
 
 from __future__ import annotations
@@ -103,18 +105,24 @@ def resolve_from_repo(value: str | os.PathLike) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def validate_jepa_provenance(
+PRETRAINING_OBJECTIVE_BY_SOURCE = {"target": "jepa", "context": "jepa", "mae": "mae"}
+
+
+def validate_pretraining_provenance(
     hparams: dict[str, object],
     hparams_path: Path,
     checkpoint_dir: Path,
     *,
     inspect_pretraining_checkpoint: bool = True,
 ) -> dict[str, object]:
-    """Fail closed unless this is an exact-backbone JEPA target fine-tune."""
+    """Fail closed unless this is an exact-backbone JEPA or MAE fine-tune."""
     errors = []
     source = hparams.get("pretrained_encoder_resolved_source")
-    if source != "target":
-        errors.append(f"pretrained encoder source is {source!r}, expected 'target'")
+    if source not in PRETRAINING_OBJECTIVE_BY_SOURCE:
+        errors.append(
+            f"pretrained encoder source is {source!r}, expected one of "
+            f"{sorted(PRETRAINING_OBJECTIVE_BY_SOURCE)}"
+        )
 
     coverage = hparams.get("pretrained_encoder_coverage")
     if coverage is None or not math.isclose(float(coverage), 1.0):
@@ -148,7 +156,7 @@ def validate_jepa_provenance(
 
     if errors:
         raise RuntimeError(
-            "Refusing to evaluate a checkpoint without valid JEPA provenance:\n- "
+            "Refusing to evaluate a checkpoint without valid pretraining provenance:\n- "
             + "\n- ".join(errors)
         )
 
@@ -162,14 +170,20 @@ def validate_jepa_provenance(
         keys = tuple(pretraining.get("state_dict", {}))
         has_context = any(key.startswith("model.context_encoder.") for key in keys)
         has_target = any(key.startswith("model.target_encoder.") for key in keys)
+        has_mae_encoder = "model.module_cls_token" in keys
         del pretraining
-        if not (has_context and has_target):
+        if PRETRAINING_OBJECTIVE_BY_SOURCE[source] == "jepa" and not (has_context and has_target):
             raise RuntimeError(
                 f"{pretraining_path} is not a JEPA checkpoint with context and target encoders"
+            )
+        if source == "mae" and (has_context or has_target or not has_mae_encoder):
+            raise RuntimeError(
+                f"{pretraining_path} is not a single-encoder MAE checkpoint"
             )
 
     return {
         "model": model,
+        "pretraining_objective": PRETRAINING_OBJECTIVE_BY_SOURCE[source],
         "pretrained_encoder_source": source,
         "pretrained_encoder_coverage": float(coverage),
         "pretraining_checkpoint": str(pretraining_path.resolve()),
@@ -179,6 +193,10 @@ def validate_jepa_provenance(
         ),
         "hparams": str(hparams_path.resolve()),
     }
+
+
+# Backwards-compatible name from when only JEPA fine-tunes were accepted.
+validate_jepa_provenance = validate_pretraining_provenance
 
 
 def completed_validation_epochs(metrics_path: Path) -> set[int]:
@@ -429,7 +447,7 @@ def main(argv=None):
         else discover_hparams(cli.log_root.resolve(), checkpoint_dir.name)
     )
     hparams = read_hparams(hparams_path)
-    provenance = validate_jepa_provenance(hparams, hparams_path, checkpoint_dir)
+    provenance = validate_pretraining_provenance(hparams, hparams_path, checkpoint_dir)
     completed_epoch = require_completed_training(hparams, hparams_path)
 
     training_dataset_path = str(hparams["dataset_path"])
@@ -464,7 +482,8 @@ def main(argv=None):
         f"Run: {checkpoint_dir.name}\n"
         f"  hparams: {hparams_path}\n"
         f"  architecture: vit_{provenance['model']}\n"
-        f"  JEPA encoder: {provenance['pretrained_encoder_source']} "
+        f"  pretrained encoder: {provenance['pretraining_objective']} "
+        f"{provenance['pretrained_encoder_source']} "
         f"(coverage={provenance['pretrained_encoder_coverage']:.1f})\n"
         f"  dataset: {evaluation_dataset_path}\n"
         f"  split: {len(train_files)} train / {len(validation_files)} val / "

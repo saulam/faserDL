@@ -87,10 +87,15 @@ class JEPAPreTrainer(pl.LightningModule):
         cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
         return self.ema_decay + (self.ema_end_decay - self.ema_decay) * cosine_progress
 
-    def on_before_zero_grad(self, optimizer):
-        # Lightning calls this after optimizer.step(), which is the desired EMA
-        # ordering.  Every DDP rank applies the same update to synchronized
-        # context parameters.
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        # Lightning runs the closure (forward/backward) inside optimizer.step().
+        # Updating the target here, after the step has returned, applies EMA
+        # exactly once per optimizer step with the post-step context weights.
+        # (on_before_zero_grad runs inside the closure before backward, i.e.
+        # before the step it was meant to follow.)  global_step is incremented
+        # only after this hook, so it still indexes the step just taken.  Every
+        # DDP rank applies the same update to synchronized context parameters.
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
         decay = self._ema_decay_for_step()
         self.model.update_target_encoder(decay)
         self.log(
@@ -103,15 +108,28 @@ class JEPAPreTrainer(pl.LightningModule):
         )
 
     @staticmethod
-    def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        return values[mask]
+    def _cross_event_std(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Mean per-slot standard deviation across events of valid latent slots.
+
+        Pooling all slots (as ``prediction_std``/``target_std`` do) mixes slot
+        identity with event content and stays large for a collapsed encoder;
+        this statistic tends to zero when every event maps to the same slot
+        representation.
+        """
+        weights = mask.to(values.dtype).unsqueeze(-1)                     # [B, S, 1]
+        counts = weights.sum(dim=0)                                       # [S, 1]
+        mean = (values * weights).sum(dim=0) / counts.clamp_min(1.0)
+        variance = ((values - mean).square() * weights).sum(dim=0) / counts.clamp_min(1.0)
+        valid = counts.squeeze(-1) >= 2
+        if not valid.any():
+            return values.new_zeros(())
+        return variance.sqrt().mean(dim=-1)[valid].mean()
 
     def common_step(self, batch):
         batch_input, *batch_input_global = arrange_input(batch)
         output = self.forward(batch_input, batch_input_global)
-        prediction_mask = output["prediction_mask"]
-        selected_prediction = self._masked_values(output["prediction"], prediction_mask)
-        selected_target = self._masked_values(output["target"], prediction_mask)
+        selected_prediction = output["selected_prediction"]
+        selected_target = output["selected_target"]
 
         with torch.no_grad():
             if selected_prediction.numel():
@@ -119,30 +137,43 @@ class JEPAPreTrainer(pl.LightningModule):
                     selected_prediction.float(), selected_target.float(), dim=-1
                 ).mean()
                 # Population standard deviation stays finite even when a very
-                # sparse batch contributes only one target slot.
+                # sparse batch contributes only one target.
                 prediction_std = selected_prediction.float().std(dim=0, correction=0).mean()
                 target_std = selected_target.float().std(dim=0, correction=0).mean()
             else:
                 zero = output["loss"].detach().new_zeros(())
                 cosine = prediction_std = target_std = zero
+            # Collapse monitors of the encoder latents (the downstream
+            # representation), in the normalized space used by the loss.
+            context_event_std = self._cross_event_std(
+                self.model._normalize(output["context_latents"].detach().float()),
+                output["context_latent_keep"],
+            )
+            target_event_std = self._cross_event_std(
+                self.model._normalize(output["target_latents"].float()),
+                output["target_latent_keep"],
+            )
 
             fcal_real = output["fcal_patch_keep"].sum().clamp_min(1)
             ahcal_real = output["ahcal_patch_keep"].sum().clamp_min(1)
-            target_slots_per_event = prediction_mask.float().sum(dim=1)
-            valid_slots_per_event = output["target_latent_keep"].float().sum(dim=1)
+            targets_per_event = output["targets_per_event"]
             metrics = {
                 "jepa/cosine": cosine,
                 "jepa/prediction_std": prediction_std,
                 "jepa/target_std": target_std,
-                "jepa/target_slots": target_slots_per_event.mean(),
+                "jepa/context_event_std": context_event_std,
+                "jepa/target_event_std": target_event_std,
+                "jepa/targets_per_event": targets_per_event.mean(),
                 "jepa/target_coverage": (
-                    target_slots_per_event / valid_slots_per_event.clamp_min(1.0)
+                    targets_per_event / output["target_candidates_per_event"].clamp_min(1.0)
                 ).mean(),
                 "mask/fcal_fraction": output["fcal_patch_mask"].sum() / fcal_real,
                 "mask/ahcal_fraction": output["ahcal_patch_mask"].sum() / ahcal_real,
                 "mask/ecal_fraction": output["ecal_drop"].float().mean(),
                 "mask/muon_fraction": output["muon_drop"].float().mean(),
             }
+            for name, value in output.get("group_losses", {}).items():
+                metrics[f"jepa/loss_{name}"] = value
         return output["loss"], metrics, batch_input.batch_size
 
     def _log_step(self, loss, metrics, batch_size, split):

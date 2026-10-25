@@ -7,7 +7,7 @@ set -euo pipefail
 
 shardshuffle="${SHARDSHUFFLE:-200}"
 shuffle="${SHUFFLE:-2000}"
-model="${MODEL:-tiny}"
+model="${MODEL:-base}"
 eps="${EPS:-1e-8}"
 batch_size="${BATCH_SIZE:-1024}"
 mixup_alpha="${MIXUP_ALPHA:-0.0}"
@@ -38,6 +38,8 @@ save_dir="${SAVE_DIR:-logs_final}"
 name="${NAME:-finetune_v7.0_finerel_paper}"
 log_every_n_steps="${LOG_EVERY_N_STEPS:-10}"
 save_top_k="${SAVE_TOP_K:-10}"
+save_last="${SAVE_LAST:-1}"
+checkpoint_monitors="${CHECKPOINT_MONITORS:-all}"
 checkpoint_path="${CHECKPOINT_PATH:-checkpoints}"
 checkpoint_name="${CHECKPOINT_NAME:-$name}"
 early_stop_patience="${EARLY_STOP_PATIENCE:-10}"
@@ -89,6 +91,8 @@ python -m train.finetune \
     --name $name \
     --log_every_n_steps $log_every_n_steps \
     --save_top_k $save_top_k \
+    --save_last $save_last \
+    --checkpoint_monitors $checkpoint_monitors \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \

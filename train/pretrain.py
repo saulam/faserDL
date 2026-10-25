@@ -12,7 +12,13 @@ import os
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
-from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger
+from utils import (
+    ini_argparse,
+    split_dataset,
+    create_loader,
+    SplitTensorBoardLogger,
+    resolve_checkpoint_path,
+)
 from dataset import *
 from model import *
 from model.lightning_model_pretrain import MAEPreTrainer
@@ -58,10 +64,23 @@ def shard_pattern(split, meta, out_dir):
     return str(out_dir / f"{split}-{{{start}..{end}}}.tar")
 
 
+def skip_unused_jepa_labels(args, *datasets):
+    """JEPA reads only the detector inputs, so skip building the MAE relational
+    voxel labels (hierarchy, decay, particle type) in every loader worker.
+    The augmentations do not depend on this flag: the inputs are unchanged."""
+    if args.pretraining_objective == "jepa":
+        for dataset in datasets:
+            dataset.stage1 = False
+
+
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
+    pl.seed_everything(args.seed, workers=True)
+
+    load_path = resolve_checkpoint_path(args.load_checkpoint, "Load")
+    resume_path = resolve_checkpoint_path(args.resume_checkpoint, "Resume")
     
     print("\n- Arguments:")
     for arg, value in vars(args).items():
@@ -87,6 +106,7 @@ def main():
         val_set = SparseFASERCALIterableDataset(
             args, 'val', meta=meta, shard_pattern=val_pat, shardshuffle=args.shardshuffle, shuffle=args.shuffle
         )
+        skip_unused_jepa_labels(args, train_set, val_set)
         train_loader = create_loader(train_set, shuffle=False, drop_last=True, args=args)
         valid_loader = create_loader(val_set, shuffle=False, drop_last=True, args=args)
         metadata = train_set.metadata
@@ -97,6 +117,7 @@ def main():
         print("Standard dataset")
         dataset = SparseFASERCALMapDataset(args)
         print("- Dataset size: {} events".format(len(dataset)))
+        skip_unused_jepa_labels(args, dataset)
         train_loader, valid_loader, _ = split_dataset(
             dataset, args, splits=[0.85, 0.05, 0.1],
         )
@@ -123,6 +144,10 @@ def main():
             target_normalization=args.jepa_target_normalization,
             loss_type=args.jepa_loss_type,
             target_selection=args.jepa_target_selection,
+            target_level=args.jepa_target_level,
+            predictor_embed_dim=args.jepa_predictor_embed_dim,
+            predictor_depth=args.jepa_predictor_depth,
+            predictor_num_heads=args.jepa_predictor_num_heads,
         )
     else:
         model = args.model(
@@ -207,18 +232,17 @@ def main():
         log_every_n_steps=args.log_every_n_steps,
         deterministic=False,
         accumulate_grad_batches=args.accum_grad_batches,
+        fast_dev_run=args.fast_dev_run,
     )
 
     # Load pre-trained weights (start fresh training)
-    if args.load_checkpoint is not None and os.path.exists(args.load_checkpoint):
-        checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
+    if load_path is not None:
+        checkpoint = torch.load(load_path, map_location='cpu', weights_only=True)
         msg = lightning_model.load_state_dict(checkpoint['state_dict'], strict=True)
-        print(f"Loaded pre-trained weights from: {args.load_checkpoint}")
+        print(f"Loaded pre-trained weights from: {load_path}")
         print(f"Load msg: {msg}")
 
     # Resume training from checkpoint (restores optimiser, epoch, etc.)
-    resume_path = args.resume_checkpoint if args.resume_checkpoint and os.path.exists(args.resume_checkpoint) else None
-
     # Train and validate the model
     trainer.fit(
         model=lightning_model,

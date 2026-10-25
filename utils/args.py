@@ -39,7 +39,7 @@ def ini_argparse(
     parser.add_argument("--shardshuffle", type=int, default=200, help="shard shuffling if iterable dataset")
     parser.add_argument("--shuffle", type=int, default=2000, help="sample shuffling if iterable dataset")
     parser.add_argument("--metadata_path", type=str, default=None, required=True, help="Path for metadata")
-    parser.add_argument('--model', type=model_type, default='tiny', help='Which model size to use (tiny / base)')
+    parser.add_argument('--model', type=model_type, default='base', help='Which model size to use (tiny / base)')
     parser.add_argument("--pretraining_objective", type=str, default="mae", choices=["mae", "jepa"],
                         help="Stage-1 objective: existing masked reconstruction (mae) or latent prediction (jepa)")
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Percentage of masked patches during pre-training")
@@ -61,10 +61,19 @@ def ini_argparse(
                         help="Initial EMA decay for the JEPA target encoder")
     parser.add_argument("--jepa_ema_end_decay", type=float, default=1.0,
                         help="Final EMA decay reached with a cosine schedule during JEPA pretraining")
+    parser.add_argument("--jepa_target_level", type=str, default="patch", choices=["patch", "slot"],
+                        help="JEPA targets: target-encoder tokens of masked patches and dropped ECAL/muon tokens "
+                             "(patch), or the original slot-to-slot latent objective of the first JEPA run (slot)")
     parser.add_argument("--jepa_predictor_hidden_dim", type=int, default=384,
-                        help="Hidden dimension of the discardable JEPA latent predictor")
+                        help="Hidden dimension of the slot-level JEPA MLP predictor (slot targets only)")
+    parser.add_argument("--jepa_predictor_embed_dim", type=int, default=256,
+                        help="Width of the patch-level JEPA predictor (MAE decoder width)")
+    parser.add_argument("--jepa_predictor_depth", type=int, default=2,
+                        help="Cross-attention blocks in the patch-level JEPA predictor (MAE decoder depth)")
+    parser.add_argument("--jepa_predictor_num_heads", type=int, default=8,
+                        help="Attention heads in the patch-level JEPA predictor (MAE decoder heads)")
     parser.add_argument("--jepa_predictor_dropout", type=float, default=0.0,
-                        help="Dropout in the JEPA latent predictor")
+                        help="Dropout in the JEPA predictor")
     parser.add_argument("--jepa_target_normalization", type=str, default="layernorm",
                         choices=["none", "layernorm", "l2"],
                         help="Normalization applied to predicted and target JEPA latents before the loss")
@@ -73,7 +82,8 @@ def ini_argparse(
                         help="Latent-space JEPA prediction loss")
     parser.add_argument("--jepa_target_selection", type=str, default="masked_modules",
                         choices=["masked_modules", "all"],
-                        help="Predict latent slots associated with masked modules, or every valid latent slot")
+                        help="Slot targets only: predict latent slots associated with masked modules, "
+                             "or every valid latent slot")
     parser.add_argument("--pretrained_encoder_source", type=str, default="auto",
                         choices=["auto", "context", "target"],
                         help="Encoder branch to load from a JEPA checkpoint; auto prefers the EMA target")
@@ -93,6 +103,11 @@ def ini_argparse(
     parser.add_argument("--log_every_n_steps", type=int, default=50, help="steps between logs")
     parser.add_argument("--early_stop_patience", type=int, default=0, help="early stopping patience (0 means no early stopping)")
     parser.add_argument("--save_top_k", type=int, default=1, help="save top k checkpoints")
+    parser.add_argument("--save_last", type=int, default=1, choices=[0, 1],
+                        help="fine-tuning: also keep last.ckpt for every monitored loss (needed only to resume)")
+    parser.add_argument("--checkpoint_monitors", type=str, default="all", choices=["all", "evaluated"],
+                        help="fine-tuning: checkpoint every validation loss (all), or only the five task losses "
+                             "whose best checkpoints the test-set evaluation uses (evaluated)")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints", help="checkpoint directory")
     parser.add_argument("--checkpoint_name", type=str, default="v1", help="checkpoint name")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="path to a checkpoint to load weights from (starts fresh training; for pretraining: strict key matching; for finetuning: encoder-only with flexible matching)")

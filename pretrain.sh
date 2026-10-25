@@ -62,12 +62,27 @@ beta2="${BETA2:-0.95}"
 save_dir="${SAVE_DIR:-logs_final}"
 name="${NAME:-pretrain_v7.0_distance_v1}"
 log_every_n_steps="${LOG_EVERY_N_STEPS:-50}"
-save_top_k="${SAVE_TOP_K:-1}"
+if [[ -n "${SAVE_TOP_K:-}" ]]; then
+    save_top_k="$SAVE_TOP_K"
+elif [[ "$pretraining_objective" == "jepa" ]]; then
+    # The EMA target changes throughout training, so JEPA validation loss is
+    # not comparable across epochs and must not select a downstream checkpoint.
+    save_top_k=0
+else
+    save_top_k=1
+fi
 checkpoint_path="${CHECKPOINT_PATH:-checkpoints_final}"
 checkpoint_name="${CHECKPOINT_NAME:-$name}"
-early_stop_patience="${EARLY_STOP_PATIENCE:-200}"
+if [[ -n "${EARLY_STOP_PATIENCE:-}" ]]; then
+    early_stop_patience="$EARLY_STOP_PATIENCE"
+elif [[ "$pretraining_objective" == "jepa" ]]; then
+    early_stop_patience=0
+else
+    early_stop_patience=200
+fi
 load_checkpoint="${LOAD_CHECKPOINT:-}"
 resume_checkpoint="${RESUME_CHECKPOINT:-}"
+seed="${SEED:-7}"
 nb_nodes="${NB_NODES:-1}"
 read -r -a gpus <<< "${GPUS:-0 1}"
 reconstruction_loss_mode="${RECONSTRUCTION_LOSS_MODE:-hybrid}"
@@ -86,11 +101,21 @@ relational_voxel_keep_prob="${RELATIONAL_VOXEL_KEEP_PROB:-0.5}"
 relational_pass_seed="${RELATIONAL_PASS_SEED:-42}"
 jepa_ema_decay="${JEPA_EMA_DECAY:-0.996}"
 jepa_ema_end_decay="${JEPA_EMA_END_DECAY:-1.0}"
+jepa_target_level="${JEPA_TARGET_LEVEL:-patch}"
 jepa_predictor_hidden_dim="${JEPA_PREDICTOR_HIDDEN_DIM:-384}"
+jepa_predictor_embed_dim="${JEPA_PREDICTOR_EMBED_DIM:-256}"
+jepa_predictor_depth="${JEPA_PREDICTOR_DEPTH:-2}"
+jepa_predictor_num_heads="${JEPA_PREDICTOR_NUM_HEADS:-8}"
 jepa_predictor_dropout="${JEPA_PREDICTOR_DROPOUT:-0.0}"
 jepa_target_normalization="${JEPA_TARGET_NORMALIZATION:-layernorm}"
 jepa_loss_type="${JEPA_LOSS_TYPE:-smooth_l1}"
 jepa_target_selection="${JEPA_TARGET_SELECTION:-masked_modules}"
+fast_dev_run="${FAST_DEV_RUN:-0}"
+
+fast_dev_run_args=()
+if [[ "$fast_dev_run" == "1" || "$fast_dev_run" == "true" ]]; then
+    fast_dev_run_args+=(--fast_dev_run)
+fi
 
 python -m train.pretrain \
     --train \
@@ -127,6 +152,7 @@ python -m train.pretrain \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
+    --seed $seed \
     --nb_nodes $nb_nodes \
     --gpus "${gpus[@]}" \
     --reconstruction_loss_mode $reconstruction_loss_mode \
@@ -145,10 +171,15 @@ python -m train.pretrain \
     --relational_pass_seed $relational_pass_seed \
     --jepa_ema_decay $jepa_ema_decay \
     --jepa_ema_end_decay $jepa_ema_end_decay \
+    --jepa_target_level $jepa_target_level \
     --jepa_predictor_hidden_dim $jepa_predictor_hidden_dim \
+    --jepa_predictor_embed_dim $jepa_predictor_embed_dim \
+    --jepa_predictor_depth $jepa_predictor_depth \
+    --jepa_predictor_num_heads $jepa_predictor_num_heads \
     --jepa_predictor_dropout $jepa_predictor_dropout \
     --jepa_target_normalization $jepa_target_normalization \
     --jepa_loss_type $jepa_loss_type \
     --jepa_target_selection $jepa_target_selection \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
-    ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"}
+    ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
+    "${fast_dev_run_args[@]}"

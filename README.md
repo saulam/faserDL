@@ -158,10 +158,12 @@ export LOAD_CHECKPOINT='path/to/pretrain_checkpoint.ckpt'
 bash finetune.sh
 ```
 
-Pretraining, fine-tuning, and the scratch control default to the same `tiny`
-backbone.  Set `MODEL=base` consistently across stages to use `base`; in-domain
-fine-tuning rejects partial encoder loads.  For the completed JEPA run, use
-`conda run -n spconv bash finetune_jepa.sh`.
+The historical pretraining launcher defaults to `tiny`, while the published
+fine-tuning and scratch launchers default to the paper's `base` encoder.  Set
+`MODEL` explicitly and identically across pretraining and fine-tuning;
+in-domain fine-tuning rejects partial encoder loads.  The completed local JEPA
+checkpoint is `tiny`, so use `conda run -n spconv bash finetune_jepa.sh`, whose
+wrapper pins `MODEL=tiny`.
 
 ### Fine-tuning from scratch
 

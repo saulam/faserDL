@@ -11,7 +11,14 @@ import os
 import torch
 import pytorch_lightning as pl
 from pathlib import Path
-from utils import ini_argparse, split_dataset, create_loader, SplitTensorBoardLogger, load_mae_encoder
+from utils import (
+    ini_argparse,
+    split_dataset,
+    create_loader,
+    SplitTensorBoardLogger,
+    load_mae_encoder,
+    resolve_checkpoint_path,
+)
 from dataset import *
 from model import *
 from pytorch_lightning.strategies import DDPStrategy
@@ -51,11 +58,37 @@ def shard_pattern(split, meta, out_dir):
     return str(out_dir / f"{split}-{{{start}..{end}}}.tar")
 
 
+# The test-set evaluation (evaluation/inference_common.TASK_MONITORS) reads only
+# the best checkpoint of these five task losses.
+EVALUATED_MONITORS = [
+    "loss_cls/flavour/val",
+    "loss_cls/charm/val",
+    "loss_vis/geom/val",
+    "loss_jet/geom/val",
+    "loss_vertex/val",
+]
+ALL_MONITORS = [
+    "loss_total/val",
+    "loss_cls/flavour/val",
+    "loss_cls/charm/val",
+    "loss_vis/geom/val",
+    "loss_jet/geom/val",
+    "loss_lep/geom/val",
+    "loss_vertex/val",
+]
+
+
+def checkpoint_monitors(selection):
+    return list(EVALUATED_MONITORS if selection == "evaluated" else ALL_MONITORS)
+
+
 def main():
     torch.multiprocessing.set_sharing_strategy('file_system')
     parser = ini_argparse(MODEL_FACTORIES)
     args = parser.parse_args()
     pl.seed_everything(args.seed, workers=True)
+    load_path = resolve_checkpoint_path(args.load_checkpoint, "Pretraining")
+    resume_path = resolve_checkpoint_path(args.resume_checkpoint, "Resume")
     print("\n- Arguments:")
     for arg, value in vars(args).items():
         print(f"  {arg}: {value}")
@@ -115,12 +148,9 @@ def main():
     args.pretrained_encoder_coverage = None
     args.pretrained_checkpoint_epoch = None
     args.pretrained_checkpoint_global_step = None
-    if args.load_checkpoint is not None:
-        if not os.path.exists(args.load_checkpoint):
-            raise FileNotFoundError(
-                f"Pretraining checkpoint does not exist: {args.load_checkpoint}"
-            )
-        checkpoint = torch.load(args.load_checkpoint, map_location='cpu', weights_only=True)
+    args.pretrained_checkpoint_type = None
+    if load_path is not None:
+        checkpoint = torch.load(load_path, map_location='cpu', weights_only=True)
         load_report = load_mae_encoder(
             model,
             checkpoint,
@@ -131,20 +161,15 @@ def main():
         args.pretrained_encoder_coverage = load_report["encoder_coverage"]
         args.pretrained_checkpoint_epoch = checkpoint.get("epoch")
         args.pretrained_checkpoint_global_step = checkpoint.get("global_step")
+        args.pretrained_checkpoint_type = (
+            "jepa" if load_report["source"] in {"context", "target"} else "mae"
+        )
     else:
         print("Training from scratch!")
 
     # Validation losses used for checkpoint selection.
-    monitor_losses = [
-        "loss_total/val",
-        "loss_cls/flavour/val",
-        "loss_cls/charm/val",
-        "loss_vis/geom/val",
-        "loss_jet/geom/val",
-        "loss_lep/geom/val",
-        "loss_vertex/val",
-    ]
-    
+    monitor_losses = checkpoint_monitors(args.checkpoint_monitors)
+
     # Checkpoint callbacks.
     def make_callbacks():
         cbs = []
@@ -158,7 +183,7 @@ def main():
                     save_top_k=args.save_top_k,
                     monitor=loss,
                     mode="min",
-                    save_last=True,
+                    save_last=bool(args.save_last),
                 )
             )
         progress_bar = CustomProgressBar()
@@ -209,8 +234,6 @@ def main():
     )
 
     # Resume training from checkpoint (restores optimiser, epoch, etc.)
-    resume_path = args.resume_checkpoint if args.resume_checkpoint and os.path.exists(args.resume_checkpoint) else None
-
     # Train and validate the model
     trainer.fit(
         model=lightning_model,
