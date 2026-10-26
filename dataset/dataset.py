@@ -11,7 +11,10 @@ import io
 import pickle as pk
 import numpy as np
 import torch
-import webdataset as wds
+try:
+    import webdataset as wds
+except ModuleNotFoundError:  # only SparseFASERCALIterableDataset needs it
+    wds = None
 from glob import glob
 from itertools import chain
 from torch.utils.data import Dataset, IterableDataset
@@ -415,16 +418,7 @@ class SparseFASERCALDataset(Dataset):
         """
         run_number = data['run_number'].item()
         event_id = data['event_id'].item()
-        true_hits = data['true_hits']                   # [T]
-        true_pdg = true_hits[:, 3]                      # [T]
-        true_primary = true_hits[:, 9]                  # [T]
-        true_secondary = true_hits[:, 10]               # [T]
-        true_tau_decay = true_hits[:, 11]               # [T]
-        true_charm_decay = true_hits[:, 12]             # [T]
         reco_hits = data['reco_hits']                   # [N]
-        indptr = data['indptr']                         # [N+1] CSR row pointers for reco->true contributions
-        true_index = data['true_index']                 # [E] concatenated true-hit indices for each reco hit
-        link_weight = data['link_weight']               # [E] Per-edge weights
         ghost_mask = data['ghost_mask']                 # [N] Ghost mask for reco hits
         primary_vertex = data['primary_vertex']
         is_cc = data['is_cc']
@@ -454,6 +448,17 @@ class SparseFASERCALDataset(Dataset):
 
         csr_hie, csr_dec, csr_pid = None, None, None
         if self.stage1:
+            # Decompressing the truth arrays is ~40% of the loading time, so
+            # read them only for the stage-1 relational labels that use them.
+            true_hits = data['true_hits']               # [T]
+            true_pdg = true_hits[:, 3]                  # [T]
+            true_primary = true_hits[:, 9]              # [T]
+            true_secondary = true_hits[:, 10]           # [T]
+            true_tau_decay = true_hits[:, 11]           # [T]
+            true_charm_decay = true_hits[:, 12]         # [T]
+            indptr = data['indptr']                     # [N+1] CSR row pointers for reco->true contributions
+            true_index = data['true_index']             # [E] concatenated true-hit indices for each reco hit
+            link_weight = data['link_weight']           # [E] Per-edge weights
             true_hierarchy = true_primary.copy()
             true_hierarchy[true_secondary > 0] = 2
             true_decay = true_tau_decay.copy()
@@ -652,6 +657,8 @@ class SparseFASERCALIterableDataset(SparseFASERCALDataset, IterableDataset):
         return sample
     
     def __iter__(self):
+        if wds is None:
+            raise ModuleNotFoundError("webdataset is required for --web_dataset_path")
         dataset = (
             wds.WebDataset(
                 self.shard_pattern,

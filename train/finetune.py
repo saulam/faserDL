@@ -18,6 +18,7 @@ from utils import (
     SplitTensorBoardLogger,
     load_mae_encoder,
     resolve_checkpoint_path,
+    checkpoint_monitors,
 )
 from dataset import *
 from model import *
@@ -56,30 +57,6 @@ def shard_pattern(split, meta, out_dir):
     start = "0000"
     end = f"{n-1:04d}"
     return str(out_dir / f"{split}-{{{start}..{end}}}.tar")
-
-
-# The test-set evaluation (evaluation/inference_common.TASK_MONITORS) reads only
-# the best checkpoint of these five task losses.
-EVALUATED_MONITORS = [
-    "loss_cls/flavour/val",
-    "loss_cls/charm/val",
-    "loss_vis/geom/val",
-    "loss_jet/geom/val",
-    "loss_vertex/val",
-]
-ALL_MONITORS = [
-    "loss_total/val",
-    "loss_cls/flavour/val",
-    "loss_cls/charm/val",
-    "loss_vis/geom/val",
-    "loss_jet/geom/val",
-    "loss_lep/geom/val",
-    "loss_vertex/val",
-]
-
-
-def checkpoint_monitors(selection):
-    return list(EVALUATED_MONITORS if selection == "evaluated" else ALL_MONITORS)
 
 
 def main():

@@ -12,7 +12,10 @@ import copy
 import torch
 from pathlib import Path
 from torch.nn.utils.rnn import pad_sequence
-from spconv.pytorch import SparseConvTensor
+try:
+    from spconv.pytorch import SparseConvTensor
+except ModuleNotFoundError:  # spconv-free environments use model.flash_vit.collate_tokens
+    SparseConvTensor = None
 from functools import partial
 from torch.utils.data import random_split, DataLoader
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
@@ -34,7 +37,32 @@ def resolve_checkpoint_path(path, argument_name="checkpoint"):
     return str(checkpoint)
 
 
-def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
+# The test-set evaluation (evaluation/inference_common.TASK_MONITORS) reads only
+# the best checkpoint of these five task losses.
+EVALUATED_MONITORS = [
+    "loss_cls/flavour/val",
+    "loss_cls/charm/val",
+    "loss_vis/geom/val",
+    "loss_jet/geom/val",
+    "loss_vertex/val",
+]
+ALL_MONITORS = [
+    "loss_total/val",
+    "loss_cls/flavour/val",
+    "loss_cls/charm/val",
+    "loss_vis/geom/val",
+    "loss_jet/geom/val",
+    "loss_lep/geom/val",
+    "loss_vertex/val",
+]
+
+
+def checkpoint_monitors(selection):
+    """Fine-tuning validation losses to checkpoint: all, or only the evaluated ones."""
+    return list(EVALUATED_MONITORS if selection == "evaluated" else ALL_MONITORS)
+
+
+def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, collate_fn=None):
     """
     Splits the dataset into training, validation, and test sets based on the given splits.
 
@@ -44,6 +72,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
         splits (list): A list of three floats representing the split ratios [train, validation, test]. Must sum to 1.
         seed (int): Seed for reproducibility. Default is 7.
         test (bool): Default is False.
+        collate_fn (callable): collate taking (batch, test=...); default spconv collate.
 
     Returns:
         tuple: DataLoader objects for training, validation, and test sets.
@@ -74,7 +103,7 @@ def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False):
         train_set.calc_primary_vertices()
 
     train_set.augmentations_enabled = args.augmentations_enabled   
-    collate_fn = partial(collate, test=test)
+    collate_fn = partial(collate if collate_fn is None else collate_fn, test=test)
 
     return (
         create_loader(train_set, shuffle=True, drop_last=True, collate_fn=collate_fn, args=args),
@@ -107,6 +136,8 @@ def _make_spconv_tensor(
     spatial_shape = None,  # predefine if you want fixed grid
 ):
     assert len(coords_list) > 0, "Empty batch."
+    if SparseConvTensor is None:
+        raise ModuleNotFoundError("spconv is required for the spconv collate")
     D = coords_list[0].shape[1]
     assert all(c.shape[1] == D for c in coords_list), "All coords must have same D."
 
@@ -250,6 +281,14 @@ def collate(
     ret["muspec_attn_mask"] = muspec_attn_mask
     ret["muspec_counts"] = muspec_counts
 
+    return collate_targets(batch, ret, mode)
+
+
+def collate_targets(batch, ret, mode):
+    """Add the per-event targets (and test-time identifiers) of ``batch`` to ``ret``.
+
+    Shared by the spconv collate and the flash-attention token collate.
+    """
     if mode == "test":
         optional_keys = [
             "run_number", "event_id", "primary_vertex", "is_cc", "in_neutrino_pdg",
@@ -666,7 +705,7 @@ def load_mae_encoder(
 
 
 def move_obj(o, device):
-    if isinstance(o, SparseConvTensor):
+    if SparseConvTensor is not None and isinstance(o, SparseConvTensor):
         ind = o.indices.to(device)
         if ind.dtype != torch.int32:
             ind = ind.int()

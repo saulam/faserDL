@@ -7,9 +7,7 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from torch_ema import ExponentialMovingAverage
-
-from model.lightning_model_finetune import ViTFineTuner
+from model.lightning_model_finetune import ExponentialMovingAverage, ViTFineTuner
 from utils import resolve_checkpoint_path
 
 
@@ -84,7 +82,10 @@ class TrainingSafetyTests(unittest.TestCase):
         self.assertIn('early_stop_patience=0', pretrain)
 
     def test_jepa_pretraining_skips_only_unused_relational_labels(self):
-        from train.pretrain import skip_unused_jepa_labels
+        try:
+            from train.pretrain import skip_unused_jepa_labels
+        except (ModuleNotFoundError, NameError):
+            self.skipTest("train.pretrain needs the spconv models")
 
         for objective, expected in (("jepa", False), ("mae", True)):
             datasets = [SimpleNamespace(stage1=True), SimpleNamespace(stage1=True)]
@@ -124,7 +125,7 @@ class TrainingSafetyTests(unittest.TestCase):
 
     def test_evaluated_checkpoint_monitors_are_exactly_those_the_test_evaluation_uses(self):
         from evaluation.inference_common import TASK_MONITORS
-        from train.finetune import checkpoint_monitors
+        from utils import checkpoint_monitors
 
         evaluated = checkpoint_monitors("evaluated")
         self.assertEqual({m.replace("/", "_") for m in evaluated}, set(TASK_MONITORS.values()))

@@ -89,7 +89,7 @@ def get_layer_id_for_vit(name, num_intra_layers, num_ahcal_layers, num_io_layers
         "intra_pos_embed", "ahcal_pos_embed",
         "ecal_embed", "muon_state_embed", 
         "muon_spec_count_encoder", "muon_spec_embed",
-        "kv_src_embed",
+        "kv_src_embed", "token_type_embed",
     )):
         return 0
     elif name.startswith("blocks."):

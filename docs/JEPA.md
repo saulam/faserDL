@@ -6,6 +6,11 @@ deliberately narrow: it changes the stage-1 objective while preserving the
 event representation, sparse patching, hierarchical encoder, data pipeline,
 optimiser/scheduler conventions, checkpointing, and downstream model.
 
+A separate, spconv-free implementation that follows I-JEPA more closely
+(plain global ViT with varlen flash attention, multi-block 3D masking, no
+Perceiver) is described in [FLASH_JEPA.md](FLASH_JEPA.md).  It leaves
+everything in this document unchanged.
+
 ## Existing MAE data flow
 
 The map dataset loads one compressed NumPy event per file.  The principal

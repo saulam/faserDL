@@ -7,9 +7,33 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+try:  # the spconv models; skipped in spconv-free environments (neutrino-jepa)
+    import spconv.pytorch  # noqa: F401
+    import timm  # noqa: F401
+except ModuleNotFoundError as error:
+    raise unittest.SkipTest(f"needs {error.name}")
+
 from model.lightning_model_jepa import JEPAPreTrainer
 from model.sparsejepa import SparseJEPA
 from tests.test_jepa import DummyEncoder
+
+
+_DETERMINISTIC_STATE = None
+
+
+def setUpModule():
+    global _DETERMINISTIC_STATE
+    _DETERMINISTIC_STATE = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+
+
+def tearDownModule():
+    # Trainer(deterministic=True) enables deterministic algorithms process-wide;
+    # restore the previous state so later CUDA (cuBLAS) tests are unaffected.
+    enabled, warn_only = _DETERMINISTIC_STATE
+    torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 class _ToyJEPAPreTrainer(JEPAPreTrainer):

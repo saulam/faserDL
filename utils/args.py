@@ -159,3 +159,28 @@ def ini_argparse(
                         help="Random seed for relational pass stochastic gating")
 
     return parser
+
+
+def add_flash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Arguments of the spconv-free flash-attention models (train/*_flash.py)."""
+    group = parser.add_argument_group("flash-attention encoder and JEPA")
+    group.add_argument("--flash_fcal_patch_size", type=int, nargs=3, default=[12, 12, 10],
+                       help="FASERCal patch size in voxels (one token per occupied patch)")
+    group.add_argument("--flash_ahcal_patch_size", type=int, nargs=3, default=[6, 6, 5],
+                       help="AHCAL patch size in voxels (one token per occupied patch)")
+    group.add_argument("--flash_predictor_embed_dim", type=int, default=256,
+                       help="Width of the JEPA predictor transformer")
+    group.add_argument("--flash_predictor_depth", type=int, default=6,
+                       help="Blocks in the JEPA predictor transformer")
+    group.add_argument("--flash_predictor_num_heads", type=int, default=4,
+                       help="Attention heads in the JEPA predictor transformer")
+    group.add_argument("--flash_mask_num_blocks", type=int, default=4,
+                       help="Target blocks per event and detector (FASERCal, AHCAL)")
+    group.add_argument("--flash_mask_block_scale", type=float, nargs=2, default=[0.15, 0.2],
+                       help="Range of the fraction of an event's occupied patches in one target block")
+    group.add_argument("--flash_mask_block_aspect", type=float, nargs=2, default=[0.5, 2.0],
+                       help="Range of the per-axis stretch of a target block (log-uniform)")
+    group.add_argument("--flash_mask_global_prob", type=float, default=0.25,
+                       help="Probability that the ECAL token and the muon-spectrometer token are targets")
+    return parser
+

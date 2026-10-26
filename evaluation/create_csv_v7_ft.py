@@ -24,6 +24,7 @@ import os
 import re
 import tempfile
 from datetime import datetime, timezone
+from functools import partial
 from glob import glob
 from itertools import chain
 from pathlib import Path
@@ -35,6 +36,7 @@ import yaml
 from torch.utils.data import random_split
 
 from dataset import SparseFASERCALMapDataset
+from model.flash_vit import collate_tokens
 from utils import create_loader
 
 from .inference_common import (
@@ -74,9 +76,12 @@ def read_hparams(path: Path) -> dict[str, object]:
         raw_value = raw_value.strip()
         if key == "model":
             match = _MODEL_RE.search(raw_value)
-            if not match:
+            if match:
+                values[key] = match.group("size")
+            elif raw_value in {"tiny", "base"}:  # flash-attention runs record the preset name
+                values[key] = raw_value
+            else:
                 raise RuntimeError(f"Cannot identify model architecture in {path}: {line}")
-            values[key] = match.group("size")
             continue
         try:
             values[key] = yaml.safe_load(raw_value)
@@ -117,6 +122,9 @@ def validate_pretraining_provenance(
 ) -> dict[str, object]:
     """Fail closed unless this is an exact-backbone JEPA or MAE fine-tune."""
     errors = []
+    backbone = hparams.get("backbone") or "spconv"
+    if backbone not in {"spconv", "flash"}:
+        errors.append(f"unknown backbone {backbone!r}")
     source = hparams.get("pretrained_encoder_resolved_source")
     if source not in PRETRAINING_OBJECTIVE_BY_SOURCE:
         errors.append(
@@ -171,7 +179,13 @@ def validate_pretraining_provenance(
         has_context = any(key.startswith("model.context_encoder.") for key in keys)
         has_target = any(key.startswith("model.target_encoder.") for key in keys)
         has_mae_encoder = "model.module_cls_token" in keys
+        is_flash = "flash_encoder_config" in pretraining
         del pretraining
+        if is_flash != (backbone == "flash"):
+            raise RuntimeError(
+                f"{pretraining_path} is {'a flash-attention' if is_flash else 'an spconv'} "
+                f"checkpoint, but the fine-tune used the {backbone} backbone"
+            )
         if PRETRAINING_OBJECTIVE_BY_SOURCE[source] == "jepa" and not (has_context and has_target):
             raise RuntimeError(
                 f"{pretraining_path} is not a JEPA checkpoint with context and target encoders"
@@ -183,6 +197,7 @@ def validate_pretraining_provenance(
 
     return {
         "model": model,
+        "backbone": backbone,
         "pretraining_objective": PRETRAINING_OBJECTIVE_BY_SOURCE[source],
         "pretrained_encoder_source": source,
         "pretrained_encoder_coverage": float(coverage),
@@ -481,7 +496,7 @@ def main(argv=None):
     print(
         f"Run: {checkpoint_dir.name}\n"
         f"  hparams: {hparams_path}\n"
-        f"  architecture: vit_{provenance['model']}\n"
+        f"  architecture: {'flash_' if provenance['backbone'] == 'flash' else ''}vit_{provenance['model']}\n"
         f"  pretrained encoder: {provenance['pretraining_objective']} "
         f"{provenance['pretrained_encoder_source']} "
         f"(coverage={provenance['pretrained_encoder_coverage']:.1f})\n"
@@ -521,6 +536,7 @@ def main(argv=None):
         preprocessing_input=str(hparams.get("preprocessing_input", "log")),
         preprocessing_output=str(hparams.get("preprocessing_output", "log")),
         label_smoothing=float(hparams.get("label_smoothing", 0.02)),
+        backbone=str(provenance["backbone"]),
     )
     dataset = SparseFASERCALMapDataset(args)
     require_same_inventory(evaluation_files, dataset.data_files)
@@ -529,6 +545,9 @@ def main(argv=None):
         dataset,
         shuffle=False,
         drop_last=False,
+        collate_fn=(
+            partial(collate_tokens, test=True) if provenance["backbone"] == "flash" else None
+        ),
         args=args,
     )
 

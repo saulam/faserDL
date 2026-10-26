@@ -1,6 +1,12 @@
 import unittest
 
 import torch
+try:  # the spconv models; skipped in spconv-free environments (neutrino-jepa)
+    import spconv.pytorch  # noqa: F401
+    import timm  # noqa: F401
+except ModuleNotFoundError as error:
+    raise unittest.SkipTest(f"needs {error.name}")
+
 from spconv.pytorch import SparseConv3d, SparseConvTensor
 
 from model.sparsejepa import SparseJEPA

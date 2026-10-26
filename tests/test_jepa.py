@@ -4,6 +4,12 @@ import unittest
 import torch
 import torch.nn as nn
 
+try:  # the spconv models; skipped in spconv-free environments (neutrino-jepa)
+    import spconv.pytorch  # noqa: F401
+    import timm  # noqa: F401
+except ModuleNotFoundError as error:
+    raise unittest.SkipTest(f"needs {error.name}")
+
 from model.sparsejepa import SparseJEPA
 from utils.funcs import extract_pretrained_encoder_state, load_mae_encoder, pack_muspec
 

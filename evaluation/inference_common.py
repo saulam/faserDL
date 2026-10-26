@@ -17,13 +17,21 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 import tqdm
-from spconv.pytorch import SparseConvTensor
 
-from model import vit_base, vit_tiny
-from utils import arrange_input, arrange_truth, ini_argparse
+from model.flash_vit import FLASH_ENCODER_PRESETS, EventBatch, FlashViT
+from utils import arrange_input, arrange_truth, ini_argparse, move_obj
 
+try:
+    from spconv.pytorch import SparseConvTensor
+except ModuleNotFoundError:  # spconv-free environments evaluate flash-attention models only
+    SparseConvTensor = None
 
-MODEL_FACTORIES = {"tiny": vit_tiny, "base": vit_base}
+if SparseConvTensor is not None:
+    from model import vit_base, vit_tiny
+    MODEL_FACTORIES = {"tiny": vit_tiny, "base": vit_base}
+else:
+    MODEL_FACTORIES = {}
+FLASH_MODEL_PRESETS = {name: name for name in FLASH_ENCODER_PRESETS}
 
 TASK_MONITORS = {
     "flavour": "loss_cls_flavour_val",
@@ -75,9 +83,10 @@ def build_eval_args(
     preprocessing_input: str = "log",
     preprocessing_output: str = "log",
     label_smoothing: float = 0.02,
+    backbone: str = "spconv",
 ):
     """Construct the repository's normal argument namespace for evaluation."""
-    parser = ini_argparse(MODEL_FACTORIES)
+    parser = ini_argparse(FLASH_MODEL_PRESETS if backbone == "flash" else MODEL_FACTORIES)
     return parser.parse_args(
         [
             "--test",
@@ -166,7 +175,13 @@ def load_models_from_paths(ckpt_paths, args, metadata, device, verbose=True):
                 f"(epoch={info['epoch']}, {info['monitor']}={info['value']})"
             )
 
-        model = args.model(
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+        model_kwargs = dict(
             drop_rate=args.dropout,
             attn_drop_rate=args.attn_dropout,
             drop_path_rate=args.drop_path_rate,
@@ -175,12 +190,11 @@ def load_models_from_paths(ckpt_paths, args, metadata, device, verbose=True):
             head_dropout_reg=args.head_dropout_reg,
             metadata=metadata,
         )
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
-        )
+        if "flash_encoder_config" in checkpoint:
+            # Flash-attention fine-tunes store their exact encoder architecture.
+            model = FlashViT(**checkpoint["flash_encoder_config"], **model_kwargs)
+        else:
+            model = args.model(**model_kwargs)
         encoded_epoch = checkpoint_metadata(checkpoint_path)["epoch"]
         stored_epoch = checkpoint.get("epoch")
         if stored_epoch != encoded_epoch:
@@ -216,6 +230,8 @@ def _to_device(x, device):
 
 
 def _arrange_batch(batch, device):
+    if "x_sp" not in batch:  # packed-token batch of model.flash_vit.collate_tokens
+        return EventBatch(move_obj(batch, device)), [], arrange_truth(batch)
     batch_input, *batch_input_global = arrange_input(batch)
     batch_input = _spconv_to_device(batch_input, device)
     batch_input_global = [_to_device(value, device) for value in batch_input_global]

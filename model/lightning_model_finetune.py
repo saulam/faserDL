@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from typing import Any
-from torch_ema import ExponentialMovingAverage
+try:
+    from torch_ema import ExponentialMovingAverage
+except ModuleNotFoundError:  # e.g. neutrino-jepa; same update rule and state format
+    from utils.ema import ExponentialMovingAverage
 from utils import (
     param_groups_lrd, KinematicsMultiTaskLoss, CylindricalConsistencyLoss,
     arrange_input, arrange_truth,
