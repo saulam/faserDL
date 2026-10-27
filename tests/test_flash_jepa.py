@@ -16,9 +16,10 @@ import torch
 import torch.nn.functional as F
 
 from model.flash_jepa import FlashJEPA, MultiBlockMasker, flash_jepa_tiny
+import model.flash_vit as flash_vit
 from model.flash_vit import (
-    AHCAL, ECAL, FCAL, MUON, EventBatch, FlashViT, SeqInfo, SparsePatchEmbed,
-    TokenSet, collate_tokens, padded_attention, varlen_attention, varlen_attn,
+    AHCAL, ECAL, FCAL, MUON, EventBatch, FlashVarlenAttention, FlashViT, SeqInfo,
+    SparsePatchEmbed, TokenSet, collate_tokens, padded_attention, varlen_attention,
 )
 from utils import load_mae_encoder, move_obj
 
@@ -30,7 +31,7 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 METADATA = REPO_ROOT / "events_v7.0_500_npz" / "metadata_stats.pkl"
 SMALL = dict(embed_dim=96, depth=2, num_heads=4)
-HAS_FLASH = varlen_attn is not None and torch.cuda.is_available()
+HAS_FLASH = (flash_vit.VARLEN_WINDOW or flash_vit.HAS_FLASH_OPS) and torch.cuda.is_available()
 
 
 def synthetic_event(rng, n_fcal=None, n_ahcal=None, n_tracks=None):
@@ -230,21 +231,29 @@ class FlashJEPATests(unittest.TestCase):
         q, k, v = (torch.randn(len(event), 2, 8, dtype=torch.float64) for _ in range(3))
         torch.testing.assert_close(padded_attention(q, k, v, seq), reference_attention(q, k, v, seq))
 
-    @unittest.skipUnless(HAS_FLASH, "needs CUDA and torch.nn.attention.varlen")
+    @unittest.skipUnless(HAS_FLASH, "needs CUDA and FlashAttention kernels")
     def test_flash_attention_matches_exact_attention_forward_and_backward(self):
         lengths = torch.tensor([3, 129, 340, 1, 200])
         seq = SeqInfo.from_event(torch.repeat_interleave(torch.arange(5), lengths).cuda(), 5)
         q, k, v = (torch.randn(int(lengths.sum()), 6, 64, device="cuda", requires_grad=True) for _ in range(3))
         grad = torch.randn_like(q)
-        flash = varlen_attention(q.bfloat16(), k.bfloat16(), v.bfloat16(), seq)
-        flash_grads = torch.autograd.grad(flash.float(), (q, k, v), grad)
         exact = reference_attention(q, k, v, seq)
         exact_grads = torch.autograd.grad(exact, (q, k, v), grad)
+
         def relative_error(a, b):
             return float((a.float() - b).norm() / b.norm())
-        self.assertLess(relative_error(flash, exact), 1e-2)
-        for a, b in zip(flash_grads, exact_grads):
-            self.assertLess(relative_error(a, b), 2e-2)
+
+        # The dispatcher (varlen_attn where available) and the direct kernel
+        # path used with torch versions without varlen_attn (e.g. 2.9).
+        paths = {"dispatch": varlen_attention}
+        if flash_vit.HAS_FLASH_OPS:
+            paths["direct"] = lambda q, k, v, s: FlashVarlenAttention.apply(q, k, v, s.cu_seqlens, s.max_seqlen)
+        for name, attention in paths.items():
+            flash = attention(q.bfloat16(), k.bfloat16(), v.bfloat16(), seq)
+            flash_grads = torch.autograd.grad(flash.float(), (q, k, v), grad)
+            self.assertLess(relative_error(flash, exact), 1e-2, name)
+            for a, b in zip(flash_grads, exact_grads):
+                self.assertLess(relative_error(a, b), 2e-2, name)
 
     # ------------------------------------------------------------ masking
     def test_block_masking_invariants(self):
@@ -336,7 +345,180 @@ class FlashJEPATests(unittest.TestCase):
         for name, parameter in jepa.target_encoder.named_parameters():
             torch.testing.assert_close(parameter, 0.9 * before[name] + 0.1 * context[name])
 
-    @unittest.skipUnless(HAS_FLASH, "needs CUDA and torch.nn.attention.varlen")
+    def test_default_targets_are_the_layer_normed_final_output(self):
+        jepa = FlashJEPA(**SMALL, predictor_embed_dim=64, predictor_depth=1, predictor_num_heads=4).eval()
+        self.assertEqual(jepa.target_layers, 1)
+        batch = synthetic_batch(seed=11, batch_size=4)
+        tokens, seq, target = jepa._targets(batch)
+        out = jepa.target_encoder.forward_tokens(tokens.x, seq)
+        self.assertTrue(torch.equal(target, F.layer_norm(out.float(), (out.size(-1),))))
+        # Block.forward is still the plain pre-norm block.
+        block, x = jepa.target_encoder.blocks[0], tokens.x
+        h = x + block.attn(block.norm1(x), seq)
+        self.assertTrue(torch.equal(block(x, seq), h + block.mlp(block.norm2(h))))
+
+    def test_multi_layer_targets_average_the_last_mlp_outputs(self):
+        jepa = FlashJEPA(**dict(SMALL, depth=3), drop_rate=0.5, drop_path_rate=0.5, target_layers=2,
+                         predictor_embed_dim=64, predictor_depth=1, predictor_num_heads=4).train()
+        batch = synthetic_batch(seed=12, batch_size=4)
+        tokens, seq, target = jepa._targets(batch)
+        self.assertTrue(jepa.target_encoder.training)
+
+        def norm(t):
+            return F.layer_norm(t.float(), (t.size(-1),))
+
+        encoder = jepa.target_encoder.eval()
+        x, mlp = tokens.x, []
+        with torch.no_grad():
+            for block in encoder.blocks:
+                h = x + block.attn(block.norm1(x), seq)
+                mlp.append(block.mlp(block.norm2(h)))
+                x = h + mlp[-1]
+        torch.testing.assert_close(target, norm((norm(mlp[1]) + norm(mlp[2])) / 2))
+        final = norm(encoder.forward_tokens(tokens.x, seq))
+        self.assertFalse(torch.allclose(target, final, atol=1e-3))
+
+        jepa.train()
+        out = jepa(batch)
+        self.assertTrue(torch.isfinite(out["loss"]))
+        out["loss"].backward()
+        for name, parameter in jepa.named_parameters():
+            if name.startswith("target_encoder."):
+                self.assertIsNone(parameter.grad)
+            else:
+                self.assertIsNotNone(parameter.grad, name)
+
+    def test_target_layers_must_fit_the_encoder(self):
+        for layers in (0, SMALL["depth"] + 1):
+            with self.assertRaisesRegex(ValueError, "target_layers"):
+                FlashJEPA(**SMALL, target_layers=layers)
+        encoder = FlashJEPA(**SMALL).context_encoder
+        with self.assertRaisesRegex(ValueError, "num_layers"):
+            encoder.forward_mlp_outputs(torch.zeros(1, SMALL["embed_dim"]), None, SMALL["depth"] + 1)
+
+    def test_pretraining_script_passes_target_layers(self):
+        import argparse
+        from train.pretrain_flash import build_flash_jepa
+        from utils.args import add_flash_args
+
+        parser = add_flash_args(argparse.ArgumentParser())
+        self.assertEqual(parser.parse_args([]).flash_target_layers, 1)
+        flash = vars(parser.parse_args(["--flash_target_layers", "3"]))
+        args = SimpleNamespace(model="tiny", dropout=0.0, attn_dropout=0.0, drop_path_rate=0.0, **flash)
+        self.assertEqual(build_flash_jepa(args).target_layers, 3)
+        self.assertEqual(parser.parse_args([]).flash_target_norm, "token")
+        flash = vars(parser.parse_args(["--flash_target_norm", "batch"]))
+        args = SimpleNamespace(model="tiny", dropout=0.0, attn_dropout=0.0, drop_path_rate=0.0, **flash)
+        self.assertEqual(build_flash_jepa(args).target_norm, "batch")
+
+    def test_standardise_per_kind_removes_what_every_token_of_a_kind_shares(self):
+        from model.flash_jepa import standardise_per_kind
+
+        generator = torch.Generator().manual_seed(0)
+        kind = torch.tensor([FCAL] * 50 + [AHCAL] * 20 + [ECAL] * 5 + [MUON])
+        x = torch.randn(kind.numel(), 8, generator=generator) * torch.rand(8, generator=generator) * 3
+        out = standardise_per_kind(x, kind)
+        for k in (FCAL, AHCAL, ECAL):
+            selected = out[kind == k]
+            torch.testing.assert_close(selected.mean(0), torch.zeros(8), atol=1e-5, rtol=0)
+            torch.testing.assert_close(selected.var(0, unbiased=False), torch.ones(8), atol=1e-3, rtol=0)
+            reference = (x[kind == k] - x[kind == k].mean(0)) / x[kind == k].std(0, unbiased=False)
+            torch.testing.assert_close(selected, reference, atol=1e-4, rtol=1e-4)
+        # A lone token of its kind has nothing to differ from: zero, not NaN.
+        self.assertTrue(torch.equal(out[kind == MUON], torch.zeros(1, 8)))
+        # A vector added to every token of a kind (a collapsed component) is removed.
+        shared = torch.randn(4, 8, generator=generator)
+        torch.testing.assert_close(standardise_per_kind(x + 5 * shared[kind], kind), out, atol=1e-4, rtol=1e-4)
+
+    def test_batch_target_norm_standardises_the_default_targets(self):
+        for layers in (1, 2):
+            jepa = FlashJEPA(**SMALL, predictor_embed_dim=64, predictor_depth=1, predictor_num_heads=4,
+                             target_layers=layers, target_norm="batch").train()
+            self.assertEqual(FlashJEPA(**SMALL).target_norm, "token")
+            batch = synthetic_batch(seed=13, batch_size=6)
+            tokens, _, target = jepa._targets(batch)
+            jepa.target_norm = "token"
+            _, _, token_target = jepa._targets(batch)
+            jepa.target_norm = "batch"
+            from model.flash_jepa import standardise_per_kind
+            self.assertTrue(torch.equal(target, standardise_per_kind(token_target, tokens.kind)))
+
+            out = jepa(batch)
+            self.assertTrue(torch.isfinite(out["loss"]))
+            out["loss"].backward()
+            for name, parameter in jepa.named_parameters():
+                if name.startswith("target_encoder."):
+                    self.assertIsNone(parameter.grad)
+                else:
+                    self.assertIsNotNone(parameter.grad, name)
+        with self.assertRaisesRegex(ValueError, "target_norm"):
+            FlashJEPA(**SMALL, target_norm="instance")
+
+    def _fit_toy_pretraining(self, directory, epochs, save_top_k=0, save_every_n_epochs=0, resume=None):
+        """Fits a toy module with the pretraining checkpoint callbacks on the CPU.
+        Returns, for each epoch run, its index and the epoch stored in last.ckpt
+        at its start."""
+        import pytorch_lightning as pl
+        from pytorch_lightning.callbacks import ModelCheckpoint
+        from train.pretrain_flash import build_callbacks
+
+        class Toy(pl.LightningModule):
+            def __init__(self):
+                super().__init__()
+                self.layer = torch.nn.Linear(2, 1)
+
+            def training_step(self, batch, _):
+                return self.layer(batch).pow(2).mean()
+
+            def validation_step(self, batch, _):
+                self.log("loss_total/val", self.layer(batch).pow(2).mean())
+
+            def configure_optimizers(self):
+                return torch.optim.SGD(self.parameters(), lr=0.1)
+
+        last = Path(directory) / "run" / "loss_total_val" / "last.ckpt"
+        seen = []
+
+        class Record(pl.Callback):
+            def on_train_epoch_start(self, trainer, module):
+                stored = torch.load(last, weights_only=False)["epoch"] if last.exists() else None
+                seen.append((trainer.current_epoch, stored))
+
+        args = SimpleNamespace(checkpoint_path=directory, checkpoint_name="run", save_top_k=save_top_k,
+                               save_every_n_epochs=save_every_n_epochs, early_stop_patience=0)
+        callbacks = [c for c in build_callbacks(args) if isinstance(c, ModelCheckpoint)]
+        data = torch.utils.data.DataLoader(torch.randn(8, 2), batch_size=4)
+        trainer = pl.Trainer(max_epochs=epochs, accelerator="cpu", devices=1, logger=False,
+                             callbacks=callbacks + [Record()], enable_progress_bar=False,
+                             enable_model_summary=False)
+        trainer.fit(Toy(), data, data, ckpt_path=resume)
+        return seen
+
+    def test_pretraining_writes_last_checkpoint_every_epoch_and_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # Default save_top_k=0: last.ckpt holds the previous epoch at the
+            # start of every epoch, not only after training.
+            seen = self._fit_toy_pretraining(directory, epochs=3)
+            self.assertEqual(seen, [(0, None), (1, 0), (2, 1)])
+            last = Path(directory) / "run" / "loss_total_val" / "last.ckpt"
+            # Resuming from it continues with the next epoch and overwrites it.
+            seen = self._fit_toy_pretraining(directory, epochs=5, resume=str(last))
+            self.assertEqual(seen, [(3, 2), (4, 3)])
+            self.assertEqual(torch.load(last, weights_only=False)["epoch"], 4)
+            self.assertEqual(sorted(p.name for p in last.parent.iterdir()), ["last.ckpt"])
+
+    def test_pretraining_checkpoints_with_top_k_and_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            seen = self._fit_toy_pretraining(directory, epochs=2, save_top_k=1, save_every_n_epochs=1)
+            self.assertEqual(seen, [(0, None), (1, 0)])
+            run = Path(directory) / "run"
+            names = sorted(p.name for p in (run / "loss_total_val").iterdir())
+            self.assertEqual(len(names), 2)
+            self.assertIn("last.ckpt", names)
+            self.assertEqual(sorted(p.name for p in (run / "snapshots").iterdir()),
+                             ["epoch=000.ckpt", "epoch=001.ckpt"])
+
+    @unittest.skipUnless(HAS_FLASH, "needs CUDA and FlashAttention kernels")
     def test_bf16_flash_training_step_matches_fp32_reference(self):
         jepa = FlashJEPA(**SMALL, predictor_embed_dim=64, predictor_depth=2, predictor_num_heads=4).cuda()
         batch = move_obj(synthetic_batch(seed=8, batch_size=8), "cuda")
@@ -437,6 +619,37 @@ class FlashJEPATests(unittest.TestCase):
         self.assertEqual(flash["batch_size"], reference["batch_size"])
         torch.testing.assert_close(flash["ecal_hits"], reference["ecal_hits"])
 
+    @unittest.skipUnless(METADATA.is_file(), "local events are not available")
+    def test_split_fingerprint_cli_matches_the_training_loaders(self):
+        from evaluation.create_csv_v7_ft import deterministic_split_files, discover_event_files
+        from dataset import SparseFASERCALMapDataset
+        from utils import require_split_fingerprint, split_dataset, split_fingerprint
+
+        args = SimpleNamespace(
+            train=True, stage1=False, preprocessing_input="log", preprocessing_output="log",
+            label_smoothing=0.02, mixup_alpha=0.0, dataset_path=str(METADATA.parent),
+            metadata_path=str(METADATA), augmentations_enabled=True, batch_size=4, num_workers=0)
+        loaders = split_dataset(SparseFASERCALMapDataset(args), args, splits=[0.85, 0.05, 0.1],
+                                collate_fn=collate_tokens)
+        files = [loader.dataset.data_files for loader in loaders]
+        expected = split_fingerprint(*deterministic_split_files(discover_event_files(METADATA.parent)))
+        self.assertEqual(require_split_fingerprint(expected, *files), expected)
+        with self.assertRaisesRegex(RuntimeError, "split differs"):
+            require_split_fingerprint("0" * 64, *files)
+        # Independent of where the events are stored.
+        moved = [[f"/elsewhere/{Path(f).parent.name}/{Path(f).name}" for f in group] for group in files]
+        self.assertEqual(split_fingerprint(*moved), expected)
+        # Paths stored as numpy arrays (shared with workers) load the same events.
+        from utils import share_file_lists
+        before = loaders[1].dataset[3]
+        share_file_lists(*loaders)
+        self.assertIsInstance(loaders[0].dataset.data_files, np.ndarray)
+        self.assertEqual(split_fingerprint(*(l.dataset.data_files for l in loaders)), expected)
+        after = loaders[1].dataset[3]
+        for key in before:
+            if torch.is_tensor(before[key]):
+                self.assertTrue(torch.equal(before[key], after[key]), key)
+
     def test_evaluation_builds_flash_models_from_checkpoints(self):
         from evaluation.inference_common import _arrange_batch, build_eval_args, load_models_from_paths
 
@@ -488,7 +701,9 @@ class FlashJEPATests(unittest.TestCase):
         for line in ('model="${MODEL:-base}"', 'batch_size="${BATCH_SIZE:-2048}"',
                      'accum_grad_batches="${ACCUM_GRAD_BATCHES:-1}"', 'blr="${BLR:-1e-4}"',
                      'epochs="${EPOCHS:-400}"', 'warmup_epochs="${WARMUP_EPOCHS:-40}"',
-                     'save_top_k="${SAVE_TOP_K:-0}"', 'read -r -a gpus <<< "${GPUS:-0 1}"'):
+                     'save_top_k="${SAVE_TOP_K:-0}"', 'read -r -a gpus <<< "${GPUS:-0 1}"',
+                     'target_layers="${TARGET_LAYERS:-1}"', "--flash_target_layers $target_layers",
+                     'target_norm="${TARGET_NORM:-token}"', "--flash_target_norm $target_norm"):
             self.assertIn(line, pretrain)
         finetune = (REPO_ROOT / "finetune_flash.sh").read_text()
         reference = (REPO_ROOT / "finetune.sh").read_text()

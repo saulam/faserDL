@@ -13,6 +13,7 @@ scatter operations and dense matrix products, so it needs no spconv and has no
 voxel-count limit.
 """
 
+import inspect
 import math
 from dataclasses import dataclass
 from functools import partial
@@ -26,8 +27,11 @@ from .common import CylindricalHeadNormalized, choose_k1_k2, get_3d_sincos_pos_e
 
 try:
     from torch.nn.attention.varlen import varlen_attn
-except ImportError:  # torch < 2.9: exact padded attention only (tests, spconv env)
+except ImportError:  # e.g. torch 2.9 (Clariden): FlashVarlenAttention below
     varlen_attn = None
+# varlen_attn is used only where it accepts window_size (see varlen_attention).
+VARLEN_WINDOW = varlen_attn is not None and "window_size" in inspect.signature(varlen_attn).parameters
+HAS_FLASH_OPS = hasattr(torch.ops.aten, "_flash_attention_forward")
 
 
 FCAL, AHCAL, ECAL, MUON = 0, 1, 2, 3
@@ -139,9 +143,35 @@ def padded_attention(q, k, v, seq):
     return out.transpose(1, 2)[seq.event, rank]
 
 
+class FlashVarlenAttention(torch.autograd.Function):
+    """Packed FlashAttention-2 for torch versions without varlen_attn (e.g. 2.9).
+
+    Calls the same aten kernels that varlen_attn wraps, forward and backward.
+    (Jagged nested tensors also reach them, but with 3-5x the time per call.)
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen):
+        out, lse, rng_state, unused, _ = torch.ops.aten._flash_attention_forward(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, False, False)
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens, rng_state, unused)
+        ctx.max_seqlen = max_seqlen
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, out, lse, cu_seqlens, rng_state, unused = ctx.saved_tensors
+        dq, dk, dv = torch.ops.aten._flash_attention_backward(
+            grad_out.contiguous(), q, k, v, out, lse, cu_seqlens, cu_seqlens,
+            ctx.max_seqlen, ctx.max_seqlen, 0.0, False, rng_state, unused)
+        return dq, dk, dv, None, None
+
+
 def varlen_attention(q, k, v, seq):
     """Self-attention within each event of a packed sequence; [T, H, D] in and out."""
-    if varlen_attn is not None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+    if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) and (VARLEN_WINDOW or HAS_FLASH_OPS):
+        if not VARLEN_WINDOW:
+            return FlashVarlenAttention.apply(q, k, v, seq.cu_seqlens, seq.max_seqlen)
         # A window covering the whole sequence is full attention (FlashAttention
         # treats windows >= max_seqlen as unbounded) and selects the
         # FlashAttention-2 kernels for forward and backward on every GPU.
@@ -212,8 +242,13 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path)
 
     def forward(self, x, seq):
+        return self.forward_with_mlp(x, seq)[0]
+
+    def forward_with_mlp(self, x, seq):
+        """forward() and the MLP output before its residual addition (data2vec targets)."""
         x = x + self.drop_path(self.attn(self.norm1(x), seq), seq)
-        return x + self.drop_path(self.mlp(self.norm2(x)), seq)
+        mlp = self.mlp(self.norm2(x))
+        return x + self.drop_path(mlp, seq), mlp
 
 
 class SparsePatchEmbed(nn.Module):
@@ -436,6 +471,21 @@ class FlashEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, seq)
         return self.norm(x)
+
+    def forward_mlp_outputs(self, x, seq, num_layers):
+        """MLP outputs (before the residual addition) of the last ``num_layers`` blocks."""
+        if not 1 <= num_layers <= len(self.blocks):
+            raise ValueError(f"num_layers must be in [1, {len(self.blocks)}], got {num_layers}")
+        x = self.pos_drop(x)
+        first = len(self.blocks) - num_layers
+        outputs = []
+        for index, block in enumerate(self.blocks):
+            if index < first:
+                x = block(x, seq)
+            else:
+                x, mlp = block.forward_with_mlp(x, seq)
+                outputs.append(mlp)
+        return outputs
 
     def forward_features(self, batch):
         tokens = self.embed(batch)

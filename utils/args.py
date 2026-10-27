@@ -182,5 +182,16 @@ def add_flash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                        help="Range of the per-axis stretch of a target block (log-uniform)")
     group.add_argument("--flash_mask_global_prob", type=float, default=0.25,
                        help="Probability that the ECAL token and the muon-spectrometer token are targets")
+    group.add_argument("--flash_target_layers", type=int, default=1,
+                       help="JEPA targets: 1 = the target encoder's final output (I-JEPA); K > 1 = the "
+                            "average of the layer-normalised MLP outputs of its last K blocks (data2vec)")
+    group.add_argument("--flash_target_norm", type=str, default="token", choices=["token", "batch"],
+                       help="JEPA targets: token = layer norm of each token; batch = then also standardise "
+                            "each channel over the batch's tokens of each detector type")
+    group.add_argument("--save_every_n_epochs", type=int, default=0,
+                       help="Pretraining: also keep a checkpoint every N epochs in <checkpoint>/snapshots (0: off)")
+    group.add_argument("--expected_split_sha256", type=str, default=None,
+                       help="Fail unless the train/val/test split has this fingerprint "
+                            "(python -m train.split_fingerprint), e.g. to match another machine")
     return parser
 

@@ -5,6 +5,7 @@ task weighting, layer-wise LR decay, EMA and checkpoint selection as
 train/finetune.py.  Runs without spconv, timm or torch_ema.
 """
 
+import gc
 import os
 import torch
 import pytorch_lightning as pl
@@ -16,6 +17,8 @@ from utils import (
     load_mae_encoder,
     resolve_checkpoint_path,
     checkpoint_monitors,
+    require_split_fingerprint,
+    share_file_lists,
 )
 from dataset import SparseFASERCALMapDataset
 from model.flash_vit import FLASH_ENCODER_PRESETS, FlashViT, collate_tokens
@@ -93,9 +96,14 @@ def main():
     # Dataset (same split as train/finetune.py)
     dataset = SparseFASERCALMapDataset(args)
     print("- Dataset size: {} events".format(len(dataset)))
-    train_loader, valid_loader, _ = split_dataset(
+    train_loader, valid_loader, test_loader = split_dataset(
         dataset, args, splits=[0.85, 0.05, 0.1], collate_fn=collate_tokens,
     )
+    args.split_sha256 = require_split_fingerprint(
+        args.expected_split_sha256, train_loader.dataset.data_files,
+        valid_loader.dataset.data_files, test_loader.dataset.data_files,
+    )
+    share_file_lists(train_loader, valid_loader)
     metadata = dataset.metadata
 
     model = build_flash_vit(args, metadata)
@@ -178,6 +186,10 @@ def main():
         fast_dev_run=args.fast_dev_run,
     )
 
+    # Loader workers are forked from this process.  Without freezing, Python's
+    # collector writes to every inherited object in each worker, copying most
+    # of this heap into every worker (GBs each with 64 KB pages, e.g. GH200).
+    gc.freeze()
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,

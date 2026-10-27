@@ -40,12 +40,23 @@ mask_num_blocks="${MASK_NUM_BLOCKS:-4}"
 mask_block_scale="${MASK_BLOCK_SCALE:-0.15 0.2}"
 mask_block_aspect="${MASK_BLOCK_ASPECT:-0.5 2.0}"
 mask_global_prob="${MASK_GLOBAL_PROB:-0.25}"
+# JEPA targets: 1 = final target-encoder output (I-JEPA); K > 1 = data2vec's
+# average of the last K blocks' layer-normalised MLP outputs.
+target_layers="${TARGET_LAYERS:-1}"
+# token = layer norm per token; batch = also standardise each channel over the
+# batch's tokens of each detector type (no target shared by every token).
+target_norm="${TARGET_NORM:-token}"
 save_dir="${SAVE_DIR:-logs_final}"
 name="${NAME:-pretrain_flash_jepa_base}"
 log_every_n_steps="${LOG_EVERY_N_STEPS:-50}"
 # The EMA target moves, so validation losses of different epochs are not
 # comparable: keep only last.ckpt and never stop early by default.
 save_top_k="${SAVE_TOP_K:-0}"
+# Snapshots in <checkpoint>/snapshots every N epochs for later probing (0: off).
+save_every_n_epochs="${SAVE_EVERY_N_EPOCHS:-25}"
+# Optional: fail unless the train/val/test split has this fingerprint
+# (python -m train.split_fingerprint --dataset_path ...).
+expected_split_sha256="${EXPECTED_SPLIT_SHA256:-}"
 early_stop_patience="${EARLY_STOP_PATIENCE:-0}"
 checkpoint_path="${CHECKPOINT_PATH:-checkpoints_final}"
 checkpoint_name="${CHECKPOINT_NAME:-$name}"
@@ -103,16 +114,20 @@ python -m train.pretrain_flash \
     --flash_mask_block_scale "${block_scale[@]}" \
     --flash_mask_block_aspect "${block_aspect[@]}" \
     --flash_mask_global_prob $mask_global_prob \
+    --flash_target_layers $target_layers \
+    --flash_target_norm $target_norm \
     --save_dir $save_dir \
     --name $name \
     --log_every_n_steps $log_every_n_steps \
     --save_top_k $save_top_k \
+    --save_every_n_epochs $save_every_n_epochs \
     --checkpoint_path $checkpoint_path \
     --checkpoint_name $checkpoint_name \
     --early_stop_patience $early_stop_patience \
     --seed $seed \
     --nb_nodes $nb_nodes \
     --gpus "${gpus[@]}" \
+    ${expected_split_sha256:+--expected_split_sha256 "$expected_split_sha256"} \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
     "${fast_dev_run_args[@]}"

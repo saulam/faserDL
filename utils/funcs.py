@@ -9,6 +9,8 @@ Description:
 
 import math
 import copy
+import hashlib
+import numpy as np
 import torch
 from pathlib import Path
 from torch.nn.utils.rnn import pad_sequence
@@ -60,6 +62,45 @@ ALL_MONITORS = [
 def checkpoint_monitors(selection):
     """Fine-tuning validation losses to checkpoint: all, or only the evaluated ones."""
     return list(EVALUATED_MONITORS if selection == "evaluated" else ALL_MONITORS)
+
+
+def split_fingerprint(*file_lists):
+    """sha256 of the ordered event identities ("directory/file") of each list.
+
+    Independent of where the events are stored, so equal fingerprints of
+    (train, val, test) mean identical splits on every machine.
+    """
+    digest = hashlib.sha256()
+    for files in file_lists:
+        for path in files:
+            path = Path(path)
+            digest.update(f"{path.parent.name}/{path.name}\n".encode())
+        digest.update(b"--\n")
+    return digest.hexdigest()
+
+
+def require_split_fingerprint(expected, train_files, val_files, test_files):
+    """Print the split fingerprint and fail if it differs from ``expected``."""
+    actual = split_fingerprint(train_files, val_files, test_files)
+    counts = f"{len(train_files)} train / {len(val_files)} val / {len(test_files)} test"
+    print(f"- Split fingerprint: {actual} ({counts})")
+    if expected and actual != expected:
+        raise RuntimeError(
+            f"The train/val/test split differs from the expected one ({counts}; fingerprint "
+            f"{actual} != {expected}).  Is the dataset copy complete and identical?")
+    return actual
+
+
+def share_file_lists(*loaders):
+    """Store the loaders' event paths in numpy arrays before workers start.
+
+    Forked DataLoader workers then index the paths without touching Python
+    object reference counts, so they do not copy the list's pages
+    (copy-on-read).  With 64 KB pages (e.g. Clariden's GH200 nodes) that copy
+    reached ~1 GB per worker for the ~1M training paths.
+    """
+    for loader in loaders:
+        loader.dataset.data_files = np.array(loader.dataset.data_files)
 
 
 def split_dataset(dataset, args, splits=[0.6, 0.1, 0.3], seed=7, test=False, collate_fn=None):

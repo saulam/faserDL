@@ -4,6 +4,7 @@ encoder (model/flash_jepa.py).  Runs without spconv, timm or torch_ema, e.g.
 in the neutrino-jepa environment.
 """
 
+import gc
 import os
 import torch
 import pytorch_lightning as pl
@@ -13,6 +14,8 @@ from utils import (
     split_dataset,
     SplitTensorBoardLogger,
     resolve_checkpoint_path,
+    require_split_fingerprint,
+    share_file_lists,
 )
 from dataset import SparseFASERCALMapDataset
 from model.flash_vit import FLASH_ENCODER_PRESETS, collate_tokens
@@ -55,7 +58,52 @@ def build_flash_jepa(args):
         mask_block_scale=tuple(args.flash_mask_block_scale),
         mask_block_aspect=tuple(args.flash_mask_block_aspect),
         mask_global_prob=args.flash_mask_global_prob,
+        target_layers=args.flash_target_layers,
+        target_norm=args.flash_target_norm,
     )
+
+
+class LastCheckpoint(ModelCheckpoint):
+    """last.ckpt after every epoch.  Its own class keeps its state key distinct
+    from the snapshots' when those are also saved every epoch."""
+
+
+def build_callbacks(args):
+    checkpoint_dir = f"{args.checkpoint_path}/{args.checkpoint_name}"
+    # last.ckpt after every epoch, for resuming.  A monitored ModelCheckpoint
+    # writes save_last only together with a top-k file, so with save_top_k=0
+    # last.ckpt appeared only when training ended.
+    callbacks = [
+        LastCheckpoint(
+            dirpath=f"{checkpoint_dir}/loss_total_val",
+            filename="last",
+            enable_version_counter=False,
+        ),
+        CustomProgressBar(),
+    ]
+    # The EMA target changes throughout training, so the validation loss is not
+    # comparable across epochs: keep only last.ckpt (save_top_k=0 by default).
+    if args.save_top_k != 0:
+        callbacks.append(ModelCheckpoint(
+            dirpath=f"{checkpoint_dir}/loss_total_val",
+            save_top_k=args.save_top_k,
+            monitor="loss_total/val",
+            mode="min",
+        ))
+    if args.save_every_n_epochs > 0:
+        # Snapshots for later analysis; epoch=024 is the state after 25 epochs.
+        callbacks.append(ModelCheckpoint(
+            dirpath=f"{checkpoint_dir}/snapshots",
+            filename="epoch={epoch:03d}",
+            auto_insert_metric_name=False,
+            every_n_epochs=args.save_every_n_epochs,
+            save_top_k=-1,
+            save_on_train_epoch_end=True,
+        ))
+    if args.early_stop_patience > 0:
+        callbacks.append(EarlyStopping(
+            monitor='loss_total/val', patience=args.early_stop_patience, verbose=True, mode='min'))
+    return callbacks
 
 
 def main():
@@ -86,9 +134,14 @@ def main():
     dataset = SparseFASERCALMapDataset(args)
     dataset.stage1 = False
     print("- Dataset size: {} events".format(len(dataset)))
-    train_loader, valid_loader, _ = split_dataset(
+    train_loader, valid_loader, test_loader = split_dataset(
         dataset, args, splits=[0.85, 0.05, 0.1], collate_fn=collate_tokens,
     )
+    args.split_sha256 = require_split_fingerprint(
+        args.expected_split_sha256, train_loader.dataset.data_files,
+        valid_loader.dataset.data_files, test_loader.dataset.data_files,
+    )
+    share_file_lists(train_loader, valid_loader)
 
     model = build_flash_jepa(args)
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -96,22 +149,7 @@ def main():
     print("Total trainable params model: {}".format(trainable_params))
     print("Encoder params: {}".format(encoder_params))
     args.flash_encoder_config = model.encoder_config
-
-    # The EMA target changes throughout training, so the validation loss is not
-    # comparable across epochs: keep last.ckpt (save_top_k=0 by default).
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=f"{args.checkpoint_path}/{args.checkpoint_name}/loss_total_val",
-            save_top_k=args.save_top_k,
-            monitor="loss_total/val",
-            mode="min",
-            save_last=True,
-        ),
-        CustomProgressBar(),
-    ]
-    if args.early_stop_patience > 0:
-        callbacks.append(EarlyStopping(
-            monitor='loss_total/val', patience=args.early_stop_patience, verbose=True, mode='min'))
+    callbacks = build_callbacks(args)
 
     logger = CSVLogger(save_dir=args.save_dir + "/logs", name=args.name)
     tb_logger = SplitTensorBoardLogger(
@@ -154,6 +192,10 @@ def main():
         print(f"Loaded pre-trained weights from: {load_path}")
         print(f"Load msg: {msg}")
 
+    # Loader workers are forked from this process.  Without freezing, Python's
+    # collector writes to every inherited object in each worker, copying most
+    # of this heap into every worker (GBs each with 64 KB pages, e.g. GH200).
+    gc.freeze()
     trainer.fit(
         model=lightning_model,
         train_dataloaders=train_loader,

@@ -43,6 +43,9 @@ log_every_n_steps="${LOG_EVERY_N_STEPS:-10}"
 save_top_k="${SAVE_TOP_K:-10}"
 save_last="${SAVE_LAST:-1}"
 checkpoint_monitors="${CHECKPOINT_MONITORS:-all}"
+# Optional: fail unless the train/val/test split has this fingerprint
+# (python -m train.split_fingerprint --dataset_path ...).
+expected_split_sha256="${EXPECTED_SPLIT_SHA256:-}"
 checkpoint_path="${CHECKPOINT_PATH:-checkpoints}"
 checkpoint_name="${CHECKPOINT_NAME:-$name}"
 early_stop_patience="${EARLY_STOP_PATIENCE:-10}"
@@ -105,6 +108,7 @@ python -m train.finetune_flash \
     --early_stop_patience $early_stop_patience \
     --seed $seed \
     --nb_nodes $nb_nodes \
+    ${expected_split_sha256:+--expected_split_sha256 "$expected_split_sha256"} \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
     "${fast_dev_run_args[@]}" \

@@ -115,7 +115,8 @@ class FlashJEPAPreTrainer(pl.LightningModule):
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
         decay = self._ema_decay_for_step()
         self.model.update_target_encoder(decay)
-        self.log("jepa/ema_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        # Identical on every rank: no reduction needed.
+        self.log("jepa/ema_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
 
     @staticmethod
     def _event_std(tokens, seq):
@@ -158,11 +159,21 @@ class FlashJEPAPreTrainer(pl.LightningModule):
         return output["loss"], metrics, batch_size
 
     def _log_step(self, loss, metrics, batch_size, split):
-        self.log(f"loss_total/{split}", loss.detach(), batch_size=batch_size,
-                 on_step=(split == "train"), on_epoch=True, prog_bar=True, sync_dist=True)
-        for name, value in metrics.items():
-            self.log(f"{name}/{split}", value, batch_size=batch_size,
-                     on_step=(split == "train"), on_epoch=True, prog_bar=False, sync_dist=True)
+        values = {"loss_total": loss.detach(), **metrics}
+        if split == "val":
+            for name, value in values.items():
+                self.log(f"{name}/val", value, batch_size=batch_size, on_step=False, on_epoch=True,
+                         prog_bar=(name == "loss_total"), sync_dist=True)
+            return
+        # Same keys as on_step+on_epoch logging, but the per-step values come
+        # from each rank's own batch: with sync_dist, Lightning all-reduces
+        # every step-level metric at every step, which stalls multi-node jobs.
+        # The epoch means are still reduced across ranks (once per epoch).
+        for name, value in values.items():
+            self.log(f"{name}/train_step", value, batch_size=batch_size, on_step=True, on_epoch=False,
+                     prog_bar=(name == "loss_total"), sync_dist=False)
+            self.log(f"{name}/train_epoch", value, batch_size=batch_size, on_step=False, on_epoch=True,
+                     sync_dist=True)
 
     def training_step(self, batch, batch_idx):
         loss, metrics, batch_size = self.common_step(batch)

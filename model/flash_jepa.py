@@ -4,6 +4,12 @@ Description: I-JEPA-style pretraining of the spconv-free flash-attention encoder
 - Context encoder: FlashEncoder over the visible (context) tokens only.
 - Target encoder: EMA copy of the context encoder over all tokens; its final
   token representations, layer-normalised, are the regression targets.
+  Optionally (target_layers = K > 1) the targets are data2vec's instead: the
+  average of the layer-normalised MLP outputs (before the residual addition)
+  of its last K blocks, layer-normalised again, which keeps more of the
+  lower-level content of the deposits.  Optionally (target_norm = "batch")
+  each target channel is then standardised over the batch's tokens of the
+  same detector type, so a component shared by every token is no target.
 - Predictor: a narrow transformer over the context tokens plus one mask token
   per target, each carrying the target's position and detector type; it
   predicts the target encoder's representation of every target token.
@@ -166,6 +172,20 @@ class FlashPredictor(nn.Module):
         return x[position[context.event.numel():]]
 
 
+def standardise_per_kind(x, kind, eps=1e-5):
+    """Zero mean and unit variance of every channel over the tokens of each
+    detector type (FASERCal, AHCAL, ECAL, muon) in the batch: [T, C] -> [T, C].
+
+    A component that every token of a type shares becomes zero, so targets
+    that collapse onto one vector carry no easy-to-predict part; differences
+    between tokens and between events are kept at unit scale."""
+    counts = torch.bincount(kind, minlength=NUM_TOKEN_KINDS).clamp_min(1).unsqueeze(-1).to(x.dtype)
+    mean = x.new_zeros(NUM_TOKEN_KINDS, x.size(-1)).index_add_(0, kind, x) / counts
+    centred = x - mean[kind]
+    var = x.new_zeros(NUM_TOKEN_KINDS, x.size(-1)).index_add_(0, kind, centred.square()) / counts
+    return centred * torch.rsqrt(var[kind] + eps)
+
+
 class FlashJEPA(nn.Module):
     def __init__(
         self,
@@ -176,10 +196,19 @@ class FlashJEPA(nn.Module):
         mask_block_scale=(0.15, 0.2),
         mask_block_aspect=(0.5, 2.0),
         mask_global_prob=0.25,
+        target_layers=1,
+        target_norm="token",
         **encoder_kwargs,
     ):
         super().__init__()
         self.context_encoder = FlashEncoder(**encoder_kwargs)
+        depth = len(self.context_encoder.blocks)
+        if not 1 <= int(target_layers) <= depth:
+            raise ValueError(f"target_layers must be in [1, {depth}], got {target_layers}")
+        if target_norm not in ("token", "batch"):
+            raise ValueError(f"target_norm must be 'token' or 'batch', got {target_norm!r}")
+        self.target_layers = int(target_layers)
+        self.target_norm = target_norm
         self.target_encoder = copy.deepcopy(self.context_encoder)
         for parameter in self.target_encoder.parameters():
             parameter.requires_grad_(False)
@@ -217,16 +246,29 @@ class FlashJEPA(nn.Module):
 
     @torch.no_grad()
     def _targets(self, batch):
-        """Layer-normalised target-encoder representations of all tokens (no dropout)."""
+        """Layer-normalised target-encoder representations of all tokens (no dropout).
+
+        target_layers = 1: the final output.  K > 1: the average of the
+        layer-normalised MLP outputs of the last K blocks (data2vec).
+        target_norm = "batch": then standardised per channel and detector type
+        over the batch (standardise_per_kind).
+        """
         was_training = self.target_encoder.training
         self.target_encoder.eval()
         try:
             tokens = self.target_encoder.embed(batch)
             seq = tokens.seq()
-            out = self.target_encoder.forward_tokens(tokens.x, seq)
+            if self.target_layers == 1:
+                out = self.target_encoder.forward_tokens(tokens.x, seq)
+            else:
+                layers = self.target_encoder.forward_mlp_outputs(tokens.x, seq, self.target_layers)
+                out = sum(F.layer_norm(layer.float(), (layer.size(-1),)) for layer in layers) / len(layers)
         finally:
             self.target_encoder.train(was_training)
-        return tokens, seq, F.layer_norm(out.float(), (out.size(-1),))
+        out = F.layer_norm(out.float(), (out.size(-1),))
+        if self.target_norm == "batch":
+            out = standardise_per_kind(out, tokens.kind)
+        return tokens, seq, out
 
     def forward(self, batch):
         tokens = self.context_encoder.embed(batch)
