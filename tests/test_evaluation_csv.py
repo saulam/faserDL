@@ -157,6 +157,20 @@ class EvaluationCSVTests(unittest.TestCase):
                     inspect_pretraining_checkpoint=False,
                 )
 
+            report = validate_jepa_provenance(
+                scratch, root / "hparams.yaml", checkpoint_dir, allow_scratch=True,
+            )
+            self.assertEqual(report["pretraining_objective"], "none")
+            self.assertEqual(report["pretrained_encoder_coverage"], 0.0)
+            self.assertIsNone(report["pretraining_checkpoint"])
+
+            # allow_scratch does not excuse a missing checkpoint that was loaded.
+            missing = dict(hparams, load_checkpoint=str(root / "gone.ckpt"))
+            with self.assertRaisesRegex(RuntimeError, "pretraining checkpoint is missing"):
+                validate_jepa_provenance(
+                    missing, root / "hparams.yaml", checkpoint_dir, allow_scratch=True,
+                )
+
     def test_provenance_accepts_mae_and_rejects_source_checkpoint_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

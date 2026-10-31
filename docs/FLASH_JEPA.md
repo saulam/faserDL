@@ -13,6 +13,88 @@ Everything here runs in the `neutrino-jepa` environment (PyTorch 2.14, CUDA
 environment has no spconv, timm, torch_ema or webdataset, and the new code
 needs none of them.
 
+## Recommended recipe (as of 2026-10-31)
+
+The rest of this file is a chronological log.  This is the best recipe it
+found; the evidence is in "Stabilisation", under "Predictor QK-norm, three
+seeds: test metrics".
+
+**Pretraining:** K = 16 data2vec targets with predictor QK-norm.  Both are
+opt-in, so set them explicitly; the launcher defaults (`TARGET_LAYERS=1`,
+`PREDICTOR_QK_NORM=0`) keep the earlier runs reproducible.
+- **Targets:** `TARGET_LAYERS=16`, as in data2vec.  The MLP outputs of
+  all 16 target-encoder blocks, before the residual, are each
+  layer-normalised, averaged, and normalised again per token
+  (`TARGET_NORM=token`, the default; see "data2vec targets").
+- **Predictor QK-norm:** `PREDICTOR_QK_NORM=1`.  Without it, every seed of
+  this recipe had a collapse episode (2 seeds at BLR 1e-4, 3 at 5e-5).
+  With it, 3 of 3 seeds had none.
+- **Everything else is the launcher's default:**
+  - `base` encoder;
+  - effective batch 4,096 and BLR 1e-4 (peak LR 1.6e-3), with 40 warm-up
+    epochs then cosine, for 400 epochs;
+  - weight decay 0.05;
+  - teacher EMA 0.996 -> 1.0;
+  - the default masks.
+- **Monitoring (optional):** `LOG_GRAD_NORM=1` logs the gradient norm per
+  block and of the predictor.
+- **Use `loss_total_val/last.ckpt`.**  The fine-tune loads its target (EMA)
+  encoder.
+
+**Fine-tuning:** the published 20-epoch recipe (`finetune_flash.sh`
+defaults) with `LAYER_DECAY=0.85`.
+- Defaults: global batch 1,024, BLR 5e-4, 5 warm-up and 15 cosine epochs,
+  drop path 0.2, label smoothing 0.02, weight decay 0.05, model EMA 0.9999.
+- 0.85 beat 0.75 and 0.80; 0.90 was no better (see the two layer-decay
+  sections).
+- Fine-tuning seed 7 throughout.
+
+**Results:** test set, the same 122,639 events.
+- Pretraining seeds 7, 8 and 9 give flavour accuracy 0.8256, 0.8243 and
+  0.8250 (published MAE base: 0.8153).
+- Their mean is better than the published MAE base on all 15 metrics
+  (paired event bootstrap).
+- It recovers 102-141% of the scratch -> MAE gap per metric.
+
+**Cost on Clariden:** about 5 h of pretraining on 2 nodes (8 GH200),
+then about 40 min of fine-tune plus test CSV on 1 node.
+
+**Caveats:**
+- The vertex median is the one metric that does not improve on K = 1 or
+  on the healthy encoders without QK-norm.  It also varies most across
+  seeds (14.3-16.0 mm).
+- The QK-norm's learned gain and bias still let the last predictor blocks'
+  attention logits grow in the second half of training.  No episode
+  followed in 400 epochs, but longer runs are untested.
+
+**Commands on Clariden,** from `/users/salonso/faserDL`.  One job pretrains,
+fine-tunes and writes the test CSV:
+
+```bash
+NAME=pretrain_flash_jepa_base_d2v16_qkn SEED=7 TARGET_LAYERS=16 PREDICTOR_QK_NORM=1 LOG_GRAD_NORM=1 FT_NAME=finetune_flash_jepa_base_d2v16_qkn_ld085 sbatch clariden/pretrain_finetune_flash.sbatch
+```
+
+The wrapper fine-tunes with `FT_SEED=7` and `FT_LAYER_DECAY=0.85` by default.
+To fine-tune and evaluate an existing pretraining separately (1 node, fits
+the debug partition):
+
+```bash
+LOAD_CHECKPOINT=/capstor/scratch/cscs/salonso/faser/checkpoint/pretrain_flash_jepa_base_d2v16_qkn/loss_total_val/last.ckpt NAME=finetune_flash_jepa_base_d2v16_qkn_ld085 SEED=7 LAYER_DECAY=0.85 sbatch clariden/finetune_evaluate_flash.sbatch
+```
+
+**Commands on dlnu (2 GPUs):** the "Commands" section below, with the
+recipe's settings added:
+
+```bash
+NAME=pretrain_flash_jepa_base_d2v16_qkn TARGET_LAYERS=16 PREDICTOR_QK_NORM=1 LOG_GRAD_NORM=1 DATASET_PATH='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*' METADATA_PATH=/scratch/salonso/sparse-nns/faser_develop/events_v7.0_500_npz/metadata_stats.pkl bash pretrain_flash.sh
+NAME=finetune_flash_jepa_base_d2v16_qkn_ld085 LAYER_DECAY=0.85 GPUS='0 1' BATCH_SIZE=512 NUM_WORKERS=24 CHECKPOINT_PATH=/scratch4/salonso/faser/checkpoints_final SAVE_TOP_K=1 SAVE_LAST=0 CHECKPOINT_MONITORS=evaluated LOAD_CHECKPOINT=checkpoints_final/pretrain_flash_jepa_base_d2v16_qkn/loss_total_val/last.ckpt DATASET_PATH='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*' METADATA_PATH=/scratch/salonso/sparse-nns/faser_develop/events_v7.0_500_npz/metadata_stats.pkl bash finetune_flash.sh
+python -m evaluation.create_csv_v7_ft --checkpoint_dir /scratch4/salonso/faser/checkpoints_final/finetune_flash_jepa_base_d2v16_qkn_ld085
+```
+
+The pretraining curves of the three seeds, with seed 8 without QK-norm for
+reference: `results/flash_audit_20261026/pretraining_curves_qkn.png`
+(`plot_pretraining_curves_qkn.py`).
+
 ## Design
 
 **Tokens.**  Every occupied FASERCal patch (`12 x 12 x 10` voxels, `4 x 4 x 20`
@@ -819,14 +901,15 @@ python results/flash_audit_20261026/metrics_flash_d2v.py > results/flash_audit_2
   intervals excluding 0.  The biggest gains are flavour accuracy +0.0086,
   E_vis -0.0241, pT_miss -0.0295 and |p_lep| CC -0.0424.  charm->e, charm->mu,
   |p_jet| and vertex are tied.
-- **The partial collapse barely matters after fine-tuning.**  e400 against
+- **The partial collapse cost little after fine-tuning.**  e400 against
   e299 is tied on all 10 classification metrics.  On the regressions it is
   slightly better for E_vis, |p_jet| and |p_lep| but worse for pT_miss
   (+0.0065) and vertex (+0.49 mm), and its validation total is slightly
   lower.  Full fine-tuning seems to rebuild what the deep blocks lost, from
-  the early blocks that kept their event content.  The collapse is therefore
-  a problem for the representation (and for frozen-encoder uses), not for
-  these fine-tuned results.
+  the early blocks that kept their event content.  This is one fine-tune
+  each, with no uncollapsed epoch-400 model to compare against.  Frozen use
+  is not clearly worse either: the external review's frozen linear probe
+  scores epoch 399 above epoch 299 (flavour macro-AUC 0.763 against 0.732).
 - **Layer decay 0.90 is no better than 0.85** (K = 1).  Validation total is
   tied (1.2529 against 1.2524), with flavour and vis worse.  On test the
   classification is tied, E_vis and |p_lep| are better, and pT_miss, |p_jet|
@@ -835,7 +918,1546 @@ python results/flash_audit_20261026/metrics_flash_d2v.py > results/flash_audit_2
 Caveats: one fine-tuning seed per run.  The layer decay was chosen on K = 1
 validation and not re-tuned for K = 16.  The MAE numbers use their published
 0.75 recipe.  Epoch 299 was picked from the pretraining diagnostic, before
-any fine-tune.
+any fine-tune.  All K = 16 results in this section come from one
+pretraining seed (7).  The second seed's fine-tune does not reproduce them:
+it is mixed against the MAE (worse on flavour accuracy, E_vis and pT_miss)
+and below K = 1 (see "Second pretraining seed"
+below).
+
+## Second pretraining seed, K = 16 `token` (Clariden, 2026-10-27)
+
+Every K = 16 result above comes from one pretraining run (seed 7).  The same
+setup with `SEED=8` (initialisation, data order and masks; the split stays
+seed 7, as `split_dataset` fixes it) tests whether the gain over the MAE
+holds across pretraining runs.  Its `last.ckpt` is fine-tuned as for the
+others (published recipe, `LAYER_DECAY=0.85`, fine-tuning seed 7), then
+evaluated.  The Clariden code matched dlnu's (46 files, sha256) at
+submission.
+
+```bash
+c=/capstor/scratch/cscs/salonso/faser/checkpoint; p=pretrain_flash_jepa_base_d2v16_s8; f=finetune_flash_jepa_base_d2v16_s8_ld085; pid=$(NAME=$p TARGET_LAYERS=16 SEED=8 sbatch --parsable clariden/pretrain_flash.sbatch) && fid=$(LOAD_CHECKPOINT=$c/$p/loss_total_val/last.ckpt NAME=$f LAYER_DECAY=0.85 sbatch --parsable --dependency=afterok:$pid clariden/finetune_flash.sbatch) && eid=$(CHECKPOINT_DIR=$c/$f sbatch --parsable --dependency=afterok:$fid clariden/evaluate_flash.sbatch)
+```
+
+Jobs: pretraining 3769470 (2 nodes), fine-tune 3769471, evaluation 3769472,
+each starting only if the previous one succeeds.
+
+**Pretraining result** (3769470: 400 epochs in 4 h 21 min, no NaN; run
+settings confirmed as `seed: 8`, `flash_target_layers: 16`,
+`flash_target_norm: token`).  Validation diagnostics:
+
+| epoch | 130 | 138 | 142 | 144 | 146 | 148 | 150 | 152 | 160 | 200 | 250 | 300 | 399 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| val loss | 0.077 | 0.101 | 0.144 | 0.000 | 0.002 | 0.254 | 0.002 | 0.041 | 0.091 | 0.054 | 0.040 | 0.037 | 0.034 |
+| `context_event_std` | 0.52 | 0.44 | 0.02 | 0.01 | 0.60 | 0.63 | 0.20 | 0.42 | 0.60 | 0.50 | 0.42 | 0.41 | 0.41 |
+| `target_event_std` | 0.57 | 0.52 | 0.39 | 0.01 | 0.02 | 0.62 | 0.06 | 0.34 | 0.48 | 0.55 | 0.46 | 0.47 | 0.48 |
+| `target_std` | 0.94 | 0.72 | 0.61 | 0.01 | 0.06 | 0.63 | 0.06 | 0.31 | 0.62 | 0.79 | 0.94 | 0.94 | 0.94 |
+
+- **A complete collapse at epochs ~138-152, then recovery.**  At epoch 144
+  the targets were nearly constant (`target_std` 0.01) and the loss ~0.
+  The run then oscillated for a few epochs and rebuilt the targets over
+  epochs 152-220.
+- **Stable from epoch ~250 to the end.**  No late collapse: the minimum
+  `context_event_std` after epoch 200 is 0.40, against 0.07 for seed 7.  At
+  epoch 399, `target_std` (0.94) and the event spreads (0.41, 0.48) are
+  close to seed 7's values before its collapse (epoch 300: 0.93, 0.40,
+  0.54).
+- **Both K = 16 `token` seeds collapsed, at different times.**  Seed 7
+  collapsed partially at epochs 316-346 and did not recover.  Seed 8
+  collapsed completely at epochs 138-152 and did.  The instability is a
+  property of the setup, not of one late stretch of the schedule.
+- **The validation loss settles lower than seed 7's** (0.037-0.040 against
+  0.085-0.090 at epochs 250-310; 0.034 at epoch 399), with similar target
+  scale.  Its cause is
+  not established.  Fine-tuning of `last.ckpt` (the pre-planned choice) will
+  show whether either episode matters.
+- **K = 1 for comparison** (`pretrain_flash_jepa_base`, dlnu): no abrupt
+  event.  Its spreads only narrow slowly over training (`target_std` 0.99 to
+  0.63, `context_event_std` 0.65 to 0.23), with no epoch after 25 below 0.5
+  in `target_std`.
+
+**Block-by-block check** (`results/flash_audit_20261026/collapse_check_s8.{sbatch,out}`,
+Clariden debug job 3780035, 77 s; same script and the same 2,048 validation
+events as for seed 7).  Seed 7's epoch 299 is repeated and reproduces
+`collapse_check.out` exactly.
+
+```bash
+sbatch results/flash_audit_20261026/collapse_check_s8.sbatch   # from /users/salonso/faserDL
+```
+
+Teacher (target encoder) `event` fraction, with `same` (identical for every
+token) in brackets for selected rows:
+
+| | s7 e299 | s8 e124 | s8 e149 | s8 e174 | s8 e199 | s8 e249 | s8 e399 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| block 1 | 0.32 | 0.25 | 0.47 | 0.57 | 0.42 | 0.20 | 0.23 |
+| block 4 | 0.67 | 0.71 | 0.35 (0.63) | 0.42 (0.53) | 0.47 | 0.73 | 0.58 |
+| block 8 | 0.88 | 0.83 | 0.22 (0.77) | 0.54 | 0.73 | 0.76 | 0.73 |
+| block 12 | 0.92 | 0.97 | 0.22 (0.76) | 0.58 | 0.78 | 0.79 | 0.83 |
+| block 16 | 0.60 | 0.55 | 0.24 (0.75) | 0.39 | 0.79 | 0.87 | 0.76 |
+| K = 16 target | 0.66 | 0.70 | 0.29 (0.69) | 0.45 (0.50) | 0.52 (0.36) | 0.57 | 0.55 (0.06) |
+| final output | 0.56 | 0.68 | 0.41 | 0.47 | 0.35 | 0.65 | 0.59 |
+| block 1 loud | 0.84 | 1.36 | 56.7 | 89.4 | 15.1 | 1.44 | 0.72 |
+
+- **A different collapse from seed 7's.**  At epoch 149 the student (context
+  encoder) had no event content left in any block from 4 on (`event`
+  0.000, pooled spread 0.009): it was constant.  Block 1's MLP output was
+  57x the size of the patch embedding it adds to (`loud`), and 89x at epoch
+  174, so it swamped the input.  The teacher followed halfway (`same`
+  0.50-0.78).  Seed 7 instead lost its deep half while blocks 1-4 kept the
+  event content.  Both end in the same shortcut, a representation shared by
+  every token, reached from opposite ends of the encoder.
+- **The recovery is real.**  By epoch 249 block 1's `loud` is back to 1.4,
+  and at epoch 399 the deep blocks carry 0.73-0.90 event content.  That is
+  close to before the collapse (epoch 124) and to seed 7's healthy epoch
+  299, and nothing like seed 7's epoch 399 (block 16: 0.76 against 0.01).
+  Final output: event 0.59, spread 0.40, against seed 7's 0.04 and 0.12 at
+  epoch 399.
+- **Why the loss is lower than seed 7's.**  The K = 16 target at epoch 399
+  is 45% predictable from the token's place alone (`layout` = 1 - `event`),
+  against 30-34% at seed 8 e124 and seed 7 e299.  The extra part is
+  position-specific, not a shared constant (`same` 0.06).  It is spread over
+  blocks 4-12, whose event content dropped by 0.1-0.2 from epoch 124
+  (block 6: 0.82 to 0.59; block 11: 0.96 to 0.83), while block 16 rose (0.55
+  to 0.76).  The predictor is given the positions, so this part is easy to
+  predict.
+- **Both collapses started with a loss spike** (seed 7: 0.087 to 0.132 at
+  epochs 316-328; seed 8: 0.085 to 0.223 at epochs 136-140), despite
+  gradient clipping at norm 1.0.  The LR was very different: 1.3e-3 for
+  seed 8, 2.2e-4 to 1.7e-4 for seed 7 (logged `lr`).  An optimisation spike followed by a fall into
+  the constant-target shortcut fits both; the trigger is not established.
+- MLP biases in blocks 1-3 have grown slowly since recovery (6-13% of the
+  output at e399, from below 1% at e124).  Small, and not part of either
+  collapse.
+- This healthier representation did not give a better fine-tune: see the
+  fine-tune result below.
+
+**Fine-tune on dlnu instead.**  The Clariden fine-tune and evaluation
+(3769471/3769472) were cancelled before starting: no outputs.  `last.ckpt`
+was copied to dlnu (sha256 5a689619... on both sides) and fine-tuned there
+(2 x 512, same global batch) from 2026-10-28 09:03 to 11:08, evaluation
+included.  In the replicate pair below, the machine difference is small
+on classification and up to ~0.004 sMAD on the regressions.  Hyperparameters are identical to the batch-standardised
+dlnu fine-tune's except the name and the checkpoint (`hparams.yaml` diff).
+
+```bash
+cd /scratch/salonso/sparse-nns/faser_develop && source /scratch/salonso/anaconda3/etc/profile.d/conda.sh && conda activate neutrino-jepa && n=finetune_flash_jepa_base_d2v16_s8_ld085_dlnu && c=/scratch4/salonso/faser/checkpoints_final && nohup bash -c "NAME=$n LAYER_DECAY=0.85 GPUS='0 1' BATCH_SIZE=512 NUM_WORKERS=24 CHECKPOINT_PATH=$c SAVE_TOP_K=1 SAVE_LAST=0 CHECKPOINT_MONITORS=evaluated LOAD_CHECKPOINT=$c/pretrain_flash_jepa_base_d2v16_s8/loss_total_val/last.ckpt EXPECTED_SPLIT_SHA256=02078f72b5ec271f81e14f3a24b769e665a9a928908b141bd1fb2134c730fd7c DATASET_PATH='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*' METADATA_PATH=/scratch/salonso/sparse-nns/faser_develop/events_v7.0_500_npz/metadata_stats.pkl bash finetune_flash.sh && python -m evaluation.create_csv_v7_ft --checkpoint_dir $c/$n" > /scratch4/salonso/faser/$n.log 2>&1 &
+```
+
+**Fine-tune result.**  The log has no errors.  It loaded 100% of the
+encoder from the target branch of epoch 399, and the task checkpoints were
+picked at epochs 17-19.
+`results/flash_audit_20261026/metrics_flash_s8.{py,out}` scores it on the
+same 122,639 test events (paired event bootstrap, 200 resamples):
+
+```bash
+python results/flash_audit_20261026/metrics_flash_s8.py > results/flash_audit_20261026/metrics_flash_s8.out 2>&1
+```
+
+Validation (best per-task loss):
+
+| run | flavour | charm | vis | jet | vertex | total |
+|---|---:|---:|---:|---:|---:|---:|
+| K = 1, 0.85 | 0.5085 | 0.2166 | 1.1608 | 0.2631 | 0.005640 | 1.2524 |
+| K = 16 seed 7 e299 | 0.4909 | 0.2127 | 1.1168 | 0.2528 | 0.005307 | 1.1761 |
+| K = 16 seed 7 e400 | 0.4896 | 0.2136 | 1.1121 | 0.2529 | 0.005010 | 1.1674 |
+| K = 16 batch (dlnu) | 0.5081 | 0.2153 | 1.1559 | 0.2654 | 0.006010 | 1.2520 |
+| K = 16 seed 8 e400 (dlnu) | 0.5268 | 0.2185 | 1.2161 | 0.2765 | 0.005953 | 1.3473 |
+
+Seed 8's total validation loss is the highest of the five at every one of
+the 20 epochs.
+
+Test:
+
+| metric | MAE (pub) | K = 1 | seed 7 e299 | seed 7 e400 | seed 8 e400 | seed 8 - seed 7 e400 [95%] |
+|---|---:|---:|---:|---:|---:|---:|
+| AUC nue | 0.9756 | 0.9775 | 0.9787 | 0.9788 | 0.9756 | -0.0032 [-0.0037, -0.0027] |
+| AUC numu | 0.9473 | 0.9470 | 0.9520 | 0.9518 | 0.9424 | -0.0093 [-0.0100, -0.0087] |
+| AUC nutau->e | 0.9103 | 0.9181 | 0.9225 | 0.9221 | 0.9150 | -0.0072 [-0.0107, -0.0041] |
+| AUC nutau->mu | 0.8364 | 0.8413 | 0.8488 | 0.8483 | 0.8418 | -0.0065 [-0.0105, -0.0017] |
+| AUC nutau->had | 0.9386 | 0.9404 | 0.9444 | 0.9437 | 0.9376 | -0.0061 [-0.0076, -0.0046] |
+| AUC NC | 0.9388 | 0.9382 | 0.9443 | 0.9443 | 0.9316 | -0.0126 [-0.0136, -0.0118] |
+| flavour acc | 0.8153 | 0.8152 | 0.8238 | 0.8231 | 0.8062 | -0.0169 [-0.0185, -0.0153] |
+| AUC charm->e | 0.8042 | 0.8217 | 0.8262 | 0.8234 | 0.8148 | -0.0086 [-0.0195, +0.0028] |
+| AUC charm->mu | 0.8844 | 0.8932 | 0.8996 | 0.9003 | 0.8897 | -0.0106 [-0.0208, -0.0009] |
+| AUC charm->had | 0.8691 | 0.8710 | 0.8785 | 0.8768 | 0.8677 | -0.0090 [-0.0117, -0.0069] |
+| sMAD E_vis | 0.2144 | 0.2222 | 0.1981 | 0.1963 | 0.2332 | +0.0368 [+0.0351, +0.0392] |
+| sMAD pT_miss | 0.5573 | 0.5782 | 0.5488 | 0.5552 | 0.6049 | +0.0497 [+0.0460, +0.0543] |
+| sMAD \|p_jet\| | 0.1637 | 0.1543 | 0.1540 | 0.1516 | 0.1623 | +0.0108 [+0.0095, +0.0120] |
+| sMAD \|p_lep\| CC | 0.3857 | 0.3930 | 0.3506 | 0.3429 | 0.3851 | +0.0422 [+0.0386, +0.0457] |
+| vertex median mm | 16.88 | 14.68 | 14.67 | 15.16 | 14.28 | -0.88 [-0.99, -0.77] |
+
+- **Seed 7's K = 16 gain does not replicate.**  Seed 8 is worse than seed
+  7's e400 fine-tune on 13 of 15 metrics (intervals excluding 0), tied on
+  charm->e, and better only on vertex.  The same holds against seed 7's
+  e299 (vertex -0.39 mm).  The gaps are about 10x the difference between
+  the two fine-tunes of the `batch` checkpoint below: flavour accuracy
+  -0.0169 against +0.0001, E_vis +0.0368 against -0.0034.  That is a single
+  cross-machine pair, not a variance estimate.
+- **Below K = 1.**  Against K = 1 at the same layer decay: worse on 10
+  (including flavour accuracy -0.0089, E_vis +0.0110, pT_miss +0.0267),
+  better on 2 (|p_lep| CC -0.0079, vertex -0.40 mm), tied on 3
+  (nutau->mu, charm->e, charm->mu).  It is also below the
+  batch-standardised fine-tune on 13 of 15.
+- **Mixed against the published MAE, with clear losses on central
+  metrics.**  Better on 2 (nutau->e +0.0047, vertex -2.60 mm), worse on 5
+  (numu, NC, flavour accuracy -0.0091, E_vis +0.0188, pT_miss +0.0476), tied
+  on 8.
+- **The pretraining diagnostics did not predict this.**  Seed 8 ended with
+  the lower pretraining loss (0.037-0.040 against 0.085-0.090 at epochs
+  250-310) and the healthier representation by every block-level measure
+  above.  Yet it fine-tunes
+  worst, while seed 7's partly collapsed e400 fine-tunes best.  Neither the
+  pretraining loss nor the `event`/spread measures are a proxy for
+  fine-tuned quality here.
+- **Collapse or seed?  Not separable from these runs.**  One candidate:
+  seed 8's collapse came early, near the peak LR, and its recovery used
+  about 100 epochs (138-250).  It also left a target that is more
+  position-predictable (45% against 30-34%).  Seed 7's collapse came after
+  epoch 316, at a low LR, when its early blocks kept their event content.
+  The other candidate is that K = 16 pretraining seeds simply differ this
+  much.  Either way, the spread between the two seeds (flavour accuracy
+  0.0169) is larger than seed 7's gain over K = 1 (0.0079).
+- Vertex is the one metric where seed 8 is the best of all runs (14.28 mm).
+  Not explained.  Its two Clariden fine-tunes later gave 15.33 and
+  16.35 mm, so this is within the spread between repeat fine-tunes (see
+  the Clariden controls results).
+
+**Consequence.**  K = 16 `token` is not established as the final
+configuration.  The flash JEPA has one fine-tune clearly above the MAE
+(K = 16 seed 7) and one mixed against it, worse on flavour accuracy, E_vis
+and pT_miss (K = 16 seed 8).  K = 1 and
+`batch`, one pretraining seed each, are about the MAE's level, with mixed
+signs.  None of these final checkpoints shows a gain over the MAE that has
+been reproduced across pretraining seeds.  The epoch-124 snapshots of both
+K = 16 seeds do, on all metrics but pT_miss.  That snapshot was chosen with
+hindsight; see the epoch-124 results below.
+
+**Epoch-124 fine-tunes (dlnu, started 2026-10-28).**  These locate when
+the gap between the seeds appeared, by fine-tuning both seeds' epoch-124
+snapshots, from before seed 8's collapse, with the same recipe as above.
+They time the gap but do not test its cause: after epoch 124 the two runs
+also follow different trajectories (external review, G1).
+- If the two come out close, the gap opened after epoch 124.  That fits
+  the collapse causing it but does not prove it.
+- If seed 8 is already worse at epoch 124, the seeds differed before the
+  collapse.  Later damage on top is still possible.
+
+A causal test would continue seed 8 from a pre-collapse snapshot, with the
+optimizer and teacher state kept (the checkpoints hold no RNG state), with
+and without a stabilising change.  The run without a change is the seed-8
+reproducer below.
+
+**Prediction, recorded 2026-10-28 13:35, before either result.**  The
+external review's frozen linear probe (`codex_review2_report.md` section 5)
+scores the two epoch-124 teachers close: flavour macro-AUC 0.749 (seed 7)
+and 0.738 (seed 8), against 0.662 for seed 8's final snapshot.  If the
+probe tracks fine-tuning, the two epoch-124 fine-tunes come out close to
+each other and both above seed 8's final fine-tune.  The probe is not
+validated:
+- On the five finished fine-tunes it gives the same order as flavour
+  accuracy, except seed 7's e299/e400, which are tied (Spearman 0.9).  The
+  sample is tiny, and two of the five share seed 7.
+- It scores `batch` and seed 8's final snapshot alike (0.665 and 0.662),
+  but their fine-tunes differ by 0.0088 in flavour accuracy.
+
+The review's programs, logs and frozen features are kept, without its
+checkpoint copies, in `/scratch4/salonso/faser/codex_review2_evidence/`.
+The report's `/tmp/faser-codex-review2.ZfUx6P` links point to the original
+temporary copy.
+
+Seed 7 is the Clariden run (3760078) that the seed-7 fine-tunes above came
+from.  The dlnu run of the same name
+(`checkpoints_final/pretrain_flash_jepa_base_d2v16`, 2 x 2,048, stopped at
+epoch 135) is a different realisation and is not used.  The script waits
+for a valid CSCS SSH certificate (checked locally; no login attempts).  It
+then copies both snapshots from Clariden with sha256 checked: seed 7 to
+`checkpoints_final/pretrain_flash_jepa_base_d2v16_clariden/snapshots/`,
+seed 8 to `checkpoints_final/pretrain_flash_jepa_base_d2v16_s8/snapshots/`.
+Finally it fine-tunes and evaluates `finetune_flash_jepa_base_d2v16_ep124_ld085_dlnu`
+and `finetune_flash_jepa_base_d2v16_s8_ep124_ld085_dlnu` one after the other
+(~2 h each).  It refuses to overwrite any existing output.
+
+```bash
+cd /scratch/salonso/sparse-nns/faser_develop && nohup bash results/flash_audit_20261026/finetune_ep124_pair.sh > /scratch4/salonso/faser/finetune_ep124_pair.log 2>&1 &
+```
+
+**Epoch-124 results, both seeds (2026-10-28).**  Scored with
+`python results/flash_audit_20261026/metrics_flash_ep124.py`; the output,
+with every paired interval, is `metrics_flash_ep124.out` next to it.
+- **Seed 7's results came first**, while seed 8's fine-tune was still
+  running.  The bootstrap draws do not depend on which pairs are scored, so
+  its intervals are the same in the full output.
+- **Seed 8's run checks out.**  `finetune_flash_jepa_base_d2v16_s8_ep124_ld085_dlnu`
+  (16:16) loaded `epoch=124.ckpt`:
+  - global step 31,750;
+  - sha256 d8cc63eb..., the same on Clariden and dlnu (seed 7's is 7fccb385...);
+  - full encoder coverage, `target` source.
+
+  It ran all 20 epochs.  Its log has no NaN or error.
+- **Platforms.**  Every e124 fine-tune and seed 8's final fine-tune ran on
+  dlnu.  Seed 7's e299 and e400 fine-tunes ran on Clariden.
+
+| Metric | MAE | K = 1 | s7 e124 | s8 e124 | s7 e299 | s7 e400 | s8 e400 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| validation total | | 1.2524 | 1.2168 | 1.2073 | 1.1761 | 1.1674 | 1.3473 |
+| flavour acc | 0.8153 | 0.8152 | 0.8198 | 0.8191 | 0.8238 | 0.8231 | 0.8062 |
+| AUC NC | 0.9388 | 0.9382 | 0.9413 | 0.9406 | 0.9443 | 0.9443 | 0.9316 |
+| sMAD E_vis | 0.2144 | 0.2222 | 0.2115 | 0.2048 | 0.1981 | 0.1963 | 0.2332 |
+| sMAD pT_miss | 0.5573 | 0.5782 | 0.5710 | 0.5691 | 0.5488 | 0.5552 | 0.6049 |
+| sMAD \|p_lep\| CC | 0.3857 | 0.3930 | 0.3714 | 0.3507 | 0.3506 | 0.3429 | 0.3851 |
+| vertex median mm | 16.88 | 14.68 | 15.40 | 14.63 | 14.67 | 15.16 | 14.28 |
+
+- **The two seeds were level at epoch 124 (same platform).**  Seed 8
+  against seed 7:
+  - tied on 11 of 15 metrics: all six flavour AUCs, flavour accuracy
+    (seed 7 +0.0007 [-0.0006, +0.0021]), pT_miss, |p_jet|, charm->e and
+    charm->mu;
+  - better on the other 4: E_vis (-0.0066), |p_lep| CC (-0.0207), vertex
+    (-0.78 mm) and charm->had (+0.0028).
+
+  So the gap between the seeds' final fine-tunes opened after epoch 124.
+  That fits seed 8's collapse causing it but does not prove it (G1).
+- **Seed 8 lost ground after epoch 124 (same platform).**  Its e124
+  fine-tune is better than its final one on 11 of 15:
+  - flavour accuracy +0.0129 [+0.0114, +0.0141];
+  - E_vis -0.0284, pT_miss -0.0358, |p_jet| -0.0095 and |p_lep| CC -0.0344.
+
+  It is tied on nutau->mu, charm->e and charm->mu, and worse only on vertex
+  (+0.34 mm).  Seed 7 instead gained after epoch 124 (below).
+- **Both seeds beat the MAE at epoch 124.**  This is the first gain over the
+  MAE seen in both pretraining seeds.
+  - Seed 8 is better on 14 of 15 metrics and worse only on pT_miss
+    (+0.0118).
+  - Seed 7 is better on 12, tied on 2 and worse on pT_miss (+0.0137).
+
+  Three limits:
+  - **Epoch 124 was chosen with hindsight.**  It is the last snapshot before
+    seed 8's collapse, picked from its pretraining diagnostics, not a
+    stopping rule fixed in advance.  A run without that hindsight would have
+    used `last.ckpt`.
+  - **One fine-tuning seed.**  Both runs used fine-tuning seed 7.
+  - **Part of the gain may be architecture.**  The Clariden scratch control
+    below measures how much.
+- **The vertex differences in this section (0.3-0.8 mm) are within the
+  ~1 mm spread between repeat fine-tunes** measured in the Clariden
+  controls below.  The event bootstrap does not cover that spread.
+- **Both seeds beat K = 1 at epoch 124.**  Seed 8 is better on 9 and tied
+  on 6, including vertex.  Seed 7 is better on 11, tied on 3 and worse on
+  vertex (+0.72 mm).
+- **Seed 7 was already above the MAE and K = 1 at epoch 124.**
+  - Against the MAE it is better on 12 of 15 metrics (intervals excluding 0),
+    tied on charm->e and charm->mu, and worse only on pT_miss (+0.0137).
+  - Against K = 1 it is better on 11, tied on 3 and worse on vertex
+    (+0.72 mm).
+- **Pretraining past epoch 124 still helped seed 7.**  Against e299 it is
+  worse on 12 of 15:
+  - flavour accuracy -0.0040 [-0.0053, -0.0026];
+  - E_vis +0.0133, pT_miss +0.0223 and |p_lep| CC +0.0208;
+  - vertex +0.73 mm.
+
+  It is better only on |p_jet| (-0.0023), and tied on nutau->e and
+  nutau->mu.  The regression gaps are several times the ~0.004 sMAD
+  cross-machine pair.  This e124 fine-tune ran on dlnu, while e299/e400 ran
+  on Clariden.
+- **The recorded prediction held; the probe still partly misses.**
+  - Both halves of the prediction held.  The two epoch-124 fine-tunes are
+    tied on flavour accuracy, and both are above seed 8's final fine-tune
+    (0.8198 and 0.8191 against 0.8062).
+  - The miss stands: the probe put seed 7's epoch 124 above epoch 299
+    (0.749 against 0.732), and the fine-tunes put it below.
+  - One right and one wrong ordering on new runs do not validate the probe.
+
+**Clariden controls (submitted 2026-10-28 13:56).**  These are the two
+cheapest steps the external review recommends (`codex_review2_report.md`
+section 6, items 2 and 3).
+- **A FlashViT trained from scratch.**  This measures how much of the gain
+  over the MAE comes from the architecture rather than from pretraining.
+- **A second fine-tuning seed for both final K = 16 checkpoints.**  This
+  shows whether the gap between pretraining seeds 7 and 8 survives a
+  different fine-tuning seed.
+
+Together with the existing Clariden seed-7 fine-tune
+(`finetune_flash_jepa_base_d2v16_last_ld085`), seeds 7 and 8 are then
+crossed with fine-tuning seeds 7 and 8 on one platform.  All four runs use
+the published recipe with layer decay 0.85: 20 epochs, 1 x 4 GH200, global
+batch 1,024.
+
+| Run | Encoder | Fine-tuning seed | Fine-tune / evaluation job |
+|---|---|---:|---|
+| `finetune_flash_scratch_base_ld085` | random init (flash base) | 7 | 3782686 / 3782687 |
+| `finetune_flash_jepa_base_d2v16_last_ld085_ft8` | K16 seed 7 `last.ckpt` (epoch 400) | 8 | 3782688 / 3782689 |
+| `finetune_flash_jepa_base_d2v16_s8_ld085` | K16 seed 8 `last.ckpt` (sha256 5a689619...) | 7 | 3782690 / 3782691 |
+| `finetune_flash_jepa_base_d2v16_s8_ld085_ft8` | K16 seed 8 `last.ckpt` | 8 | 3782692 / 3782693 |
+
+- **The scratch run is a control, not a tuned scratch baseline.**  It keeps
+  the pretrained runs' recipe, including layer decay 0.85, which lowers the
+  learning rate of the early blocks even though they start from random
+  weights.  The published scratch baseline used its own recipe on the
+  SparseViT.
+- **Two small code changes made the scratch run possible.**
+  - `clariden/finetune_flash.sbatch` now accepts an empty `LOAD_CHECKPOINT`,
+    as its message already said it should.
+  - `evaluation.create_csv_v7_ft --allow_scratch` (`ALLOW_SCRATCH=1` in
+    `clariden/evaluate_flash.sbatch`) accepts a run that loaded no
+    checkpoint.  It records the pretraining objective as `none` and the
+    encoder coverage as 0.0.  Without the flag, the script refuses such a
+    run as before.
+  - Both files and the test were copied to `/users/salonso/faserDL` before
+    submission; the code there matched dlnu's.
+
+From `/users/salonso/faserDL` on Clariden:
+
+```bash
+c=/capstor/scratch/cscs/salonso/faser/checkpoint; s7=$c/pretrain_flash_jepa_base_d2v16/loss_total_val/last.ckpt; s8=$c/pretrain_flash_jepa_base_d2v16_s8/loss_total_val/last.ckpt
+sub() { fid=$(LOAD_CHECKPOINT=$2 NAME=$1 SEED=$3 LAYER_DECAY=0.85 sbatch --parsable clariden/finetune_flash.sbatch) && eid=$(ALLOW_SCRATCH=${4:-} CHECKPOINT_DIR=$c/$1 sbatch --parsable --dependency=afterok:$fid clariden/evaluate_flash.sbatch) && echo "$1 finetune=$fid evaluate=$eid"; }
+sub finetune_flash_scratch_base_ld085 "" 7 1
+sub finetune_flash_jepa_base_d2v16_last_ld085_ft8 $s7 8
+sub finetune_flash_jepa_base_d2v16_s8_ld085 $s8 7
+sub finetune_flash_jepa_base_d2v16_s8_ld085_ft8 $s8 8
+```
+
+**Clariden controls: results (2026-10-28).**
+- **All eight jobs completed.**  The fine-tunes ran 17:45-18:20, about 34
+  minutes each.  The evaluations ran 21:54-22:00.
+- **The CSVs were copied** to `results/`, with sha256 checked against
+  Clariden.
+- **Provenance checks out.**  Every CSV covers the same 122,639 test events
+  (inventory 57c3a1b1...) after 20 epochs.  The three pretrained runs
+  loaded their encoder fully.  The scratch run records objective `none`
+  and coverage 0.0.
+- **Scripts.**  Scored with
+  `python results/flash_audit_20261026/metrics_flash_controls.py`, whose
+  output with every interval is `metrics_flash_controls.out`.  A contrast
+  there can average over both fine-tuning seeds.  Vertex offsets come from
+  `vertex_offset_check.{py,out}`.
+
+The flash runs ran on Clariden except the last column.  s7/s8 is the
+pretraining seed, FT7/FT8 the fine-tuning seed.
+
+| Metric | scratch SparseViT (pub) | MAE (pub) | flash scratch | s7 FT7 | s7 FT8 | s8 FT7 | s8 FT8 | s8 FT7 (dlnu) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| validation total | | | 1.5931 | 1.1674 | 1.1749 | 1.3342 | 1.3421 | 1.3473 |
+| flavour acc | 0.7437 | 0.8153 | 0.7846 | 0.8231 | 0.8230 | 0.8062 | 0.8063 | 0.8062 |
+| AUC NC | 0.8762 | 0.9388 | 0.9159 | 0.9443 | 0.9442 | 0.9318 | 0.9317 | 0.9316 |
+| AUC charm->had | 0.7829 | 0.8691 | 0.8381 | 0.8768 | 0.8801 | 0.8689 | 0.8669 | 0.8677 |
+| sMAD E_vis | 0.3528 | 0.2144 | 0.2704 | 0.1963 | 0.1993 | 0.2278 | 0.2294 | 0.2332 |
+| sMAD pT_miss | 0.8233 | 0.5573 | 0.6910 | 0.5552 | 0.5581 | 0.6104 | 0.6161 | 0.6049 |
+| sMAD \|p_lep\| CC | 0.5130 | 0.3857 | 0.4286 | 0.3429 | 0.3549 | 0.3740 | 0.3747 | 0.3851 |
+| vertex median mm | 22.06 | 16.88 | 19.07 | 15.16 | 15.94 | 15.33 | 16.35 | 14.28 |
+
+- **The flash architecture alone recovers 50-85% of the paper's
+  scratch-to-MAE gap.**
+  - Flash scratch is better than the SparseViT scratch on all 15 metrics:
+    flavour accuracy +0.0409 [+0.0391, +0.0427], E_vis -0.082, vertex
+    -2.99 mm.
+  - Its share of the gap is 57% on flavour accuracy, 60% on E_vis, 50% on
+    pT_miss and 58% on vertex.
+  - It is still below the MAE, worse on 12 of 15: flavour accuracy -0.0307,
+    E_vis +0.056, pT_miss +0.134, vertex +2.19 mm.  It is tied on
+    nutau->e, charm->e and charm->mu.
+  - **These shares are lower bounds.**  The run had 20 epochs, against 40
+    for the published SparseViT scratch, and layer decay 0.85.  Every
+    per-task best checkpoint is its last epoch.  The validation total was
+    still falling (1.607 to 1.593 over the last epoch).  The comparison
+    with the SparseViT scratch also mixes recipes.
+- **Pretraining adds about as much again on the flash encoder.**
+  - Seed 7 (FT7) is better than flash scratch on all 15: flavour accuracy
+    +0.0385, E_vis -0.074, pT_miss -0.136, vertex -3.91 mm.
+  - Seed 8 (FT7) is too: flavour accuracy +0.0217, vertex -3.73 mm.
+  - Flash scratch's under-training makes these upper bounds.
+  - So the flash vertex result needs both the encoder and the pretraining.
+    The encoder alone gives 19.1 mm.
+- **The gap between pretraining seeds survives a change of fine-tuning
+  seed.**
+  - Seed 7 minus seed 8 in flavour accuracy is +0.0169 with fine-tuning
+    seed 7 and +0.0167 with seed 8.
+  - Averaged over both fine-tuning seeds, seed 7 is better on all 15:
+    flavour accuracy +0.0168 [+0.0153, +0.0181], E_vis -0.031, pT_miss
+    -0.057, |p_lep| CC -0.025, vertex -0.29 mm.
+- **The fine-tuning seed barely moves classification.**
+  - Flavour accuracy changes by 0.0001 for both encoders, and every flavour
+    AUC is tied.
+  - Regressions move by up to 0.003 (E_vis), 0.006 (pT_miss) and 0.012
+    (|p_lep| CC, seed 7).
+  - Seed 8's Clariden and dlnu fine-tunes (same seed, other platform) agree
+    as closely on classification.
+  - On these final checkpoints, flavour accuracy varies about 100x more
+    between pretraining seeds than between fine-tuning seeds.
+- **Vertex medians differ by up to ~1 mm between repeat fine-tunes.**
+  - With the same encoder, another fine-tuning seed gives 0.78 mm (seed 7)
+    and 1.01 mm (seed 8).
+  - With the same encoder and seed, another platform gives 1.05 mm (seed 8)
+    and 0.26 mm (the `batch` pair below).
+  - The event bootstrap gives about +-0.1 mm, so it understates this
+    spread about 10x.
+  - **It is not an offset.**  Removing each run's median signed residual
+    changes the 3D median by at most 0.4 mm.  The z spread itself differs
+    between seed 8's three fine-tunes: 19.6, 20.4 and 22.5 mm.
+  - **Single-run vertex differences below ~1 mm are not established.**
+    This covers seed 8 being the best on vertex (14.28 mm), the epoch-124
+    vertex differences, and the SparseViT MAE / JEPA-patch / MAE+Rel order
+    (16.88 / 16.58 / 16.07 mm).
+- **Against the MAE, averaged over both fine-tuning seeds:**
+  - **Seed 7 is better on 14 of 15**, including flavour accuracy +0.0078
+    [+0.0065, +0.0094] and vertex -1.33 mm.  It is tied on pT_miss
+    (-0.0006 [-0.0040, +0.0031]).
+  - **Seed 8 is mixed.**  It is better on 5 (nutau->e, nutau->mu, |p_jet|,
+    |p_lep| CC, vertex -1.04 mm), worse on 5 (nu_mu, NC, flavour accuracy
+    -0.0090, E_vis +0.0143, pT_miss +0.056) and tied on 5.
+  - The MAE is a single fine-tune, so the vertex gaps are about one
+    replicate spread.
+
+Commands (dlnu, repository root, `neutrino-jepa` environment):
+
+```bash
+rsync -a --ignore-existing clariden:/users/salonso/faserDL/results/results_v7_test_finetune_{flash_scratch_base_ld085,flash_jepa_base_d2v16_last_ld085_ft8,flash_jepa_base_d2v16_s8_ld085,flash_jepa_base_d2v16_s8_ld085_ft8}.{csv,manifest.txt,metadata.json} results/
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 python -u results/flash_audit_20261026/metrics_flash_controls.py > results/flash_audit_20261026/metrics_flash_controls.out
+python results/flash_audit_20261026/vertex_offset_check.py | tee results/flash_audit_20261026/vertex_offset_check.out
+```
+
+**Seed-8 reproducer (Clariden job 3785161, submitted 2026-10-28 19:40).**
+This tests whether seed 8's collapse at epochs ~138-152 follows from its
+epoch-124 state and the schedule, or was a chance event.
+- **If it collapses again,** a candidate fix can be tested in ~25 minutes
+  from the same snapshot, instead of a 4.3 h pretraining plus a 2 h
+  fine-tune.
+- **If it does not,** the collapse was chance, and a guard that rolls back
+  to the last snapshot is the cheaper answer.
+
+The run, `pretrain_flash_jepa_base_d2v16_s8_r124`:
+- **Resumes** `pretrain_flash_jepa_base_d2v16_s8/snapshots/epoch=124.ckpt`
+  (global step 31,750, sha256 d8cc63eb..., as copied to dlnu above).  It
+  keeps the student, teacher, optimizer and LR-scheduler state.
+- **Keeps the original settings:** K = 16 `token`, seed 8, 2 nodes x 4
+  GH200, 512 per GPU, and `EPOCHS=400`, so the LR and teacher-momentum
+  schedules are the original ones.
+- **Changes only the name and the snapshots,** every 5 epochs
+  (`epoch=129`, `134`, ..., `164`) instead of every 25; `last.ckpt` is still
+  written every epoch.
+- **Is not a replay.**  The checkpoint holds no RNG state, so masks,
+  augmentation draws and the non-deterministic GPU kernels differ from the
+  original run.
+- **Stops by time limit.**  There is no stop-at-epoch option, and changing
+  `EPOCHS` would change the schedules.  At the original ~38.5 s per epoch,
+  31 minutes reach epoch ~165-170.  The epoch cut by the time limit is lost.
+- **Uses unchanged code.**  On Clariden, only `evaluation/create_csv_v7_ft.py`
+  and its test changed after seed 8's job (3769470) started, for the
+  controls above.  No code was copied for this run.
+
+Compare `jepa/target_std`, `jepa/context_event_std` and the loss over epochs
+125-165 with the original run's log.  From `/users/salonso/faserDL` on
+Clariden:
+
+```bash
+NAME=pretrain_flash_jepa_base_d2v16_s8_r124 TARGET_LAYERS=16 SEED=8 SAVE_EVERY_N_EPOCHS=5 RESUME_CHECKPOINT=/capstor/scratch/cscs/salonso/faser/checkpoint/pretrain_flash_jepa_base_d2v16_s8/snapshots/epoch=124.ckpt sbatch --time=00:31:00 clariden/pretrain_flash.sbatch
+```
+
+**Reproducer result (2026-10-28).**  The job ran 21:54-22:25 and stopped
+on its time limit during epoch 170.  It wrote snapshots `epoch=129` to
+`epoch=169` and `last.ckpt` (epoch 169), with no error or NaN.
+- **Resume confirmed.**  The log shows the restore from `epoch=124.ckpt`.
+  The first logged step is 31,799 (31,750 + 49), and the teacher momentum
+  is 0.99689, on the original schedule.
+- **Comparison script.**  `results/flash_audit_20261026/reproducer_s8_r124.{py,out}`
+  compares the two runs epoch by epoch from the two `metrics.csv` files,
+  copied to `/scratch4/salonso/faser/reproducer_s8_r124/`.
+
+Validation values (`ctx_ev` = `context_event_std`):
+
+| epoch | 136 | 137 | 140 | 142 | 144 | 145 | 146 | 148 | 150 | 155 | 160 | 169 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| original val loss | 0.085 | 0.131 | 0.223 | 0.144 | 0.000 | 0.000 | 0.002 | 0.254 | 0.002 | 0.096 | 0.091 | 0.081 |
+| rerun val loss | 0.082 | 0.082 | 0.143 | 0.107 | 0.128 | 0.003 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| original `target_std` | 0.94 | 0.78 | 0.74 | 0.61 | 0.01 | 0.01 | 0.06 | 0.63 | 0.06 | 0.55 | 0.62 | 0.69 |
+| rerun `target_std` | 0.94 | 0.94 | 0.83 | 0.71 | 0.51 | 0.06 | 0.02 | 0.01 | 0.01 | 0.01 | 0.01 | 0.02 |
+| original `ctx_ev` | 0.47 | 0.29 | 0.38 | 0.02 | 0.01 | 0.01 | 0.60 | 0.63 | 0.20 | 0.58 | 0.60 | 0.64 |
+| rerun `ctx_ev` | 0.47 | 0.46 | 0.27 | 0.37 | 0.01 | 0.01 | 0.03 | 0.01 | 0.01 | 0.01 | 0.00 | 0.01 |
+
+- **The collapse is reproducible.**
+  - The rerun followed the original within ~0.01 in loss and spreads to
+    epoch 136.
+  - It then had the same loss spike, 3 epochs later (training mean 0.135 at
+    epoch 140, against 0.168 at epoch 137).
+  - It collapsed completely at epochs 145-146, against 144.
+
+  Two realisations from the same state, with different masks, augmentations
+  and kernels, both collapsed within 21 epochs.  The collapse follows from
+  the epoch-124 state and the schedule (LR ~1.3e-3), not from one unlucky
+  draw.
+- **The recovery was chance.**  The original run recovered within a few
+  epochs, after oscillating until epoch ~152.  The rerun stayed constant through epoch 169 (`target_std`
+  0.01-0.02, `ctx_ev` <= 0.01, loss 0.000), 24 epochs after collapsing.
+  Whether it would recover later is not known.  So seed 8's final
+  checkpoint rests on a recovery that the rerun did not repeat.
+- **A rollback guard alone would probably not help.**  Rolling back to
+  epoch 124 with a new data order is what this rerun did, and it collapsed
+  again.  A guard needs a change at the rollback, such as a lower LR or a
+  stabilising term.
+- **A cheap test bed.**  From `epoch=124.ckpt`, the collapse came by epoch
+  ~145 in both runs: ~14 minutes on 2 nodes, plus ~2 minutes of start-up.
+  A candidate fix can be judged on whether it passes epoch ~150 intact.
+  Two runs are a small sample, and the trigger of the spike is still
+  unidentified (no gradient-norm or per-block logging).
+
+## Stabilisation (2026-10-29, last two days of the Clariden allocation)
+
+**Recipe against the published configurations.**  Checked in the released
+code and configs, not from memory (I-JEPA `configs/in1k_vith14_ep300.yaml`,
+`src/train.py`, `src/helper.py`; V-JEPA 2 `configs/train/vitl16/pretrain-256px-16f.yaml`;
+fairseq data2vec 2.0 `config/v2/base_images_only_task.yaml`; DINOv2
+`ssl_default_config.yaml`; papers 2301.08243, 2506.09985, 2202.03555,
+2212.07525, 2302.05442).
+
+| | ours (K = 16 `token`) | I-JEPA | V-JEPA 2 | data2vec 2.0 (ViT-B) |
+|---|---|---|---|---|
+| teacher momentum | 0.996 -> 1.0 cosine (0.9970 at epoch 140) | 0.996 -> 1.0 linear | 0.99925 constant | 0.9998 -> 0.99999 |
+| targets | mean of LN(MLP out) of all 16 blocks, then LN | LN(last block) | LN(last block) | IN per layer, mean of top 10 of 12, LN |
+| loss | smooth L1 | smooth L1 | L1 | L2 |
+| AdamW betas / weight decay | 0.9, 0.95 / 0.05 | 0.9, 0.999 / 0.04 -> 0.4 cosine | 0.9, 0.999 / 0.04 | 0.9, 0.95 / 0.05 |
+| gradient clipping | norm 1.0 | none | none | norm 4 |
+| LR schedule | warm-up 40 epochs, cosine | warm-up 40, cosine | warm-up, constant, cool-down | warm-up, cosine |
+| init | xavier | trunc. normal 0.02 (its sqrt(2l) rescale is overwritten by `init_model`) | trunc. normal 0.02, rescaled | |
+
+- **The clearest difference is the teacher's speed when seed 8 collapsed.**
+  At epoch 140 ours averages over ~340 steps (1.3 epochs); V-JEPA 2's over
+  ~1,300 steps and data2vec's over >= 5,000.  data2vec 1.0 (section 6)
+  names a too-low teacher momentum, a too-large LR and a too-short warm-up
+  as causes of collapse.
+- data2vec 1.0 normalises vision targets per token (parameter-free LN, as
+  here) and averages the top 6 of 12 blocks; instance normalisation is for
+  speech.  data2vec 2.0 uses instance normalisation per layer.
+- Not tried here: QK-norm (ViT-22B; not in I-JEPA or V-JEPA 2, and no
+  attention-logit growth has been seen), I-JEPA's initialisation (an
+  earlier short test was negative; needs a full run), per-event target
+  normalisation (the `batch` variant lost the gain), VICReg / SIGReg terms
+  (objective changes with weights to tune).
+
+**New options** (all off by default; the recipe of every earlier run is
+unchanged):
+- `WEIGHT_DECAY_END` (`--flash_weight_decay_end`): I-JEPA's cosine schedule
+  from `WEIGHT_DECAY` to this value over training.  Set before every step
+  from the global step, so a resumed run follows it.
+- `LR_SCALE_ON_RESUME` (`--flash_lr_scale_on_resume`): multiplies the
+  restored LR, the warm-up and cosine base rates and the cosine floor of a
+  `RESUME_CHECKPOINT` run, which then continues on that multiple of the
+  original schedule.  Refused without a resume.
+- `LOG_GRAD_NORM=1` (`--flash_log_grad_norm`): logs the gradient norms
+  before clipping (`grad_norm/total`, `/predictor`, `/encoder_other`,
+  `/block01`..`/block16`) every logged step.
+- `clariden/pretrain_finetune_flash.sbatch`: pretraining on 2 nodes, then
+  the 20-epoch fine-tune of `last.ckpt` on the first node (1 x 4 GH200,
+  global batch 1,024, `FT_SEED` 7, `FT_LAYER_DECAY` 0.85) and the test CSV,
+  in one job.  None of the pretraining variables reach the fine-tune.
+  `clariden/finetune_flash.sbatch` (`FT_NODES`) and
+  `clariden/evaluate_flash.sbatch` now pin their job steps to explicit node
+  and task counts; standalone they run as before.
+- Tests: `tests/test_flash_jepa.py`
+  (`test_weight_decay_schedule_lr_scale_on_resume_and_grad_norms`: the
+  decay follows the cosine formula, a resumed run with scale 0.5 has half
+  the LR of the uninterrupted run at every later step), plus a one-batch
+  DDP run on dlnu's two GPUs with `LOG_GRAD_NORM=1 WEIGHT_DECAY_END=0.4`.
+- Wrapper, end to end on Clariden (2-epoch pretraining, `FT_EPOCHS=1`,
+  `MAX_BATCHES=5`, output under `/capstor/scratch/cscs/salonso/faser/test_wrapper/`).
+  The first test (job 3789878) failed in the fine-tune with an empty
+  dataset: its staging and training steps had each asked for one node and
+  were placed on different nodes.  Every step of `finetune_flash.sbatch`
+  and `evaluate_flash.sbatch` now names its host(s) (`--nodelist`, the first
+  `FT_NODES` hosts of the job).  The second test (job 3789953, 7.5 min)
+  pretrained on 2 nodes, fine-tuned on 1 node x 4 GPUs (256 per GPU) and
+  wrote the CSV.  Its fine-tune `hparams.yaml` equals that of
+  `finetune_flash_jepa_base_d2v16_s8_ld085` apart from the name, the
+  checkpoint, the test's epochs and the three new (unused) options.
+
+**Resume tests from seed 8's `epoch=124.ckpt`** (debug partition: at most
+90 node-minutes per job, so 2 nodes x 45 min, reaching epoch ~185; one job
+at a time).  Pass: from epoch 150 to the last complete epoch, validation
+`target_std` >= 0.5 and `context_event_std` >= 0.3.  Decision rule, fixed
+before the results: the first test that passes, in the order S1, S4, S3,
+S5, alone becomes the recipe of three full seeds (7, 8, 9); if none passes,
+S1 and S3 together.
+
+| test | change | job | result |
+|---|---|---|---|
+| S1 | teacher momentum constant 0.99925 (V-JEPA 2) | 3789641 | **fail**: collapsed at epoch 138-140 |
+| S4 | K = 8 (top half of the blocks, data2vec 1.0) | 3789642 | **fail**: collapsed at epoch 142-143 |
+| S3 | LR x 0.5 from the resume, gradient norms logged | 3789771 | **fail**: unstable from epoch 140, `target_std` 0.27-0.58 |
+| S5 | weight decay 0.04 -> 0.4 cosine (I-JEPA), gradient norms logged | 3789943 | **fail**: collapsed at epoch 140-143 |
+| S3b | LR x 0.25 from the resume, gradient norms logged (added after S3) | 3789952 | **fail**: recovered from epochs 135-144, unstable again at 160-187 |
+
+**S1: a slower teacher does not prevent the collapse.**  Validation values:
+
+| epoch | 135 | 136 | 137 | 138 | 139 | 140 | 145 | 150 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| val loss | 0.078 | 0.222 | 0.171 | 0.369 | 0.035 | 0.002 | 0.000 | 0.000 |
+| `target_std` | 0.942 | 0.939 | 0.924 | 0.890 | 0.272 | 0.063 | 0.009 | 0.005 |
+| `context_event_std` | 0.484 | 0.321 | 0.337 | 0.003 | 0.001 | 0.001 | 0.002 | 0.002 |
+
+- The loss spike came at epoch 136, one epoch earlier than in the original
+  run, and the collapse was complete by epoch 140, earlier than both
+  unchanged runs (144-146).
+- **The student collapsed first**: its event spread was 0.003 at epoch 138
+  while the teacher's target spread was still 0.89.  The teacher followed
+  within two epochs.  The unchanged rerun shows the same order (epoch 144:
+  `context_event_std` 0.012, `target_std` 0.51).  So the collapse starts
+  in the context encoder and predictor, not in a teacher that moves too
+  fast.
+- Cancelled after epoch 150 (19.6 min), once the verdict was fixed, so
+  that S4 could start.
+
+**S4: K = 8 does not prevent it either.**
+
+| epoch | 135 | 139 | 140 | 141 | 142 | 143 | 145 | 150 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| val loss | 0.098 | 0.108 | 0.157 | 0.235 | 0.241 | 0.007 | 0.000 | 0.000 |
+| `target_std` | 0.981 | 0.979 | 0.978 | 0.928 | 0.714 | 0.010 | 0.001 | 0.000 |
+| `context_event_std` | 0.540 | 0.497 | 0.390 | 0.386 | 0.004 | 0.003 | 0.001 | 0.000 |
+
+- The switch to 8 target blocks raised the loss (0.079 to ~0.10, other
+  targets) and the spreads, but the spike came at epoch 140 and the
+  collapse was complete by 143, again student first (epoch 142).
+- Four realisations from this state (original, rerun, S1, S4), with
+  different data order, teacher speed and targets, all collapsed between
+  epochs 138 and 146.  What they share is the state and the LR schedule
+  (~1.3e-3 there).  Cancelled after epoch 153.
+
+**S3: half the LR weakens and delays it, but does not prevent it.**  LR
+6.96e-4 at epoch 125 (1.39e-3 originally), so the scaling took effect.
+
+| epoch | 130 | 134 | 138 | 139 | 140 | 141 | 143 | 146 | 150 | 153 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| val loss | 0.072 | 0.072 | 0.081 | 0.125 | 0.215 | 0.062 | 0.019 | 0.143 | 0.053 | 0.028 |
+| `target_std` | 0.940 | 0.932 | 0.942 | 0.938 | 0.918 | 0.535 | 0.348 | 0.576 | 0.290 | 0.304 |
+| `context_event_std` | 0.484 | 0.501 | 0.447 | 0.439 | 0.253 | 0.248 | 0.184 | 0.075 | 0.078 | 0.192 |
+| grad norm, median | 0.026 | 0.195 | 0.224 | 0.408 | 1.22 | 0.81 | 0.19 | 0.44 | 38.2 | 1.07 |
+
+- Not a complete collapse (the loss never reached 0.000 and the spreads
+  oscillate), but below the pass line from epoch 141.  Cancelled after
+  epoch 153.
+- **Clipping at 1.0 is inactive in normal training**: the gradient norm
+  before clipping is ~0.02-0.025 up to epoch 130, 40-50x below it.
+- **The predictor goes first.**  Median gradient norms per module:
+
+  | epoch | 125 | 131 | 132 | 134 | 137 | 138 | 139 | 140 |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | predictor | 0.016 | 0.036 | 0.069 | 0.194 | 0.176 | 0.209 | 0.393 | 1.17 |
+  | encoder block 1 | 0.0054 | 0.0064 | 0.0074 | 0.0076 | 0.0126 | 0.0271 | 0.0605 | 0.144 |
+  | encoder block 8 | 0.0025 | 0.0031 | 0.0034 | 0.0050 | 0.0047 | 0.0049 | 0.0189 | 0.036 |
+  | encoder block 16 | 0.0021 | 0.0027 | 0.0029 | 0.0054 | 0.0050 | 0.0051 | 0.0070 | 0.020 |
+
+  The predictor's gradient grows ~10x over epochs 131-134 while the
+  encoder's stays flat; the encoder follows from epoch 137, early blocks
+  first (block 1 x5 by epoch 138).  The validation loss moves only from
+  epoch 139.  So the gradient norm warns ~8 epochs ahead, and the
+  instability starts in the predictor.
+
+**S5: the I-JEPA weight-decay schedule does not prevent it** (decay 0.121
+at epoch 125, 0.139 at 140).
+
+| epoch | 130 | 134 | 137 | 138 | 140 | 141 | 143 | 150 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| val loss | 0.081 | 0.083 | 0.116 | 0.123 | 0.312 | 0.006 | 0.000 | 0.000 |
+| `target_std` | 0.951 | 0.950 | 0.951 | 0.874 | 0.827 | 0.139 | 0.012 | 0.001 |
+| `context_event_std` | 0.504 | 0.520 | 0.422 | 0.387 | 0.023 | 0.010 | 0.005 | 0.001 |
+| grad norm, predictor | 0.028 | 0.155 | 0.088 | 3.36 | 4.83 | 0.28 | 0.022 | 0.006 |
+
+Same sequence: the predictor's gradient grows from epoch 131, the loss
+spikes at 137-140, the student collapses at 140 and the teacher at 141.
+Cancelled after epoch 152.
+
+**S3b: a quarter of the LR survives the first episode but not the next.**
+Ran to its time limit (epoch 187).
+
+| epoch | 134 | 138 | 140 | 144 | 145 | 150 | 155 | 160 | 165 | 170 | 175 | 180 | 185 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| val loss | 0.063 | 0.081 | 0.076 | 0.053 | 0.094 | 0.080 | 0.083 | 0.331 | 0.002 | 0.171 | 0.037 | 0.028 | 0.133 |
+| `target_std` | 0.932 | 0.892 | 0.764 | 0.533 | 0.828 | 0.908 | 0.900 | 0.894 | 0.077 | 0.566 | 0.387 | 0.225 | 0.520 |
+| `context_event_std` | 0.452 | 0.281 | 0.138 | 0.163 | 0.506 | 0.529 | 0.510 | 0.210 | 0.067 | 0.013 | 0.233 | 0.025 | 0.304 |
+| grad norm, predictor | 0.041 | 1.31 | 6.75 | 1.75 | 0.25 | 0.23 | 0.21 | | | | | | |
+
+- The predictor's gradient grew from epoch 132, as in every run, but
+  the spreads recovered by epoch 145 and held to 159.  The predictor's
+  gradient norm stayed ~15x above its level before the episode (0.2
+  against 0.013).
+- A second episode began at epoch 160 and was still oscillating at 187.
+- **Conclusion of the resume tests.**  From this state none of the five
+  changes keeps the run healthy: the teacher's speed (S1), the target
+  layers (S4) and weight decay (S5) change nothing; lowering the LR delays
+  and softens the episodes (S3) and makes the first recoverable (S3b) but
+  not the later ones.  The instability starts in the predictor ~8 epochs
+  before the loss shows it.  These tests start from a state trained 124
+  epochs at the full LR; whether a run that never has the full LR reaches
+  such a state is what a full run answers.
+
+All five tests and the two earlier runs: `results/flash_audit_20261026/screens_s8_r124.{py,out}`.
+
+**Full runs: K = 16 `token` at half the LR (`BLR=5e-5`), seeds 7, 8, 9
+(submitted 2026-10-29 11:30).**  None of the tests passed, so the
+fall-back applied.  The agreed fall-back was S1 + S3; S1 had made the
+collapse slightly earlier, so on the user's go-ahead ("do whatever you
+think is best") the runs use the lower LR alone, which is also the external
+review's first stabilisation trial (`codex_review2_report.md`, section 6,
+item 5).  Peak LR 8e-4; everything else as the K = 16 `token` runs (400
+epochs, 40 warm-up, teacher 0.996 -> 1.0, weight decay 0.05), plus
+gradient-norm logging.  Each job pretrains, fine-tunes `last.ckpt` (seed 7,
+layer decay 0.85) and writes the test CSV.  Seeds 7 and 8 start from the
+same initialisation as the earlier `token` seeds 7 (job 3760078) and 8
+(job 3769470).
+
+| seed | pretraining | fine-tune | job |
+|---:|---|---|---|
+| 7 | `pretrain_flash_jepa_base_d2v16_blr5e5` | `finetune_flash_jepa_base_d2v16_blr5e5_ld085` | 3790448 |
+| 8 | `pretrain_flash_jepa_base_d2v16_blr5e5_s8` | `finetune_flash_jepa_base_d2v16_blr5e5_s8_ld085` | 3790449 |
+| 9 | `pretrain_flash_jepa_base_d2v16_blr5e5_s9` | `finetune_flash_jepa_base_d2v16_blr5e5_s9_ld085` | 3790451 |
+
+What to read when they finish: `jepa/target_std`, `jepa/context_event_std`
+and `grad_norm/predictor` over training (a predictor gradient rising
+~10x is the early warning seen in every resume test), then the test
+metrics against the `token` seeds and the published MAE.  From
+`/users/salonso/faserDL` on Clariden:
+
+```bash
+for s in 7 8 9; do suf=$([[ $s == 7 ]] && echo "" || echo "_s$s"); NAME=pretrain_flash_jepa_base_d2v16_blr5e5$suf SEED=$s TARGET_LAYERS=16 BLR=5e-5 LOG_GRAD_NORM=1 FT_NAME=finetune_flash_jepa_base_d2v16_blr5e5${suf}_ld085 sbatch --job-name=pt_ft_blr5e5_s$s clariden/pretrain_finetune_flash.sbatch; done
+```
+
+**Full runs at half the LR: results (2026-10-29).**  Half the LR does not
+remove the episodes, and on average it fine-tunes worse.
+- **All three jobs completed** (5 h 15 min to 5 h 28 min: pretraining 4 h
+  34 min to 4 h 49 min, fine-tune 33-34 min, CSV ~5.5 min; every Slurm step
+  COMPLETED).  Each fine-tune ran its 20 epochs from the epoch-399
+  `last.ckpt` (target encoder, coverage 1.0, fine-tuning seed 7).  Each
+  CSV has the 122,639 test events, `partial: false`.  The fetcher
+  (`results/flash_audit_20261026/fetch_blr5e5.sh`) copied the CSVs, with
+  sha256 checked, and the `metrics.csv` files to
+  `/scratch4/salonso/faser/blr5e5/`.
+- **Every run had an episode**, and the predictor's gradient warned first
+  again.  An episode here means a validation epoch from epoch 10 with
+  `target_std` < 0.5 or `context_event_std` < 0.3.  The warning is the
+  first epoch where the predictor's largest gradient norm exceeds twice
+  its median over epochs 40-149; in no run did this happen between
+  epochs 40 and 200.
+
+  At the first episode, the table gives the LR and the teacher momentum,
+  with in brackets the epochs the teacher averages over, 1 / (1 -
+  momentum) steps of 254 per epoch.  The last column is the end of
+  training: val loss / `target_std` / `context_event_std`.
+
+  | run | warning | first episode | episode epochs | LR | teacher momentum | end of training |
+  |---|---:|---:|---:|---:|---:|---|
+  | seed 7, BLR 1e-4 (earlier) | not logged | 324 | 76 | 1.8e-4 | 0.99966 (11.7) | 0.053 / 0.54 / 0.11 |
+  | seed 8, BLR 1e-4 (earlier) | not logged | 137 | 11 | 1.3e-3 | 0.99706 (1.3) | 0.034 / 0.94 / 0.41 |
+  | seed 7, BLR 5e-5 | 314 | 315 | 71 | 1.1e-4 | 0.99958 (9.4) | 0.108 / 0.79 / 0.04 |
+  | seed 8, BLR 5e-5 | 215 | 223 | 43 | 3.9e-4 | 0.99837 (2.4) | 0.066 / 0.81 / 0.46 |
+  | seed 9, BLR 5e-5 | 224 | 232 | 58 | 3.6e-4 | 0.99851 (2.6) | 0.005 / 0.53 / 0.47 |
+
+  - Half the LR moved seed 8's first episode from epoch 137 to 223, but
+    did not prevent it; seed 7's still came at ~315-324.  No single LR
+    triggers it: the episodes began at LRs from 1.1e-4 to 1.3e-3.
+  - The sequence is the same as in the resume tests.  For ~10 epochs the
+    predictor's gradient creeps up (x2-6) and `context_event_std` slides
+    (0.47 to 0.41).  Then the predictor's gradient jumps to 3-12, the
+    loss spikes and the context encoder's event spread drops.  The encoder
+    blocks follow, and in the worst epochs the gradient norm before
+    clipping reaches 100-850 (clipped to 1.0).
+  - Seed 9 ended in a near-trivial state: validation loss 0.005 from
+    epoch ~245 to the end.
+- **Test metrics** (fine-tuning seed 7; the BLR 1e-4 columns are the
+  earlier `finetune_flash_jepa_base_d2v16_last_ld085` and
+  `..._s8_ld085`):
+
+  | | flash scratch | MAE base (pub) | s7 1e-4 | s8 1e-4 | s7 5e-5 | s8 5e-5 | s9 5e-5 | mean 1e-4 | mean 5e-5 |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | flavour acc | 0.7846 | 0.8153 | 0.8231 | 0.8062 | 0.8202 | 0.7942 | 0.7584 | 0.8147 | 0.7909 |
+  | AUC NC | 0.9159 | 0.9388 | 0.9443 | 0.9318 | 0.9427 | 0.9242 | 0.8932 | 0.9380 | 0.9200 |
+  | AUC charm->had | 0.8381 | 0.8691 | 0.8768 | 0.8689 | 0.8766 | 0.8517 | 0.7999 | 0.8728 | 0.8427 |
+  | sMAD E_vis | 0.2704 | 0.2144 | 0.1963 | 0.2278 | 0.1994 | 0.2498 | 0.3232 | 0.2121 | 0.2574 |
+  | sMAD pT_miss | 0.6910 | 0.5573 | 0.5552 | 0.6104 | 0.5709 | 0.6525 | 0.7599 | 0.5828 | 0.6611 |
+  | vertex median mm | 19.07 | 16.88 | 15.16 | 15.34 | 15.75 | 17.30 | 22.45 | 15.25 | 18.50 |
+
+  Share of the published scratch -> MAE flavour-accuracy gap recovered:
+  seed 7 107%, seed 8 70%, seed 9 21% (flash scratch 57%; the BLR 1e-4
+  seeds 111% and 87%).  Seed 9 is worse than training from scratch on
+  every metric.  All 15 metrics with paired bootstrap intervals:
+  `results/flash_audit_20261026/metrics_flash_blr5e5.out`.
+- **Paired event-bootstrap differences** (95% intervals cover test-set
+  noise only; the pretraining seed matters far more, flavour accuracy
+  spreading 0.062 across the three BLR 5e-5 seeds against 0.017 across
+  the two BLR 1e-4 seeds):
+  - mean(BLR 5e-5) - mean(BLR 1e-4): worse on all 15 metrics, flavour
+    accuracy -0.0238 [-0.0247, -0.0227], `pT_miss` sMAD +0.078.
+  - Same seed and initialisation: seed 7 -0.0030 [-0.0043, -0.0016] in
+    flavour accuracy, seed 8 -0.0121 [-0.0137, -0.0105].
+  - mean(BLR 5e-5) - flash scratch: flavour accuracy +0.0063 [0.0052,
+    0.0076], so the pretraining keeps only ~20% of the gain over scratch
+    that the BLR 1e-4 seeds give.
+  - Seed 7 at BLR 5e-5 against the published MAE: better on 14 of 15
+    metrics (flavour accuracy +0.0048 [0.0032, 0.0066]), worse on
+    `pT_miss` (+0.014).  Seeds 8 and 9 are worse than MAE on most
+    metrics (flavour accuracy -0.021 and -0.057).
+- **When the first episode comes predicts the fine-tune.**
+  - Both runs whose first episode came late (seed 7 at either LR, epochs
+    315-324) fine-tune well, and seed 7's earlier pretraining fine-tuned
+    the same from its epoch-299 snapshot as from `last.ckpt` (flavour
+    0.8238 against 0.8231, `metrics_flash_ep124.out`).
+  - The three whose first episode came mid-training (seed 8 at either LR,
+    epochs 137 and 223, and seed 9 at 232) fine-tune clearly worse.
+  - The fine-tune starts from the teacher (EMA) encoder, which at the late
+    episodes averages over 9-12 epochs and at the mid-training ones over
+    1.3-2.6.  So a likely explanation, not tested, is that a late episode
+    stays mostly in the student, while earlier the teacher follows it.
+    `target_std` at the end does not measure the damage: the earlier seed
+    7 ends at 0.54 and fine-tunes well.
+- **Conclusion.**  The LR sets when the instability arrives, not whether it
+  does.  The instability starts in the predictor, and the fine-tune
+  depends mainly on whether the teacher still has a pre-episode state.
+  BLR 5e-5 is not a better recipe: mean flavour accuracy 0.7909 against
+  0.8147 at BLR 1e-4.  Of the five K = 16 `token` pretrainings, two are
+  clean at their end (seed 7 at both LRs) and three are damaged.
+
+Curves: `results/flash_audit_20261026/curves_blr5e5.{py,out}`.  Test
+metrics: `results/flash_audit_20261026/metrics_flash_blr5e5.{py,out}`.
+Figure of all seven full pretrainings:
+`results/flash_audit_20261026/pretraining_curves.png`
+(`plot_pretraining_curves.py`).  It has one row per run (K = 1, the K = 16
+seeds at both LRs, batch-standardised targets) and four columns: validation
+loss, `target_std`, `context_event_std`, and the predictor gradient norm.
+- Every run is disturbed at least once.  K = 1 has a small spike at
+  epoch ~182, then its `context_event_std` drifts below 0.3 without an
+  abrupt event.  The batch-standardised run has short drops of
+  `context_event_std` at epochs ~183 and ~372; its `target_std` is 1 by
+  construction.
+- In every run `context_event_std` falls from ~0.87 to ~0.5 during the
+  warm-up and then keeps sliding slowly until the episode.
+- Training and validation loss agree within ~3% at every epoch of every
+  run (augmentations on for training, off for validation), so the model
+  is not memorising the training events.
+On dlnu (the BLR 1e-4 curves copied first, see the docstring of
+`curves_blr5e5.py`):
+
+```bash
+bash results/flash_audit_20261026/fetch_blr5e5.sh
+python results/flash_audit_20261026/curves_blr5e5.py > results/flash_audit_20261026/curves_blr5e5.out
+python results/flash_audit_20261026/metrics_flash_blr5e5.py > results/flash_audit_20261026/metrics_flash_blr5e5.out
+```
+
+**Fine-tunes of the pre-warning snapshots (submitted 2026-10-29 17:57).**
+- **Rule, fixed before any of these results:** for each BLR 5e-5 run,
+  take the last saved snapshot (every 25 epochs) before the first epoch
+  whose largest predictor gradient norm exceeds twice its median over
+  epochs 40-149.  That gives epoch 299 for seed 7 (warning at epoch 314),
+  and epoch 199 for seeds 8 and 9 (warnings at 215 and 224).
+- **Recipe:** the published one, as for `last.ckpt` (20 epochs, layer
+  decay 0.85, fine-tuning seed 7, 1 x 4 GH200), then the test CSV.
+- **What they test:** whether the episodes are what costs the fine-tune,
+  and what the three seeds give when healthy.
+- **Comparison:** the earlier runs' healthy snapshots gave flavour
+  accuracy 0.8238 (seed 7, epoch 299) and 0.8191 (seed 8, epoch 124).
+
+| seed | snapshot | fine-tune | first jobs, cancelled (fine-tune / evaluate) | debug job |
+|---:|---|---|---|---:|
+| 7 | `pretrain_flash_jepa_base_d2v16_blr5e5/snapshots/epoch=299.ckpt` | `finetune_flash_jepa_base_d2v16_blr5e5_e299_ld085` | 3794337 / 3794338 | 3801599 |
+| 8 | `pretrain_flash_jepa_base_d2v16_blr5e5_s8/snapshots/epoch=199.ckpt` | `finetune_flash_jepa_base_d2v16_blr5e5_s8_e199_ld085` | 3794340 / 3794341 | 3801600 |
+| 9 | `pretrain_flash_jepa_base_d2v16_blr5e5_s9/snapshots/epoch=199.ckpt` | `finetune_flash_jepa_base_d2v16_blr5e5_s9_e199_ld085` | 3794342 / 3794343 | 3802005 |
+
+The code on Clariden matched dlnu's (sha256 of the sbatch files,
+`finetune_flash.sh`, `evaluation/create_csv_v7_ft.py`,
+`model/lightning_model_flash.py`, `utils/args.py`).  From
+`/users/salonso/faserDL` on Clariden:
+
+```bash
+c=/capstor/scratch/cscs/salonso/faser/checkpoint; sub() { fid=$(LOAD_CHECKPOINT=$2 NAME=$1 SEED=7 LAYER_DECAY=0.85 sbatch --parsable clariden/finetune_flash.sbatch) && eid=$(CHECKPOINT_DIR=$c/$1 sbatch --parsable --dependency=afterok:$fid clariden/evaluate_flash.sbatch) && echo "$1 finetune=$fid evaluate=$eid"; }
+sub finetune_flash_jepa_base_d2v16_blr5e5_e299_ld085 $c/pretrain_flash_jepa_base_d2v16_blr5e5/snapshots/epoch=299.ckpt
+sub finetune_flash_jepa_base_d2v16_blr5e5_s8_e199_ld085 $c/pretrain_flash_jepa_base_d2v16_blr5e5_s8/snapshots/epoch=199.ckpt
+sub finetune_flash_jepa_base_d2v16_blr5e5_s9_e199_ld085 $c/pretrain_flash_jepa_base_d2v16_blr5e5_s9/snapshots/epoch=199.ckpt
+```
+
+The first start estimate was 08:00 the next morning.  The fine-tunes take
+~35 min and the evaluations ~6, so their limits were lowered from 4 h and
+1 h so that they can backfill:
+
+```bash
+for j in 3794337 3794340 3794342; do scontrol update job=$j TimeLimit=01:00:00; done; for j in 3794338 3794341 3794343; do scontrol update job=$j TimeLimit=00:20:00; done
+```
+
+**Moved to the debug partition (2026-10-30 11:08).**
+- **Why:** at 11:05 the next day none had started.  The reason was
+  `QOSGrpNodeLimit`: the normal partition's QoS (`normalp`, 400 nodes
+  shared by all users) was full; account a0178 itself had nothing
+  running.  `debug-qos` has no group cap (4 nodes and 90 node-minutes per
+  job, 1 running and 2 submitted per user).
+- **Change:** the six pending jobs were cancelled, before any had started.
+  A new one-job script, `clariden/finetune_evaluate_flash.sbatch`, runs
+  `finetune_flash.sbatch` and then `evaluate_flash.sbatch` on the same
+  node (the sequence of the second half of
+  `pretrain_finetune_flash.sbatch`).  It refuses to start if the run or
+  its CSV exists.
+- **Same recipe, names and outputs** as the cancelled jobs.  Seed 7 is job
+  3801599, seed 8 job 3801600.  Seed 9 is submitted when seed 7 ends (one
+  running and two submitted per user in debug).
+
+From `/users/salonso/faserDL` on Clariden (the script copied there first,
+sha256 checked):
+
+```bash
+c=/capstor/scratch/cscs/salonso/faser/checkpoint
+LOAD_CHECKPOINT=$c/pretrain_flash_jepa_base_d2v16_blr5e5/snapshots/epoch=299.ckpt NAME=finetune_flash_jepa_base_d2v16_blr5e5_e299_ld085 SEED=7 LAYER_DECAY=0.85 sbatch --partition=debug --job-name=ftev_s7_e299 clariden/finetune_evaluate_flash.sbatch
+LOAD_CHECKPOINT=$c/pretrain_flash_jepa_base_d2v16_blr5e5_s8/snapshots/epoch=199.ckpt NAME=finetune_flash_jepa_base_d2v16_blr5e5_s8_e199_ld085 SEED=7 LAYER_DECAY=0.85 sbatch --partition=debug --job-name=ftev_s8_e199 clariden/finetune_evaluate_flash.sbatch
+LOAD_CHECKPOINT=$c/pretrain_flash_jepa_base_d2v16_blr5e5_s9/snapshots/epoch=199.ckpt NAME=finetune_flash_jepa_base_d2v16_blr5e5_s9_e199_ld085 SEED=7 LAYER_DECAY=0.85 sbatch --partition=debug --job-name=ftev_s9_e199 clariden/finetune_evaluate_flash.sbatch
+```
+
+Results are copied by `bash results/flash_audit_20261026/fetch_blr5e5_snapshots.sh`
+(it waits on the three job names) and scored by
+`python results/flash_audit_20261026/metrics_flash_blr5e5_snapshots.py > results/flash_audit_20261026/metrics_flash_blr5e5_snapshots.out`.
+
+**Pre-warning snapshots: results (2026-10-30).**  The episodes are what cost
+the fine-tune.  Before them, every seed gives the same, good encoder.
+- **All three jobs completed** (39 min 52 s to 40 min 15 s each, fine-tune
+  plus CSV).  Each fine-tune loaded the intended snapshot (epochs 299, 199,
+  199; target encoder, coverage 1.0), ran 20 epochs with seed 7 and
+  evaluated the 122,639 test events (`partial: false`).  The CSVs were
+  copied with sha256 checked.
+- **Flavour accuracy:**
+
+  | | seed 7 | seed 8 | seed 9 | mean | max - min |
+  |---|---:|---:|---:|---:|---:|
+  | BLR 5e-5, `last.ckpt` (epoch 399) | 0.8202 | 0.7942 | 0.7584 | 0.7909 | 0.0618 |
+  | BLR 5e-5, pre-warning snapshot (299 / 199 / 199) | 0.8200 | 0.8195 | 0.8208 | 0.8201 | 0.0013 |
+  | BLR 1e-4, `last.ckpt` | 0.8231 | 0.8062 | | 0.8147 | |
+  | BLR 1e-4, healthy snapshot (299 / 124, dlnu) | 0.8238 | 0.8191 | | 0.8214 | |
+
+  Published MAE base: 0.8153.  Flash scratch: 0.7846.
+- **Paired event-bootstrap differences** (95% intervals; test-set noise
+  only):
+  - Snapshot minus `last.ckpt`, flavour accuracy:
+    - seed 7: -0.0001 [-0.0013, 0.0009], the same (its episode came late);
+    - seed 8: +0.0253 [0.0236, 0.0269];
+    - seed 9: +0.0624 [0.0606, 0.0647].
+    Seeds 8 and 9 also improve on every other metric, e.g. seed 9's
+    `pT_miss` sMAD -0.199 and vertex resolution -7.1 mm.
+  - Mean of the three BLR 5e-5 snapshots against:
+
+    | | flavour accuracy | AUC NC | AUC charm->had | sMAD E_vis | sMAD pT_miss | vertex (mm) |
+    |---|---|---|---|---|---|---|
+    | published MAE base | +0.0048 [0.0034, 0.0064] | +0.0033 | +0.0081 | -0.0131 | +0.0058 [0.0026, 0.0093] | -1.52 |
+    | flash scratch | +0.0355 [0.0341, 0.0370] | +0.0263 | +0.0391 | -0.069 | -0.128 | -3.72 |
+    | K = 1 | +0.0050 [0.0039, 0.0061] | +0.0040 | +0.0062 | -0.021 | -0.015 | +0.67 |
+    | mean of the BLR 1e-4 `last.ckpt` | +0.0054 [0.0046, 0.0063] | +0.0041 | +0.0044 | -0.011 | -0.020 | +0.11 |
+    | mean of the BLR 1e-4 healthy snapshots | -0.0013 [-0.0022, -0.0005] | -0.0004 | -0.0016 | -0.0002 | +0.0042 | +0.71 |
+
+  - **Against the published MAE**, the mean of the three snapshots is
+    better on 14 of 15 metrics and worse only on `pT_miss` (+0.006).
+- **Conclusions:**
+  - A healthy K = 16 `token` encoder is reproducible across seeds
+    (flavour accuracy within 0.0013).  It beats the published MAE base on
+    14 of 15 metrics and recovers 106-108% of the scratch -> MAE gap in
+    flavour accuracy.
+  - At BLR 5e-5 the healthy encoder is about as good as at 1e-4 (-0.0013),
+    so halving the LR neither helps nor costs anything when the run stays
+    healthy.
+  - What costs the fine-tune is a mid-training episode.  The aim is now a
+    run that never has one; the predictor QK-norm runs below test that.
+    Failing that, the fall-back is the last snapshot before the predictor
+    gradient warning, a rule fixed before these results.
+
+**Predictor diagnostic (2026-10-30, dlnu): attention-logit growth in the
+predictor's last block.**  `results/flash_audit_20261026/predictor_diagnostic.py`
+(method in its docstring; same 2,048 validation events as
+`collapse_check.py`, the same masks for every checkpoint, bf16 as in
+training).  Its loss on the first batch matches `FlashJEPA.forward`'s.
+Snapshots:
+- seed 9 at BLR 5e-5: epochs 199, 224 (its warning epoch) and 249 (in
+  the episode);
+- the BLR 1e-4 seeds at epoch 124: seed 8, 13 epochs before its episode,
+  and seed 7, 200 epochs before;
+- the K = 1 run at epoch 399 (no abrupt episode).
+
+- **No positional shortcut before the episode.**  Before every episode,
+  the predictor relies on the event's own context (smooth-L1 loss on the
+  target tokens):
+
+  | | s9 e199 | s9 e224 | s9 e249 | s8 e124 | s7 e124 | K = 1 e399 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | own context (training loss) | 0.087 | 0.086 | 0.325 | 0.080 | 0.082 | 0.060 |
+  | another event's context | 0.474 | 0.463 | 0.351 | 0.460 | 0.472 | 0.230 |
+  | no context | 0.509 | 0.498 | 0.349 | 0.416 | 0.466 | 0.448 |
+  | best guess from position alone | 0.321 | 0.311 | 0.279 | 0.315 | 0.323 | 0.167 |
+
+  Only inside the episode (s9 e249) does the predictor stop using the
+  event: another event's context then does as well, and all of them do
+  worse than the position-only guess.  That is a consequence of the
+  episode, not its start.
+- **The last predictor block's queries and keys grow large.**  RMS of q
+  and k (mean over heads):
+
+  | block | s9 e199 | s9 e224 | s9 e249 | s8 e124 | s7 e124 | K = 1 e399 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | predictor 1-4, q (range) | 0.8-1.1 | 0.8-1.2 | 1.2-1.6 | 0.7-1.0 | 0.8-1.0 | 0.8-182 |
+  | predictor 5, q / k | 1.2 / 3.1 | 2.3 / 4.3 | 9.9 / 10 | 1.2 / 2.8 | 1.2 / 2.8 | 325 / 20 |
+  | predictor 6, q / k | 13 / 16 | 209 / 43 | 1444 / 1048 | 8.2 / 17 | 2.6 / 15 | 98 / 27 |
+  | context encoder, every block, q and k | ~0.8-1.2 | ~0.8-1.2 | 1.0-2.2 | | | |
+
+  - **Seed 9, block 6.**  Between epochs 199 and 224 its q RMS grows 16x
+    and k 3x.  The logit spread softmax sees (per query, largest logit
+    minus the row mean) jumps from 9 to 7,500, and to 1.5M at 249.
+  - **What block 6 attends to.**  Its mask-token queries put 97-100% of
+    their attention on the context tokens.  Their large logits mainly
+    separate context keys from mask-token keys.
+  - **The encoder is normal** (spread 3-6) until the episode.
+  - **Same ordering in every run.**  The block-6 q RMS ranks the runs by
+    how soon the episode came: seed 7 at epoch 124 has 2.6 (episode 200
+    epochs later), seed 8 at 124 has 8.2 (13 epochs later), seed 9 has 13
+    at 199 (33 epochs before) and 209 at its warning epoch.
+  - **K = 1 has the same growth by epoch 399, in blocks 4-6, without an
+    abrupt episode.**  So the growth comes from this predictor, whatever
+    the target, and how it ends varies.
+- **bf16 precision.**  In block 6 the attention computed from bf16 q and k
+  (as in training) differs from float32 by a total-variation distance of
+  0.13-0.15 for seed 9 and seed 8 (0.08 for seed 7 at 124).  In their
+  other blocks it is below 0.02.  For K = 1 it is 0.17 and 0.09 in blocks
+  4 and 5, where its q grew most.  Part of that attention is rounding
+  noise.
+- **Gradient at the warning epoch** (seed 9, e199 -> e224; training loss,
+  batches of 128): block 6 attention 0.018 -> 0.126, block 5 MLP 0.006 ->
+  0.093.  The rest of the predictor and the context encoder are unchanged
+  (encoder 0.111 -> 0.111).  At e249 the encoder's gradient is 27 and the
+  predictor's embedding 2.5.
+- **Interpretation.**  This is the attention-logit growth instability:
+  query and key norms grow until the attention saturates and the
+  training diverges.  ViT-22B (Dehghani et al. 2023, arXiv:2302.05442)
+  and Wortsman et al. 2023 (arXiv:2309.14322) report it.  Both fix it
+  with QK-layernorm, which in Wortsman et al. also removes the
+  instability's dependence on the LR.
+  - It fits every observation here: the predictor's gradient warns first,
+    the encoder only follows, and a lower LR only delays it.
+  - The resume tests also fit: from epoch 124, when block 6 had already
+    grown, changing the teacher, the target layers or the weight decay
+    could not undo it.
+  - A plausible driver, not tested: separating context tokens from mask
+    tokens is easy (the mask token is one shared vector).  Adam's
+    normalised steps keep enlarging that separation at a rate set by the
+    LR, and a weight decay of 0.05 does not hold it back.
+
+Outputs: `results/flash_audit_20261026/predictor_diagnostic_{s9,blr1e4_e124,k1}.out`.
+Seed 9's snapshots were copied from Clariden to
+`/scratch4/salonso/faser/checkpoints_final/pretrain_flash_jepa_base_d2v16_blr5e5_s9/snapshots/`
+(sha256 checked), with the run's `hparams.yaml` next to them.  On dlnu:
+
+```bash
+D='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*'; M=events_v7.0_500_npz/metadata_stats.pkl; c=/scratch4/salonso/faser/checkpoints_final; s=$c/pretrain_flash_jepa_base_d2v16_blr5e5_s9/snapshots
+CUDA_VISIBLE_DEVICES=1 python results/flash_audit_20261026/predictor_diagnostic.py "$D" $M e199=$s/epoch=199.ckpt e224=$s/epoch=224.ckpt e249=$s/epoch=249.ckpt > results/flash_audit_20261026/predictor_diagnostic_s9.out
+CUDA_VISIBLE_DEVICES=0 python results/flash_audit_20261026/predictor_diagnostic.py "$D" $M s8_e124=$c/pretrain_flash_jepa_base_d2v16_s8/snapshots/epoch=124.ckpt s7_e124=$c/pretrain_flash_jepa_base_d2v16_clariden/snapshots/epoch=124.ckpt > results/flash_audit_20261026/predictor_diagnostic_blr1e4_e124.out
+CUDA_VISIBLE_DEVICES=0 TARGET_LAYERS=1 python results/flash_audit_20261026/predictor_diagnostic.py "$D" $M k1_e399=checkpoints_final/pretrain_flash_jepa_base/loss_total_val/last.ckpt > results/flash_audit_20261026/predictor_diagnostic_k1.out
+```
+
+**Predictor QK-norm (opt-in, `PREDICTOR_QK_NORM=1` /
+`--flash_predictor_qk_norm`; 2026-10-30).**
+- **What:** each predictor attention layer normalises every head's queries
+  and keys (LayerNorm over the head dimension, eps 1e-6, learned gain and
+  bias) before the dot product, as `timm`'s `qk_norm` (ViT-22B).  This
+  bounds the logits whatever the scale of the query/key weights.
+- **Where:** `model/flash_vit.py` (`Attention` / `Block`, `qk_norm=False`),
+  `model/flash_jepa.py` (`FlashPredictor`, `FlashJEPA(predictor_qk_norm)`),
+  `utils/args.py`, `train/pretrain_flash.py`, `pretrain_flash.sh`.
+- **What stays the same:**
+  - Off by default, with no new parameters, so every earlier run and
+    checkpoint is unchanged.
+  - The encoder never has it, so fine-tuning, evaluation and the
+    checkpoints they load are unaffected.
+  - The new norm parameters are 1-D, so the optimiser exempts them from
+    weight decay, like the other norms.
+- **Tests** (`tests/test_flash_jepa.py`):
+  - `test_predictor_qk_norm_bounds_the_logits_and_leaves_the_encoder_unchanged`:
+    - off adds no keys, and on adds exactly the predictor's q/k norms;
+    - the encoder keys are the same with and without;
+    - multiplying every predictor query and key by 100 leaves the
+      predictions unchanged with QK-norm and changes them without;
+    - the norms receive finite gradients;
+    - the option reaches `build_flash_jepa`.
+  - `test_predictor_qk_norm_runs_under_bf16_flash_attention` (GPU): the
+    bf16 FlashAttention loss is within 2% of float32, and all gradients
+    are finite.
+  - The launcher test checks the new line and default.
+  - All pass: `test_flash_jepa.py` 30 passed, 3 skipped (spconv); every
+    other test file importing the changed modules 51 passed, 7 skipped.
+- **Real-data smoke test on dlnu:** one DDP training and validation step
+  on both GPUs with real events, K = 16, gradient logging and QK-norm.
+  Exit 0; `flash_predictor_qk_norm: True` in the saved settings.
+
+  ```bash
+  d=/scratch4/salonso/faser/flash_dryrun/qkn; NAME=smoke_qk_norm FAST_DEV_RUN=1 TARGET_LAYERS=16 LOG_GRAD_NORM=1 PREDICTOR_QK_NORM=1 BATCH_SIZE=256 NUM_WORKERS=16 SAVE_DIR=$d CHECKPOINT_PATH=$d/ckpt DATASET_PATH='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*' METADATA_PATH=/scratch/salonso/sparse-nns/faser_develop/events_v7.0_500_npz/metadata_stats.pkl bash pretrain_flash.sh
+  ```
+
+**Full runs with predictor QK-norm: K = 16 `token`, BLR 1e-4, seeds 7, 8,
+9.**  The recipe is the original K = 16 `token` one (BLR 1e-4, 400 epochs,
+teacher 0.996 -> 1.0, weight decay 0.05) plus `PREDICTOR_QK_NORM=1` and
+`LOG_GRAD_NORM=1`.  Each job pretrains, fine-tunes `last.ckpt` (seed 7,
+layer decay 0.85) and writes the test CSV
+(`clariden/pretrain_finetune_flash.sbatch`).  Seeds 7 and 8 start from the
+same initialisation as the earlier `token` seeds, apart from the new norms.
+
+Submission: `results/flash_audit_20261026/sync_and_submit_qkn.sh`, log
+`/scratch4/salonso/faser/sync_and_submit_qkn.log`.
+- It waits until the queued debug job `ftev_s9_e199` has started (its
+  fine-tune has already imported the model code).
+- It copies the six changed files under temporary names and moves them
+  into place, then checks that all 22 code files on Clariden match
+  dlnu's sha256.
+- It refuses if any new run name already exists (an existing pretraining
+  name would be resumed), then submits.  The code is synced before the
+  submission, so no job can start on the old code.  From
+  `/users/salonso/faserDL` on Clariden:
+
+```bash
+for s in 7 8 9; do suf=$([[ $s == 7 ]] && echo '' || echo _s$s); NAME=pretrain_flash_jepa_base_d2v16_qkn$suf SEED=$s TARGET_LAYERS=16 BLR=1e-4 PREDICTOR_QK_NORM=1 LOG_GRAD_NORM=1 FT_NAME=finetune_flash_jepa_base_d2v16_qkn${suf}_ld085 sbatch --job-name=pt_ft_qkn_s$s clariden/pretrain_finetune_flash.sbatch; done
+```
+
+| seed | pretraining | fine-tune | job |
+|---:|---|---|---|
+| 7 | `pretrain_flash_jepa_base_d2v16_qkn` | `finetune_flash_jepa_base_d2v16_qkn_ld085` | 3802469 |
+| 8 | `pretrain_flash_jepa_base_d2v16_qkn_s8` | `finetune_flash_jepa_base_d2v16_qkn_s8_ld085` | 3802470 (cancelled; debug chain, see below) |
+| 9 | `pretrain_flash_jepa_base_d2v16_qkn_s9` | `finetune_flash_jepa_base_d2v16_qkn_s9_ld085` | 3802471 |
+
+- **The first attempt (12:34) changed nothing.**  The home file system
+  `/users` (VAST) was at its 50 GB quota, and the first copy failed
+  before anything was moved into place.  The evaluations also write their
+  CSV there: seed 8's snapshot CSV, written at 12:28, had filled it.
+- **Fix:** on the user's go-ahead, `pip cache purge` on Clariden removed
+  `~/.cache/pip` (1,219 files, 3.4 GB).  What remains in `/users` is
+  mostly three 2025 container images (`~/spconv`, `~/mink-engine`,
+  `~/podman`, ~41 GB together), left as they are.
+- **Second attempt, submitted 12:47:** the code was verified first (22
+  files equal to dlnu).  Logs:
+  `/scratch4/salonso/faser/sync_and_submit_qkn{.attempt1,}.log`.  The
+  first start estimate was 13:19.
+- **Results:** `bash results/flash_audit_20261026/fetch_qkn.sh` copies
+  them to `/scratch4/salonso/faser/qkn/` and `results/`.
+
+**Faster start (2026-10-30 15:10).**  The three jobs kept waiting on the
+normal partition's shared 400-node cap (`QOSGrpNodeLimit` on QoS
+`normalp`; the day before, normal jobs had not started at all).
+- **Seeds 7 and 9 (jobs 3802469, 3802471)** are now also eligible for the
+  `preemptable` partition.  It accepts QoS `normal`, has normal's priority
+  tier (20) and no 400-node cap.  Only `highprio` jobs (CSCS staff) can
+  preempt it, after a 240 s grace period.  The jobs are set to requeue on
+  preemption (the cluster default is no requeue).
+  - A requeued job restarts `pretrain_finetune_flash.sbatch`, whose
+    pretraining resumes from `last.ckpt`.  Lightning writes that file
+    atomically through a temporary file, every epoch.
+  - A preemption during the fine-tune would make the wrapper refuse to
+    restart (the fine-tuning run exists).  The fine-tune and evaluation
+    would then be rerun alone with `finetune_evaluate_flash.sbatch`.
+- **Seed 8:** its normal job (3802470) was cancelled before it started.
+  It runs instead as a chain of debug jobs.
+  - Debug allows 90 node-minutes per job and one running job per user,
+    so the pretraining runs as 2-node, 45-min segments of
+    `clariden/pretrain_flash.sbatch` (about 60 epochs each), each resuming
+    from `last.ckpt`.
+  - Then `clariden/finetune_evaluate_flash.sbatch` runs in debug.
+  - Expected: about 7 segments plus 40 min, roughly 6 h.  Seed 8 collapsed
+    at epoch 137 at this LR without QK-norm, so its window 137-200 is
+    passed after 3-4 segments.
+- **Driver:** `results/flash_audit_20261026/debug_chain_qkn_s8.sh`, run
+  detached on dlnu (log `/scratch4/salonso/faser/debug_chain_qkn_s8.log`).
+  - It submits one segment at a time.  After each one it copies every log
+    version's `metrics.csv` to `/scratch4/salonso/faser/qkn/progress/` and
+    prints the last epochs' spreads, the episode epochs so far and the
+    largest predictor gradient norm.
+  - It stops if a segment ends other than by its time limit or makes no
+    progress.  At the end it fetches the results (CSVs sha256 checked).
+- **Segment 1** (job 3804768) started at 15:15 on 2 nodes (512 events per
+  GPU, effective batch 4,096).  Its `hparams.yaml` shows
+  `flash_predictor_qk_norm: true`, `flash_target_layers: 16`, `blr: 1e-4`
+  and seed 8.
+- **Fetcher:** `fetch_qkn.sh` now handles seeds 7 and 9 and copies every
+  log version (a requeued run resumes into a new one).  It runs detached
+  (log `/scratch4/salonso/faser/fetch_qkn.log`).
+
+From `/users/salonso/faserDL` on Clariden:
+
+```bash
+for j in 3802469 3802471; do scontrol update jobid=$j Partition=normal,preemptable Requeue=1; done; scancel 3802470
+```
+
+On dlnu:
+
+```bash
+setsid nohup bash results/flash_audit_20261026/debug_chain_qkn_s8.sh > /scratch4/salonso/faser/debug_chain_qkn_s8.log 2>&1 < /dev/null &
+setsid nohup bash results/flash_audit_20261026/fetch_qkn.sh > /scratch4/salonso/faser/fetch_qkn.log 2>&1 < /dev/null &
+```
+
+What to read when they finish:
+- `grad_norm/predictor` over training, against the warnings at epochs
+  215-314 of the BLR 5e-5 runs;
+- validation `target_std` and `context_event_std`, using the same episode
+  definition as before;
+- `predictor_diagnostic.py` (`PREDICTOR_QK_NORM=1`) on the snapshots;
+- the test metrics against the `token` seeds and the published MAE.
+
+**Seed 8 with predictor QK-norm: results (2026-10-31).**
+- **Run:** the debug chain finished the 400 epochs in 7 segments, jobs
+  3804768, 3805294, 3805777, 3808412, 3808915, 3809175 and 3809471
+  (2026-10-30 15:15 to 2026-10-31 00:26).  Segments 1-6 ended at their
+  45-min limit with 57-60 new epochs each; segment 7 completed (48).  The
+  3.5 h queue wait came before segment 3 (debug was busy in the
+  afternoon).
+  - The fine-tune and evaluation (job 3809639, debug, 40 min) loaded the
+    target encoder of `last.ckpt` (epoch 399, step 101,600).
+  - Accounting: `/scratch4/salonso/faser/qkn/sacct_qkn_s8_chain.txt`.
+  - Pretraining metrics: one file per segment,
+    `/scratch4/salonso/faser/qkn/pretrain_flash_jepa_base_d2v16_qkn_s8_version_{0..6}_metrics.csv`.
+    Together they give epochs 0-399 once each.
+- **No episode, no warning.**
+  - After epoch 10, the lowest validation `target_std` is 0.909 and the
+    lowest `context_event_std` 0.396, both in the last epochs.
+  - The predictor's gradient norm (largest per epoch) never exceeded twice
+    its median over epochs 40-149 (0.035).  Its largest value after
+    epoch 40 is 0.056 (epoch 95).  The median per 50 epochs falls
+    steadily, from 0.058 (epochs 0-49) to 0.017 (350-399).
+  - The same seed without QK-norm, same initialisation apart from the new
+    norms:
+    - its `context_event_std` rose to 0.53 at epoch 131;
+    - its episode started at epoch 137 (`target_std` 0.78,
+      `context_event_std` 0.29) and reached `target_std` 0.058 at 146;
+    - it recovered to 0.94 by epoch 250.
+    With QK-norm, epochs 131-150 have `target_std` 0.940-0.943 and
+    `context_event_std` 0.48-0.49.
+  - The validation loss is higher than without QK-norm before the latter's
+    episode: 0.088 against 0.077 at epoch 131.  It ends at 0.0724.
+    Without QK-norm the loss after the episode (0.034 at epoch 399) is not
+    comparable, because the targets are much narrower.
+- **Test metrics:** fine-tuning seed 7, layer decay 0.85, the same 122,639
+  events.  Paired event-bootstrap 95% intervals (200 draws).
+  "Significant" means the interval excludes 0.
+
+| | flavour acc | better (sig.) | not sig. | worse (sig.) |
+|---|---:|---:|---:|---:|
+| QK-norm seed 8 (`last.ckpt`) | **0.8243** | | | |
+| same seed without QK-norm, `last.ckpt` (episode at 137-153) | 0.8062 | 14 | 1 | 0 |
+| same seed without QK-norm, healthy epoch-124 snapshot | 0.8191 | 9 | 5 | 1 (\|p_lep\| CC) |
+| mean of the 5 pre-warning snapshots | 0.8206 | 10 | 4 | 1 (\|p_lep\| CC) |
+| seed 7 without QK-norm, `last.ckpt` (best earlier full run) | 0.8231 | 7 | 6 | 2 (E_vis, \|p_lep\| CC) |
+| published MAE base | 0.8153 | 13 | 2 | 0 |
+| K = 1 (layer decay 0.85) | 0.8152 | 14 | 1 | 0 |
+| flash scratch | 0.7846 | 15 | 0 | 0 |
+
+  - The comparison columns count the 15 metrics where QK-norm seed 8 is
+    better, not significantly different, or worse.
+  - The 5 pre-warning snapshots are: seed 7 epoch 299 and seed 8 epoch 124
+    at BLR 1e-4; seed 7 epoch 299 and seeds 8 and 9 epoch 199 at BLR 5e-5.
+  - Against the published MAE base, the two non-significant metrics are
+    charm->e (+0.0155, [-0.0013, +0.0270]) and the pT_miss sMAD (-0.0009,
+    [-0.0048, +0.0033]).  Both point in QK-norm's favour.
+  - It recovers 100-149% of the published scratch -> MAE gap per metric
+    (flavour accuracy 113%).
+  - Over the 5 pre-warning snapshots, the gain is +0.0037 in flavour
+    accuracy ([+0.0028, +0.0047]).  The 3 BLR 5e-5 snapshots spread by
+    0.0013 (0.8195-0.8208).
+  - **Caveat:** this is one pretraining seed and one fine-tuning seed.
+    Seeds 7 and 9 (jobs 3802469 and 3802471) decide whether the fix holds.
+
+Output: `results/flash_audit_20261026/metrics_flash_qkn_s8.out`.  On dlnu:
+
+```bash
+python results/flash_audit_20261026/metrics_flash_qkn_s8.py > results/flash_audit_20261026/metrics_flash_qkn_s8.out
+```
+
+**Predictor diagnostic, seed 8 with QK-norm (epochs 124, 149, 399).**
+QK-norm removed the runaway, but not all growth of the last blocks'
+attention logits.
+- **The predictor still uses the event.**  Target-token loss with the
+  event's own context, then with another event's context, then with none:
+  - epoch 124: 0.086, 0.462, 0.507;
+  - epoch 149: 0.088, 0.451, 0.501;
+  - epoch 399: 0.072, 0.408, 0.515.
+  The position-only reference is 0.28-0.32.
+- **The logit spread of blocks 5 and 6 grows late in training.**  Mean
+  over queries of (largest logit minus the row mean), mean over heads:
+
+| | block 5 | block 6 | bf16 TV, block 5 / 6 |
+|---|---:|---:|---|
+| QK-norm seed 8, epoch 124 | 9.5 | 13.3 | 0.022 / 0.221 |
+| QK-norm seed 8, epoch 149 | 10.7 | 17.6 | 0.040 / 0.329 |
+| QK-norm seed 8, epoch 399 | 117 | 294 | 0.205 / 0.150 |
+| seed 8 without QK-norm, epoch 124 (episode at 137) | 9.3 | 8.7 | 0.006 / 0.132 |
+| seed 9 BLR 5e-5, epoch 224 (warning) | 12.4 | 7,498 | 0.019 / 0.134 |
+| seed 9 BLR 5e-5, epoch 249 (episode at 232) | 145 | 1,480,428 | 0.140 / 0.082 |
+
+- **Where the growth comes from:** the norms' learned gains and biases.
+  These are 1-D, so they have no weight decay.  Mean absolute values in
+  blocks 5 and 6:
+  - query gain: 1.5 and 4.0 at epoch 124, 15 and 20 at epoch 399;
+  - query bias: 0.2 and 2.1 at epoch 124, 11 and 17 at epoch 399;
+  - key gain: 1.4 at epoch 124, 5.2 and 3.8 at epoch 399.
+
+  The key bias grows most (29 -> 62 in block 6), but it adds the same
+  amount to every logit of a query's row, so it does not change the
+  attention.
+- **Reading:**
+  - Without QK-norm, the query and key weights and their inputs grew
+    together.  In seed 9 the block-6 spread grew from 9 to 7,498 within
+    25 epochs, ahead of its episode.
+  - With QK-norm, only these gains and biases can grow.  Adam moves them
+    by at most about the learning rate per step, so they grow steadily
+    rather than explosively.  By epoch 399 the spread is 294: still 25 to
+    5,000 times smaller than seed 9's around its episode.
+  - The bf16 rounding error of blocks 5 and 6 at epoch 399 (TV 0.15-0.21)
+    is as large as before the earlier episodes.
+  - So QK-norm appears to have cut the feedback loop, and seed 8 had no
+    episode in 400 epochs.  The last two blocks still drift towards hard attention in
+    the second half of training.  That is a residual risk for longer
+    runs, and seeds 7 and 9 will show whether it matters.
+  - Not tested: QK-norm without the learned affine, or with weight decay
+    on its gain, would remove this path.
+- The "What" line above holds for the query/key weights only.  The
+  learned gain and bias of the norm still scale the logits.
+
+Output: `results/flash_audit_20261026/predictor_diagnostic_qkn_s8.out`.
+The three snapshots were copied from Clariden to
+`/scratch4/salonso/faser/checkpoints_final/pretrain_flash_jepa_base_d2v16_qkn_s8/snapshots/`
+(sha256 checked), with the run's `hparams.yaml`.  On dlnu:
+
+```bash
+D='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*'; M=events_v7.0_500_npz/metadata_stats.pkl; s=/scratch4/salonso/faser/checkpoints_final/pretrain_flash_jepa_base_d2v16_qkn_s8/snapshots
+CUDA_VISIBLE_DEVICES=0 PREDICTOR_QK_NORM=1 python results/flash_audit_20261026/predictor_diagnostic.py "$D" $M e124=$s/epoch=124.ckpt e149=$s/epoch=149.ckpt e399=$s/epoch=399.ckpt > results/flash_audit_20261026/predictor_diagnostic_qkn_s8.out
+```
+
+**Seeds 7 and 9 with QK-norm: pretraining (2026-10-31).**
+- **Scheduling:** both ran on `preemptable` and were preempted four times
+  (`/scratch4/salonso/faser/qkn/sacct.txt`), each time requeued and
+  resumed from `last.ckpt`:
+  - 2026-10-30 16:26-16:30;
+  - 2026-10-31 11:30-13:36;
+  - 13:44, after 0.5 min (seed 9) and 4.6 min (seed 7);
+  - seed 9 13:50-17:10, seed 7 13:56-17:10.
+
+  The pretraining logs have three versions (epochs 0-2, 3-171, 172-399).
+- **Both finished the 400 epochs** (`last.ckpt` at 16:55 and 16:48), with
+  no episode and no predictor-gradient warning:
+
+| seed | lowest `target_std` | lowest `context_event_std` | predictor grad: median 40-149, largest after 40 |
+|---:|---:|---:|---|
+| 7 | 0.914 | 0.438 | 0.033, 0.058 (epoch 55) |
+| 8 | 0.909 | 0.396 | 0.035, 0.056 (epoch 95) |
+| 9 | 0.894 | 0.419 | 0.032, 0.052 (epoch 54) |
+
+  The lowest values are taken from epoch 10 on.  Without QK-norm, at the
+  same LR both earlier seeds (7 and 8) went through an episode.  At half
+  the LR, all three seeds did.
+- **The fine-tunes were cut:** the 17:10 preemption hit both jobs during
+  the fine-tune, at epochs 7 (seed 7) and 8 (seed 9) of 20.
+  - On requeue at 17:27, the wrapper refused to restart, because the
+    fine-tuning runs existed (exit 2, as expected).
+  - The Slurm output files were overwritten by that requeue (Slurm
+    truncates on restart).
+  - The partial runs `finetune_flash_jepa_base_d2v16_qkn{,_s9}_ld085` are
+    left as they are.
+- **Reruns (17:36):** same settings, new names
+  `finetune_flash_jepa_base_d2v16_qkn{,_s9}_ld085_rerun`.
+  - Driver: `results/flash_audit_20261026/rerun_ft_qkn.sh` (log
+    `/scratch4/salonso/faser/rerun_ft_qkn.log`).
+  - Seed 7 is job 3815152 (debug).  Seed 9 is job 3815153 (normal), moved
+    to debug if still pending when seed 7 ends.
+
+  On dlnu:
+
+  ```bash
+  setsid nohup bash results/flash_audit_20261026/rerun_ft_qkn.sh > /scratch4/salonso/faser/rerun_ft_qkn.log 2>&1 < /dev/null &
+  ```
+
+  - Seed 7: job 3815152, debug, 17:36-18:15.
+  - Seed 9: its normal job (3815153) was still pending when seed 7 ended.
+    It was cancelled and rerun as job 3815749, debug, 18:16-18:57.
+  - Both loaded `last.ckpt` (epoch 399, target encoder) and completed the
+    20 epochs.  The CSVs were copied to `results/` (sha256 checked).
+  - Accounting: `/scratch4/salonso/faser/qkn/sacct_rerun_ft.txt`.
+
+**Predictor QK-norm, three seeds: test metrics (2026-10-31).**
+Fine-tuning seed 7, layer decay 0.85, the same 122,639 events.  Seeds 7 and
+9 are the `_rerun` fine-tunes.  Paired event-bootstrap 95% intervals (200
+draws).
+
+| | flavour acc | vertex median (mm) |
+|---|---:|---:|
+| QK-norm seed 7 | 0.8256 | 15.98 |
+| QK-norm seed 8 | 0.8243 | 14.31 |
+| QK-norm seed 9 | 0.8250 | 16.03 |
+| **mean of the 3 QK-norm seeds** | **0.8250** | 15.44 |
+| without QK-norm, BLR 1e-4, seeds 7 and 8 (`last.ckpt`) | 0.8147 | 15.25 |
+| without QK-norm, BLR 5e-5, seeds 7-9 (`last.ckpt`) | 0.7909 | 18.50 |
+| mean of the 5 pre-warning snapshots | 0.8206 | 15.07 |
+| published MAE base | 0.8153 | 16.88 |
+| K = 1 (layer decay 0.85) | 0.8152 | 14.68 |
+| flash scratch | 0.7846 | 19.07 |
+
+The mean of the three QK-norm seeds against each reference, over the 15
+metrics:
+
+| mean of the 3 QK-norm seeds vs | better (sig.) | not sig. | worse (sig.) |
+|---|---:|---:|---:|
+| published MAE base | 15 | 0 | 0 |
+| flash scratch | 15 | 0 | 0 |
+| without QK-norm, BLR 5e-5, 3 seeds | 15 | 0 | 0 |
+| without QK-norm, BLR 1e-4, 2 seeds | 13 | 1 | 1 (vertex, +0.19 mm) |
+| K = 1 | 13 | 1 | 1 (vertex, +0.76 mm) |
+| the 5 pre-warning snapshots | 9 | 5 | 1 (vertex, +0.37 mm) |
+
+- Against the published MAE base: flavour accuracy +0.0097 ([+0.0082,
+  +0.0112]), vertex median -1.44 mm.  It recovers 102-141% of the
+  published scratch -> MAE gap per metric (flavour accuracy 113%).
+- Against the 5 healthy pre-warning snapshots: flavour accuracy +0.0043
+  ([+0.0036, +0.0051]).  The 5 non-significant metrics are the ντ->e and
+  ντ->μ AUCs and the three charm AUCs.
+- **Same seed, same LR, with and without QK-norm:**
+  - seed 8: 14 better, 1 not significant, 0 worse.  This seed collapsed
+    at epochs 137-153 without QK-norm.
+  - seed 7: 8 better, 6 not significant, 1 worse (vertex, +0.82 mm).
+    Without QK-norm, this seed's episode began at epoch 324 and lasted to
+    the end, yet its `last.ckpt` fine-tune still reached 0.8231.
+- **Reproducibility across pretraining seeds** (max - min):
+  - flavour accuracy: 0.0013 with QK-norm, against 0.0047 over the 5
+    snapshots and 0.0618 over the 3 BLR 5e-5 runs;
+  - the vertex median varies most: seed 8 is 1.7 mm better than seeds 7
+    and 9.
+- **Conclusion:**
+  - With predictor QK-norm, the K = 16 `token` recipe at BLR 1e-4 had no
+    episode in 3 of 3 seeds.  Without it, every seed tried had one: at
+    BLR 1e-4, seed 7 (epochs 324-399) and seed 8 (137-153); at BLR 5e-5,
+    seed 7 (315-399), seed 8 (223-276) and seed 9 (232-294).
+  - Its fine-tunes are the best flash-JEPA results so far, and the most
+    consistent across seeds.  They beat the published MAE base on all 15
+    metrics.
+  - The one metric that does not improve on the healthy encoders without
+    QK-norm (and on K = 1) is the vertex median.
+  - The residual growth of the last predictor blocks' logits (above)
+    remains for longer runs.
+
+Output: `results/flash_audit_20261026/metrics_flash_qkn.out`.  On dlnu:
+
+```bash
+python results/flash_audit_20261026/metrics_flash_qkn.py > results/flash_audit_20261026/metrics_flash_qkn.out
+```
+
+From `/users/salonso/faserDL` on Clariden:
+
+```bash
+c=/capstor/scratch/cscs/salonso/faser/checkpoint; r=$c/pretrain_flash_jepa_base_d2v16_s8/snapshots/epoch=124.ckpt
+NAME=pretrain_flash_jepa_base_d2v16_s8_r124_ema99925 TARGET_LAYERS=16 SEED=8 SAVE_EVERY_N_EPOCHS=10 JEPA_EMA_DECAY=0.99925 JEPA_EMA_END_DECAY=0.99925 RESUME_CHECKPOINT=$r sbatch --partition=debug --time=00:45:00 --job-name=s8r124_ema clariden/pretrain_flash.sbatch
+NAME=pretrain_flash_jepa_base_d2v16_s8_r124_k8 TARGET_LAYERS=8 SEED=8 SAVE_EVERY_N_EPOCHS=10 RESUME_CHECKPOINT=$r sbatch --partition=debug --time=00:45:00 --job-name=s8r124_k8 clariden/pretrain_flash.sbatch
+NAME=pretrain_flash_jepa_base_d2v16_s8_r124_lr05 TARGET_LAYERS=16 SEED=8 SAVE_EVERY_N_EPOCHS=10 LR_SCALE_ON_RESUME=0.5 LOG_GRAD_NORM=1 RESUME_CHECKPOINT=$r sbatch --partition=debug --time=00:45:00 --job-name=s8r124_lr05 clariden/pretrain_flash.sbatch
+```
+
+S5 and S3b:
+
+```bash
+NAME=pretrain_flash_jepa_base_d2v16_s8_r124_wd TARGET_LAYERS=16 SEED=8 SAVE_EVERY_N_EPOCHS=10 WEIGHT_DECAY=0.04 WEIGHT_DECAY_END=0.4 LOG_GRAD_NORM=1 RESUME_CHECKPOINT=$r sbatch --partition=debug --time=00:45:00 --job-name=s8r124_wd clariden/pretrain_flash.sbatch
+NAME=pretrain_flash_jepa_base_d2v16_s8_r124_lr025 TARGET_LAYERS=16 SEED=8 SAVE_EVERY_N_EPOCHS=10 LR_SCALE_ON_RESUME=0.25 LOG_GRAD_NORM=1 RESUME_CHECKPOINT=$r sbatch --partition=debug --time=00:45:00 --job-name=s8r124_lr025 clariden/pretrain_flash.sbatch
+```
+
+(S1 and S4 were submitted with `--time=01:00:00` and `00:50:00` and cut to
+45 min with `scontrol update`; S1 ran before the new options were copied to
+Clariden, S4 started before too, S3 with them.)
+
+Scored with `results/flash_audit_20261026/screens_s8_r124.py` (commands
+in its docstring).
 
 ## Batch-standardised targets (opt-in, `TARGET_NORM=batch`)
 
@@ -898,7 +2520,148 @@ NAME=pretrain_flash_jepa_base_d2v16_bn TARGET_LAYERS=16 TARGET_NORM=batch sbatch
 c=/capstor/scratch/cscs/salonso/faser/checkpoint; name=finetune_flash_jepa_base_d2v16_bn_ld085; jid=$(LOAD_CHECKPOINT=$c/pretrain_flash_jepa_base_d2v16_bn/loss_total_val/last.ckpt NAME=$name LAYER_DECAY=0.85 sbatch --parsable clariden/finetune_flash.sbatch); CHECKPOINT_DIR=$c/$name sbatch --dependency=afterok:$jid clariden/evaluate_flash.sbatch
 ```
 
-## Not yet done
+**Pretraining result** (job 3764165, 2 nodes, 400 epochs in 4 h 28 min, no
+NaN; `last.ckpt` and `snapshots/epoch=024..399.ckpt`).  Validation event
+spread, with the `token` K = 16 run for comparison:
+
+| epoch | 300 | 320 | 328 | 340 | 350 | 365 | 370 | 380 | 399 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `context_event_std`, token | 0.40 | 0.35 | 0.16 | 0.11 | 0.13 | | | | 0.11 |
+| `context_event_std`, batch | 0.48 | 0.49 | 0.50 | 0.51 | 0.51 | 0.47 | 0.23 | 0.44 | 0.35 |
+| `target_event_std`, token | 0.54 | 0.53 | 0.51 | 0.33 | 0.34 | | | | 0.35 |
+| `target_event_std`, batch | 0.57 | 0.58 | 0.58 | 0.58 | 0.58 | 0.59 | 0.59 | 0.59 | 0.59 |
+
+- **No collapse at epochs 316-346**, where the `token` run collapsed.
+- **The student wobbled at epochs ~365-371.**  Its event spread fell from
+  0.49 to 0.23 and partly recovered (0.35-0.44).  The validation loss rose
+  from 0.049 to 0.086, then settled at 0.07-0.08.  A collapse onto an easy
+  target would have lowered the loss instead.
+- **The teacher did not follow the student.**  Its event spread stayed at
+  0.586-0.588, and the EMA decay is ~1 this late.  The teacher is what
+  fine-tuning loads.
+- **Transient at epoch ~185**: the loss rose to 0.156, then fell to 0.042,
+  and both spreads rose (target 0.57 to 0.88) before settling at ~0.58 by
+  epoch 210.
+- **Losses are not comparable with the `token` run**, because its targets
+  have a different scale.
+
+### Fine-tune of `last.ckpt` (2026-10-27)
+
+Published recipe, `LAYER_DECAY=0.85`, one seed, run on two machines:
+- **dlnu** (2 x 512, same global batch of 1,024): 20 epochs in 2 h,
+  evaluation 8 min.  Results below.
+- **Clariden** (command above, 1 node, 4 x 256): job 3768156 (33 min),
+  evaluated by 3768157.  Same checkpoint, as a replicate across machines
+  (below).  Results copied to `results/` (sha256 checked).
+
+```bash
+cd /scratch/salonso/sparse-nns/faser_develop && source /scratch/salonso/anaconda3/etc/profile.d/conda.sh && conda activate neutrino-jepa && n=finetune_flash_jepa_base_d2v16_bn_ld085_dlnu && c=/scratch4/salonso/faser/checkpoints_final && nohup bash -c "NAME=$n LAYER_DECAY=0.85 GPUS='0 1' BATCH_SIZE=512 NUM_WORKERS=24 CHECKPOINT_PATH=$c SAVE_TOP_K=1 SAVE_LAST=0 CHECKPOINT_MONITORS=evaluated LOAD_CHECKPOINT=$c/pretrain_flash_jepa_base_d2v16_bn/loss_total_val/last.ckpt EXPECTED_SPLIT_SHA256=02078f72b5ec271f81e14f3a24b769e665a9a928908b141bd1fb2134c730fd7c DATASET_PATH='/scratch/salonso/sparse-nns/faser_develop/events_v7.0*' METADATA_PATH=/scratch/salonso/sparse-nns/faser_develop/events_v7.0_500_npz/metadata_stats.pkl bash finetune_flash.sh && python -m evaluation.create_csv_v7_ft --checkpoint_dir $c/$n" > /scratch4/salonso/faser/$n.log 2>&1 &
+```
+
+The checkpoint was copied from Clariden (sha256 a4201449... on both sides).
+`results/flash_audit_20261026/metrics_flash_bn.{py,out}` scores both runs
+on the same 122,639 test events (paired event bootstrap, 200 resamples):
+
+```bash
+python results/flash_audit_20261026/metrics_flash_bn.py > results/flash_audit_20261026/metrics_flash_bn.out 2>&1
+```
+
+**Validation** (best per-task loss):
+
+| run | flavour | charm | vis | jet | vertex | total |
+|---|---:|---:|---:|---:|---:|---:|
+| K = 1, 0.85 | 0.5085 | 0.2166 | 1.1608 | 0.2631 | 0.005640 | 1.2524 |
+| K = 16 e400, 0.85 | 0.4896 | 0.2136 | 1.1121 | 0.2529 | 0.005010 | 1.1674 |
+| K = 16 batch, 0.85 (dlnu) | 0.5081 | 0.2153 | 1.1559 | 0.2654 | 0.006010 | 1.2520 |
+| K = 16 batch, 0.85 (Clariden) | 0.5066 | 0.2157 | 1.1556 | 0.2651 | 0.006219 | 1.2528 |
+
+Both batch runs' total validation losses are above the e400 run's at all 20
+epochs.
+
+**Test:**
+
+| metric | MAE (pub) | K = 1 | K = 16 e400 | K = 16 batch (dlnu) | batch - e400 [95%] |
+|---|---:|---:|---:|---:|---:|
+| AUC nue | 0.9756 | 0.9775 | 0.9788 | 0.9770 | -0.0018 [-0.0024, -0.0013] |
+| AUC numu | 0.9473 | 0.9470 | 0.9518 | 0.9480 | -0.0037 [-0.0045, -0.0032] |
+| AUC nutau->e | 0.9103 | 0.9181 | 0.9221 | 0.9204 | -0.0017 [-0.0048, +0.0008] |
+| AUC nutau->mu | 0.8364 | 0.8413 | 0.8483 | 0.8466 | -0.0017 [-0.0061, +0.0028] |
+| AUC nutau->had | 0.9386 | 0.9404 | 0.9437 | 0.9404 | -0.0032 [-0.0043, -0.0021] |
+| AUC NC | 0.9388 | 0.9382 | 0.9443 | 0.9386 | -0.0057 [-0.0065, -0.0050] |
+| flavour acc | 0.8153 | 0.8152 | 0.8231 | 0.8150 | -0.0081 [-0.0095, -0.0067] |
+| AUC charm->e | 0.8042 | 0.8217 | 0.8234 | 0.8133 | -0.0101 [-0.0196, +0.0009] |
+| AUC charm->mu | 0.8844 | 0.8932 | 0.9003 | 0.9020 | +0.0017 [-0.0076, +0.0104] |
+| AUC charm->had | 0.8691 | 0.8710 | 0.8768 | 0.8744 | -0.0024 [-0.0048, +0.0001] |
+| sMAD E_vis | 0.2144 | 0.2222 | 0.1963 | 0.2166 | +0.0202 [+0.0186, +0.0220] |
+| sMAD pT_miss | 0.5573 | 0.5782 | 0.5552 | 0.5801 | +0.0248 [+0.0211, +0.0284] |
+| sMAD \|p_jet\| | 0.1637 | 0.1543 | 0.1516 | 0.1561 | +0.0045 [+0.0034, +0.0057] |
+| sMAD \|p_lep\| CC | 0.3857 | 0.3930 | 0.3429 | 0.3738 | +0.0308 [+0.0266, +0.0341] |
+| vertex median mm | 16.88 | 14.68 | 15.16 | 15.27 | +0.12 [+0.02, +0.23] |
+
+- **Worse than K = 16 without it on 10 of 15 metrics** (intervals excluding
+  0) and better on none.  nutau->e, nutau->mu and the three charm AUCs are
+  tied.  For example, flavour accuracy -0.0081, E_vis +0.0202, pT_miss
+  +0.0248, |p_lep| CC +0.0308.
+- **About K = 1's level.**  Against K = 1 at the same layer decay: better on
+  5 (numu, nutau->mu, charm->had, E_vis -0.0057, |p_lep| CC -0.0192), worse
+  on 2 (|p_jet| +0.0017, vertex +0.59 mm), tied on 8 including flavour
+  accuracy.  The validation totals are tied (1.2520 against 1.2524).
+- **Against the published MAE**: better on 9, worse on E_vis (+0.0022) and
+  pT_miss (+0.0228), tied on numu, NC, flavour accuracy and charm->e.
+- **So the batch standardisation prevented the pretraining collapse but gave
+  up most of K = 16's fine-tuning gain.**  The collapse itself barely
+  affected fine-tuning (e400 against e299, above), so `token` stays the
+  choice for fine-tuned results.  Whether `batch` helps a frozen encoder is
+  untested.  This compares against `token` seed 7 only.  `token` seed 8
+  fine-tunes below `batch` on 13 of 15 metrics (see "Second pretraining
+  seed"), so with two `token` seeds the order of the two options is not
+  established.
+- Why is not established.  One untested candidate: dividing by each
+  channel's spread gives low-variance channels the same weight in the loss
+  as the informative ones.
+
+**Replicate across machines.**  The same checkpoint, recipe and seed,
+fine-tuned on Clariden (4 GPUs x 256) and on dlnu (2 x 512).  Hardware, GPU
+count and therefore data order differ:
+
+| metric | dlnu | Clariden | Clariden - dlnu [95%] |
+|---|---:|---:|---:|
+| AUC nue | 0.9770 | 0.9768 | -0.0002 [-0.0006, +0.0002] |
+| AUC numu | 0.9480 | 0.9478 | -0.0003 [-0.0006, +0.0002] |
+| AUC nutau->e | 0.9204 | 0.9198 | -0.0006 [-0.0026, +0.0011] |
+| AUC nutau->mu | 0.8466 | 0.8477 | +0.0011 [-0.0023, +0.0037] |
+| AUC nutau->had | 0.9404 | 0.9403 | -0.0002 [-0.0010, +0.0008] |
+| AUC NC | 0.9386 | 0.9385 | 0.0000 [-0.0005, +0.0005] |
+| flavour acc | 0.8150 | 0.8151 | +0.0001 [-0.0009, +0.0013] |
+| AUC charm->e | 0.8133 | 0.8130 | -0.0003 [-0.0080, +0.0092] |
+| AUC charm->mu | 0.9020 | 0.9005 | -0.0015 [-0.0077, +0.0045] |
+| AUC charm->had | 0.8744 | 0.8735 | -0.0009 [-0.0025, +0.0006] |
+| sMAD E_vis | 0.2166 | 0.2131 | -0.0034 [-0.0049, -0.0021] |
+| sMAD pT_miss | 0.5801 | 0.5805 | +0.0004 [-0.0022, +0.0034] |
+| sMAD \|p_jet\| | 0.1561 | 0.1580 | +0.0020 [+0.0008, +0.0030] |
+| sMAD \|p_lep\| CC | 0.3738 | 0.3769 | +0.0031 [+0.0001, +0.0062] |
+| vertex median mm | 15.27 | 15.53 | +0.26 [+0.17, +0.37] |
+
+- **Classification agrees within the bootstrap intervals on all 10
+  metrics.**  Flavour accuracy differs by 0.0001.
+- **Four regressions differ by more than the bootstrap allows:** E_vis,
+  |p_jet|, |p_lep| CC and vertex.  The bootstrap covers test sampling only,
+  so for regressions it understates the spread between fine-tuning runs.
+  The regressions differ by up to ~0.004 sMAD and ~0.3 mm.  This is one
+  observed pair, mixing machine, GPU count and data order.  It is not a
+  noise threshold, and it may not carry over to other checkpoints.
+- **Same machine, the conclusion holds.**  Clariden batch minus e400 is worse
+  on 12 of 15 metrics and better on none: flavour accuracy -0.0080, E_vis
+  +0.0168, pT_miss +0.0253, |p_lep| CC +0.0340, vertex +0.37 mm.  nutau->e,
+  nutau->mu and charm->mu are tied.
+- **Earlier comparisons against this spread.**  K = 16 against the MAE and
+  against K = 1 exceed it on every metric that was called different.  Inside
+  it: e400 against e299 on E_vis (-0.0018) and |p_jet| (-0.0024), and layer
+  decay 0.90 against 0.85 on |p_jet| (+0.0019).
+
+Caveats: one fine-tuning seed per machine.  This pair says nothing about
+variation between pretraining seeds; the second pretraining seed (section
+above) tests that.
 
 **Layer-wise LR decay is not depth-matched.**  `param_groups_lrd` gives
 layer id `i` the scale `decay^(num_layers - i)`.  The published SparseViT base

@@ -411,6 +411,78 @@ class FlashJEPATests(unittest.TestCase):
         args = SimpleNamespace(model="tiny", dropout=0.0, attn_dropout=0.0, drop_path_rate=0.0, **flash)
         self.assertEqual(build_flash_jepa(args).target_norm, "batch")
 
+    def test_predictor_qk_norm_bounds_the_logits_and_leaves_the_encoder_unchanged(self):
+        import argparse
+        from train.pretrain_flash import build_flash_jepa
+        from utils.args import add_flash_args
+
+        config = dict(**SMALL, predictor_embed_dim=64, predictor_depth=2, predictor_num_heads=4)
+        torch.manual_seed(0)
+        plain = FlashJEPA(**config)
+        torch.manual_seed(0)
+        normed = FlashJEPA(**config, predictor_qk_norm=True)
+        # Off by default: no new parameters, so earlier checkpoints load strictly.
+        self.assertFalse(any("q_norm" in k or "k_norm" in k for k in plain.state_dict()))
+        extra = set(normed.state_dict()) - set(plain.state_dict())
+        self.assertEqual(extra, {f"predictor.blocks.{i}.attn.{n}_norm.{p}"
+                                 for i in range(2) for n in "qk" for p in ("weight", "bias")})
+        for block in normed.predictor.blocks:
+            self.assertEqual(block.attn.q_norm.normalized_shape, (16,))
+            self.assertEqual(block.attn.q_norm.eps, 1e-6)
+        # The encoders (all that fine-tuning loads) are the same with and without.
+        self.assertEqual(plain.context_encoder.state_dict().keys(), normed.context_encoder.state_dict().keys())
+
+        # Scaling every predictor query and key by 100 leaves the predictions
+        # unchanged with QK-norm (the logits are bounded) and not without.
+        batch = synthetic_batch(seed=11, batch_size=4)
+        tokens = normed.context_encoder.embed(batch)
+        mask = normed.masker(tokens)
+        for jepa, invariant in ((normed, True), (plain, False)):
+            jepa.eval()
+            with patch.object(jepa.masker, "forward", return_value=mask):
+                before = jepa(batch)["prediction"]
+                with torch.no_grad():
+                    for block in jepa.predictor.blocks:
+                        width = block.attn.qkv.out_features // 3
+                        block.attn.qkv.weight[:2 * width] *= 100.0
+                        block.attn.qkv.bias[:2 * width] *= 100.0
+                after = jepa(batch)["prediction"]
+            self.assertEqual(torch.allclose(before, after, atol=1e-4), invariant)
+
+        # The new parameters are trained.
+        torch.manual_seed(0)
+        jepa = FlashJEPA(**config, predictor_qk_norm=True).train()
+        jepa(synthetic_batch(seed=12, batch_size=6, n_tracks=1))["loss"].backward()
+        for name, parameter in jepa.named_parameters():
+            if "q_norm" in name or "k_norm" in name:
+                self.assertIsNotNone(parameter.grad, name)
+                self.assertTrue(bool(torch.isfinite(parameter.grad).all()), name)
+
+        parser = add_flash_args(argparse.ArgumentParser())
+        self.assertFalse(parser.parse_args([]).flash_predictor_qk_norm)
+        for flags, expected in (([], False), (["--flash_predictor_qk_norm"], True)):
+            flash = vars(parser.parse_args(flags))
+            args = SimpleNamespace(model="tiny", dropout=0.0, attn_dropout=0.0, drop_path_rate=0.0, **flash)
+            model = build_flash_jepa(args)
+            self.assertEqual(isinstance(model.predictor.blocks[0].attn.q_norm, torch.nn.LayerNorm), expected)
+            self.assertFalse(any("q_norm" in k for k in model.context_encoder.state_dict()))
+
+    @unittest.skipUnless(HAS_FLASH, "needs CUDA and FlashAttention kernels")
+    def test_predictor_qk_norm_runs_under_bf16_flash_attention(self):
+        torch.manual_seed(0)
+        jepa = FlashJEPA(**SMALL, predictor_embed_dim=64, predictor_depth=2, predictor_num_heads=4,
+                         predictor_qk_norm=True).cuda()
+        batch = move_obj(synthetic_batch(seed=8, batch_size=8), "cuda")
+        tokens = jepa.context_encoder.embed(batch)
+        mask = jepa.masker(tokens)
+        with patch.object(jepa.masker, "forward", return_value=mask):
+            exact = jepa(batch)["loss"]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                flash = jepa(batch)["loss"]
+            flash.backward()
+        self.assertLess(abs(float(flash) - float(exact)), 2e-2 * float(exact))
+        self.assertTrue(all(bool(torch.isfinite(p.grad).all()) for p in jepa.parameters() if p.grad is not None))
+
     def test_standardise_per_kind_removes_what_every_token_of_a_kind_shares(self):
         from model.flash_jepa import standardise_per_kind
 
@@ -517,6 +589,70 @@ class FlashJEPATests(unittest.TestCase):
             self.assertIn("last.ckpt", names)
             self.assertEqual(sorted(p.name for p in (run / "snapshots").iterdir()),
                              ["epoch=000.ckpt", "epoch=001.ckpt"])
+
+    def _fit_toy_jepa(self, epochs, save=None, resume=None, **options):
+        """Fits a tiny FlashJEPAPreTrainer on the CPU, 2 synthetic batches per
+        epoch (warm-up 1 epoch, then cosine).  Returns (global step, LR, weight
+        decay of the decay group) at each optimiser step, and the trainer."""
+        import pytorch_lightning as pl
+        from model.lightning_model_flash import FlashJEPAPreTrainer
+
+        torch.manual_seed(0)
+        jepa = FlashJEPA(**SMALL, predictor_embed_dim=64, predictor_depth=1, predictor_num_heads=4)
+        args = SimpleNamespace(
+            warmup_epochs=1, cosine_annealing_epochs=epochs - 1, lr=1e-3, blr=None, batch_size=4,
+            beta1=0.9, beta2=0.95, weight_decay=0.04, eps=1e-8, jepa_ema_decay=0.996,
+            jepa_ema_end_decay=1.0, **options)
+        steps = []
+
+        class Record(pl.Callback):
+            def on_before_optimizer_step(self, trainer, module, optimizer):
+                group = optimizer.param_groups[1]
+                steps.append((trainer.global_step, group["lr"], group["weight_decay"]))
+
+            def on_train_epoch_end(self, trainer, module):
+                if save is not None and trainer.current_epoch == 1:
+                    trainer.save_checkpoint(save)
+
+        data = torch.utils.data.DataLoader([synthetic_batch(seed=s, batch_size=4) for s in range(2)],
+                                           batch_size=None)
+        trainer = pl.Trainer(max_epochs=epochs, accelerator="cpu", devices=1, logger=False,
+                             callbacks=[Record()], enable_progress_bar=False, enable_model_summary=False,
+                             enable_checkpointing=False, limit_val_batches=0, gradient_clip_val=1.0)
+        trainer.fit(FlashJEPAPreTrainer(jepa, args), data, ckpt_path=resume)
+        return steps, trainer
+
+    def test_weight_decay_schedule_lr_scale_on_resume_and_grad_norms(self):
+        import math
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = str(Path(directory) / "epoch1.ckpt")
+            reference, trainer = self._fit_toy_jepa(4, save=checkpoint, flash_weight_decay_end=0.4,
+                                                    flash_log_grad_norm=True)
+            # I-JEPA's cosine weight decay 0.04 -> 0.4 over the 8 steps.
+            self.assertEqual([s for s, _, _ in reference], list(range(8)))
+            for step, _, decay in reference:
+                expected = 0.4 + (0.04 - 0.4) * 0.5 * (1 + math.cos(math.pi * step / 8))
+                self.assertAlmostEqual(decay, expected, places=12)
+            for key in ("grad_norm/total", "grad_norm/predictor", "grad_norm/block01", "grad_norm/encoder_other"):
+                self.assertTrue(math.isfinite(float(trainer.callback_metrics[key])), key)
+                self.assertGreater(float(trainer.callback_metrics[key]), 0.0, key)
+            # Resumed after epoch 1 (step 4) with the LR scaled: half the LR of
+            # the uninterrupted run at every later step, same weight decay.
+            resumed, _ = self._fit_toy_jepa(4, resume=checkpoint, flash_weight_decay_end=0.4,
+                                            flash_lr_scale_on_resume=0.5)
+            self.assertEqual([s for s, _, _ in resumed], [4, 5, 6, 7])
+            for (step, lr, decay), (_, lr_ref, decay_ref) in zip(resumed, reference[4:]):
+                self.assertAlmostEqual(lr, 0.5 * lr_ref, delta=1e-12, msg=step)
+                self.assertAlmostEqual(decay, decay_ref, places=12)
+            # Without the options: unscaled LR, and the weight decay stays at
+            # the value restored from the checkpoint (that of step 3).
+            plain, _ = self._fit_toy_jepa(4, resume=checkpoint)
+            for (_, lr, decay), (_, lr_ref, _) in zip(plain, reference[4:]):
+                self.assertAlmostEqual(lr, lr_ref, delta=1e-12)
+                self.assertEqual(decay, reference[3][2])
+        with self.assertRaisesRegex(ValueError, "resume_checkpoint"):
+            self._fit_toy_jepa(2, flash_lr_scale_on_resume=0.5)
 
     @unittest.skipUnless(HAS_FLASH, "needs CUDA and FlashAttention kernels")
     def test_bf16_flash_training_step_matches_fp32_reference(self):
@@ -703,8 +839,20 @@ class FlashJEPATests(unittest.TestCase):
                      'epochs="${EPOCHS:-400}"', 'warmup_epochs="${WARMUP_EPOCHS:-40}"',
                      'save_top_k="${SAVE_TOP_K:-0}"', 'read -r -a gpus <<< "${GPUS:-0 1}"',
                      'target_layers="${TARGET_LAYERS:-1}"', "--flash_target_layers $target_layers",
-                     'target_norm="${TARGET_NORM:-token}"', "--flash_target_norm $target_norm"):
+                     'target_norm="${TARGET_NORM:-token}"', "--flash_target_norm $target_norm",
+                     # Opt-in stabilisation options, off by default.
+                     'weight_decay="${WEIGHT_DECAY:-0.05}"', 'weight_decay_end="${WEIGHT_DECAY_END:-}"',
+                     'lr_scale_on_resume="${LR_SCALE_ON_RESUME:-1}"', 'log_grad_norm="${LOG_GRAD_NORM:-0}"',
+                     'predictor_qk_norm="${PREDICTOR_QK_NORM:-0}"', "qk_norm_args+=(--flash_predictor_qk_norm)",
+                     '"${qk_norm_args[@]}"'):
             self.assertIn(line, pretrain)
+        from utils.args import add_flash_args
+        import argparse
+        defaults = vars(add_flash_args(argparse.ArgumentParser()).parse_args([]))
+        self.assertIsNone(defaults["flash_weight_decay_end"])
+        self.assertEqual(defaults["flash_lr_scale_on_resume"], 1.0)
+        self.assertFalse(defaults["flash_log_grad_norm"])
+        self.assertFalse(defaults["flash_predictor_qk_norm"])
         finetune = (REPO_ROOT / "finetune_flash.sh").read_text()
         reference = (REPO_ROOT / "finetune.sh").read_text()
         for key in ("EPOCHS", "BLR", "LAYER_DECAY", "DROP_PATH_RATE", "WARMUP_EPOCHS",

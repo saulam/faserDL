@@ -55,6 +55,12 @@ class FlashJEPAPreTrainer(pl.LightningModule):
                 "Expected 0 <= jepa_ema_decay <= jepa_ema_end_decay <= 1, "
                 f"got {self.ema_decay} and {self.ema_end_decay}."
             )
+        end = getattr(args, "flash_weight_decay_end", None)
+        self.weight_decay_end = None if end is None else float(end)
+        self.lr_scale_on_resume = float(getattr(args, "flash_lr_scale_on_resume", 1.0))
+        if self.lr_scale_on_resume <= 0:
+            raise ValueError(f"flash_lr_scale_on_resume must be positive, got {self.lr_scale_on_resume}")
+        self.log_grad_norm = bool(getattr(args, "flash_log_grad_norm", False))
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
         return move_obj(batch, device)
@@ -65,6 +71,30 @@ class FlashJEPAPreTrainer(pl.LightningModule):
     def on_train_start(self):
         """Keep the wrapped optimiser groups accessible on supported Lightning versions."""
         self.optimizers().param_groups = self.optimizers()._optimizer.param_groups
+        if self.lr_scale_on_resume != 1.0:
+            if not self.trainer.ckpt_path:
+                raise ValueError("flash_lr_scale_on_resume needs --resume_checkpoint; set --blr for a new run.")
+            self._scale_lr_schedule(self.lr_scale_on_resume)
+
+    def _scale_lr_schedule(self, scale):
+        """Multiply the restored learning rates and the schedule they follow
+        (warm-up and cosine base rates, cosine floor) by ``scale``: the run
+        continues on ``scale`` times the original schedule."""
+        for group in self.optimizers().param_groups:
+            group["lr"] *= scale
+            if "initial_lr" in group:
+                group["initial_lr"] *= scale
+        scheduler = self.lr_schedulers()
+        for inner in (getattr(scheduler, "scheduler1", None), getattr(scheduler, "scheduler2", None)):
+            if inner is None:
+                continue
+            inner.base_lrs = [lr * scale for lr in inner.base_lrs]
+            if hasattr(inner, "eta_min"):
+                inner.eta_min *= scale
+            if hasattr(inner, "_last_lr"):
+                inner._last_lr = [lr * scale for lr in inner._last_lr]
+        if self.trainer.is_global_zero:
+            print(f"lr schedule scaled by {scale} on resume: lr = {self.optimizers().param_groups[0]['lr']:.3e}")
 
     def on_train_epoch_start(self):
         raw = getattr(self.trainer, "train_dataloader", None)
@@ -108,7 +138,46 @@ class FlashJEPAPreTrainer(pl.LightningModule):
         cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
         return self.ema_decay + (self.ema_end_decay - self.ema_decay) * cosine_progress
 
+    def _weight_decay_for_step(self) -> float:
+        """I-JEPA's cosine schedule (CosineWDSchedule) from weight_decay to weight_decay_end."""
+        total_steps = max(1, int(self.trainer.estimated_stepping_batches))
+        progress = min(1.0, max(0.0, float(self.trainer.global_step) / total_steps))
+        return self.weight_decay_end + (self.weight_decay - self.weight_decay_end) * 0.5 * (
+            1.0 + math.cos(math.pi * progress))
+
+    def on_before_optimizer_step(self, optimizer):
+        """Gradient norms before clipping (Lightning clips after this hook)."""
+        if not self.log_grad_norm:
+            return
+        grads = {}
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+            if name.startswith("predictor."):
+                key = "predictor"
+            elif name.startswith("context_encoder.blocks."):
+                key = f"block{int(name.split('.')[2]) + 1:02d}"
+            else:
+                key = "encoder_other"  # embeddings and the final norm
+            grads.setdefault(key, []).append(param.grad.detach())
+        squares = {key: torch.stack(torch._foreach_norm(values)).float().square().sum()
+                   for key, values in grads.items()}
+        if not squares:
+            return
+        # DDP has already averaged the gradients: identical on every rank.
+        self.log("grad_norm/total", torch.stack(list(squares.values())).sum().sqrt(),
+                 on_step=True, on_epoch=False, sync_dist=False)
+        for key, value in squares.items():
+            self.log(f"grad_norm/{key}", value.sqrt(), on_step=True, on_epoch=False, sync_dist=False)
+
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        if self.weight_decay_end is not None:
+            # Set before every step, so a resumed run follows the schedule too.
+            groups = getattr(optimizer, "_optimizer", optimizer).param_groups
+            if len(groups) != 2:
+                raise RuntimeError(f"Expected the no-decay and decay groups, got {len(groups)} groups.")
+            groups[1]["weight_decay"] = decay = self._weight_decay_for_step()
+            self.log("weight_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
         # As in JEPAPreTrainer: the closure (forward/backward) runs inside
         # optimizer.step(), so the EMA update here follows each optimizer step
         # exactly once, with global_step still indexing the step just taken.
@@ -207,6 +276,8 @@ class FlashJEPAPreTrainer(pl.LightningModule):
             print(f"scheduler_steps   = {cosine_annealing_steps}")
             print(f"start_cosine_step = {start_cosine_step}")
             print(f"jepa_ema_decay    = {self.ema_decay} -> {self.ema_end_decay}")
+            print(f"weight_decay      = {self.weight_decay}"
+                  + ("" if self.weight_decay_end is None else f" -> {self.weight_decay_end} (cosine)"))
 
         param_groups = param_groups_weight_decay(
             self.model, self.weight_decay, no_weight_decay_list=self.model.no_weight_decay(),

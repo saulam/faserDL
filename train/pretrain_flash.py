@@ -54,6 +54,7 @@ def build_flash_jepa(args):
         predictor_embed_dim=args.flash_predictor_embed_dim,
         predictor_depth=args.flash_predictor_depth,
         predictor_num_heads=args.flash_predictor_num_heads,
+        predictor_qk_norm=args.flash_predictor_qk_norm,
         mask_num_blocks=args.flash_mask_num_blocks,
         mask_block_scale=tuple(args.flash_mask_block_scale),
         mask_block_aspect=tuple(args.flash_mask_block_aspect),

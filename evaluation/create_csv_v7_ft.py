@@ -119,32 +119,41 @@ def validate_pretraining_provenance(
     checkpoint_dir: Path,
     *,
     inspect_pretraining_checkpoint: bool = True,
+    allow_scratch: bool = False,
 ) -> dict[str, object]:
-    """Fail closed unless this is an exact-backbone JEPA or MAE fine-tune."""
+    """Fail closed unless this is an exact-backbone JEPA or MAE fine-tune.
+
+    With allow_scratch, a run that loaded no checkpoint at all (no
+    load_checkpoint, no recorded encoder source or coverage) is accepted as a
+    from-scratch baseline.
+    """
     errors = []
     backbone = hparams.get("backbone") or "spconv"
     if backbone not in {"spconv", "flash"}:
         errors.append(f"unknown backbone {backbone!r}")
     source = hparams.get("pretrained_encoder_resolved_source")
-    if source not in PRETRAINING_OBJECTIVE_BY_SOURCE:
+    coverage = hparams.get("pretrained_encoder_coverage")
+    load_checkpoint = hparams.get("load_checkpoint")
+    scratch = (
+        allow_scratch and not load_checkpoint and source is None and coverage is None
+    )
+    if not scratch and source not in PRETRAINING_OBJECTIVE_BY_SOURCE:
         errors.append(
             f"pretrained encoder source is {source!r}, expected one of "
             f"{sorted(PRETRAINING_OBJECTIVE_BY_SOURCE)}"
         )
 
-    coverage = hparams.get("pretrained_encoder_coverage")
-    if coverage is None or not math.isclose(float(coverage), 1.0):
+    if not scratch and (coverage is None or not math.isclose(float(coverage), 1.0)):
         errors.append(f"pretrained encoder coverage is {coverage!r}, expected 1.0")
 
     model = hparams.get("model")
     if model not in {"tiny", "base"}:
         errors.append(f"unknown fine-tuning model architecture {model!r}")
 
-    load_checkpoint = hparams.get("load_checkpoint")
     pretraining_path = (
         resolve_from_repo(load_checkpoint) if load_checkpoint else None
     )
-    if pretraining_path is None or not pretraining_path.is_file():
+    if not scratch and (pretraining_path is None or not pretraining_path.is_file()):
         errors.append(f"pretraining checkpoint is missing: {load_checkpoint!r}")
 
     recorded_name = hparams.get("checkpoint_name")
@@ -167,6 +176,19 @@ def validate_pretraining_provenance(
             "Refusing to evaluate a checkpoint without valid pretraining provenance:\n- "
             + "\n- ".join(errors)
         )
+
+    if scratch:
+        return {
+            "model": model,
+            "backbone": backbone,
+            "pretraining_objective": "none",
+            "pretrained_encoder_source": None,
+            "pretrained_encoder_coverage": 0.0,
+            "pretraining_checkpoint": None,
+            "pretraining_checkpoint_epoch": None,
+            "pretraining_checkpoint_global_step": None,
+            "hparams": str(hparams_path.resolve()),
+        }
 
     if inspect_pretraining_checkpoint:
         pretraining = torch.load(
@@ -444,6 +466,10 @@ def build_cli():
     parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--max_batches", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--allow_scratch", action="store_true",
+        help="also accept a fine-tune that loaded no pretraining checkpoint",
+    )
     return parser
 
 
@@ -462,7 +488,9 @@ def main(argv=None):
         else discover_hparams(cli.log_root.resolve(), checkpoint_dir.name)
     )
     hparams = read_hparams(hparams_path)
-    provenance = validate_pretraining_provenance(hparams, hparams_path, checkpoint_dir)
+    provenance = validate_pretraining_provenance(
+        hparams, hparams_path, checkpoint_dir, allow_scratch=cli.allow_scratch,
+    )
     completed_epoch = require_completed_training(hparams, hparams_path)
 
     training_dataset_path = str(hparams["dataset_path"])

@@ -13,6 +13,8 @@ Description: I-JEPA-style pretraining of the spconv-free flash-attention encoder
 - Predictor: a narrow transformer over the context tokens plus one mask token
   per target, each carrying the target's position and detector type; it
   predicts the target encoder's representation of every target token.
+  Optionally (predictor_qk_norm) its attention layer-normalises each head's
+  queries and keys (QK-norm), which bounds the attention logits.
 - Masking: multi-block masking adapted to sparse 3D events.  Each target block
   is the set of occupied patches nearest to a random occupied patch (a
   randomly stretched 3D neighbourhood), so the targets are contiguous regions
@@ -117,7 +119,7 @@ class MultiBlockMasker(nn.Module):
 class FlashPredictor(nn.Module):
     """Narrow transformer predicting target-encoder tokens from context tokens and mask tokens."""
 
-    def __init__(self, encoder, embed_dim=256, depth=6, num_heads=4, mlp_ratio=4.0):
+    def __init__(self, encoder, embed_dim=256, depth=6, num_heads=4, mlp_ratio=4.0, qk_norm=False):
         super().__init__()
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.predictor_embed = nn.Linear(encoder.embed_dim, embed_dim)
@@ -130,7 +132,7 @@ class FlashPredictor(nn.Module):
             "ahcal_pos_embed", FlashEncoder._sincos(embed_dim, encoder.ahcal_patch_embed.patch_grid),
             persistent=False)
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer, qk_norm=qk_norm)
             for _ in range(depth)
         ])
         self.norm = norm_layer(embed_dim)
@@ -192,6 +194,7 @@ class FlashJEPA(nn.Module):
         predictor_embed_dim=256,
         predictor_depth=6,
         predictor_num_heads=4,
+        predictor_qk_norm=False,
         mask_num_blocks=4,
         mask_block_scale=(0.15, 0.2),
         mask_block_aspect=(0.5, 2.0),
@@ -215,6 +218,7 @@ class FlashJEPA(nn.Module):
         self.predictor = FlashPredictor(
             self.context_encoder, embed_dim=predictor_embed_dim, depth=predictor_depth,
             num_heads=predictor_num_heads, mlp_ratio=self.context_encoder.encoder_config["mlp_ratio"],
+            qk_norm=predictor_qk_norm,
         )
         self.masker = MultiBlockMasker(
             num_blocks=mask_num_blocks, block_scale=mask_block_scale,

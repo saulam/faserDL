@@ -201,18 +201,25 @@ class DropPath(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, qkv_bias=True, proj_drop=0.0):
+    def __init__(self, dim, num_heads, qkv_bias=True, proj_drop=0.0, qk_norm=False,
+                 norm_layer=nn.LayerNorm):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # QK-norm (ViT-22B): layer norm of each head's queries and keys, which
+        # bounds the attention logits.  Off: no parameters, as before.
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, seq):
         T, C = x.shape
         q, k, v = self.qkv(x).view(T, 3, self.num_heads, self.head_dim).unbind(1)
+        # Under autocast the layer norms return float32; attention needs one dtype.
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
         x = varlen_attention(q, k, v, seq).reshape(T, C)
         return self.proj_drop(self.proj(x))
 
@@ -233,10 +240,11 @@ class Block(nn.Module):
     """Pre-norm transformer block over a packed variable-length sequence."""
 
     def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=True, drop=0.0,
-                 drop_path=0.0, norm_layer=nn.LayerNorm):
+                 drop_path=0.0, norm_layer=nn.LayerNorm, qk_norm=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads, qkv_bias=qkv_bias, proj_drop=drop)
+        self.attn = Attention(dim, num_heads, qkv_bias=qkv_bias, proj_drop=drop, qk_norm=qk_norm,
+                              norm_layer=norm_layer)
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(dim, int(dim * mlp_ratio), drop=drop)
         self.drop_path = DropPath(drop_path)

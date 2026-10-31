@@ -29,8 +29,13 @@ cd /users/salonso/faserDL
 # shell breaks srun itself (its OpenSSL shadows the system one).
 export UENV="${UENV:-pytorch/v2.9.1:v2}"
 export VENV="${VENV:-/users/salonso/venvs/neutrino-jepa-pt2.9}"
+# Nodes used by the job steps: the whole allocation unless FT_NODES is set
+# (clariden/pretrain_finetune_flash.sbatch fine-tunes on 1 of its 2 nodes).
+# Every step names the same hosts, so the data are staged where they are read.
+nodes="${FT_NODES:-$SLURM_NNODES}"
+hosts=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n "$nodes" | paste -sd, -)
 
-: "${LOAD_CHECKPOINT:?Set LOAD_CHECKPOINT to the pretraining checkpoint (or to an empty string for scratch training).}"
+: "${LOAD_CHECKPOINT?Set LOAD_CHECKPOINT to the pretraining checkpoint (or to an empty string for scratch training).}"
 export DATASET_PATH="${DATASET_PATH:-/iopsstor/scratch/cscs/salonso/faser_new/events_v7.0*}"
 export METADATA_PATH="${METADATA_PATH:-/iopsstor/scratch/cscs/salonso/faser_new/events_v7.0_500_npz/metadata_stats.pkl}"
 export EXPECTED_SPLIT_SHA256="${EXPECTED_SPLIT_SHA256-02078f72b5ec271f81e14f3a24b769e665a9a928908b141bd1fb2134c730fd7c}"
@@ -41,8 +46,8 @@ export EXPECTED_SPLIT_SHA256="${EXPECTED_SPLIT_SHA256-02078f72b5ec271f81e14f3a24
 export SLIM_SHARDS="${SLIM_SHARDS-/iopsstor/scratch/cscs/salonso/faser_slim_v7.0}"
 if [[ -n "$SLIM_SHARDS" ]]; then
     staged="/dev/shm/$USER/faser_slim"
-    trap 'srun --ntasks-per-node=1 --ntasks="$SLURM_NNODES" rm -rf "$staged" || true' EXIT
-    srun --ntasks-per-node=1 --ntasks="$SLURM_NNODES" --cpus-per-task="$SLURM_CPUS_ON_NODE" \
+    trap 'srun --nodelist="$hosts" --nodes="$nodes" --ntasks-per-node=1 --ntasks="$nodes" rm -rf "$staged" || true' EXIT
+    srun --nodelist="$hosts" --nodes="$nodes" --ntasks-per-node=1 --ntasks="$nodes" --cpus-per-task="$SLURM_CPUS_ON_NODE" \
         bash clariden/stage_slim_dataset.sh "$SLIM_SHARDS" "$staged"
     export DATASET_PATH="$staged/events_v7.0*"
 fi
@@ -55,9 +60,9 @@ export SAVE_TOP_K="${SAVE_TOP_K:-1}"
 export SAVE_LAST="${SAVE_LAST:-0}"
 export CHECKPOINT_MONITORS="${CHECKPOINT_MONITORS:-evaluated}"
 export GPUS="0 1 2 3"
-export NB_NODES="$SLURM_NNODES"
+export NB_NODES="$nodes"
 
-gpus_total=$((SLURM_NNODES * 4))
+gpus_total=$((nodes * 4))
 export ACCUM_GRAD_BATCHES="${ACCUM_GRAD_BATCHES:-1}"
 effective_batch="${EFFECTIVE_BATCH:-1024}"
 if [[ -z "${BATCH_SIZE:-}" ]]; then
@@ -67,10 +72,11 @@ if [[ -z "${BATCH_SIZE:-}" ]]; then
     fi
     export BATCH_SIZE=$((effective_batch / (gpus_total * ACCUM_GRAD_BATCHES)))
 fi
-echo "nodes=$SLURM_NNODES gpus=$gpus_total batch/GPU=$BATCH_SIZE accumulation=$ACCUM_GRAD_BATCHES" \
+echo "nodes=$nodes gpus=$gpus_total batch/GPU=$BATCH_SIZE accumulation=$ACCUM_GRAD_BATCHES" \
      "effective batch=$((gpus_total * BATCH_SIZE * ACCUM_GRAD_BATCHES)) workers/GPU=$NUM_WORKERS"
 
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
-srun --uenv="$UENV" --view=default --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+srun --nodelist="$hosts" --nodes="$nodes" --ntasks="$gpus_total" --ntasks-per-node=4 \
+    --uenv="$UENV" --view=default --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     bash -c 'source "$VENV/bin/activate" && exec bash finetune_flash.sh'

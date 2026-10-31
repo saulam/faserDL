@@ -36,6 +36,9 @@ ahcal_patch_size="${AHCAL_PATCH_SIZE:-6 6 5}"
 predictor_embed_dim="${PREDICTOR_EMBED_DIM:-256}"
 predictor_depth="${PREDICTOR_DEPTH:-6}"
 predictor_num_heads="${PREDICTOR_NUM_HEADS:-4}"
+# Opt-in, off by default: QK-norm in the predictor's attention (bounds its
+# attention logits; the encoder is unchanged).
+predictor_qk_norm="${PREDICTOR_QK_NORM:-0}"
 mask_num_blocks="${MASK_NUM_BLOCKS:-4}"
 mask_block_scale="${MASK_BLOCK_SCALE:-0.15 0.2}"
 mask_block_aspect="${MASK_BLOCK_ASPECT:-0.5 2.0}"
@@ -46,6 +49,13 @@ target_layers="${TARGET_LAYERS:-1}"
 # token = layer norm per token; batch = also standardise each channel over the
 # batch's tokens of each detector type (no target shared by every token).
 target_norm="${TARGET_NORM:-token}"
+# Opt-in, off by default: cosine weight decay from WEIGHT_DECAY to
+# WEIGHT_DECAY_END (I-JEPA: 0.04 -> 0.4); LR_SCALE_ON_RESUME multiplies the
+# restored LR schedule of a RESUME_CHECKPOINT run; LOG_GRAD_NORM=1 logs the
+# gradient norms before clipping (total, predictor, each encoder block).
+weight_decay_end="${WEIGHT_DECAY_END:-}"
+lr_scale_on_resume="${LR_SCALE_ON_RESUME:-1}"
+log_grad_norm="${LOG_GRAD_NORM:-0}"
 save_dir="${SAVE_DIR:-logs_final}"
 name="${NAME:-pretrain_flash_jepa_base}"
 log_every_n_steps="${LOG_EVERY_N_STEPS:-50}"
@@ -76,6 +86,14 @@ if (( warmup_epochs < 0 || cosine_annealing_epochs < 0 )); then
     exit 2
 fi
 
+grad_norm_args=()
+if [[ "$log_grad_norm" == "1" || "$log_grad_norm" == "true" ]]; then
+    grad_norm_args+=(--flash_log_grad_norm)
+fi
+qk_norm_args=()
+if [[ "$predictor_qk_norm" == "1" || "$predictor_qk_norm" == "true" ]]; then
+    qk_norm_args+=(--flash_predictor_qk_norm)
+fi
 fast_dev_run_args=()
 if [[ "$fast_dev_run" == "1" || "$fast_dev_run" == "true" ]]; then
     fast_dev_run_args+=(--fast_dev_run)
@@ -116,6 +134,8 @@ python -m train.pretrain_flash \
     --flash_mask_global_prob $mask_global_prob \
     --flash_target_layers $target_layers \
     --flash_target_norm $target_norm \
+    --flash_lr_scale_on_resume $lr_scale_on_resume \
+    ${weight_decay_end:+--flash_weight_decay_end "$weight_decay_end"} \
     --save_dir $save_dir \
     --name $name \
     --log_every_n_steps $log_every_n_steps \
@@ -130,4 +150,6 @@ python -m train.pretrain_flash \
     ${expected_split_sha256:+--expected_split_sha256 "$expected_split_sha256"} \
     ${load_checkpoint:+--load_checkpoint "$load_checkpoint"} \
     ${resume_checkpoint:+--resume_checkpoint "$resume_checkpoint"} \
+    "${grad_norm_args[@]}" \
+    "${qk_norm_args[@]}" \
     "${fast_dev_run_args[@]}"

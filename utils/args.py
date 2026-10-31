@@ -174,6 +174,9 @@ def add_flash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                        help="Blocks in the JEPA predictor transformer")
     group.add_argument("--flash_predictor_num_heads", type=int, default=4,
                        help="Attention heads in the JEPA predictor transformer")
+    group.add_argument("--flash_predictor_qk_norm", action="store_true",
+                       help="JEPA predictor: layer-normalise each head's queries and keys (QK-norm, "
+                            "ViT-22B), which bounds its attention logits; the encoder is unchanged")
     group.add_argument("--flash_mask_num_blocks", type=int, default=4,
                        help="Target blocks per event and detector (FASERCal, AHCAL)")
     group.add_argument("--flash_mask_block_scale", type=float, nargs=2, default=[0.15, 0.2],
@@ -188,6 +191,15 @@ def add_flash_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group.add_argument("--flash_target_norm", type=str, default="token", choices=["token", "batch"],
                        help="JEPA targets: token = layer norm of each token; batch = then also standardise "
                             "each channel over the batch's tokens of each detector type")
+    group.add_argument("--flash_weight_decay_end", type=float, default=None,
+                       help="JEPA pretraining: cosine weight-decay schedule over training from --weight_decay "
+                            "to this value (I-JEPA: 0.04 -> 0.4); default: constant --weight_decay")
+    group.add_argument("--flash_lr_scale_on_resume", type=float, default=1.0,
+                       help="JEPA pretraining: multiply the restored learning-rate schedule by this factor "
+                            "when resuming (--resume_checkpoint); 1 = unchanged")
+    group.add_argument("--flash_log_grad_norm", action="store_true",
+                       help="JEPA pretraining: log the gradient norm before clipping (total, predictor, "
+                            "encoder embeddings and each encoder block) every log_every_n_steps")
     group.add_argument("--save_every_n_epochs", type=int, default=0,
                        help="Pretraining: also keep a checkpoint every N epochs in <checkpoint>/snapshots (0: off)")
     group.add_argument("--expected_split_sha256", type=str, default=None,
