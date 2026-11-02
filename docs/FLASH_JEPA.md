@@ -58,11 +58,23 @@ defaults) with `LAYER_DECAY=0.85`.
 
 **Cost on Clariden:** about 5 h of pretraining on 2 nodes (8 GH200),
 then about 40 min of fine-tune plus test CSV on 1 node.
+- **A cheaper option, untested as its own run:** in all three seeds, the
+  epoch-299 snapshot fine-tunes as well as `last.ckpt`.  Flavour accuracy
+  differs by -0.0001 [-0.0007, +0.0004], with 12 of 15 metrics tied.  So
+  `EPOCHS=300` (25% cheaper) is the first thing to try when compute is
+  short.
+- Its schedule would differ from a snapshot's: it anneals the LR and the
+  teacher EMA fully by epoch 300.
+- See "Snapshot fine-tunes: results" and
+  `results/flash_audit_20261026/qkn_epochs.png`.
+- A 300-epoch run of seed 7 is under way on dlnu.  See "After the
+  allocation".
 
 **Caveats:**
-- The vertex median is the one metric that does not improve on K = 1 or
-  on the healthy encoders without QK-norm.  It also varies most across
-  seeds (14.3-16.0 mm).
+- The vertex median does not measurably improve on K = 1 or on the
+  healthy encoders without QK-norm: the differences (0.2-0.8 mm) are below
+  the ~1 mm that repeat fine-tunes of one encoder already vary by.  It also
+  varies most across seeds (14.3-16.0 mm).
 - The QK-norm's learned gain and bias still let the last predictor blocks'
   attention logits grow in the second half of training.  No episode
   followed in 400 epochs, but longer runs are untested.
@@ -2417,6 +2429,13 @@ metrics:
     snapshots and 0.0618 over the 3 BLR 5e-5 runs;
   - the vertex median varies most: seed 8 is 1.7 mm better than seeds 7
     and 9.
+- **The vertex "worse" entries are within fine-tuning noise.**  Repeat
+  fine-tunes of one encoder move the vertex median by up to ~1 mm (see
+  "Clariden controls": 0.78 and 1.01 mm with another fine-tuning seed).
+  The event bootstrap understates that about 10x.  So the +0.19 to
+  +0.82 mm differences above are not established.  The mean's -1.44 mm
+  against the MAE exceeds that range.  Seeds 7 and 9 alone are only 0.85
+  and 0.90 mm better than the MAE, within it; seed 8 is 2.57 mm better.
 - **Conclusion:**
   - With predictor QK-norm, the K = 16 `token` recipe at BLR 1e-4 had no
     episode in 3 of 3 seeds.  Without it, every seed tried had one: at
@@ -2425,8 +2444,9 @@ metrics:
   - Its fine-tunes are the best flash-JEPA results so far, and the most
     consistent across seeds.  They beat the published MAE base on all 15
     metrics.
-  - The one metric that does not improve on the healthy encoders without
-    QK-norm (and on K = 1) is the vertex median.
+  - The vertex median does not measurably improve on the healthy encoders
+    without QK-norm or on K = 1.  Its differences there are below the
+    fine-tuning noise.
   - The residual growth of the last predictor blocks' logits (above)
     remains for longer runs.
 
@@ -2435,6 +2455,194 @@ Output: `results/flash_audit_20261026/metrics_flash_qkn.out`.  On dlnu:
 ```bash
 python results/flash_audit_20261026/metrics_flash_qkn.py > results/flash_audit_20261026/metrics_flash_qkn.out
 ```
+
+**Snapshot fine-tunes of the QK-norm runs (submitted 2026-10-31 21:02, last
+evening of the allocation).**
+- **Questions:**
+  - Does the recipe need the last 100 epochs?
+  - Did the late growth of the predictor's attention logits hurt the
+    encoder?
+  - How does the downstream score grow with pretraining length?
+- **Runs:**
+  - epoch 299 of seeds 7, 8 and 9;
+  - epochs 99 and 199 of seed 8.
+
+  Same settings as the `last.ckpt` fine-tunes (fine-tuning seed 7, layer
+  decay 0.85).  Names: `finetune_flash_jepa_base_d2v16_qkn{,_s8,_s9}_e299_ld085`
+  and `finetune_flash_jepa_base_d2v16_qkn_s8_e{199,099}_ld085`.
+- **Driver:** `results/flash_audit_20261026/snapshot_ft_qkn.sh` (log
+  `/scratch4/salonso/faser/snapshot_ft_qkn.log`).
+  - All five went to `preemptable` without requeue, as jobs 3819022,
+    3819023, 3819026, 3819028 and 3819030.  All started at once.
+  - Any that does not complete is rerun in debug with the suffix `_r2`.
+  - All five completed at 21:42-21:43, none preempted.  Each loaded the
+    target encoder of the intended epoch.
+- **Second round (22:08):** epochs 99 and 199 of seeds 7 and 9 (jobs
+  3820318, 3820319, 3820325, 3820329, `preemptable`).  The
+  length curve then has all three seeds.
+  - The driver now takes the run list as arguments, and `TAG` names its
+    accounting file.
+  - Fixed: its accounting query listed only every other job.  `printf`
+    with two `%s` consumed two names per cycle.  Round 1's
+    `/scratch4/salonso/faser/qkn/sacct_snapshot_ft.txt` was rewritten
+    with all five jobs.
+
+  On dlnu:
+
+  ```bash
+  setsid nohup bash results/flash_audit_20261026/snapshot_ft_qkn.sh > /scratch4/salonso/faser/snapshot_ft_qkn.log 2>&1 < /dev/null &
+  TAG=_2 setsid nohup bash results/flash_audit_20261026/snapshot_ft_qkn.sh qkn_e199 qkn_s9_e199 qkn_e099 qkn_s9_e099 > /scratch4/salonso/faser/snapshot_ft_qkn_2.log 2>&1 < /dev/null &
+  python results/flash_audit_20261026/metrics_flash_qkn_snapshots.py > results/flash_audit_20261026/metrics_flash_qkn_snapshots.out
+  python results/flash_audit_20261026/plot_qkn_epochs.py
+  ```
+
+- **All four round-2 jobs completed** at 22:47-22:49, none preempted.
+  Accounting: `/scratch4/salonso/faser/qkn/sacct_snapshot_ft_2.txt`.
+
+**Snapshot fine-tunes: results.**  12 fine-tunes: 3 seeds x epochs 99, 199,
+299 and 399 (`last.ckpt`).  Fine-tuning seed 7, layer decay 0.85, the
+same 122,639 events, paired event-bootstrap 95% intervals (200 draws).
+Plot: `results/flash_audit_20261026/qkn_epochs.png`.
+
+Mean of the three seeds:
+
+| pretraining epochs | flavour acc | AUC NC | E_vis sMAD | pT_miss sMAD | \|p_lep\| CC sMAD | vertex (mm) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 0.8160 | 0.9390 | 0.2090 | 0.5643 | 0.3642 | 15.15 |
+| 200 | 0.8224 | 0.9437 | 0.1980 | 0.5549 | 0.3511 | 14.72 |
+| 300 | 0.8248 | 0.9454 | 0.1981 | 0.5546 | 0.3523 | 15.30 |
+| 400 | 0.8250 | 0.9451 | 0.1979 | 0.5532 | 0.3498 | 15.44 |
+| published MAE base | 0.8153 | 0.9388 | 0.2144 | 0.5573 | 0.3857 | 16.88 |
+
+Each snapshot epoch against epoch 399 (mean of the 3 seeds; counts over
+the 15 metrics):
+
+| mean of the 3 seeds | better (sig.) | not sig. | worse (sig.) | flavour acc |
+|---|---:|---:|---:|---|
+| epoch 299 - epoch 399 | 2 (ντ->e AUC; vertex -0.14 mm) | 12 | 1 (\|p_lep\| CC +0.0024) | -0.0001 [-0.0007, +0.0004] |
+| epoch 199 - epoch 399 | 1 (vertex -0.72 mm) | 9 | 5 (νe, νμ, ντ->had, NC AUCs; flavour) | -0.0026 [-0.0034, -0.0018] |
+| epoch 99 - epoch 399 | 1 (vertex -0.29 mm) | 0 | 14 | -0.0090 [-0.0099, -0.0081] |
+
+Each snapshot epoch against the published MAE base:
+
+| mean of the 3 seeds vs MAE | better (sig.) | not sig. | worse (sig.) |
+|---|---:|---:|---:|
+| epoch 99 | 10 | 4 (νμ, NC, charm->e AUCs; flavour acc) | 1 (pT_miss +0.0070) |
+| epoch 199 | 14 | 1 (pT_miss) | 0 |
+| epoch 299 | 14 | 1 (pT_miss) | 0 |
+| epoch 399 | 15 | 0 | 0 |
+
+- **The last 100 epochs add nothing measurable.**  Epoch 299 equals
+  epoch 399 in flavour accuracy and on 12 of 15 metrics.  The vertex
+  differences are below the ~1 mm fine-tuning noise (see "Clariden
+  controls").
+  - Per seed, epoch 299 minus 399 in flavour accuracy is 0.0000, +0.0007
+    and -0.0012.  The regressions move in opposite directions for
+    different seeds: seed 7's E_vis and |p_lep| are worse at 299, seed
+    8's better.
+- **The late growth of the predictor's attention logits** (diagnostic
+  above, epochs 149-399) **did not hurt the encoder:** epoch 399 is no
+  worse than 299.
+- **Classification keeps improving until epoch ~300.**  At 200 epochs it
+  is 0.0026 lower in flavour accuracy.  The energy regressions (E_vis,
+  pT_miss, |p_jet|, |p_lep|) are already at their final level by 200.
+- **Against the MAE:**
+  - after 100 epochs the run is already better on 10 metrics, but worse on
+    pT_miss;
+  - pT_miss is the last metric to cross: significant only at 400 epochs
+    (-0.0041 [-0.0074, -0.0008]).
+- **Pretraining seeds agree at every length:** flavour accuracy spreads by
+  0.0003-0.0017.
+- **Caveat: these are snapshots of 400-epoch runs.**  At epoch 299 the
+  learning rate has not finished its cosine decay, and the teacher EMA has
+  not reached 1.0.  A run scheduled for 300 epochs anneals both fully.  It
+  may match these snapshots or do slightly better, but that is not tested.
+  The recipe stays at 400 epochs.  300 epochs (25% cheaper) is a
+  well-supported option to test first when compute is short.
+
+Output: `results/flash_audit_20261026/metrics_flash_qkn_snapshots.{out,csv}`.
+
+**After the allocation (2026-11-02).**  Clariden now lists account `a0178`
+at QoS `stop`, so no more jobs run there.
+- **Checkpoints copied to dlnu,** into
+  `/scratch4/salonso/faser/checkpoints_final/`.  All 66 files match
+  Clariden's sha256 (list: `qkn_checkpoints.sha256` there).
+  - The three QK-norm pretrainings: `last.ckpt` and the 16 snapshots of
+    each.
+  - Their completed fine-tunes: `finetune_flash_jepa_base_d2v16_qkn_s8_ld085`
+    and the `_rerun` ones of seeds 7 and 9.  The originals cut by
+    preemption were not copied.
+  - Everything else is still on Clariden only, e.g. the 12 snapshot
+    fine-tunes (their test CSVs are in `results/`).
+  - A first attempt listed the cut fine-tunes.  It was stopped during seed
+    8's pretraining and restarted with the list fixed
+    (`/scratch4/salonso/faser/fetch_qkn_checkpoints.attempt1.log`).
+- **300-epoch run on dlnu (started 10:25).**  The recipe with `EPOCHS=300`,
+  seed 7: warm-up 40 epochs, cosine over 260, teacher EMA 0.996 -> 1.0 by
+  epoch 300 (76,200 steps).  Then the same fine-tune (layer decay 0.85,
+  fine-tuning seed 7, 2 x 512) and the test CSV.
+  - Names: `pretrain_flash_jepa_base_d2v16_qkn_ep300_dlnu` and
+    `finetune_flash_jepa_base_d2v16_qkn_ep300_ld085_dlnu`.
+  - 4-6 min per epoch: another user's jobs keep the load average at 60-100
+    of the 128 threads, and the data loader is CPU-bound.  So 21-28 h of
+    pretraining, then about 2 h of fine-tune and CSV.
+  - `score_qkn_ep300.sh` waits for the run to end, then writes
+    `results/flash_audit_20261026/metrics_flash_qkn_ep300.out`
+    (`metrics_flash_qkn_ep300.py`; tested with seed 7's epoch-299 CSV in
+    place of the new one).
+  - The comparison is with the 400-epoch runs' mean and seed spread, and
+    with their epoch-299 snapshots.
+  - It is not a replicate of seed 7's Clariden run.  Two ranks instead of
+    eight give other data orders and masks, at the same effective batch
+    (2 x 2,048).  The earlier dlnu/Clariden fine-tune replicate differed
+    little on classification and by up to ~0.004 sMAD on the regressions
+    (see "Fine-tune on dlnu instead").
+
+  On dlnu:
+
+  ```bash
+  setsid nohup bash results/flash_audit_20261026/fetch_qkn_checkpoints.sh > /scratch4/salonso/faser/fetch_qkn_checkpoints.log 2>&1 < /dev/null &
+  setsid nohup bash results/flash_audit_20261026/dlnu_qkn_ep300.sh > /scratch4/salonso/faser/dlnu_qkn_ep300.log 2>&1 < /dev/null &
+  setsid nohup bash results/flash_audit_20261026/score_qkn_ep300.sh > /scratch4/salonso/faser/score_qkn_ep300.log 2>&1 < /dev/null &
+  ```
+
+- **Fine-tuning seed 8 of the QK-norm encoders (queued 2026-11-02 10:48).**
+  `dlnu_qkn_ft8.sh` waits for `dlnu_qkn_ep300.sh` to end.  Then it
+  fine-tunes the three QK-norm `last.ckpt` encoders with fine-tuning seed 8
+  (otherwise their Clariden seed-7 recipe, as 2 x 512), writes each test CSV
+  and runs `metrics_flash_qkn_ft8.py`.
+  - Names: `finetune_flash_jepa_base_d2v16_qkn{,_s8,_s9}_ld085_ft8_dlnu`.
+    About 2 h each, so the scores come about 6-7 h after the 300-epoch run
+    ends.  Output: `results/flash_audit_20261026/metrics_flash_qkn_ft8.out`.
+  - **Questions:** how far does a repeat fine-tune move the vertex median
+    on these encoders?  Are the QK-norm encoders' vertex differences from
+    the MAE, K = 1, the pre-warning snapshots and the runs without QK-norm
+    larger than that?
+  - **Each new pair differs in both seed and platform.**  That is still a
+    repeat fine-tune of one encoder.  The platform alone, at the same
+    fine-tuning seed, gave vertex medians 1.05 mm (seed 8 without QK-norm)
+    and 0.26 mm (batch-standardised targets) lower on dlnu than on
+    Clariden.
+  - **The scoring:**
+    1. each repeat minus the encoder's Clariden seed-7 fine-tune, with
+       event-bootstrap intervals;
+    2. the pooled repeat-fine-tune SD per metric, over the three QK-norm
+       encoders and the two without QK-norm that already have repeats
+       (6 degrees of freedom);
+    3. the QK-norm mean over its 6 fine-tunes against the MAE, K = 1, the
+       5 pre-warning snapshots and the two BLR 1e-4 `last.ckpt` encoders
+       without QK-norm.  Each has two standard errors: from fine-tuning
+       noise, and from the spread of the encoder means.
+
+    Tested with the QK-norm epoch-299 CSVs in place of the new ones.  From
+    the existing repeats alone, the vertex median's repeat-fine-tune SD
+    without QK-norm is 0.90 mm.
+
+  On dlnu:
+
+  ```bash
+  setsid nohup bash results/flash_audit_20261026/dlnu_qkn_ft8.sh > /scratch4/salonso/faser/dlnu_qkn_ft8.log 2>&1 < /dev/null &
+  ```
 
 From `/users/salonso/faserDL` on Clariden:
 
