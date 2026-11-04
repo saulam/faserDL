@@ -13,7 +13,7 @@ Everything here runs in the `neutrino-jepa` environment (PyTorch 2.14, CUDA
 environment has no spconv, timm, torch_ema or webdataset, and the new code
 needs none of them.
 
-## Recommended recipe (as of 2026-10-31)
+## Recommended recipe (as of 2026-11-03)
 
 The rest of this file is a chronological log.  This is the best recipe it
 found; the evidence is in "Stabilisation", under "Predictor QK-norm, three
@@ -55,26 +55,41 @@ defaults) with `LAYER_DECAY=0.85`.
 - Their mean is better than the published MAE base on all 15 metrics
   (paired event bootstrap).
 - It recovers 102-141% of the scratch -> MAE gap per metric.
+- **With fine-tuning noise counted** (each encoder fine-tuned twice): the
+  QK-norm encoders are better than the MAE by more than 4 standard errors
+  on 13 of 15 metrics.  pT_miss is a tie (-0.003, 0.7 SE), and the vertex
+  median is 1.6 mm lower (1.9 SE).  See "300 epochs and repeat
+  fine-tunes: results".
 
 **Cost on Clariden:** about 5 h of pretraining on 2 nodes (8 GH200),
 then about 40 min of fine-tune plus test CSV on 1 node.
-- **A cheaper option, untested as its own run:** in all three seeds, the
-  epoch-299 snapshot fine-tunes as well as `last.ckpt`.  Flavour accuracy
-  differs by -0.0001 [-0.0007, +0.0004], with 12 of 15 metrics tied.  So
-  `EPOCHS=300` (25% cheaper) is the first thing to try when compute is
-  short.
-- Its schedule would differ from a snapshot's: it anneals the LR and the
-  teacher EMA fully by epoch 300.
-- See "Snapshot fine-tunes: results" and
-  `results/flash_audit_20261026/qkn_epochs.png`.
-- A 300-epoch run of seed 7 is under way on dlnu.  See "After the
-  allocation".
+- **A cheaper option, `EPOCHS=300` (25% less compute), tested in one
+  run.**  It anneals the LR and the teacher EMA fully by epoch 300.
+  - Seed 7 on dlnu falls within the 400-epoch seeds' spread on all 15
+    metrics: |z| <= 2.3 against their mean and SD.  The largest
+    differences have opposite signs: AUC nutau->had -0.0018, nutau->e
+    +0.0016.
+  - Flavour accuracy 0.8238, against 0.8243-0.8256 at 400 epochs.
+  - One seed can't resolve differences below ~0.001 in flavour accuracy,
+    so 400 epochs stays the default here.
+  - See "300 epochs and repeat fine-tunes: results".  The epoch-299
+    snapshots of the 400-epoch runs had already fine-tuned as well as
+    `last.ckpt` ("Snapshot fine-tunes: results",
+    `results/flash_audit_20261026/qkn_epochs.png`).
+- **Cost on dlnu** (A100 + H100, under another user's CPU load): 4.7 min
+  per epoch, so about 23 h for 300 epochs.  Each fine-tune plus test CSV
+  takes 1.5-2 h.
 
 **Caveats:**
 - The vertex median does not measurably improve on K = 1 or on the
-  healthy encoders without QK-norm: the differences (0.2-0.8 mm) are below
-  the ~1 mm that repeat fine-tunes of one encoder already vary by.  It also
-  varies most across seeds (14.3-16.0 mm).
+  healthy encoders without QK-norm: the differences (0.2-0.6 mm) are within
+  1 SE.
+  - A repeat fine-tune of one encoder moves it with an SD of 0.73 mm.
+    The spread across pretraining seeds is about as large.
+  - The event bootstrap's 95% half-width is only ~0.1 mm, so it can't be
+    used alone for single-run vertex comparisons.
+  - The regressions are understated too, by less: for |p_lep| CC the SD is
+    0.0085, against a half-width of ~0.003.
 - The QK-norm's learned gain and bias still let the last predictor blocks'
   attention logits grow in the second half of training.  No episode
   followed in 400 epochs, but longer runs are untested.
@@ -120,13 +135,33 @@ tokens (p99 250 and 72), so a 1,024-event batch is about 120k tokens.
 
 **Patch embedding without spconv.**  `SparsePatchEmbed` computes the same
 function as the spconv models' sparse convolution with kernel = stride, using
-`torch.unique`, `index_add_` and one dense matrix product per step.  That
+an occupancy table, `index_add_` and one dense matrix product per step.  That
 includes the two-step embedding of 1,440-voxel FASERCal patches (`4 x 4 x 2`
 cells, then LayerNorm + GELU, then `3 x 3 x 5`).  Outputs exist only at
 occupied cells, coincident voxels are summed, and out-of-grid voxels are
 dropped, all as in spconv.  A test copies spconv weights into it and matches
 spconv's output to float32 precision.  On 32 real augmented events the
 relative difference is about 1e-7.
+
+How it is computed (2026-11-04; the parameters, and therefore all
+checkpoints, are unchanged):
+- **Index geometry.**  Every voxel's cell gets a key ordered by (event,
+  patch, cell within the patch).  An occupancy table over all possible keys
+  and its cumulative sum rank the occupied cells in the order `torch.unique`
+  gave, without sorting the ~11M voxels of a 2,048-event batch.  Out-of-grid
+  voxels go to an extra row that is dropped.  The geometry depends only on
+  the coordinates: `FlashJEPA.forward` computes it once
+  (`FlashEncoder.patch_geometry`) for both encoders.
+- **Compiled dense steps.**  On GPUs the voxel keys and everything after the
+  geometry (`_embed_one_step`, `_embed_two_step`) run through
+  `torch.compile(dynamic=True)`.  Eager PyTorch's LayerNorm is slow at width
+  96 over ~2.1M cells, and the fp32 round trips of autocast added copies; the
+  compiled code fuses LayerNorm, GELU and the casts.  The weights are
+  arguments, so all encoders share the compiled code.  Each function compiles
+  at most four times (training, target encoder, validation, fp32 inference);
+  batch-size changes do not recompile.  The first step takes 11-21 s longer.
+  `FLASH_COMPILE_PATCH_EMBED=0` runs the same code eagerly.  CPU tensors
+  always run eagerly.
 
 Two AHCAL details differ from the old pipeline:
 - About 1.6% of events have AHCAL hits at x or y = 18, outside the
@@ -260,6 +295,26 @@ machine.
 - Fine-tuning (2 GPUs x 512, 32 workers, before the loader fix) runs at 3.7 to 3.8 it/s, i.e. about
   3,800 events/s or 4.5 min per epoch, against 2,850 events/s for the spconv
   fine-tune.
+
+**Faster patch embedding (2026-11-04).**  On one real 2,048-event batch (K =
+16 targets, bf16, forward and backward, no optimiser), the patch embeddings
+took 11% of the step.  Most of that was memory traffic, not matrix products:
+the LayerNorm over 2.1M cells x 96 channels, autocast's fp32 copies, two
+`torch.unique` sorts of 11M voxels, and the target encoder repeating all
+index work.  After the change (see "Patch embedding without spconv"):
+
+| | A100 | H100 |
+|---|---:|---:|
+| Patch embeddings per JEPA step | 66 → 23 ms | 38 → 14 ms |
+| Training step | 624 → 577 ms | 377 → 356 ms (± 5 ms) |
+| Peak memory | 40.5 → 39.4 GiB | 40.5 → 39.5 GiB |
+
+DDP waits for the A100, so GPU-bound epochs are ~7% faster.  The committed and
+new code give the same outputs from the published checkpoints: a fine-tuned
+`FlashViT` (`finetune_flash_jepa_base_d2v16_qkn_ld085`, 256 events) agrees to
+6e-7 relative in fp32 (3e-7 between two runs of the old code).  In bf16 each
+output is as close to fp32 as before.  The pretrained target encoder's final
+tokens agree to 4e-6.
 
 ### Against the published MAE (2026-10-27)
 
@@ -550,6 +605,16 @@ T=/iopsstor/scratch/cscs/salonso/faser_flash_tests NAME=test_resume_lastckpt SAV
 - Job 3763860, the same command, resumed automatically from `last.ckpt`,
   ran epochs 2 and 3 only, and stopped at `max_epochs=4`.  It left a single
   `last.ckpt` and logged no warnings.
+
+The faster patch embedding (2026-11-04) adds four tests: the new code
+against the original `torch.unique` implementation (kept in the test file
+as the reference) on synthetic voxels (CPU and GPU, one and two input
+channels, an empty event, coincident and out-of-grid voxels, fp32 and bf16,
+outputs and gradients) and on 32 real events, a detector without voxels, and
+one shared geometry per JEPA step.  With both dlnu GPUs:
+- `neutrino-jepa`: 55 passed, 7 spconv-only skipped (pytest);
+- `spconv`: 80 tests OK (`unittest discover`), including the spconv
+  equivalence tests through the compiled code (torch 2.5.1).
 
 Two pre-existing test-isolation problems were fixed:
 - `tests/test_jepa_resume.py` left `torch.use_deterministic_algorithms(True)`
@@ -2572,8 +2637,8 @@ at QoS `stop`, so no more jobs run there.
   - Their completed fine-tunes: `finetune_flash_jepa_base_d2v16_qkn_s8_ld085`
     and the `_rerun` ones of seeds 7 and 9.  The originals cut by
     preemption were not copied.
-  - Everything else is still on Clariden only, e.g. the 12 snapshot
-    fine-tunes (their test CSVs are in `results/`).
+  - Everything else was mirrored later that day (see "Clariden mirror"
+    below).
   - A first attempt listed the cut fine-tunes.  It was stopped during seed
     8's pretraining and restarted with the list fixed
     (`/scratch4/salonso/faser/fetch_qkn_checkpoints.attempt1.log`).
@@ -2643,6 +2708,337 @@ at QoS `stop`, so no more jobs run there.
   ```bash
   setsid nohup bash results/flash_audit_20261026/dlnu_qkn_ft8.sh > /scratch4/salonso/faser/dlnu_qkn_ft8.log 2>&1 < /dev/null &
   ```
+
+- **Clariden mirror (2026-11-02 14:23).**  Capstor scratch can be purged,
+  so `fetch_clariden_checkpoints.sh` copies all of Clariden's
+  `/capstor/scratch/cscs/salonso/faser/checkpoint/` to
+  `/scratch4/salonso/faser/checkpoints_clariden/`, in the same layout.
+  That is 53 runs, 354 files and 171 GB, including the BLR 5e-5 runs, the
+  snapshot fine-tunes, the `s8_r124` screens and the fine-tunes cut by
+  preemption.
+  - It is a tree of its own, not merged into `checkpoints_final`.  Some
+    names there are other runs: dlnu's own
+    `pretrain_flash_jepa_base_d2v16` is the realisation that stopped at
+    epoch 135, not Clariden's 400-epoch seed 7.
+  - Files identical to the QK-norm copies in `checkpoints_final` (same
+    size and modification time) are hard links (`rsync --link-dest`), so
+    they take no extra space.
+  - Every file's sha256 is checked against Clariden's (list:
+    `/scratch4/salonso/faser/checkpoints_clariden.sha256`).  Done at
+    15:02: all 354 match.
+  - 63 files are hard links.  Seed 8's QK-norm epochs 124, 149 and 399 were
+    in `checkpoints_final` before the copy above, with other modification
+    times, so they were copied again (1.6 GB).  The mirror takes 140 GB of
+    new space.
+  - Clariden's training logs and Slurm output (`logs/` and `slurm/`, 381
+    files, 0.5 GB) are in `/scratch4/salonso/faser/clariden_scratch/`.  A
+    checksum dry run (`rsync -c -n`) against Clariden listed no
+    differences.
+
+  On dlnu:
+
+  ```bash
+  setsid nohup bash results/flash_audit_20261026/fetch_clariden_checkpoints.sh > /scratch4/salonso/faser/fetch_clariden_checkpoints.log 2>&1 < /dev/null &
+  mkdir -p /scratch4/salonso/faser/clariden_scratch && cd /scratch4/salonso/faser/clariden_scratch && rsync -a --ignore-existing clariden:/capstor/scratch/cscs/salonso/faser/logs clariden:/capstor/scratch/cscs/salonso/faser/slurm ./
+  rsync -a -c -n --itemize-changes clariden:/capstor/scratch/cscs/salonso/faser/logs clariden:/capstor/scratch/cscs/salonso/faser/slurm ./
+  ```
+
+**300 epochs and repeat fine-tunes: results (2026-11-03).**  All four new
+CSVs have the 122,639 test events, the expected split (1,042,418 / 61,318 /
+122,639, same test inventory sha256), `partial: false` and
+`completed_epoch` 19.  Their metadata names the intended encoder and
+fine-tuning seed.
+- **Timing:** the 300-epoch pretraining ran 2026-11-02 10:25 to 2026-11-03
+  09:46 (4.7 min per epoch).  Each fine-tune plus CSV then took 1 h 32 min to
+  2 h 05 min.
+- **Health:** it had no episode.
+  - The gradient norm's largest step after warm-up was 0.068 (epoch 52),
+    against 0.22 during epochs 10-39.  The per-epoch maxima had a median of
+    0.034 and fell to ~0.02 by the end.
+  - The teacher EMA reached 0.99996 by epoch 280 and 1.0 at epoch 299.
+
+*300 epochs against 400* (fine-tuning seed 7; the 400-epoch fine-tunes ran
+on Clariden).  z = (ep300 - mean) / (SD x sqrt(1 + 1/3)), where SD is the
+three 400-epoch seeds' SD.  That SD includes fine-tuning noise but has
+only 2 degrees of freedom.
+
+| metric | ep300 (dlnu) | e399 mean | e399 min-max | diff | z |
+|---|---|---|---|---|---|
+| AUC nue | 0.9788 | 0.9790 | 0.9787-0.9793 | -0.0002 | -0.7 |
+| AUC numu | 0.9524 | 0.9525 | 0.9523-0.9528 | -0.0001 | -0.3 |
+| AUC nutau->e | 0.9238 | 0.9222 | 0.9216-0.9229 | +0.0016 | +2.1 |
+| AUC nutau->mu | 0.8475 | 0.8488 | 0.8462-0.8516 | -0.0013 | -0.4 |
+| AUC nutau->had | 0.9432 | 0.9450 | 0.9442-0.9454 | -0.0018 | -2.3 |
+| AUC NC | 0.9453 | 0.9452 | 0.9449-0.9454 | +0.0001 | +0.5 |
+| flavour acc | 0.8238 | 0.8250 | 0.8243-0.8256 | -0.0012 | -1.6 |
+| AUC charm->e | 0.8221 | 0.8237 | 0.8197-0.8307 | -0.0016 | -0.2 |
+| AUC charm->mu | 0.9044 | 0.9031 | 0.8981-0.9095 | +0.0013 | +0.2 |
+| AUC charm->had | 0.8812 | 0.8789 | 0.8768-0.8806 | +0.0023 | +1.0 |
+| sMAD E_vis | 0.1939 | 0.1979 | 0.1915-0.2013 | -0.0040 | -0.6 |
+| sMAD pT_miss | 0.5584 | 0.5532 | 0.5503-0.5564 | +0.0052 | +1.5 |
+| sMAD \|p_jet\| | 0.1504 | 0.1503 | 0.1479-0.1520 | +0.0001 | +0.1 |
+| sMAD \|p_lep\| CC | 0.3423 | 0.3499 | 0.3363-0.3574 | -0.0076 | -0.6 |
+| vertex median mm | 14.69 | 15.44 | 14.31-16.03 | -0.75 | -0.7 |
+
+- **The 300-epoch run is indistinguishable from the 400-epoch runs.**  No
+  metric has |z| above 2.3, and the two near 2 have opposite signs.  It is
+  outside the 400-epoch min-max on 5 metrics, by at most 0.0020.
+- **Against the published MAE:** better on 14 of 15 (event-bootstrap
+  intervals excluding 0).  That includes the vertex median, 2.19 mm lower,
+  but see the fine-tuning noise below.  pT_miss is a tie (+0.0011
+  [-0.0030, +0.0048]).
+- **It is one seed, on another platform:** two ranks give other data
+  orders and masks than Clariden's eight.  dlnu fine-tunes have given
+  0.26-1.05 mm lower vertex medians at the same seed.
+
+Output: `results/flash_audit_20261026/metrics_flash_qkn_ep300.out`.
+
+*Repeat fine-tunes.*  Each QK-norm encoder now has its Clariden fine-tune
+(fine-tuning seed 7) and a dlnu one (seed 8).
+
+| encoder | vertex median, repeat - FT7 (mm) | flavour acc, repeat - FT7 |
+|---|---|---|
+| QK-norm s7 (FT8 dlnu) | -0.23 | +0.0003 |
+| QK-norm s8 (FT8 dlnu) | +0.34 | -0.0013 |
+| QK-norm s9 (FT8 dlnu) | -1.19 | -0.0023 |
+| 1e-4 s7 without QK-norm (FT8 Clariden) | +0.78 | -0.0001 |
+| 1e-4 s8 without QK-norm (FT8 Clariden) | +1.01 | +0.0001 |
+| 1e-4 s8 without QK-norm (FT7 dlnu) | -1.05 | +0.0000 |
+
+- **Pooled repeat-fine-tune SD** over the 5 encoders (6 degrees of
+  freedom):
+
+  | metric | SD |
+  |---|---|
+  | vertex median | 0.73 mm (0.52 with QK-norm, 0.90 without) |
+  | flavour accuracy | 0.0008 |
+  | AUC charm->e / charm->mu / charm->had | 0.0029 / 0.0036 / 0.0017 |
+  | sMAD E_vis / pT_miss / \|p_jet\| / \|p_lep\| CC | 0.0030 / 0.0039 / 0.0012 / 0.0085 |
+  | flavour AUCs | 0.0002-0.0013 |
+
+- **The event bootstrap roughly captures the classification noise, but not
+  the vertex and regression noise.**
+  - For classification, the 95% half-width of a repeat difference is
+    within a factor of 2 of what this SD implies.  Flavour accuracy:
+    ~0.0012 against 1.96 x sqrt(2) x 0.0008 = 0.0022.
+  - For the vertex median it is ~0.1 mm against 2.0 mm, and for
+    |p_lep| CC ~0.003 against 0.024.
+  - So single-run vertex and |p_lep| differences of up to ~2 mm and ~0.02
+    are not established, even when their event-bootstrap intervals
+    exclude 0.
+- **The QK-norm group (3 encoders x 2 fine-tunes)** against the other
+  groups.  Each cell is the difference, with the difference / SE in
+  brackets; the SE includes the spread of the encoder means.
+
+  | QK-norm minus | flavour acc | sMAD pT_miss | sMAD \|p_lep\| CC | vertex median mm |
+  |---|---|---|---|---|
+  | MAE base (pub) | +0.0091 (8.9) | -0.0028 (-0.7) | -0.0368 (-4.2) | -1.62 (-1.9) |
+  | K = 1 | +0.0093 (9.1) | -0.0238 (-5.9) | -0.0441 (-5.0) | +0.58 (+0.7) |
+  | 5 pre-warning snapshots | +0.0038 (3.6) | -0.0070 (-1.7) | -0.0054 (-1.9) | +0.19 (+0.4) |
+  | 1e-4 `last.ckpt` without QK-norm (2 encoders) | +0.0098 (1.2) | -0.0291 (-1.1) | -0.0146 (-1.0) | -0.18 (-0.4) |
+
+  - **Against the MAE:** better by more than 4 SE on 13 of 15 metrics.
+    pT_miss is a tie, and the vertex is better by 1.9 SE.
+  - **Against K = 1:** better on 13 of 15.  AUC charm->e (+0.2 SE) and the
+    vertex (+0.7 SE) are ties.
+  - **Against the 5 pre-warning snapshots:** better beyond 2 SE only on
+    AUC nue, numu, nutau->had and NC, flavour accuracy and |p_jet|.  The
+    rest are within 2 SE.
+  - **Against the 2 encoders without QK-norm:** the encoder spread is too
+    large to resolve (all about 1 SE).  Seed 8 had an episode and seed 7
+    did not.
+- **Vertex conclusion:** the QK-norm encoders' vertex median (15.26 mm,
+  mean of 6 fine-tunes) is not measurably different from K = 1, the
+  pre-warning snapshots or the encoders without QK-norm.  It is 1.6 mm
+  better than the MAE, at about 2 SE.
+- **Platform:** the mean of FT8 dlnu - FT7 over the QK-norm encoders is
+  -0.36 mm [-0.42, -0.29] on the vertex median.  It mixes the seed and the
+  platform.
+  - The same-seed dlnu - Clariden shifts were -0.26 and -1.05 mm.  So
+    dlnu may give vertex medians a few tenths of a mm lower.  The
+    300-epoch run's -0.75 mm fits that.
+  - That is within the repeat SD, and is not established.  If real, it
+    inflates the pooled SD slightly, since 4 of its 6 degrees of freedom
+    compare platforms.
+
+Output: `results/flash_audit_20261026/metrics_flash_qkn_ft8.out`.
+
+**What the encoder knows before it sees a label (2026-11-04).**  Frozen
+probes and 2D latent maps of the best encoder: K = 16 `token` targets with
+predictor QK-norm, pretraining seed 7.  It is shown untrained (torch seed 7),
+at its epoch-24 and epoch-99 snapshots, and at `last.ckpt` (epoch 399, the
+encoder its fine-tunes used).  The same analysis of the published MAE
+follows ("The same for the published MAE").
+- **Features:** the target (EMA) encoder's tokens, mean-pooled per event,
+  with no masking.  Two kinds, from one pass:
+  - `last`: the final output, which is what FlashViT pools;
+  - `k16`: the data2vec target.
+- **Events:** 100,000 training-split events train the probes, 10,000
+  validation-split events choose the regularisation, and all 122,639 test
+  events are scored with the fine-tune metrics.  The fine-tuned column
+  reproduces the seed-7 fine-tune's CSV scores exactly (0.8256, 15.98 mm),
+  which checks the metric code.
+- **Linear probes:** logistic regression for flavour and charm.  Ridge
+  regression for the momenta and vertex, with log(1 + |p|) and the unit
+  direction as targets, and lepton = visible - jet as in the fine-tune.
+- **kNN:** the 20 nearest training events by cosine similarity.
+
+Test metrics, `last` features (sMAD and vertex: lower is better).  The last
+column is the supervised flash fine-tune from scratch (no pretraining).
+
+| metric | linear, untrained | linear, e24 | linear, e99 | linear, e399 | kNN, e399 | fine-tuned e399 | scratch fine-tune |
+|---|---|---|---|---|---|---|---|
+| flavour acc | 0.594 | 0.667 | 0.748 | **0.767** | 0.728 | 0.826 | 0.785 |
+| AUC nue | 0.777 | 0.908 | 0.951 | 0.953 | 0.912 | 0.979 | 0.969 |
+| AUC numu | 0.741 | 0.830 | 0.907 | 0.921 | 0.892 | 0.953 | 0.931 |
+| AUC NC | 0.697 | 0.789 | 0.887 | 0.907 | 0.859 | 0.945 | 0.916 |
+| AUC nutau->had | 0.755 | 0.827 | 0.880 | 0.890 | 0.806 | 0.945 | 0.925 |
+| AUC nutau->e | 0.705 | 0.808 | 0.860 | 0.860 | 0.688 | 0.922 | 0.906 |
+| AUC nutau->mu | 0.641 | 0.682 | 0.741 | 0.761 | 0.604 | 0.852 | 0.826 |
+| AUC charm->e | 0.574 | 0.611 | 0.663 | 0.649 | 0.513 | 0.831 | 0.791 |
+| AUC charm->mu | 0.591 | 0.663 | 0.705 | 0.751 | 0.530 | 0.898 | 0.872 |
+| AUC charm->had | 0.648 | 0.702 | 0.728 | 0.724 | 0.624 | 0.879 | 0.838 |
+| sMAD E_vis | 0.768 | 0.530 | 0.442 | 0.425 | 0.527 | 0.192 | 0.270 |
+| sMAD \|p_jet\| | 0.649 | 0.420 | 0.356 | 0.373 | 0.440 | 0.148 | 0.185 |
+| sMAD \|p_lep\| CC | 0.880 | 0.820 | 0.750 | 0.733 | 0.811 | 0.336 | 0.429 |
+| vertex median mm | 137.7 | 77.1 | 55.2 | 62.2 | 131.3 | 16.0 | 19.1 |
+
+- **Pretraining alone captures most of the flavour information.**
+  - A linear classifier on the frozen features reaches flavour accuracy
+    0.767.  Untrained gives 0.594, and always guessing numu gives 0.560.
+  - That closes 75% of the gap from untrained to the fine-tune (0.826).
+    It comes close to a fully supervised fine-tune from scratch (0.785),
+    although the encoder never saw a label.
+  - ν_e CC, ν_μ CC and NC are the most linearly separable (AUC 0.91-0.95).
+- **Most of it is learned by epoch 99** (0.748).  Epochs 100-399 add 0.019
+  in flavour accuracy.  The vertex and |p_jet| probes are best at epoch 99.
+- **Charm, the vertex position and the lepton momentum are mostly not in the
+  pooled features.**
+  - Charm: linear AUCs 0.65-0.75 against 0.83-0.90 fine-tuned.  kNN is near
+    chance for charm->e and ->mu (0.51-0.53).
+  - Vertex: 62 mm against 16 mm.  |p_lep| CC: sMAD 0.73 against 0.34.
+  - These need local detail that mean pooling discards, and fine-tuning
+    recovers it.
+- **pT_miss** (left out of the table): the linear probe gets worse with
+  training (sMAD 5.8 untrained, 15.1 at epoch 399).  A linear map to
+  direction cosines can't resolve the small transverse component.  kNN
+  improves from 3.5 to 1.5, against 0.55 fine-tuned.
+- **Neighbourhoods are label-consistent for the common classes:** kNN flavour
+  accuracy is 0.728, but it is weak for ν_τ and charm.
+- **`k16` and `last` probe alike** for this encoder (flavour 0.761 against
+  0.767).  In the K = 1 encoder, the K = 16 average had probed far better
+  ("Probe of the existing encoder").  K = 16 training has moved that
+  information into the final output.
+
+*Maps* (`latent_maps_{pca,tsne}.png`, `latent_maps_tsne_flavour.png`): 11,400
+test events, 1,900 per flavour (fixed seed).
+- Each row is an encoder, and the columns colour the same points by
+  outgoing lepton (electron: ν_e CC and ν_τ->e; muon: ν_μ CC and ν_τ->μ;
+  none: NC and ν_τ->had), by charm, and by E_vis.  The coordinates are in
+  `latent_maps.npz`.
+- **PCA shows little for the trained encoders.**  With the `last`
+  features, the first two components hold about 3% of the variance each
+  (11% and 7% for `k16`): the information is spread over many dimensions.  The untrained encoder's PCA is one curve ordered by energy
+  (PC1 30%).
+- **The t-SNE of epoch 399 separates the flavours partly.**  It has ν_μ CC
+  regions, a ν_e CC core and NC-rich regions, while the ν_τ classes spread
+  across them.
+  - The detached island is not flavour: 314 events of all flavours, with low
+    energy (median E_vis 142 GeV, against 360) and upstream, off-centre
+    vertices (median z -693 mm, against -39).
+  - Charm shows no structure in any map.
+- **Caveats:**
+  - Mean pooling with a linear or kNN probe is a lower bound on what the
+    tokens hold; an attentive probe could read more.
+  - One encoder and one seed.
+  - t-SNE distances and cluster sizes are not quantitative.
+  - The maps' flavour-balanced sample overweights ν_τ relative to the test
+    set.
+
+On dlnu (~12 min of feature extraction on one H100, then ~3 min):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python results/flash_audit_20261026/latent_features.py /scratch4/salonso/faser/latents_qkn_s7 24 > /scratch4/salonso/faser/latent_features.log
+CUDA_VISIBLE_DEVICES=0 python results/flash_audit_20261026/latent_probes.py /scratch4/salonso/faser/latents_qkn_s7 > results/flash_audit_20261026/latent_probes.out
+```
+
+**The same for the published MAE (2026-11-04).**  This is the MAE base the
+paper fine-tuned (`pretrain_v7.0_lat_norel_v2`).  It is shown untrained
+(torch seed 7), at epoch 215 (its best-validation checkpoint) and at
+`last.ckpt` (epoch 399, the encoder the published fine-tune used).  It has no
+earlier snapshots.
+- **Feature:** its Perceiver latents, mean-pooled over the valid latents, as
+  SparseViT pools them for the fine-tune.  Its stacked encoder has no
+  counterpart of the K = 16 target, so there is only one feature kind.
+- **Same events, labels, probes and metrics** as the JEPA.  The features
+  cover the same events in the same order.  The fine-tuned column
+  reproduces the published CSV (0.8153, 16.88 mm).
+- **The two encoders' pooled features are not the same object:** each is
+  pooled the way its own fine-tune pools it.
+
+The two final encoders (epoch 399) side by side:
+
+| metric | JEPA linear | MAE linear | JEPA kNN | MAE kNN | JEPA fine-tuned | MAE fine-tuned |
+|---|---|---|---|---|---|---|
+| flavour acc | **0.767** | 0.696 | 0.728 | 0.632 | 0.826 | 0.815 |
+| AUC nue | 0.953 | 0.928 | 0.912 | 0.869 | 0.979 | 0.976 |
+| AUC numu | 0.921 | 0.846 | 0.892 | 0.744 | 0.953 | 0.947 |
+| AUC NC | 0.907 | 0.818 | 0.859 | 0.694 | 0.945 | 0.939 |
+| AUC nutau->had | 0.890 | 0.831 | 0.806 | 0.720 | 0.945 | 0.939 |
+| AUC nutau->e | 0.860 | 0.820 | 0.688 | 0.646 | 0.922 | 0.910 |
+| AUC nutau->mu | 0.761 | 0.696 | 0.604 | 0.553 | 0.852 | 0.836 |
+| AUC charm->e | 0.649 | 0.644 | 0.513 | 0.512 | 0.831 | 0.804 |
+| AUC charm->mu | 0.751 | 0.652 | 0.530 | 0.509 | 0.898 | 0.884 |
+| AUC charm->had | 0.724 | 0.713 | 0.624 | 0.617 | 0.879 | 0.869 |
+| sMAD E_vis | 0.425 | 0.597 | 0.527 | 0.771 | 0.192 | 0.214 |
+| sMAD \|p_jet\| | 0.373 | 0.434 | 0.440 | 0.570 | 0.148 | 0.164 |
+| sMAD \|p_lep\| CC | 0.733 | 0.881 | 0.811 | 0.910 | 0.336 | 0.386 |
+| vertex median mm | 62.2 | **50.8** | 131.3 | **97.3** | 16.0 | 16.9 |
+
+- **Untrained, the two start level:** linear flavour accuracy 0.594 (JEPA)
+  against 0.601 (MAE).
+- **Pretraining puts much more label information into the JEPA's frozen
+  features.**
+  - Linear flavour accuracy rises to 0.767 for the JEPA against 0.696 for
+    the MAE.  That is 75% of the gap to its fine-tune against 44%.
+  - The JEPA is ahead on every flavour AUC, by 0.025 (ν_e) to 0.089
+    (NC).  It is also ahead on E_vis, |p_jet|, |p_lep| and charm->mu.
+  - kNN shows the same picture (0.728 against 0.632).
+  - So the MAE depends more on fine-tuning to make its features usable.
+    Its fine-tune still comes within 0.011 of the JEPA's.
+- **The MAE keeps more position information:** the vertex is 50.8 mm
+  against 62.2 (linear) and 97 against 131 (kNN).  Reconstructing the
+  inputs rewards it; predicting latents does not.
+- **Epoch 215 and epoch 399 of the MAE probe alike** (flavour 0.700 against
+  0.696).
+- **Charm is weak in both** (linear AUCs 0.64-0.75, kNN near chance for
+  charm->e and charm->mu).
+- **Maps** (`latent_mae_maps_{pca,tsne}.png`,
+  `latent_mae_maps_tsne_flavour.png`, coordinates in `latent_mae_maps.npz`):
+  - Its epoch-399 t-SNE is mostly mixed, with one compact ν_μ CC patch.
+    It has none of the JEPA's broad ν_μ and ν_e regions.
+  - The untrained MAE's t-SNE splits into a few islands, each mixed in
+    flavour.
+  - PCA: 6.5-8% of the variance per component after training, 49% in PC1
+    untrained.
+- **Caveats:** as for the JEPA (pooled features, one encoder, t-SNE not
+  quantitative).  The backbones also differ (SparseViT with Perceiver
+  latents against the flash ViT), so this compares the two pretrained
+  models as published and used, not the two objectives on one
+  architecture.
+
+Commands on dlnu (MAE extraction in the `spconv` environment, ~13 min; probes
+~2 min in `neutrino-jepa`):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python results/flash_audit_20261026/latent_features_mae.py /scratch4/salonso/faser/latents_mae 24 > /scratch4/salonso/faser/latent_features_mae.log
+CUDA_VISIBLE_DEVICES=0 python results/flash_audit_20261026/latent_probes.py /scratch4/salonso/faser/latents_mae mae > results/flash_audit_20261026/latent_probes_mae.out
+```
+
+- A second extraction was launched by mistake while the first was still
+  running.  It was stopped before it wrote anything
+  (`/scratch4/salonso/faser/latent_features_mae.duplicate_stopped.log`).
+- A rerun of the probes reproduced every number and map coordinate exactly.
 
 From `/users/salonso/faserDL` on Clariden:
 

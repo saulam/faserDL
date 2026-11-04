@@ -7,6 +7,7 @@ spconv environment (where the patch embedding is checked against spconv).
 import math
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -64,6 +65,45 @@ def synthetic_event(rng, n_fcal=None, n_ahcal=None, n_tracks=None):
 def synthetic_batch(seed=0, batch_size=6, **kwargs):
     rng = np.random.default_rng(seed)
     return collate_tokens([synthetic_event(rng, **kwargs) for _ in range(batch_size)], test=False)
+
+
+def sorting_patch_embed(embed, coords, feats, event):
+    """The original torch.unique-based SparsePatchEmbed.forward, as a reference."""
+    coords, event = coords.long(), event.long()
+    feats = feats.reshape(coords.size(0), embed.in_chans).float()
+    inside = ((coords >= 0) & (coords < torch.tensor(embed.grid_size, device=coords.device))).all(dim=1)
+    coords, feats, event = coords[inside], feats[inside], event[inside]
+    chans = embed.in_chans
+    flat = flash_vit._flat_index
+
+    def scatter(key, offset, volume):
+        cells, inverse = torch.unique(key, sorted=True, return_inverse=True)
+        index = ((inverse * volume + offset).unsqueeze(-1) * chans
+                 + torch.arange(chans, device=feats.device)).reshape(-1)
+        dense = feats.new_zeros(cells.numel() * volume * chans).index_add_(0, index, feats.reshape(-1))
+        return cells, dense.view(cells.numel(), volume * chans)
+
+    if not embed.two_step:
+        patch_size = torch.tensor(embed.patch_size, device=coords.device)
+        patches, dense = scatter(event * embed.num_patches + flat(coords // patch_size, embed.patch_grid),
+                                 flat(coords % patch_size, embed.patch_size), math.prod(embed.patch_size))
+        tokens = embed.proj(dense)
+    else:
+        k1 = torch.tensor(embed.k1, device=coords.device)
+        k2 = torch.tensor(embed.k2, device=coords.device)
+        cell_grid = tuple(g // k for g, k in zip(embed.grid_size, embed.k1))
+        per_event = math.prod(cell_grid)
+        cells, dense = scatter(event * per_event + flat(coords // k1, cell_grid),
+                               flat(coords % k1, embed.k1), math.prod(embed.k1))
+        hidden = F.gelu(embed.norm1(embed.proj1(dense)))
+        hidden = hidden.to(flash_vit._autocast_dtype(hidden))
+        cell_coords = flash_vit._unflatten_index(cells % per_event, cell_grid)
+        key = cells // per_event * embed.num_patches + flat(cell_coords // k2, embed.patch_grid)
+        patches, inverse = torch.unique(key, sorted=True, return_inverse=True)
+        stacked = hidden.new_zeros(patches.numel(), math.prod(embed.k2), hidden.size(-1))
+        stacked[inverse, flat(cell_coords % k2, embed.k2)] = hidden
+        tokens = embed.proj2(stacked.flatten(1))
+    return tokens, patches // embed.num_patches, patches % embed.num_patches
 
 
 def reference_attention(q, k, v, seq):
@@ -148,6 +188,100 @@ class FlashJEPATests(unittest.TestCase):
             twice = embed(coords, torch.tensor([[0.3], [0.5], [0.2]]), event)[0]
             once = embed(coords[1:], torch.tensor([[0.8], [0.2]]), event[1:])[0]
             torch.testing.assert_close(twice, once)
+
+    def assert_matches_sorting_patch_embed(self, embed, coords, feats, event, bf16=False):
+        """Same tokens, order and parameter gradients as sorting_patch_embed."""
+        results = []
+        for fn in (embed, partial(sorting_patch_embed, embed)):
+            embed.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+                tokens, event_out, pos = fn(coords, feats, event)
+            torch.manual_seed(1)
+            (tokens.float() * torch.randn(tokens.shape, device=tokens.device)).sum().backward()
+            grads = {name: p.grad.clone() for name, p in embed.named_parameters()}
+            results.append((tokens.float().detach(), event_out, pos, grads))
+        (tokens, event_out, pos, grads), (ref_tokens, ref_event, ref_pos, ref_grads) = results
+        torch.testing.assert_close(event_out, ref_event)
+        torch.testing.assert_close(pos, ref_pos)
+        if bf16:
+            # Rounding only: a few bf16 ulps of the tokens and of the gradients.
+            self.assertLess(float((tokens - ref_tokens).norm() / ref_tokens.norm()), 1e-3)
+            for name, grad in grads.items():
+                self.assertLess(float((grad - ref_grads[name]).norm() / ref_grads[name].norm()), 1e-2, name)
+        else:
+            torch.testing.assert_close(tokens, ref_tokens, rtol=1e-5, atol=1e-5)
+            for name, grad in grads.items():
+                torch.testing.assert_close(grad, ref_grads[name], rtol=1e-4, atol=1e-5, msg=name)
+
+    def test_patch_embedding_matches_the_sorting_implementation(self):
+        # Exact fp32 matrix products: training modules imported by other tests
+        # enable TF32 (torch.set_float32_matmul_precision("high")).
+        precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest")
+        self.addCleanup(torch.set_float32_matmul_precision, precision)
+        rng = np.random.default_rng(3)
+        for device in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+            for grid, patch_size in (((48, 48, 200), (12, 12, 10)), ((18, 18, 40), (6, 6, 5))):
+                for chans in (1, 2):
+                    embed = SparsePatchEmbed(grid, patch_size, chans, 32, torch.nn.LayerNorm).to(device)
+                    with torch.no_grad():
+                        for parameter in embed.parameters():
+                            parameter.normal_(0, 0.2)
+                    # Four events, the third without voxels; voxels outside the
+                    # grid; coincident voxels; events not grouped.
+                    counts = (500, 40, 0, 250)
+                    coords = np.concatenate([rng.integers(-2, np.array(grid) + 2, (n, 3)) for n in counts])
+                    coords = np.concatenate([coords, coords[:30]])
+                    event = np.concatenate([np.repeat(np.arange(4), counts), np.zeros(30, dtype=int)])
+                    order = rng.permutation(len(coords))
+                    args = (torch.tensor(coords[order], dtype=torch.int32, device=device),
+                            torch.tensor(rng.random((len(coords), chans)), dtype=torch.float32, device=device),
+                            torch.tensor(event[order], dtype=torch.int32, device=device))
+                    with self.subTest(device=device, grid=grid, chans=chans):
+                        self.assert_matches_sorting_patch_embed(embed, *args)
+                        if device == "cuda":
+                            self.assert_matches_sorting_patch_embed(embed, *args, bf16=True)
+
+    @unittest.skipUnless(torch.cuda.is_available() and METADATA.is_file(), "needs a GPU and the local events")
+    def test_patch_embedding_matches_the_sorting_implementation_on_real_events(self):
+        from dataset import SparseFASERCALMapDataset
+
+        precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("highest")
+        self.addCleanup(torch.set_float32_matmul_precision, precision)
+        dataset = SparseFASERCALMapDataset(SimpleNamespace(
+            train=True, stage1=False, preprocessing_input="log", preprocessing_output="log",
+            label_smoothing=0.02, mixup_alpha=0.0, dataset_path=str(METADATA.parent),
+            metadata_path=str(METADATA)))
+        dataset.augmentations_enabled = True
+        np.random.seed(0)
+        batch = collate_tokens([dataset[i] for i in range(0, 640, 20)], test=False)
+        encoder = FlashViT(metadata=None, **SMALL).cuda()
+        for prefix in ("fcal", "ahcal"):
+            embed = getattr(encoder, f"{prefix}_patch_embed")
+            args = [batch[f"{prefix}_{key}"].cuda() for key in ("coords", "feats", "event")]
+            with self.subTest(detector=prefix):
+                self.assert_matches_sorting_patch_embed(embed, *args)
+                self.assert_matches_sorting_patch_embed(embed, *args, bf16=True)
+
+    def test_patch_embedding_without_voxels(self):
+        for device in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+            for grid, patch_size in (((48, 48, 200), (12, 12, 10)), ((18, 18, 40), (6, 6, 5))):
+                embed = SparsePatchEmbed(grid, patch_size, 1, 32, torch.nn.LayerNorm).to(device)
+                tokens, event, pos = embed(torch.zeros(0, 3, dtype=torch.int32, device=device),
+                                           torch.zeros(0, 1, device=device),
+                                           torch.zeros(0, dtype=torch.int32, device=device), batch_size=2)
+                self.assertEqual(tuple(tokens.shape), (0, 32))
+                self.assertEqual((event.numel(), pos.numel()), (0, 0))
+                tokens.sum().backward()
+
+    def test_jepa_encoders_share_one_patch_geometry(self):
+        jepa = FlashJEPA(**SMALL, predictor_embed_dim=64, predictor_depth=1, predictor_num_heads=4)
+        batch = synthetic_batch(seed=4, batch_size=3)
+        with patch.object(SparsePatchEmbed, "geometry", autospec=True,
+                          side_effect=SparsePatchEmbed.geometry) as geometry:
+            jepa(batch)
+        self.assertEqual(geometry.call_count, 2)   # FASERCal and AHCAL, once for both encoders
 
     @unittest.skipUnless(spconv is not None and torch.cuda.is_available() and METADATA.is_file(),
                          "needs spconv, a GPU and the local events")

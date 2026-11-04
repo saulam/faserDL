@@ -249,18 +249,19 @@ class FlashJEPA(nn.Module):
                             alpha=1.0 - decay)
 
     @torch.no_grad()
-    def _targets(self, batch):
+    def _targets(self, batch, geometry=None):
         """Layer-normalised target-encoder representations of all tokens (no dropout).
 
         target_layers = 1: the final output.  K > 1: the average of the
         layer-normalised MLP outputs of the last K blocks (data2vec).
         target_norm = "batch": then standardised per channel and detector type
-        over the batch (standardise_per_kind).
+        over the batch (standardise_per_kind).  ``geometry``: the context
+        encoder's patch_geometry() of the batch, reused.
         """
         was_training = self.target_encoder.training
         self.target_encoder.eval()
         try:
-            tokens = self.target_encoder.embed(batch)
+            tokens = self.target_encoder.embed(batch, geometry)
             seq = tokens.seq()
             if self.target_layers == 1:
                 out = self.target_encoder.forward_tokens(tokens.x, seq)
@@ -275,9 +276,12 @@ class FlashJEPA(nn.Module):
         return tokens, seq, out
 
     def forward(self, batch):
-        tokens = self.context_encoder.embed(batch)
+        # The patch embeddings' index computation depends only on the voxel
+        # coordinates; both encoders use the same one.
+        geometry = self.context_encoder.patch_geometry(batch)
+        tokens = self.context_encoder.embed(batch, geometry)
         target_mask = self.masker(tokens)
-        target_tokens, token_seq, target_out = self._targets(batch)
+        target_tokens, token_seq, target_out = self._targets(batch, geometry)
         if not (torch.equal(target_tokens.kind, tokens.kind) and torch.equal(target_tokens.pos, tokens.pos)):
             raise RuntimeError("Context and target encoders tokenised the batch differently.")
 

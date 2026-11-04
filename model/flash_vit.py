@@ -10,13 +10,15 @@ Perceiver bottleneck: all tokens attend to all tokens of their event.
 The patch embedding reproduces the spconv models' sparse convolution with
 kernel = stride (including their two-step embedding of large patches) with
 scatter operations and dense matrix products, so it needs no spconv and has no
-voxel-count limit.
+voxel-count limit.  On GPUs its dense steps are compiled (torch.compile);
+FLASH_COMPILE_PATCH_EMBED=0 runs them eagerly, with the same results.
 """
 
 import inspect
 import math
+import os
 from dataclasses import dataclass
-from functools import partial
+from functools import cache, partial
 
 import torch
 import torch.nn as nn
@@ -32,6 +34,7 @@ except ImportError:  # e.g. torch 2.9 (Clariden): FlashVarlenAttention below
 # varlen_attn is used only where it accepts window_size (see varlen_attention).
 VARLEN_WINDOW = varlen_attn is not None and "window_size" in inspect.signature(varlen_attn).parameters
 HAS_FLASH_OPS = hasattr(torch.ops.aten, "_flash_attention_forward")
+COMPILE_PATCH_EMBED = os.environ.get("FLASH_COMPILE_PATCH_EMBED", "1") != "0"
 
 
 FCAL, AHCAL, ECAL, MUON = 0, 1, 2, 3
@@ -259,6 +262,90 @@ class Block(nn.Module):
         return x + self.drop_path(mlp, seq), mlp
 
 
+def _voxel_keys(coords, event, grid: tuple, patch_grid: tuple, k1: tuple, k2: tuple):
+    """Key of every voxel's cell, ordered by (event, patch, cell within the patch),
+    the voxel's offset within the cell, and whether it lies inside the grid.
+
+    A cell has k1 voxels and a patch k2 cells; k2 = (1, 1, 1) makes the cell
+    the patch (one-step embedding).
+    """
+    coords = coords.to(torch.int32)
+    lim = torch.tensor(grid, dtype=torch.int32, device=coords.device)
+    a = torch.tensor(k1, dtype=torch.int32, device=coords.device)
+    b = torch.tensor(k2, dtype=torch.int32, device=coords.device)
+    inside = ((coords >= 0) & (coords < lim)).all(dim=1)
+    cell = coords // a
+    patch = cell // b
+    num_patches = patch_grid[0] * patch_grid[1] * patch_grid[2]
+    key = ((event.to(torch.int32) * num_patches + _flat_index(patch, patch_grid)) * (k2[0] * k2[1] * k2[2])
+           + _flat_index(cell - patch * b, k2))
+    return key, _flat_index(coords - cell * a, k1), inside
+
+
+def _dense_cells(feats, voxel_index, cells: int, width: int):
+    """Sum voxel features into dense cell vectors [cells, width]; an extra last
+    row takes the voxels outside the grid and is dropped."""
+    feats = feats.reshape(-1).float()
+    dense = feats.new_zeros((cells + 1) * width).index_add_(0, voxel_index, feats)
+    return dense.view(cells + 1, width)[:cells]
+
+
+def _embed_one_step(feats, voxel_index, cells: int, weight, bias):
+    return F.linear(_dense_cells(feats, voxel_index, cells, weight.size(1)), weight, bias)
+
+
+def _embed_two_step(feats, voxel_index, cells: int, cell_slot, patches: int, dtype: torch.dtype,
+                    weight1, ln_weight, ln_bias, eps: float, weight2, bias2):
+    dense = _dense_cells(feats, voxel_index, cells, weight1.size(1))
+    mid = weight1.size(0)
+    hidden = F.gelu(F.layer_norm(F.linear(dense, weight1), (mid,), ln_weight, ln_bias, eps)).to(dtype)
+    stacked = hidden.new_zeros(patches * (weight2.size(1) // mid), mid).index_copy(0, cell_slot, hidden)
+    return F.linear(stacked.view(patches, weight2.size(1)), weight2, bias2)
+
+
+@cache
+def _compiled(fn):
+    return torch.compile(fn, dynamic=True)
+
+
+def _maybe_compiled(fn, tensor):
+    """``fn`` compiled for GPU tensors (one fused kernel for LayerNorm, GELU and
+    the casts, ~3x faster), else eager.  The weights are arguments, so all
+    encoders share the compiled code."""
+    return _compiled(fn) if COMPILE_PATCH_EMBED and tensor.is_cuda else fn
+
+
+def _rank_keys(key, size):
+    """Rank of every key among the distinct keys of [0, size), and the distinct keys.
+
+    An occupancy table and its cumulative sum give the order of torch.unique
+    without sorting.  Key ``size`` (outside the grid) gets the extra rank n.
+    """
+    table = torch.zeros(size + 1, dtype=torch.int32, device=key.device)
+    table[key] = 1
+    table[size] = 0
+    rank = table.cumsum(0, dtype=torch.int32)              # occupied keys <= each key
+    n = int(rank[-1])
+    row = torch.where(key == size, n, rank[key] - 1)
+    distinct = torch.empty(n + 1, dtype=key.dtype, device=key.device)
+    distinct[row] = key
+    return row, distinct[:n], n
+
+
+@dataclass
+class PatchGeometry:
+    """Index computation of a SparsePatchEmbed for one batch.
+
+    It depends only on the voxel coordinates, so encoders with the same patch
+    layout (the JEPA context and target encoders) can share it.
+    """
+    voxel_index: torch.Tensor  # [N * C] long: flat position of every voxel feature in the dense cell vectors
+    cells: int                 # occupied cells (patches for a one-step embedding)
+    cell_slot: torch.Tensor    # [cells] long: patch row * cells per patch + cell offset (two-step only)
+    event: torch.Tensor        # [P] long: event of every patch token
+    pos: torch.Tensor          # [P] long: patch index within the grid
+
+
 class SparsePatchEmbed(nn.Module):
     """Sparse convolution with kernel = stride (non-overlapping patches) without spconv.
 
@@ -285,65 +372,57 @@ class SparsePatchEmbed(nn.Module):
             mid = embed_dim // 4
             self.proj1 = nn.Linear(math.prod(self.k1) * in_chans, mid, bias=False)
             self.norm1 = norm_layer(mid)
-            self.act = nn.GELU()
             self.proj2 = nn.Linear(math.prod(self.k2) * mid, embed_dim)
         else:
             self.proj = nn.Linear(math.prod(self.patch_size) * in_chans, embed_dim)
 
-    def _scatter_cells(self, cell_key, offset, feats, cell_volume):
-        """Sum voxel features into dense per-cell vectors [cells, cell_volume * C]."""
-        cells, inverse = torch.unique(cell_key, sorted=True, return_inverse=True)
-        C = self.in_chans
-        index = ((inverse * cell_volume + offset).unsqueeze(-1) * C
-                 + torch.arange(C, device=feats.device)).reshape(-1)
-        dense = feats.new_zeros(cells.numel() * cell_volume * C)
-        dense.index_add_(0, index, feats.reshape(-1))
-        return cells, dense.view(cells.numel(), cell_volume * C)
+    @torch.no_grad()
+    def geometry(self, coords, event, batch_size):
+        """Index computation for voxels coords [N, 3] of events event [N] < batch_size."""
+        k1, k2 = (self.k1, self.k2) if self.two_step else (self.patch_size, (1, 1, 1))
+        cells_per_patch = math.prod(k2)
+        size = batch_size * self.num_patches * cells_per_patch    # possible cell keys
+        if size >= 2**31 - 1:
+            raise ValueError(f"Batch of {batch_size} events is too large for int32 cell keys.")
+        key, offset, inside = _maybe_compiled(_voxel_keys, coords)(
+            coords, event, self.grid_size, self.patch_grid, tuple(k1), tuple(k2))
+        row, cell_key, cells = _rank_keys(torch.where(inside, key, size), size)
+        voxel_index = row.long() * math.prod(k1) + offset
+        if self.in_chans > 1:
+            voxel_index = (voxel_index.unsqueeze(-1) * self.in_chans
+                           + torch.arange(self.in_chans, device=coords.device)).reshape(-1)
+        if self.two_step:
+            # Cells are sorted by key, so the patch keys are non-decreasing.
+            patch_key, patch_row = torch.unique_consecutive(cell_key // cells_per_patch, return_inverse=True)
+            cell_slot = patch_row.long() * cells_per_patch + (cell_key % cells_per_patch).long()
+        else:
+            patch_key, cell_slot = cell_key, None
+        patch_key = patch_key.long()
+        return PatchGeometry(voxel_index, cells, cell_slot,
+                             patch_key // self.num_patches, patch_key % self.num_patches)
 
-    def forward(self, coords, feats, event):
+    def forward(self, coords, feats, event, batch_size=None, geometry=None):
         """Embed voxels into patch tokens.
 
         coords [N, 3] voxel indices, feats [N, C], event [N].  Returns tokens
         [P, embed_dim], their event [P] and patch index [P], sorted by
-        (event, patch index).
+        (event, patch index).  ``geometry`` (from geometry()) skips the index
+        computation; ``batch_size`` defaults to the largest event index + 1.
         """
-        coords = coords.long()
-        event = event.long()
-        feats = feats.reshape(coords.size(0), self.in_chans).float()
-        grid = torch.tensor(self.grid_size, device=coords.device)
-        inside = ((coords >= 0) & (coords < grid)).all(dim=1)
-        if not bool(inside.all()):
-            coords, feats, event = coords[inside], feats[inside], event[inside]
-
+        if geometry is None:
+            if batch_size is None:
+                batch_size = int(event.max()) + 1 if event.numel() else 1
+            geometry = self.geometry(coords, event, batch_size)
+        g = geometry
         if not self.two_step:
-            patch = torch.tensor(self.patch_size, device=coords.device)
-            key = event * self.num_patches + _flat_index(coords // patch, self.patch_grid)
-            patches, dense = self._scatter_cells(
-                key, _flat_index(coords % patch, self.patch_size), feats,
-                math.prod(self.patch_size),
-            )
-            tokens = self.proj(dense)
+            tokens = _maybe_compiled(_embed_one_step, feats)(
+                feats, g.voxel_index, g.cells, self.proj.weight, self.proj.bias)
         else:
-            k1 = torch.tensor(self.k1, device=coords.device)
-            k2 = torch.tensor(self.k2, device=coords.device)
-            cell_grid = tuple(g // k for g, k in zip(self.grid_size, self.k1))
-            cells_per_event = math.prod(cell_grid)
-            cell_key = event * cells_per_event + _flat_index(coords // k1, cell_grid)
-            cells, dense = self._scatter_cells(
-                cell_key, _flat_index(coords % k1, self.k1), feats, math.prod(self.k1),
-            )
-            hidden = self.act(self.norm1(self.proj1(dense)))
-            hidden = hidden.to(_autocast_dtype(hidden))
-
-            cell_event = cells // cells_per_event
-            cell_coords = _unflatten_index(cells % cells_per_event, cell_grid)
-            key = cell_event * self.num_patches + _flat_index(cell_coords // k2, self.patch_grid)
-            patches, patch_inverse = torch.unique(key, sorted=True, return_inverse=True)
-            stacked = hidden.new_zeros(patches.numel(), math.prod(self.k2), hidden.size(-1))
-            stacked[patch_inverse, _flat_index(cell_coords % k2, self.k2)] = hidden
-            tokens = self.proj2(stacked.flatten(1))
-
-        return tokens, patches // self.num_patches, patches % self.num_patches
+            tokens = _maybe_compiled(_embed_two_step, feats)(
+                feats, g.voxel_index, g.cells, g.cell_slot, g.event.numel(),
+                _autocast_dtype(self.proj1.weight), self.proj1.weight, self.norm1.weight,
+                self.norm1.bias, self.norm1.eps, self.proj2.weight, self.proj2.bias)
+        return tokens, g.event, g.pos
 
 
 class FlashEncoder(nn.Module):
@@ -438,14 +517,28 @@ class FlashEncoder(nn.Module):
         count = batch["muspec_counts"].reshape(batch_size, 1).float()
         return mean.float() + self.muon_spec_count_encoder(count).float() + self.muon_state_embed(has_tracks)
 
-    def embed(self, batch):
-        """Embed all detector inputs of a collated batch into a packed TokenSet."""
+    def patch_geometry(self, batch):
+        """Index computation of the FASERCal and AHCAL patch embeddings for a batch."""
+        B = int(batch["batch_size"])
+        return {
+            name: getattr(self, f"{name}_patch_embed").geometry(batch[f"{name}_coords"], batch[f"{name}_event"], B)
+            for name in ("fcal", "ahcal")
+        }
+
+    def embed(self, batch, geometry=None):
+        """Embed all detector inputs of a collated batch into a packed TokenSet.
+
+        ``geometry`` (patch_geometry() of an encoder with the same patch
+        layout) skips the patch embeddings' index computation.
+        """
         B = int(batch["batch_size"])
         device = self.token_type_embed.weight.device
+        if geometry is None:
+            geometry = self.patch_geometry(batch)
         f_tok, f_event, f_pos = self.fcal_patch_embed(
-            batch["fcal_coords"], batch["fcal_feats"], batch["fcal_event"])
+            batch["fcal_coords"], batch["fcal_feats"], batch["fcal_event"], geometry=geometry["fcal"])
         a_tok, a_event, a_pos = self.ahcal_patch_embed(
-            batch["ahcal_coords"], batch["ahcal_feats"], batch["ahcal_event"])
+            batch["ahcal_coords"], batch["ahcal_feats"], batch["ahcal_event"], geometry=geometry["ahcal"])
         ecal = self.ecal_embed(batch["ecal_hits"].reshape(B, -1).float())
         muon = self._muon_tokens(batch, B)
 
