@@ -5,13 +5,22 @@
 # patch-level JEPA runs: base-size encoder, effective batch 4,096, blr 1e-4,
 # 400 epochs (40 warm-up).  Without spconv's voxel limit the 4,096 fit as
 # 2 GPUs x 2,048 without accumulation, the fastest measured configuration
-# (~5% faster than 1,024 x 2; ~68 GB of an 80 GB A100).  24 loader workers per
-# GPU saturate the CPUs; more workers were slower.
+# (~5% faster than 1,024 x 2; ~41 GB of an 80 GB A100 with the settings
+# below, ~62 GB before).  24 loader workers per GPU saturate the CPUs; more
+# workers were slower.
 
 set -euo pipefail
 
 : "${DATASET_PATH:?Set DATASET_PATH to the training dataset path.}"
 : "${METADATA_PATH:?Set METADATA_PATH to the metadata statistics pickle.}"
+
+# GPU efficiency (docs/FLASH_JEPA.md, "GPU efficiency"): compiled transformer
+# blocks (25-29% faster steps on A100/H100, ~5 GB less memory, same results
+# up to rounding) and expandable CUDA-cache segments (the batches' varying
+# token counts otherwise fragment the cache: ~62 GB reserved for ~45 GB
+# allocated).  FLASH_COMPILE_BLOCKS=0 runs the blocks eagerly.
+export FLASH_COMPILE_BLOCKS="${FLASH_COMPILE_BLOCKS:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 model="${MODEL:-base}"
 eps="${EPS:-1e-8}"

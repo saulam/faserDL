@@ -750,11 +750,38 @@ class FlashJEPATests(unittest.TestCase):
 
         data = torch.utils.data.DataLoader([synthetic_batch(seed=s, batch_size=4) for s in range(2)],
                                            batch_size=None)
+        # log_every_n_steps=1: step-level metrics (the gradient norms) are logged
+        # only on the steps Lightning writes.
         trainer = pl.Trainer(max_epochs=epochs, accelerator="cpu", devices=1, logger=False,
                              callbacks=[Record()], enable_progress_bar=False, enable_model_summary=False,
-                             enable_checkpointing=False, limit_val_batches=0, gradient_clip_val=1.0)
+                             enable_checkpointing=False, limit_val_batches=0, gradient_clip_val=1.0,
+                             log_every_n_steps=1)
         trainer.fit(FlashJEPAPreTrainer(jepa, args), data, ckpt_path=resume)
         return steps, trainer
+
+    def test_device_epoch_means_match_lightning_on_epoch_means(self):
+        """DeviceEpochLogging's `/train_epoch` values are Lightning's on_epoch
+        means: weighted by batch size, over the batches that logged the value."""
+        from model.lightning_model_flash import DeviceEpochLogging
+
+        logged = {}
+
+        class Stub(DeviceEpochLogging):
+            def log(self, name, value, **kwargs):
+                logged[name] = float(value)
+
+        stub = Stub()
+        stub._reset_epoch_means()
+        for batch_size, a, b, present in ((2, 1.0, 10.0, True), (3, 3.0, 20.0, False), (4, 5.0, 30.0, True)):
+            stub._accumulate_epoch({"a": torch.tensor(a), "b": torch.tensor(b)}, batch_size,
+                                   {"b": torch.tensor(present)})
+        stub._log_epoch_means()
+        self.assertAlmostEqual(logged["a"], (2 * 1.0 + 3 * 3.0 + 4 * 5.0) / 9, places=6)
+        self.assertAlmostEqual(logged["b"], (2 * 10.0 + 4 * 30.0) / 6, places=5)
+        self.assertIsNone(stub._epoch_names)
+        with self.assertRaisesRegex(RuntimeError, "changed within an epoch"):
+            stub._accumulate_epoch({"a": torch.tensor(1.0)}, 1)
+            stub._accumulate_epoch({"c": torch.tensor(1.0)}, 1)
 
     def test_weight_decay_schedule_lr_scale_on_resume_and_grad_norms(self):
         import math

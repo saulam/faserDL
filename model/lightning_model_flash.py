@@ -12,9 +12,23 @@ import pytorch_lightning as pl
 import torch
 from torch.nn import functional as F
 
-from utils import CombinedScheduler, CustomLambdaLR, arrange_truth, move_obj
+from utils import CombinedScheduler, CustomLambdaLR, arrange_truth
 from .flash_vit import TOKEN_KIND_NAMES, EventBatch
 from .lightning_model_finetune import ViTFineTuner
+
+
+def to_device_async(obj, device):
+    """move_obj with asynchronous host-to-device copies, so the host queues the
+    step's first kernels while the batch is copied.  Safe for the loaders'
+    pinned batches: the pinned-memory allocator keeps a buffer until its copy
+    has finished.  (Unpinned tensors are copied synchronously, as before.)"""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: to_device_async(v, device) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(to_device_async(v, device) for v in obj)
+    return obj
 
 
 def param_groups_weight_decay(model, weight_decay, no_weight_decay_list=()):
@@ -34,7 +48,59 @@ def param_groups_weight_decay(model, weight_decay, no_weight_decay_list=()):
     ]
 
 
-class FlashJEPAPreTrainer(pl.LightningModule):
+class DeviceEpochLogging:
+    """Cheaper training-step logging for the flash Lightning modules, with the
+    same logged values.
+
+    Each self.log call costs ~1 ms of host time, and an on_step value logged
+    with sync_dist is all-reduced at every step.  Lightning writes step-level
+    metrics only every log_every_n_steps steps, so they are logged only on those
+    steps (_writes_step_metrics).  The epoch means are accumulated on the device
+    (_accumulate_epoch) and logged once per epoch (_log_epoch_means): per rank
+    weighted by batch size, then averaged over ranks, as Lightning's on_epoch
+    logging does.
+    """
+
+    def _reset_epoch_means(self):
+        self._epoch_names = self._epoch_sum = self._epoch_weight = None
+
+    def _writes_step_metrics(self):
+        """Whether Lightning writes this training step's step-level metrics to the
+        loggers.  Its decision depends on a step counter that only advances
+        after the step, so it is already known during the step."""
+        trainer = self.trainer
+        connector = getattr(trainer, "_logger_connector", None)
+        return bool(getattr(connector, "should_update_logs", True)) or bool(trainer.fast_dev_run)
+
+    def _accumulate_epoch(self, values, batch_size, present=None):
+        """values: {epoch-level name: 0-dim tensor}, the same names every step;
+        present: {name: 0-dim bool tensor} for values that count only in some
+        batches (as values Lightning was not given in the others)."""
+        names = list(values)
+        if getattr(self, "_epoch_names", None) is None:
+            self._epoch_names = names
+            self._epoch_sum = next(iter(values.values())).new_zeros(len(names), dtype=torch.float32)
+            self._epoch_weight = torch.zeros_like(self._epoch_sum)
+        elif self._epoch_names != names:
+            raise RuntimeError(f"Training metrics changed within an epoch: {self._epoch_names} -> {names}")
+        present = present or {}
+        one = self._epoch_sum.new_ones(())
+        weight = torch.stack([present[name].float() if name in present else one for name in names]) * batch_size
+        self._epoch_sum += torch.stack([value.detach().float().reshape(()) for value in values.values()]) * weight
+        self._epoch_weight += weight
+
+    def _log_epoch_means(self):
+        if getattr(self, "_epoch_names", None) is None:
+            return
+        # Every name is logged on every rank, so the cross-rank reductions match
+        # (a value that counted in no batch gives 0).
+        means = self._epoch_sum / self._epoch_weight.clamp_min(1e-12)
+        for name, mean in zip(self._epoch_names, means.unbind()):
+            self.log(name, mean, on_step=False, on_epoch=True, sync_dist=True)
+        self._reset_epoch_means()
+
+
+class FlashJEPAPreTrainer(DeviceEpochLogging, pl.LightningModule):
     """Train the context encoder/predictor and update the target encoder by EMA."""
 
     def __init__(self, model, args):
@@ -63,7 +129,7 @@ class FlashJEPAPreTrainer(pl.LightningModule):
         self.log_grad_norm = bool(getattr(args, "flash_log_grad_norm", False))
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
-        return move_obj(batch, device)
+        return to_device_async(batch, device)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["flash_encoder_config"] = self.model.encoder_config
@@ -107,6 +173,10 @@ class FlashJEPAPreTrainer(pl.LightningModule):
                 dataset.set_epoch(self.trainer.current_epoch)
         lr = self.optimizers().param_groups[0]["lr"]
         self.log("lr", lr, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self._reset_epoch_means()
+
+    def on_train_epoch_end(self):
+        self._log_epoch_means()
 
     @contextmanager
     def _fixed_val_rng(self, batch_idx: int, val_mask_seed: int = 42):
@@ -146,8 +216,9 @@ class FlashJEPAPreTrainer(pl.LightningModule):
             1.0 + math.cos(math.pi * progress))
 
     def on_before_optimizer_step(self, optimizer):
-        """Gradient norms before clipping (Lightning clips after this hook)."""
-        if not self.log_grad_norm:
+        """Gradient norms before clipping (Lightning clips after this hook), on the
+        steps whose step-level metrics are written."""
+        if not self.log_grad_norm or not self._writes_step_metrics():
             return
         grads = {}
         for name, param in self.model.named_parameters():
@@ -177,7 +248,8 @@ class FlashJEPAPreTrainer(pl.LightningModule):
             if len(groups) != 2:
                 raise RuntimeError(f"Expected the no-decay and decay groups, got {len(groups)} groups.")
             groups[1]["weight_decay"] = decay = self._weight_decay_for_step()
-            self.log("weight_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
+            if self._writes_step_metrics():
+                self.log("weight_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
         # As in JEPAPreTrainer: the closure (forward/backward) runs inside
         # optimizer.step(), so the EMA update here follows each optimizer step
         # exactly once, with global_step still indexing the step just taken.
@@ -185,7 +257,8 @@ class FlashJEPAPreTrainer(pl.LightningModule):
         decay = self._ema_decay_for_step()
         self.model.update_target_encoder(decay)
         # Identical on every rank: no reduction needed.
-        self.log("jepa/ema_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
+        if self._writes_step_metrics():
+            self.log("jepa/ema_decay", decay, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
 
     @staticmethod
     def _event_std(tokens, seq):
@@ -223,36 +296,46 @@ class FlashJEPAPreTrainer(pl.LightningModule):
                 selected = kind == index
                 metrics[f"mask/{name}_fraction"] = (
                     (target_mask & selected).sum() / selected.sum().clamp_min(1))
-            for name, value in output["group_losses"].items():
+            # A detector type's loss counts only in batches with targets of that type.
+            present = {}
+            for kind, (name, value) in enumerate(output["group_losses"].items()):
                 metrics[f"jepa/loss_{name}"] = value
-        return output["loss"], metrics, batch_size
+                present[f"jepa/loss_{name}"] = output["group_counts"][kind] > 0
+        return output["loss"], metrics, batch_size, present
 
-    def _log_step(self, loss, metrics, batch_size, split):
+    def _log_step(self, loss, metrics, batch_size, split, present):
         values = {"loss_total": loss.detach(), **metrics}
         if split == "val":
             for name, value in values.items():
+                if name in present and not bool(present[name]):   # (synchronises; validation only)
+                    continue
                 self.log(f"{name}/val", value, batch_size=batch_size, on_step=False, on_epoch=True,
                          prog_bar=(name == "loss_total"), sync_dist=True)
             return
-        # Same keys as on_step+on_epoch logging, but the per-step values come
-        # from each rank's own batch: with sync_dist, Lightning all-reduces
-        # every step-level metric at every step, which stalls multi-node jobs.
-        # The epoch means are still reduced across ranks (once per epoch).
+        # Training.  Per-step values come from each rank's own batch (with
+        # sync_dist, Lightning all-reduces every step-level metric at every
+        # step, which stalls multi-node jobs); see DeviceEpochLogging for when
+        # they and the `/train_epoch` means are logged.
+        self._accumulate_epoch({f"{name}/train_epoch": value for name, value in values.items()}, batch_size,
+                               {f"{name}/train_epoch": flag for name, flag in present.items()})
+        write = self._writes_step_metrics()
         for name, value in values.items():
+            if name != "loss_total" and not write:
+                continue
+            if write and name in present and not bool(present[name]):
+                continue
             self.log(f"{name}/train_step", value, batch_size=batch_size, on_step=True, on_epoch=False,
                      prog_bar=(name == "loss_total"), sync_dist=False)
-            self.log(f"{name}/train_epoch", value, batch_size=batch_size, on_step=False, on_epoch=True,
-                     sync_dist=True)
 
     def training_step(self, batch, batch_idx):
-        loss, metrics, batch_size = self.common_step(batch)
-        self._log_step(loss, metrics, batch_size, "train")
+        loss, metrics, batch_size, present = self.common_step(batch)
+        self._log_step(loss, metrics, batch_size, "train", present)
         return loss
 
     def validation_step(self, batch, batch_idx):
         with self._fixed_val_rng(batch_idx):
-            loss, metrics, batch_size = self.common_step(batch)
-        self._log_step(loss, metrics, batch_size, "val")
+            loss, metrics, batch_size, present = self.common_step(batch)
+        self._log_step(loss, metrics, batch_size, "val", present)
         return loss
 
     def configure_optimizers(self):
@@ -303,8 +386,40 @@ class FlashJEPAPreTrainer(pl.LightningModule):
         }
 
 
-class FlashViTFineTuner(ViTFineTuner):
-    """ViTFineTuner for FlashViT: identical training, packed-token batches."""
+class FlashViTFineTuner(DeviceEpochLogging, ViTFineTuner):
+    """ViTFineTuner for FlashViT: identical training, packed-token batches, and the
+    same logged values with fewer host synchronisations (training_step)."""
+
+    part_losses_as_tensors = True   # no .item() per loss and step
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        return to_device_async(batch, device)
+
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        self._reset_epoch_means()
+
+    def on_train_epoch_end(self):
+        self._log_epoch_means()
+
+    def training_step(self, batch, batch_idx):
+        """ViTFineTuner.training_step's metrics and keys.  It logs every loss on
+        step and on epoch with sync_dist, an all-reduce per loss at every step;
+        here the step-level values (still reduced over ranks) are logged on the
+        steps Lightning writes, plus the progress-bar loss every step."""
+        loss, part_losses, kendall_w, _, batch_size = self.common_step(batch)
+        step = {"loss_total/train": loss.detach(), **{f"{key}/train": value for key, value in part_losses.items()}}
+        epoch = {f"{name}_epoch": value for name, value in step.items()}
+        for key, w in kendall_w.items():
+            epoch[f"uncertainty/{key}"] = w
+            epoch[f"uncertainty_sigma/{key}"] = (1.0 / torch.sqrt(w.clamp_min(1e-12))).detach()
+        self._accumulate_epoch(epoch, batch_size)
+        write = self._writes_step_metrics()
+        for name, value in step.items():
+            if name == "loss_total/train" or write:
+                self.log(f"{name}_step", value, batch_size=batch_size, on_step=True, on_epoch=False,
+                         prog_bar=(name == "loss_total/train"), sync_dist=True)
+        return loss
 
     def _arrange_batch(self, batch):
         return EventBatch(batch), arrange_truth(batch)

@@ -35,6 +35,12 @@ except ImportError:  # e.g. torch 2.9 (Clariden): FlashVarlenAttention below
 VARLEN_WINDOW = varlen_attn is not None and "window_size" in inspect.signature(varlen_attn).parameters
 HAS_FLASH_OPS = hasattr(torch.ops.aten, "_flash_attention_forward")
 COMPILE_PATCH_EMBED = os.environ.get("FLASH_COMPILE_PATCH_EMBED", "1") != "0"
+# Opt-in (pretrain_flash.sh turns it on): every transformer block (encoders
+# and JEPA predictor) compiled with torch.compile on GPUs, which fuses its layer
+# norms, casts and elementwise ops.  Only with varlen_attn's window_size (the
+# tested path, torch 2.14 on dlnu); with FlashVarlenAttention (e.g. torch 2.9
+# on Clariden) the blocks stay eager.
+COMPILE_BLOCKS = os.environ.get("FLASH_COMPILE_BLOCKS", "0") != "0" and VARLEN_WINDOW
 
 
 FCAL, AHCAL, ECAL, MUON = 0, 1, 2, 3
@@ -78,11 +84,16 @@ class SeqInfo:
 
     @classmethod
     def from_event(cls, event, batch_size):
-        counts = torch.bincount(event, minlength=batch_size)
-        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=event.device)
-        cu_seqlens[1:] = counts.cumsum(0)
-        max_seqlen = int(counts.max()) if counts.numel() else 0
+        # event is sorted, so the sequence boundaries are a search (bincount
+        # would synchronise with the host to size its output).
+        boundaries = torch.arange(batch_size + 1, device=event.device, dtype=event.dtype)
+        cu_seqlens = torch.searchsorted(event, boundaries).to(torch.int32)
+        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max()) if batch_size else 0
         return cls(event, cu_seqlens, max_seqlen, batch_size)
+
+    def counts(self):
+        """Tokens per event: [B] long."""
+        return (self.cu_seqlens[1:] - self.cu_seqlens[:-1]).long()
 
     def rank(self):
         """Position of every token within its event."""
@@ -92,8 +103,7 @@ class SeqInfo:
     def mean(self, x):
         """Per-event mean of token features: [T, C] -> [B, C]."""
         out = x.new_zeros(self.batch_size, x.size(-1)).index_add_(0, self.event, x)
-        counts = torch.bincount(self.event, minlength=self.batch_size).clamp_min(1)
-        return out / counts.unsqueeze(-1).to(x.dtype)
+        return out / self.counts().clamp_min(1).unsqueeze(-1).to(x.dtype)
 
 
 @dataclass
@@ -107,9 +117,12 @@ class TokenSet:
     batch_size: int
 
     def select(self, keep):
+        """The tokens where the bool mask ``keep`` [T] is set, or at the indices ``keep``."""
+        index = keep.nonzero().squeeze(1) if keep.dtype == torch.bool else keep
         return TokenSet(
-            self.x[keep], self.event[keep], self.kind[keep], self.pos[keep],
-            self.coords[keep], self.batch_size,
+            self.x.index_select(0, index), self.event.index_select(0, index),
+            self.kind.index_select(0, index), self.pos.index_select(0, index),
+            self.coords.index_select(0, index), self.batch_size,
         )
 
     def seq(self):
@@ -257,6 +270,11 @@ class Block(nn.Module):
 
     def forward_with_mlp(self, x, seq):
         """forward() and the MLP output before its residual addition (data2vec targets)."""
+        if COMPILE_BLOCKS and x.is_cuda:
+            return _compiled(Block._forward_with_mlp)(self, x, seq)
+        return self._forward_with_mlp(x, seq)
+
+    def _forward_with_mlp(self, x, seq):
         x = x + self.drop_path(self.attn(self.norm1(x), seq), seq)
         mlp = self.mlp(self.norm2(x))
         return x + self.drop_path(mlp, seq), mlp
@@ -322,8 +340,8 @@ def _rank_keys(key, size):
     without sorting.  Key ``size`` (outside the grid) gets the extra rank n.
     """
     table = torch.zeros(size + 1, dtype=torch.int32, device=key.device)
-    table[key] = 1
-    table[size] = 0
+    table.index_put_((key,), table.new_ones(()))   # (a Python scalar would be copied from the host)
+    table[size:].zero_()
     rank = table.cumsum(0, dtype=torch.int32)              # occupied keys <= each key
     n = int(rank[-1])
     row = torch.where(key == size, n, rank[key] - 1)
@@ -511,7 +529,8 @@ class FlashEncoder(nn.Module):
         tracks = self.muon_spec_embed(batch["muspec_feats"].float())
         track_event = batch["muspec_event"].long()
         summed = tracks.new_zeros(batch_size, tracks.size(-1)).index_add_(0, track_event, tracks)
-        counts = torch.bincount(track_event, minlength=batch_size)
+        counts = torch.zeros(batch_size, dtype=torch.long, device=track_event.device).index_add_(
+            0, track_event, torch.ones_like(track_event))  # bincount would synchronise
         mean = summed / counts.clamp_min(1).unsqueeze(-1).to(summed.dtype)
         has_tracks = (counts > 0).long()
         count = batch["muspec_counts"].reshape(batch_size, 1).float()

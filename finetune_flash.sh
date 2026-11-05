@@ -9,6 +9,12 @@ set -euo pipefail
 : "${DATASET_PATH:?Set DATASET_PATH to the training dataset path.}"
 : "${METADATA_PATH:?Set METADATA_PATH to the metadata statistics pickle.}"
 
+# Expandable segments: the batches' varying token counts otherwise fragment
+# the CUDA cache (reserved memory ~2x the peak allocated; same speed).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# FLASH_COMPILE_BLOCKS=1 compiles the transformer blocks; off here, as it did
+# not speed up fine-tuning (~0.5k events per GPU; host- or matmul-bound).
+
 model="${MODEL:-base}"
 eps="${EPS:-1e-8}"
 batch_size="${BATCH_SIZE:-1024}"

@@ -23,6 +23,10 @@ from utils import (
 
 
 class ViTFineTuner(pl.LightningModule):
+    # compute_losses returns its part losses as floats (one .item() each);
+    # subclasses that log 0-dim tensors instead set this.
+    part_losses_as_tensors = False
+
     def __init__(self, model, args):
         super(ViTFineTuner, self).__init__()
         self.model = model
@@ -300,8 +304,8 @@ class ViTFineTuner(pl.LightningModule):
 
         part_losses = {
             # classification
-            'loss_cls/flavour': loss_flavour.mean().detach().item(),
-            'loss_cls/charm':   loss_charm.mean().detach().item(),
+            'loss_cls/flavour': loss_flavour.mean().detach(),
+            'loss_cls/charm':   loss_charm.mean().detach(),
 
             # regression (unmasked/batch means)
             #'loss_vis/geom': loss_vis_geom.mean().detach().item(),
@@ -313,21 +317,23 @@ class ViTFineTuner(pl.LightningModule):
             #'loss_lep/geom': loss_lep_geom.mean().detach().item(),
             #'loss_lep/pt':   loss_lep_pt.mean().detach().item(),
             #'loss_lep/mag':  loss_lep_mag.mean().detach().item(),
-            'loss_vis/geom': loss_vis_geom.mean().detach().item(),
-            'loss_jet/geom': loss_jet_geom.mean().detach().item(),
-            'loss_lep/geom': loss_lep_geom.mean().detach().item(),
-            'loss_vis/latent': loss_vis_latent.mean().detach().item(),
-            'loss_vis/phi': loss_vis_phi.mean().detach().item(),
-            'loss_vis/cart': loss_vis_cart.mean().detach().item(),
-            'loss_jet/latent': loss_jet_latent.mean().detach().item(),
-            'loss_jet/phi': loss_jet_phi.mean().detach().item(),
-            'loss_jet/cart': loss_jet_cart.mean().detach().item(),
-            'loss_lep/cons': loss_lep_cons.mean().detach().item(),
-            'loss_lep/zero': loss_lep_zero.mean().detach().item(),
+            'loss_vis/geom': loss_vis_geom.mean().detach(),
+            'loss_jet/geom': loss_jet_geom.mean().detach(),
+            'loss_lep/geom': loss_lep_geom.mean().detach(),
+            'loss_vis/latent': loss_vis_latent.mean().detach(),
+            'loss_vis/phi': loss_vis_phi.mean().detach(),
+            'loss_vis/cart': loss_vis_cart.mean().detach(),
+            'loss_jet/latent': loss_jet_latent.mean().detach(),
+            'loss_jet/phi': loss_jet_phi.mean().detach(),
+            'loss_jet/cart': loss_jet_cart.mean().detach(),
+            'loss_lep/cons': loss_lep_cons.mean().detach(),
+            'loss_lep/zero': loss_lep_zero.mean().detach(),
 
-            'loss_vertex':   loss_vertex.mean().detach().item(),
+            'loss_vertex':   loss_vertex.mean().detach(),
         }
-        
+        if not self.part_losses_as_tensors:
+            part_losses = {key: value.item() if torch.is_tensor(value) else value for key, value in part_losses.items()}
+
         return total_loss, part_losses, kendall_w, kendall_s
 
     

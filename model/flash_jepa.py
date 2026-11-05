@@ -65,15 +65,15 @@ class MultiBlockMasker(nn.Module):
         """
         B, M = batch_size, self.num_blocks
         device = coords.device
-        counts = torch.bincount(event, minlength=B)
-        starts = counts.cumsum(0) - counts
+        # event is sorted: boundaries by search (bincount would synchronise).
+        cu = torch.searchsorted(event, torch.arange(B + 1, device=device, dtype=event.dtype))
+        counts, starts = cu[1:] - cu[:-1], cu[:-1]
         rank = torch.arange(event.numel(), device=device) - starts[event]
         L = int(counts.max())
 
         grid = coords.new_zeros(B, L, 3, dtype=torch.float32)
         grid[event, rank] = coords.float()
-        valid = torch.zeros(B, L, dtype=torch.bool, device=device)
-        valid[event, rank] = True
+        valid = torch.arange(L, device=device) < counts.unsqueeze(1)                 # [B, L]
 
         last = (counts - 1).clamp_min(0)
         center = (torch.rand(B, M, device=device) * counts.unsqueeze(1)).long()
@@ -95,11 +95,11 @@ class MultiBlockMasker(nn.Module):
         size = torch.minimum(size, last.unsqueeze(1))
         target = (block_rank < size.unsqueeze(-1)).any(dim=1) & valid                 # [B, L]
 
-        # If the union of blocks covers an event, reveal its least-covered patch.
+        # If the union of blocks covers an event, reveal its least-covered patch
+        # (as a mask over all events, without synchronising on whether any is).
         covered = (target.sum(dim=1) >= counts) & (counts > 0)
-        if bool(covered.any()):
-            least = block_rank.min(dim=1).values.masked_fill(~valid, -1).argmax(dim=-1)
-            target[covered, least[covered]] = False
+        least = block_rank.min(dim=1).values.masked_fill(~valid, -1).argmax(dim=-1)
+        target &= ~(covered.unsqueeze(1) & (torch.arange(L, device=device) == least.unsqueeze(1)))
         return target[event, rank]
 
     @torch.no_grad()
@@ -172,6 +172,13 @@ class FlashPredictor(nn.Module):
         position = torch.empty_like(order)
         position[order] = torch.arange(order.numel(), device=order.device)
         return x[position[context.event.numel():]]
+
+
+def _data2vec_average(layers):
+    """data2vec targets: the layer-normalised average of the layer-normalised
+    MLP outputs ``layers`` (each [T, C]), in float32."""
+    out = sum(F.layer_norm(layer.float(), (layer.size(-1),)) for layer in layers) / len(layers)
+    return F.layer_norm(out, (out.size(-1),))
 
 
 def standardise_per_kind(x, kind, eps=1e-5):
@@ -265,12 +272,13 @@ class FlashJEPA(nn.Module):
             seq = tokens.seq()
             if self.target_layers == 1:
                 out = self.target_encoder.forward_tokens(tokens.x, seq)
+                out = F.layer_norm(out.float(), (out.size(-1),))
             else:
                 layers = self.target_encoder.forward_mlp_outputs(tokens.x, seq, self.target_layers)
-                out = sum(F.layer_norm(layer.float(), (layer.size(-1),)) for layer in layers) / len(layers)
+                # Eager: compiled, inductor's kernel for K = 16 was 9x slower (H100).
+                out = _data2vec_average(layers)
         finally:
             self.target_encoder.train(was_training)
-        out = F.layer_norm(out.float(), (out.size(-1),))
         if self.target_norm == "batch":
             out = standardise_per_kind(out, tokens.kind)
         return tokens, seq, out
@@ -285,28 +293,31 @@ class FlashJEPA(nn.Module):
         if not (torch.equal(target_tokens.kind, tokens.kind) and torch.equal(target_tokens.pos, tokens.pos)):
             raise RuntimeError("Context and target encoders tokenised the batch differently.")
 
+        target_index = target_mask.nonzero().squeeze(1)
         context = tokens.select(~target_mask)
-        targets = tokens.select(target_mask)
+        targets = tokens.select(target_index)
         context_seq = context.seq()
         context_out = self.context_encoder.forward_tokens(context.x, context_seq)
         prediction = self.predictor(context_out, context, targets).float()
-        target = target_out[target_mask]
+        target = target_out.index_select(0, target_index)
 
         token_loss = F.smooth_l1_loss(prediction, target, reduction="none").mean(dim=-1)
         loss = token_loss.mean() if token_loss.numel() else prediction.sum() * 0.0
 
-        group_losses = {}
         with torch.no_grad():
-            for kind, name in enumerate(TOKEN_KIND_NAMES):
-                selected = targets.kind == kind
-                if bool(selected.any()):
-                    group_losses[name] = token_loss[selected].mean()
+            # Mean loss per detector type, and its number of target tokens (a
+            # type without targets has count 0 and mean 0).
+            group_counts = token_loss.new_zeros(NUM_TOKEN_KINDS).index_add_(
+                0, targets.kind, torch.ones_like(token_loss))
+            group_sums = token_loss.new_zeros(NUM_TOKEN_KINDS).index_add_(0, targets.kind, token_loss.detach())
+            group_mean = group_sums / group_counts.clamp_min(1)
         return {
             "loss": loss,
             "prediction": prediction,
             "target": target,
             "target_kind": targets.kind,
-            "group_losses": group_losses,
+            "group_losses": {name: group_mean[kind] for kind, name in enumerate(TOKEN_KIND_NAMES)},
+            "group_counts": group_counts,
             "token_kind": tokens.kind,
             "target_mask": target_mask,
             "context_tokens": context_out.detach(),

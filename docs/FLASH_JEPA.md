@@ -79,6 +79,10 @@ then about 40 min of fine-tune plus test CSV on 1 node.
 - **Cost on dlnu** (A100 + H100, under another user's CPU load): 4.7 min
   per epoch, so about 23 h for 300 epochs.  Each fine-tune plus test CSV
   takes 1.5-2 h.
+  - Since the GPU-efficiency changes (2026-11-04), a full epoch took 15%
+    less than the committed code's in a direct test (195 vs 228 s), with
+    ~20 GB less GPU memory.  The data loader is now the limit; see "GPU
+    efficiency".
 
 **Caveats:**
 - The vertex median does not measurably improve on K = 1 or on the
@@ -409,6 +413,11 @@ Outputs and gradients match exact fp32 attention (tested).
 
 ## Commands
 
+Since 2026-11-04 the flash runs read the slim events:
+`DATASET_PATH='/scratch/salonso/sparse-nns/faser_slim_v7.0/events_v7.0*'`
+(see "Data loading" below).  The commands in this file keep the paths they
+were run with.
+
 Activate the environment first:
 
 ```bash
@@ -449,6 +458,221 @@ schema as the paper results):
 
 ```bash
 python -m evaluation.create_csv_v7_ft --checkpoint_dir /scratch4/salonso/faser/checkpoints_final/finetune_flash_jepa_base
+```
+
+## GPU efficiency (2026-11-04)
+
+Changes for speed and memory, with the same training (up to floating-point
+rounding) and the same logged values.  `pretrain_flash.sh` turns them all
+on; `finetune_flash.sh` all but compiled blocks.
+
+**How it was measured:** `tests/bench_flash_step.py`.  It runs the real
+Lightning modules on cached real batches, on one GPU, without data loading.
+- Batches: 6 of 2,048 events (pretraining) or 12 of 512 (fine-tuning), with
+  the training augmentations.
+- Settings: the recommended recipe (K = 16 `token`, predictor QK-norm;
+  fine-tuning layer decay 0.85).
+- Each figure is the mean of 36 steps, i.e. 6 full cycles of the batches.
+- Other users' load on dlnu makes repeat runs vary by about +-15 ms.
+
+*Pretraining step (2,048 events per GPU):*
+
+| code | A100 | H100 | peak allocated | reserved |
+|---|---|---|---|---|
+| committed (eager) | 786 ms | 539 ms | 45.2 GiB | 62.2 GiB |
+| + compiled blocks | 589 ms | 418 ms | 40.5 GiB | 55-57 GiB |
+| all changes | 593 ms | 381 ms | 40.5 GiB | 40.6-40.9 GiB |
+
+*Fine-tuning step (512 events per GPU):*
+
+| code | A100 | H100 | peak allocated | reserved |
+|---|---|---|---|---|
+| committed (eager) | 225 ms | 202 ms | 14.5 GiB | 27.1-27.5 GiB |
+| all changes, eager blocks | 232 ms | 144 ms | 14.4 GiB | 14.7-14.8 GiB |
+| all changes, compiled blocks | 241 ms | 125 ms | 14.1 GiB | 14.4 GiB |
+
+**The changes:**
+- **Compiled transformer blocks** (`FLASH_COMPILE_BLOCKS=1`).
+  - Each `Block` of the encoders and the predictor is compiled with
+    `torch.compile(dynamic=True)`.  That fuses its layer norms, casts, GELU
+    and residual adds; 24% of the eager step was layer norm alone.
+  - It compiles the function, not the module, so the checkpoints' keys are
+    unchanged.  It recompiles 3 times at the start (grad mode, predictor
+    width), never per batch.
+  - Only on torch's `varlen_attn` path (torch 2.14 on dlnu).  On Clariden's
+    torch 2.9 the blocks stay eager.
+  - Off in fine-tuning: no gain on the A100, which there is bound by
+    matmuls and layer-norm backward.
+- **Fewer host synchronisations, identical results:**
+  - `SeqInfo` gets its sequence boundaries by `searchsorted` and its counts
+    from `cu_seqlens`, instead of `bincount`.
+  - `TokenSet.select` does one `nonzero` and then `index_select`s.
+  - The masker reveals the least-covered patch as a mask, without the
+    `bool(any)` check.  It draws the same random numbers, so the masks are
+    unchanged.
+  - The per-detector JEPA losses come from `index_add` (with counts), not
+    a `bool(any)` and boolean indexing per type.
+- **Lighter training logging** (`DeviceEpochLogging` in
+  `model/lightning_model_flash.py`):
+  - Each `self.log` call cost ~1 ms of host time, ~12% of a compiled
+    H100 step for the JEPA's ~25 metrics.  Step-level metrics are now
+    logged only on the steps Lightning writes (every `log_every_n_steps`),
+    plus the progress-bar loss every step.  That includes the gradient
+    norms of `LOG_GRAD_NORM=1`, now computed only on those steps.
+  - The `/train_epoch` means are accumulated on the GPU and logged at epoch
+    end, weighted by batch size as Lightning's were.
+  - In fine-tuning, the part losses stay tensors (no `.item()` per loss).
+    The per-step losses, which are all-reduced over ranks, are reduced only
+    on the written steps, instead of ~18 all-reduces at every step.
+  - The CSV has the same columns, rows and values.  The 2-GPU check below
+    gave 71 identical columns, the same step rows, and epoch means equal to
+    5 digits.
+  - `trainer.callback_metrics` holds step-level values only from the last
+    written step.
+- **Asynchronous batch copy:** `transfer_batch_to_device` copies the
+  loaders' pinned batches with `non_blocking=True`, so the host queues the
+  first kernels during the ~13 ms copy.
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** is the launchers'
+  default.  The varying token counts fragmented the cache: reserved memory
+  was ~1.4x the peak in pretraining and ~1.9x in fine-tuning.  Same speed.
+
+**Tried and dropped:**
+- **Fused AdamW:** Lightning refuses gradient clipping with it, and the
+  optimiser is not a hot spot.
+- **A compiled data2vec target average:** inductor's kernel for the 16
+  layer norms took 163 ms, against 18 ms eager (H100, 240k tokens).
+
+**Checks:**
+- **Losses:** the first 8 pretraining losses match the committed code to 4-5
+  digits (same masks); eager fine-tuning to 4 digits.  Compiled fine-tuning
+  draws its drop-path masks from another random stream.
+- **Evaluation:** the test CSV of
+  `finetune_flash_jepa_base_d2v16_qkn_ep300_ld085_dlnu` (first 40 batches,
+  5,120 events) differs from the committed code's by at most 2.7e-3.  Two
+  runs of the same code differ by 3.2e-3 (atomic float adds), so it is
+  unchanged.  The flavour argmax agrees on every event.
+- **Tests:** `tests/` pass on the CPU and on the H100, with blocks eager
+  and compiled.  The toy JEPA trainer in `tests/test_flash_jepa.py` now
+  writes every step (`log_every_n_steps=1`), and a new test checks the
+  epoch means against Lightning's weighting.
+- **2-GPU pretraining, 120k-event subset, 3 epochs:** epochs 1-2 took 48 /
+  43 s with the committed code and 35 / 33 s with the changes.  These
+  short epochs (24 steps) are dominated by the loader's first batch.
+- **Full epoch (2 GPUs, all 1,042,418 training events, the recipe):**
+  - Training took 228 s with the committed code and 195 s with the changes
+    (-15%).  Validation took 6 s and 4 s.
+  - The gain is smaller than the step times': the changed run is
+    loader-bound.  It ran at 0.77 s per step, against 0.59 s of A100
+    compute, including the first batch's ~25 s wait.
+  - Load average: 65-87 during the committed run, 83-92 during the changed
+    one.
+  - Projected 300 epochs on dlnu: ~19.5 h with the committed code, ~16.5 h
+    with the changes.
+  - Runner: `/scratch4/salonso/faser/bench_e2e/run_full_epoch.sh` (logs
+    next to it).
+
+**What is left:**
+- **The A100 sets the 2-GPU pace.**  Its compiled step is GPU-bound:
+  matmuls 38%, FlashAttention 18%.  The H100 then waits ~35% of each
+  step.
+  - Uneven per-GPU batches (about 1,600 / 2,500) would balance them, but
+    need a custom sampler and loss weighting.  Not done.
+- **The H100 step is still host-bound,** ~30% GPU idle.
+- **The data loader now roughly keeps pace with the A100.**  Two concurrent
+  loaders (24 workers each, 2,048 events) gave 0.48 and 0.68 s per batch in
+  steady state.
+  - Each epoch's first batch takes 25-36 s, because one worker builds a
+    whole batch.  That is ~10% of a full epoch.
+  - Batches built from smaller chunks by several workers would remove most
+    of it.  Not done.
+
+**Data loading (2026-11-04).**  After the GPU changes, the loader barely kept
+pace with the A100.
+- **Where a worker's time went** (`np.load` on the full files): 6.2 ms per
+  training event.  Reading took 3.8 ms, preparation, augmentations and
+  preprocessing 2.4 ms, and collate 0.2 ms.
+- **Reading was mostly numpy's overhead, not decompression or disk.**  The
+  19 stage-2 arrays took 3.4 ms even uncompressed in memory.
+  `np.lib.npyio.NpzFile` parses the zip directory with the pure-Python
+  `zipfile`, and each `.npy` header with `ast.literal_eval`: ~0.17 ms per
+  array.
+- **`dataset/fast_npz.py`** (`load_npz`, now used by
+  `SparseFASERCALMapDataset`) is a drop-in for `np.load(path,
+  allow_pickle=True)`.
+  - It reads the file once, parses the zip directory and the plain `.npy`
+    headers directly, and decodes an array only when accessed, as
+    `np.load` does.
+  - Each member's CRC-32 is checked, as `zipfile` does.  Anything unusual
+    (zip64 sizes, encryption, other compressions, object arrays, other
+    headers) falls back to numpy.
+  - `FASER_FAST_NPZ=0` restores `np.load`.
+  - The arrays are identical: same dtype, shape, flags and bytes for all
+    50,800 arrays of 1,200 full and 400 slim events, and
+    `tests/test_fast_npz.py`.
+  - Reading the 19 arrays now takes 1.20 instead of 2.34 ms (full files) and
+    0.82 instead of 2.14 ms (slim).  Measured single-process, back to back.
+- **Slim events on `/scratch`.**  `/scratch4/salonso/faser/slim_v7.0` (the
+  64 shards of `dataset/slim_shards.py`) is extracted to
+  `/scratch/salonso/sparse-nns/faser_slim_v7.0`: 1,226,375 events, 64 GB,
+  with the same `<directory>/<file>.npz` names.
+  - All 19 stage-2 arrays of every event are byte-identical to the full
+    originals (`/scratch4/salonso/faser/verify_npz_copy/verify_slim.py`: 0
+    mismatches).
+  - The split fingerprint is unchanged.
+  - An evaluation with `--dataset_path` set to the slim events passes the
+    inventory check.  Its truth columns are identical and its predictions
+    within the run-to-run nondeterminism above.
+  - Use `DATASET_PATH='/scratch/salonso/sparse-nns/faser_slim_v7.0/events_v7.0*'`
+    for flash pretraining, fine-tuning and evaluation, with `METADATA_PATH`
+    unchanged.  The MAE (stage 1) needs the truth arrays of the full files.
+- **Full events off `/scratch` (2026-11-04).**  `/scratch` was 99% full
+  (26 GB free), so the full `events_v7.0_501_npz` and `events_v7.0_tau_npz`
+  (532 GB) were deleted from the repo directory, leaving 557 GB free.
+  - First, `/scratch4/salonso/faser/verify_npz_copy/verify.py` compared all
+    1,226,376 files (with `metadata_stats.pkl`) of `/scratch4/salonso/faser/events_v7.0_*`
+    byte for byte with the `/scratch` originals: 0 mismatches.
+  - The two directories are now symlinks to the `/scratch4` copies, so
+    `<repo>/events_v7.0*` still means all 1,226,375 full events, read from
+    the hard disk.  This covers `finetune_jepa.sh`, the MAE scripts and the
+    commands below.  The split fingerprint through the symlinks is unchanged
+    (`02078f72…`), and `.gitignore` (`/events_v7.0*`) covers the links.
+  - `events_v7.0_500_npz` (11,281 events, 4.8 GB, with the `METADATA_PATH`
+    pickle) stays a real directory on `/scratch` for the tests.
+- **Loader throughput,** one loader with 24 workers, back to back (load
+  average 70-82):
+  - full files with `np.load`: 2,000-3,400 events/s;
+  - slim files with `load_npz`: 4,700-6,400 events/s.
+  - Each worker now spends 3.0 ms per event alone, 4.7-5 ms with 24
+    workers on the shared CPUs.
+- **Full epoch:** 195-196 s with either loader, 178 s in a repeat; runs vary
+  by ~10% with other users' load.
+  - Training is now bound by A100 compute in steady state: the A100 was
+    busy 88% on average (median 95%) and the H100 68%, sampled every second
+    after the first minute.
+  - The loader still sets the first step of each epoch (9-12 s, including
+    compilation in epoch 0), and leaves headroom against heavier CPU load.
+- **Not done:** building each batch from 16 chunks of 128 events, merged in
+  order, would cut the first-batch wait to ~1 s.
+  - It would save ~5-10 s per epoch (3-5%).
+  - It needs the DDP sampler set up outside Lightning.
+
+Commands (dlnu; the cache is built on the first call):
+
+```bash
+python -m tests.bench_flash_step --mode pretrain --gpu 0
+FLASH_COMPILE_BLOCKS=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m tests.bench_flash_step --mode pretrain --gpu 0
+FLASH_COMPILE_BLOCKS=1 python -m tests.bench_flash_step --mode pretrain --gpu 1 --profile
+python -m tests.bench_flash_step --mode finetune --gpu 1 --batches 12
+```
+
+The full events' move off `/scratch`:
+
+```bash
+python /scratch4/salonso/faser/verify_npz_copy/verify.py   # 0 mismatches required
+rm -rf events_v7.0_501_npz events_v7.0_tau_npz
+ln -s /scratch4/salonso/faser/events_v7.0_501_npz events_v7.0_501_npz
+ln -s /scratch4/salonso/faser/events_v7.0_tau_npz events_v7.0_tau_npz
+python -m train.split_fingerprint --dataset_path "$PWD/events_v7.0*"
 ```
 
 ## Clariden (CSCS)
@@ -2862,6 +3086,62 @@ Output: `results/flash_audit_20261026/metrics_flash_qkn_ep300.out`.
     compare platforms.
 
 Output: `results/flash_audit_20261026/metrics_flash_qkn_ft8.out`.
+
+**FASERCal patch size, from-scratch A/B (launched 2026-11-04 16:09,
+cancelled 16:40).**  The patch sizes (FASERCal 12x12x10, AHCAL 6x6x5) come
+from the published spconv models and were never tuned.  Only the z size is
+constrained: FASERCal has 10 modules of 20 layers, so 10 is half a module.
+- **Cancelled by the user during epoch 5 of the first run, unscored:** a
+  patch-size change was judged unlikely to make a large difference.
+  - The partial outputs of `finetune_flash_scratch_base_ld085_dlnu` were
+    deleted on the user's request: its checkpoints and its `logs_final`
+    CSV and TensorBoard logs.  Only the runner's log
+    `/scratch4/salonso/faser/dlnu_patch_ab.log` remains.
+  - The design below is kept for reference.
+- **Design:** the flash base encoder trained from random initialisation
+  with the published fine-tune recipe.  That is layer decay 0.85, seed 7, 2
+  x 512 on dlnu.  Three FASERCal patch sizes, all module-aligned; AHCAL
+  stays 6x6x5.  It tests whether patch resolution limits the encoder
+  before spending a pretraining on it.
+
+  | run | FASERCal patch | patch grid | stage-1 cell (k1) | cells per patch (k2) | FASERCal tokens per event, mean / p95 |
+  |---|---|---|---|---|---|
+  | `finetune_flash_scratch_base_ld085_dlnu` | 12x12x10 (now) | 4x4x20 | 4x4x2 | 3x3x5 | 79 / 204 |
+  | `finetune_flash_scratch_base_p12x12x5_ld085_dlnu` | 12x12x5 | 4x4x40 | 4x4x1 | 3x3x5 | 140 / 386 |
+  | `finetune_flash_scratch_base_p8x8x10_ld085_dlnu` | 8x8x10 | 6x6x20 | 4x4x2 | 2x2x5 | 137 / 402 |
+
+  - Token counts are from 400 events of `events_v7.0_500_npz`.
+  - At 12x12x5 the stage-1 cells shrink to one layer too: `choose_k1_k2`
+    cannot split a depth of 5.
+- **Smoke tests:** a one-batch `fast_dev_run` at 2 x 512 per size.  Each
+  passed the split fingerprint, and peak GPU memory was 19 GB (12x12x10),
+  27 GB (12x12x5) and 26 GB (8x8x10).
+  - `fast_dev_run` still writes a `last.ckpt` per monitor (~0.5 GB each).
+    Pointed at `/tmp`, it filled it.
+- **Scoring:** `metrics_flash_patch_ab.py` runs once all three CSVs exist.
+  - It compares each new size with the dlnu 12x12x10 run, and that run
+    with the Clariden `finetune_flash_scratch_base_ld085` (same recipe and
+    seed: a platform replicate).  All with paired event-bootstrap
+    intervals.
+  - It also divides each difference by sqrt(2) x the repeat-fine-tune SD
+    above.  That SD comes from fine-tunes of pretrained encoders; the
+    scratch noise may be larger.
+  - Tested with stand-in CSVs.
+- **Expected (had it run):** about 2 h for the first run and 2.5-3 h for each new size
+  (~1.5x the tokens), so the scores come around midnight.
+- **Caveats:**
+  - One seed per size.
+  - A from-scratch gain need not carry over to pretraining.  Smaller
+    patches also tell the JEPA predictor a finer occupancy map of the
+    masked region (its target positions), which makes the pretext task
+    easier.
+  - Any change breaks the like-for-like comparison with the published MAE.
+
+  On dlnu:
+
+  ```bash
+  setsid nohup bash results/flash_audit_20261026/dlnu_patch_ab.sh > /scratch4/salonso/faser/dlnu_patch_ab.log 2>&1 < /dev/null &
+  ```
 
 **What the encoder knows before it sees a label (2026-11-04).**  Frozen
 probes and 2D latent maps of the best encoder: K = 16 `token` targets with

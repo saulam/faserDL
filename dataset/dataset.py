@@ -19,6 +19,7 @@ from glob import glob
 from itertools import chain
 from torch.utils.data import Dataset, IterableDataset
 from utils.augmentations import augment, smooth_labels
+from .fast_npz import load_npz
 from utils.pdg import cluster_labels_from_pdgs
 
 
@@ -633,7 +634,7 @@ class SparseFASERCALMapDataset(SparseFASERCALDataset, Dataset):
         return len(self.data_files)
     
     def __getitem__(self, idx):
-        data = np.load(self.data_files[idx], allow_pickle=True)
+        data = load_npz(self.data_files[idx])   # = np.load(..., allow_pickle=True), faster
         return self._process_sample(data)
 
 
